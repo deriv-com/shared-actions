@@ -1,0 +1,55 @@
+name: post_action_build_comment
+description: post action build comment
+inputs:
+  issue_number:
+    description: "PR number"
+    required: true
+outputs:
+  check_run_id:
+    description: "Id of the created check"
+    value: ${{ steps.create_build_check.outputs.check_run_id }}
+runs:
+  using: composite
+  steps:
+    - name: "Create action link comment"
+      id: create_build_comment
+      uses: actions/github-script@v3
+      with:
+        github-token: ${{ github.token }}
+        script: |
+          const action_url = "${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}}"
+          const comment = [
+              '| Name | Result |',
+              '| :--- | :------ |',
+              `| **Build status**  | Building 🔨 |`,
+              `| **Action URL**  | [Visit Action](${action_url}) |`,
+              ''
+            ].join('\n')
+          core.setOutput("comment", comment);
+    - name: Post Cloudflare Pages Preview comment
+      uses: marocchino/sticky-pull-request-comment@v2
+      with:
+        header: Cloudflare Pages Preview Comment
+        number: ${{ inputs.issue_number }}
+        message: ${{steps.create_build_comment.outputs.comment}}
+        recreate: true
+
+    - name: "Create a build check"
+      id: create_build_check
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ github.token }}
+        script: |
+          const action_url = "${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}}"
+          const check = await github.rest.checks.create({
+              ...context.repo,
+              name: "Generate preview link",
+              head_sha: github.event.workflow_run.head_sha,
+              details_url: action_url,
+              status: "in_progress",
+              output: {
+                title: "Generate preview link",
+                summary: "Preview link creation is in progress",
+              },
+          });
+          core.setOutput("check_run_id", check.data.id);

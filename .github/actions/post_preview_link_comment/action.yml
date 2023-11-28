@@ -1,0 +1,80 @@
+name: post_preview_link_comment
+description: Post preview link comment
+inputs:
+  issue_number:
+    description: "PR number"
+    required: true
+  preview_url:
+    description: "URL of the published deployment"
+    required: true
+  check_run_id:
+    description: "Id of the created check"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: "Create preview link comment"
+      if: success()
+      id: create_preview_comment
+      uses: actions/github-script@v3
+      with:
+        github-token: ${{ github.token }}
+        script: |
+          const action_url = "${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}}"
+          const preview_url = "${{ inputs.preview_url }}"
+          const comment = [
+              `**Preview Link**: ${preview_url}`,
+              '| Name | Result |',
+              '| :--- | :------ |',
+              `| **Build status**  | Completed ✅ |`,
+              `| **Preview URL**  | [Visit Preview](${preview_url}) |`,
+              `| **Action URL**  | [Visit Action](${action_url}) |`,
+              ''
+            ].join('\n')
+          core.setOutput("comment", comment);
+    - name: "Create failure comment"
+      if: failure()
+      id: create_failure_comment
+      uses: actions/github-script@v3
+      with:
+        github-token: ${{ github.token }}
+        script: |
+          const action_url = "${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}}"
+          const comment = [
+            '| Name | Result |',
+            '| :--- | :------ |',
+            `| **Build status**  | Failed ❌ |`,
+            `| **Action URL**  | [Visit Action](${action_url}) |`,
+            ''
+          ].join('\n')
+          core.setOutput("comment", comment);
+    - name: Post Cloudflare Pages Preview comment
+      if: success() || failure()
+      uses: marocchino/sticky-pull-request-comment@v2
+      with:
+        header: Cloudflare Pages Preview Comment
+        number: ${{ inputs.issue_number }}
+        message: ${{steps.create_preview_comment.outputs.comment || steps.create_failure_comment.outputs.comment }}
+        recreate: true
+
+    - name: "Update the build check"
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ github.token }}
+        script: |
+          const conclusion = ${{success()}} ? 'success' : ${{cancelled()}} ? 'cancelled' : 'failure';
+          const details_url = "${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}}"
+          await github.rest.checks.update({
+            ...context.repo,
+            name: "Generate preview link",
+            check_run_id: "${{ inputs.check_run_id }}"
+            head_sha: github.event.workflow_run.head_sha,
+            details_url,
+            status: "completed",
+            conclusion,
+            output: {
+              title: "Generate preview link",
+              summary: "Generate preview link build check",
+            },
+          });
