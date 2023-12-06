@@ -1,6 +1,6 @@
 ## Shared Actions Repository
 
-This repository is dedicated to hosting reusable GitHub Actions YAML files that can be shared across different repositories. By centralizing common actions, you can promote consistency and efficiency in your workflows.
+This repository is dedicated to hosting reusable GitHub Actions YAML files that can be shared across different repositories. Centralizing common actions, to promote consistency and efficiency in workflows.
 
 #### Example Usage
 
