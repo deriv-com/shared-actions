@@ -10,13 +10,15 @@ inputs:
   check_run_id:
     description: "Id of the created check"
     required: true
-
+  status:
+    description: "Status of the job"
+    required: true
 runs:
   using: composite
   steps:
-    - name: "Create preview link comment"
-      if: success()
-      id: create_preview_comment
+    - name: "Post preview link comment"
+      if: ${{ inputs.status == 'success' }}
+      id: post_preview_comment
       uses: actions/github-script@v3
       with:
         github-token: ${{ github.token }}
@@ -33,9 +35,9 @@ runs:
               ''
             ].join('\n')
           core.setOutput("comment", comment);
-    - name: "Create failure comment"
-      if: failure()
-      id: create_failure_comment
+    - name: "Post failure comment"
+      if: ${{ inputs.status == 'failure' }}
+      id: post_failure_comment
       uses: actions/github-script@v3
       with:
         github-token: ${{ github.token }}
@@ -50,31 +52,31 @@ runs:
           ].join('\n')
           core.setOutput("comment", comment);
     - name: Post Cloudflare Pages Preview comment
-      if: success() || failure()
+      if: ${{ inputs.status == 'success' || inputs.status == 'failure' }}
       uses: marocchino/sticky-pull-request-comment@v2
       with:
         header: Cloudflare Pages Preview Comment
         number: ${{ inputs.issue_number }}
-        message: ${{steps.create_preview_comment.outputs.comment || steps.create_failure_comment.outputs.comment }}
+        message: ${{steps.post_preview_comment.outputs.comment || steps.post_failure_comment.outputs.comment }}
         recreate: true
 
     - name: "Update the build check"
       uses: actions/github-script@v7
+      if: always()
       with:
         github-token: ${{ github.token }}
         script: |
-          const conclusion = ${{success()}} ? 'success' : ${{cancelled()}} ? 'cancelled' : 'failure';
-          const details_url = "${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}}"
+          const conclusion = "${{ inputs.status }}"
+          const action_url = "${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}}"
           await github.rest.checks.update({
             ...context.repo,
             name: "Generate preview link",
-            check_run_id: "${{ inputs.check_run_id }}"
-            head_sha: github.event.workflow_run.head_sha,
-            details_url,
+            check_run_id: "${{ inputs.check_run_id }}",
+            details_url: action_url,
             status: "completed",
             conclusion,
             output: {
               title: "Generate preview link",
-              summary: "Generate preview link build check",
+              summary: `Preview link creation status: ${conclusion}. Build URL: - ${action_url}`,
             },
           });

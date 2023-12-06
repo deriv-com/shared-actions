@@ -1,8 +1,11 @@
-name: post_action_build_comment
-description: post action build comment
+name: post_preview_build_comment
+description: Post preview build comment
 inputs:
   issue_number:
     description: "PR number"
+    required: true
+  head_sha:
+    description: "SHA of the commit"
     required: true
 outputs:
   check_run_id:
@@ -11,8 +14,8 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: "Create action link comment"
-      id: create_build_comment
+    - name: "Post build comment"
+      id: post_build_comment
       uses: actions/github-script@v3
       with:
         github-token: ${{ github.token }}
@@ -26,12 +29,12 @@ runs:
               ''
             ].join('\n')
           core.setOutput("comment", comment);
-    - name: Post Cloudflare Pages Preview comment
+    - name: "Post Cloudflare Pages Preview comment"
       uses: marocchino/sticky-pull-request-comment@v2
       with:
         header: Cloudflare Pages Preview Comment
         number: ${{ inputs.issue_number }}
-        message: ${{steps.create_build_comment.outputs.comment}}
+        message: ${{steps.post_build_comment.outputs.comment}}
         recreate: true
 
     - name: "Create a build check"
@@ -44,12 +47,12 @@ runs:
           const check = await github.rest.checks.create({
               ...context.repo,
               name: "Generate preview link",
-              head_sha: github.event.workflow_run.head_sha,
+              head_sha: "${{ inputs.head_sha }}",
               details_url: action_url,
               status: "in_progress",
               output: {
                 title: "Generate preview link",
-                summary: "Preview link creation is in progress",
+                summary: `Preview link creation is in progress. Build URL: - ${action_url}`,
               },
           });
           core.setOutput("check_run_id", check.data.id);
