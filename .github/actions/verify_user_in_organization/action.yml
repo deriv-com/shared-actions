@@ -12,6 +12,7 @@ runs:
   steps:
     - name: Verify user in organization
       id: verify_user_in_organization
+      shell: bash
       run: |
         echo "Verifying user's organization..."
         response=$(curl -s -L \
@@ -19,11 +20,11 @@ runs:
             -o /dev/null -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${{ inputs.token }}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/orgs/${{vars.ORGANIZATION_VAR}}/memberships/${{inputs.username}}")
+            "https://api.github.com/orgs/binary-com/memberships/${{inputs.username}}")
             
         if [ $response != "200" ]; then
-            echo "User is not a member of ${{vars.ORGANIZATION_VAR}} organization."
+            echo "User is not a member of binary-com organization."
             exit 1
         else
-            echo "User is a member of ${{vars.ORGANIZATION_VAR}} organization."
+            echo "User is a member of binary-com organization."
         fi
