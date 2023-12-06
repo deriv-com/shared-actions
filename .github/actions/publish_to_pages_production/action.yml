@@ -1,0 +1,31 @@
+name: publish_to_pages_production
+description: Publish to cloudflare pages (production)
+inputs:
+  CLOUDFLARE_ACCOUNT_ID:
+    description: "Cloudflare account id"
+    required: true
+  CLOUDFLARE_API_TOKEN:
+    description: "Cloudflare token"
+    required: true
+  project_name:
+    description: "Name of the project in Cloudflare Pages"
+    required: true
+  output_dir:
+    description: "Directory in which your compiled frontend is located"
+    required: true
+  cname_url:
+    description: "URL of the latest deployed website. (e.g., https://app.deriv.com)"
+    required: false
+    default: "N/A"
+runs:
+  using: composite
+  steps:
+    - name: Publish to cloudflare pages (production)
+      env:
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.CLOUDFLARE_ACCOUNT_ID }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.CLOUDFLARE_API_TOKEN }}
+      run: |
+        npm i -g wrangler@3.1.0
+        npx wrangler pages deploy ${{ inputs.output_dir }} --project-name=${{ inputs.project_name }} --branch=main
+        echo "New production website - ${{ inputs.cname_url }}"
+      shell: bash

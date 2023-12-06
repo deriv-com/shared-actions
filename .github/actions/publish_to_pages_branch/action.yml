@@ -1,0 +1,42 @@
+name: publish_to_pages_branch
+description: Publish to cloudflare pages (branch)
+inputs:
+  CLOUDFLARE_ACCOUNT_ID:
+    description: "Cloudflare account id"
+    required: true
+  CLOUDFLARE_API_TOKEN:
+    description: "Cloudflare token"
+    required: true
+  project_name:
+    description: "Name of the project in Cloudflare Pages"
+    required: true
+  branch_name:
+    description: "Name of the branch in Cloudflare Pages (e.g., staging, uat, etc.)"
+    required: true
+  output_dir:
+    description: "Directory in which your compiled frontend is located"
+    required: true
+  cname_url:
+    description: "URL of the latest deployed website. (e.g., https://staging-app.deriv.com)"
+    required: false
+    default: "N/A"
+outputs:
+  cf_pages_url:
+    description: "URL of the published deployment"
+    value: ${{ steps.publish-to-clouflare-pages-branch.outputs.cf_pages_url }}
+runs:
+  using: composite
+  steps:
+    - id: publish-to-clouflare-pages-branch
+      name: Publish to cloudflare pages (branch)
+      env:
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.CLOUDFLARE_ACCOUNT_ID }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.CLOUDFLARE_API_TOKEN }}
+      run: |
+        npm i -g wrangler@3.1.0
+        branch=$(echo ${{ inputs.branch_name }} | sed 's/[^a-zA-Z0-9]/-/g' | head -c 20)
+        npx wrangler pages deploy ${{ inputs.output_dir }} --project-name=${{ inputs.project_name }} --branch=$branch
+        cf_pages_url=https://$branch.${{ inputs.project_name }}.pages.dev
+        echo "cf_pages_url=$cf_pages_url" >> "$GITHUB_OUTPUT"
+        echo "New branch website - ${{ inputs.cname_url }}"
+      shell: bash
