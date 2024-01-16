@@ -31,11 +31,9 @@ runs:
           core.setOutput("comment", comment);
     - name: "Post Cloudflare Pages Preview comment"
       uses: marocchino/sticky-pull-request-comment@v2
-      env:
-        ISSUE_NUMBER: ${{ inputs.issue_number }}
       with:
         header: Cloudflare Pages Preview Comment
-        number: ${{ env.ISSUE_NUMBER }}
+        number: ${{ inputs.issue_number }}
         message: ${{steps.post_build_comment.outputs.comment}}
         recreate: true
 
@@ -51,7 +49,7 @@ runs:
           const check = await github.rest.checks.create({
               ...context.repo,
               name: "Generate preview link",
-              head_sha: "${{ env.HEAD_SHA }}",
+              head_sha: process.env.HEAD_SHA,
               details_url: action_url,
               status: "in_progress",
               output: {

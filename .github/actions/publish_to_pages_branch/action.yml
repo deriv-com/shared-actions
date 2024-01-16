@@ -38,9 +38,9 @@ runs:
         CNAME_URL: ${{ inputs.cname_url }}
       run: |
         npm i -g wrangler@3.1.0
-        branch=$(echo ${{ env.BRANCH_NAME }} | sed 's/[^a-zA-Z0-9]/-/g' | head -c 20)
-        npx wrangler pages deploy ${{ env.OUTPUT_DIR }} --project-name=${{ env.PROJECT_NAME }} --branch=$branch
-        cf_pages_url=https://$branch.${{ env.PROJECT_NAME }}.pages.dev
+        branch=$(echo $BRANCH_NAME | sed 's/[^a-zA-Z0-9]/-/g' | head -c 20)
+        npx wrangler pages deploy $OUTPUT_DIR --project-name=$PROJECT_NAME --branch=$branch
+        cf_pages_url=https://$branch.$PROJECT_NAME.pages.dev
         echo "cf_pages_url=$cf_pages_url" >> $GITHUB_OUTPUT
-        echo "New branch website - ${{ env.CNAME_URL }}"
+        echo "New branch website - $CNAME_URL"
       shell: bash

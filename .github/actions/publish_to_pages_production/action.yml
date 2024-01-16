@@ -29,6 +29,6 @@ runs:
         CNAME_URL: ${{ inputs.cname_url }}
       run: |
         npm i -g wrangler@3.1.0
-        npx wrangler pages deploy ${{ env.OUTPUT_DIR }} --project-name=${{ env.PROJECT_NAME }} --branch=main
-        echo "New production website - ${{ env.CNAME_URL }}"
+        npx wrangler pages deploy $OUTPUT_DIR --project-name=$PROJECT_NAME --branch=main
+        echo "New production website - $CNAME_URL"
       shell: bash
