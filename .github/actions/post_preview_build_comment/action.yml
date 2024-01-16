@@ -31,15 +31,19 @@ runs:
           core.setOutput("comment", comment);
     - name: "Post Cloudflare Pages Preview comment"
       uses: marocchino/sticky-pull-request-comment@v2
+      env:
+        ISSUE_NUMBER: ${{ inputs.issue_number }}
       with:
         header: Cloudflare Pages Preview Comment
-        number: ${{ inputs.issue_number }}
+        number: ${{ env.ISSUE_NUMBER }}
         message: ${{steps.post_build_comment.outputs.comment}}
         recreate: true
 
     - name: "Create a build check"
       id: create_build_check
       uses: actions/github-script@v7
+      env:
+        HEAD_SHA: ${{ inputs.head_sha }}
       with:
         github-token: ${{ github.token }}
         script: |
@@ -47,7 +51,7 @@ runs:
           const check = await github.rest.checks.create({
               ...context.repo,
               name: "Generate preview link",
-              head_sha: "${{ inputs.head_sha }}",
+              head_sha: "${{ env.HEAD_SHA }}",
               details_url: action_url,
               status: "in_progress",
               output: {

@@ -20,11 +20,13 @@ runs:
       if: ${{ inputs.status == 'success' }}
       id: post_preview_comment
       uses: actions/github-script@v3
+      env:
+        PREVIEW_URL: ${{ inputs.preview_url }}
       with:
         github-token: ${{ github.token }}
         script: |
           const action_url = "${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}}"
-          const preview_url = "${{ inputs.preview_url }}"
+          const preview_url = "${{ env.PREVIEW_URL }}"
           const comment = [
               `**Preview Link**: ${preview_url}`,
               '| Name | Result |',
@@ -54,24 +56,29 @@ runs:
     - name: Post Cloudflare Pages Preview comment
       if: ${{ inputs.status == 'success' || inputs.status == 'failure' }}
       uses: marocchino/sticky-pull-request-comment@v2
+      env:
+        ISSUE_NUMBER: ${{ inputs.issue_number }}
       with:
         header: Cloudflare Pages Preview Comment
-        number: ${{ inputs.issue_number }}
+        number: ${{ env.ISSUE_NUMBER }}
         message: ${{steps.post_preview_comment.outputs.comment || steps.post_failure_comment.outputs.comment }}
         recreate: true
 
     - name: "Update the build check"
       uses: actions/github-script@v7
       if: always()
+      env:
+        CHECK_RUN_ID: ${{ inputs.check_run_id }}
+        STATUS: ${{ inputs.status }}
       with:
         github-token: ${{ github.token }}
         script: |
-          const conclusion = "${{ inputs.status }}"
+          const conclusion = "${{ env.STATUS }}"
           const action_url = "${{github.server_url}}/${{github.repository}}/actions/runs/${{github.run_id}}"
           await github.rest.checks.update({
             ...context.repo,
             name: "Generate preview link",
-            check_run_id: "${{ inputs.check_run_id }}",
+            check_run_id: "${{ env.CHECK_RUN_ID }}",
             details_url: action_url,
             status: "completed",
             conclusion,
