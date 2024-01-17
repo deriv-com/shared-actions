@@ -5,7 +5,7 @@ runs:
   steps:
     - name: Cache dependencies
       id: cache-node-modules
-      uses: actions/cache/restore@v3
+      uses: actions/cache/restore@e12d46a63a90f2fae62d114769bbf2a179198b5c
       with:
         key: v1-deps-{{ hashFiles("package-lock.json") }}
         path: node_modules
@@ -15,7 +15,7 @@ runs:
       shell: bash
     - name: save_cache
       if: steps.cache-node-modules.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v3
+      uses: actions/cache/save@e12d46a63a90f2fae62d114769bbf2a179198b5c
       with:
         path: node_modules
         key: v1-deps-{{ hashFiles("package-lock.json") }}
