@@ -24,8 +24,11 @@ runs:
       env:
         CLOUDFLARE_ACCOUNT_ID: ${{ inputs.CLOUDFLARE_ACCOUNT_ID }}
         CLOUDFLARE_API_TOKEN: ${{ inputs.CLOUDFLARE_API_TOKEN }}
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+        PROJECT_NAME: ${{ inputs.project_name }}
+        CNAME_URL: ${{ inputs.cname_url }}
       run: |
         npm i -g wrangler@3.1.0
-        npx wrangler pages deploy ${{ inputs.output_dir }} --project-name=${{ inputs.project_name }} --branch=main
-        echo "New production website - ${{ inputs.cname_url }}"
+        npx wrangler pages deploy $OUTPUT_DIR --project-name=$PROJECT_NAME --branch=main
+        echo "New production website - $CNAME_URL"
       shell: bash

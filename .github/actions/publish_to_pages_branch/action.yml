@@ -32,11 +32,15 @@ runs:
       env:
         CLOUDFLARE_ACCOUNT_ID: ${{ inputs.CLOUDFLARE_ACCOUNT_ID }}
         CLOUDFLARE_API_TOKEN: ${{ inputs.CLOUDFLARE_API_TOKEN }}
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+        PROJECT_NAME: ${{ inputs.project_name }}
+        BRANCH_NAME: ${{ inputs.branch_name }}
+        CNAME_URL: ${{ inputs.cname_url }}
       run: |
         npm i -g wrangler@3.1.0
-        branch=$(echo ${{ inputs.branch_name }} | sed 's/[^a-zA-Z0-9]/-/g' | head -c 20)
-        npx wrangler pages deploy ${{ inputs.output_dir }} --project-name=${{ inputs.project_name }} --branch=$branch
-        cf_pages_url=https://$branch.${{ inputs.project_name }}.pages.dev
-        echo "cf_pages_url=$cf_pages_url" >> "$GITHUB_OUTPUT"
-        echo "New branch website - ${{ inputs.cname_url }}"
+        branch=$(echo $BRANCH_NAME | sed 's/[^a-zA-Z0-9]/-/g' | head -c 20)
+        npx wrangler pages deploy $OUTPUT_DIR --project-name=$PROJECT_NAME --branch=$branch
+        cf_pages_url=https://$branch.$PROJECT_NAME.pages.dev
+        echo "cf_pages_url=$cf_pages_url" >> $GITHUB_OUTPUT
+        echo "New branch website - $CNAME_URL"
       shell: bash
