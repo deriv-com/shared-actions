@@ -1,0 +1,53 @@
+name: Sync Translations with CloudFlare
+description: Sync Crowdin translations of desired environment with cloudflare
+
+inputs:
+  CROWDIN_BRANCH_NAME:
+    description: 'Running on production, test or staging etc' 
+    default: 'crowdin'
+    requried: false
+  CROWDIN_PROJECT_ID:
+    description: 'Crowdin project ID which can be found in the crowdin project settings'
+    required: true
+  CROWDIN_PERSONAL_TOKEN:
+    description: 'Crowdin personal token which can be found in the crowdin account settings' 
+    required: true
+  R2_ACCOUNT_ID:
+    description: 'R2 account ID from the Cloudflare R2 dashboard' 
+    required: true
+  R2_ACCESS_KEY_ID:
+    description: 'R2 access key ID from the Cloudflare R2 dashboard'
+    required: true
+  R2_SECRET_ACCESS_KEY:
+    description: 'R2 secret access key from the Cloudflare R2 dashboard'
+    required: true
+  R2_BUCKET_NAME:
+    description: 'R2 bucket name from the Cloudflare R2 dashboard'
+    required: true
+
+
+runs:
+  using: composite
+  steps:
+    - name: Crowdin pull action to download translations
+      uses: crowdin/github-action@v1
+      with:
+        upload_sources: false
+        upload_translations: false
+        download_translations: true
+        create_pull_request: false
+        push_translations: false
+        crowdin_branch_name: ${{ inputs.CROWDIN_BRANCH_NAME }}
+      env:
+        CROWDIN_PROJECT_ID: ${{ inputs.CROWDIN_PROJECT_ID }}
+        CROWDIN_PERSONAL_TOKEN: ${{ inputs.CROWDIN_PERSONAL_TOKEN }}
+
+    - name: R2 Upload Action to upload translations to Cloudflare
+      uses: ryand56/r2-upload-action@latest
+      with:
+        r2-account-id: ${{ inputs.R2_ACCOUNT_ID }}
+        r2-access-key-id: ${{ inputs.R2_ACCESS_KEY_ID }}
+        r2-secret-access-key: ${{ inputs.R2_SECRET_ACCESS_KEY }}
+        r2-bucket: ${{ inputs.R2_BUCKET_NAME }}
+        source-dir: ./translations
+        destination-dir: ./${{ inputs.CROWDIN_BRANCH_NAME }}/translations
