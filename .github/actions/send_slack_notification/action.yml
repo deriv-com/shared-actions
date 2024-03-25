@@ -1,0 +1,34 @@
+name: send_slack_notification
+description: Send custom JSON data to Slack workflow
+inputs:
+  SLACK_WEBHOOK_URL:
+    description: "Slack WebHook URL"
+    required: true
+  MESSAGE:
+    description: "Status Message"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Send custom JSON data to Slack workflow
+      env:
+        SLACK_WEBHOOK_URL: ${{ inputs.SLACK_WEBHOOK_URL }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        MESSAGE: ${{ inputs.MESSAGE }}
+
+      uses: slackapi/slack-github-action@6c661ce58804a1a20f6dc5fbee7f0381b469e001 # v1.25.0
+      with:
+        # For posting a rich message using Block Kit
+        payload: |
+          {
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": ${{ toJSON(env.MESSAGE) }}
+                }
+              }
+            ]
+          }
