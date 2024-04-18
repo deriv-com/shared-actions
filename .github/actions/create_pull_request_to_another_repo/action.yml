@@ -39,15 +39,15 @@ runs:
   steps:
     - name: Create Pull Request to Provided repository
       env:
-        INPUT_SOURCE_FOLDER : ${{ inputs.source-folder }}
-        INPUT_DESTINATION_REPO : ${{ inputs.destination-repo }}
-        INPUT_DESTINATION_FOLDER : ${{ inputs.destination-folder }}
-        INPUT_USER_EMAIL : ${{ inputs.user-email }}
-        INPUT_USER_NAME : ${{ inputs.user-name }}
-        INPUT_DESTINATION_HEAD_BRANCH : ${{ inputs.destination-head-branch }}
-        INPUT_DESTINATION_BASE_BRANCH : ${{ inputs.destination-base-branch }}
-        INPUT_PULL_REQUEST_REVIEWERS : ${{ inputs.pull-request-reviewers }}
-        INPUT_COMMIT_MESSAGE_TITLE : ${{ inputs.commit-message-title }}
+        INPUT_SOURCE_FOLDER : ${{ inputs.source_folder }}
+        INPUT_DESTINATION_REPO : ${{ inputs.destination_repo }}
+        INPUT_DESTINATION_FOLDER : ${{ inputs.destination_folder }}
+        INPUT_USER_EMAIL : ${{ inputs.user_email }}
+        INPUT_USER_NAME : ${{ inputs.user_name }}
+        INPUT_DESTINATION_HEAD_BRANCH : ${{ inputs.destination_head_branch }}
+        INPUT_DESTINATION_BASE_BRANCH : ${{ inputs.destination_base_branch }}
+        INPUT_PULL_REQUEST_REVIEWERS : ${{ inputs.pull_request_reviewers }}
+        INPUT_COMMIT_MESSAGE_TITLE : ${{ inputs.commit_message_title }}
         API_TOKEN_GITHUB: ${{ inputs.api_token_github }}
       shell: bash
       run: |
