@@ -33,7 +33,7 @@ runs:
         VERCEL_TOKEN: ${{ inputs.VERCEL_TOKEN }}
         VERCEL_SCOPE: ${{ inputs.VERCEL_SCOPE }}
       run: |
-        vercel pull --yes --token=${{ env.VERCEL_TOKEN }} --scope=${{ env.VERCEL_SCOPE }}
+        vercel pull --yes --token=$VERCEL_TOKEN --scope=$VERCEL_SCOPE
 
     - name: Deploy to Vercel (Staging)
       env:
@@ -41,12 +41,12 @@ runs:
         VERCEL_SCOPE: ${{ inputs.VERCEL_SCOPE }}
         ALIAS_DOMAIN_URL: ${{ inputs.ALIAS_DOMAIN_URL }}
         ENVIRONMENT: ${{ inputs.ENVIRONMENT }}
-      if: ${{ env.ENVIRONMENT == 'Staging' }}
+      if: $ENVIRONMENT == 'Staging'
       shell: bash
       run: |
-        vercel build --yes --token=${{ env.VERCEL_TOKEN }} --scope=${{ env.VERCEL_SCOPE }}
-        url="$(vercel deploy --prebuilt --token=${{ env.VERCEL_TOKEN }} --scope=${{ env.VERCEL_SCOPE }})"
-        vercel alias "$url" ${{ env.ALIAS_DOMAIN_URL }} --token=${{ env.VERCEL_TOKEN }} --scope=${{ env.VERCEL_SCOPE }}
+        vercel build --yes --token=$VERCEL_TOKEN --scope=$VERCEL_SCOPE
+        url="$(vercel deploy --prebuilt --token=$VERCEL_TOKEN --scope=$VERCEL_SCOPE)"
+        vercel alias "$url" $ALIAS_DOMAIN_URL --token=$VERCEL_TOKEN --scope=$VERCEL_SCOPE
 
     - name: Deploy to Vercel (Production)
       env:
@@ -54,9 +54,9 @@ runs:
         VERCEL_SCOPE: ${{ inputs.VERCEL_SCOPE }}
         ALIAS_DOMAIN_URL: ${{ inputs.ALIAS_DOMAIN_URL }}
         ENVIRONMENT: ${{ inputs.ENVIRONMENT }}
-      if: ${{ env.ENVIRONMENT == 'Production' }}
+      if: $ENVIRONMENT == 'Production'
       shell: bash
       run: |
-        vercel build --yes --prod --token=${{ env.VERCEL_TOKEN }} --scope=${{ env.VERCEL_SCOPE }}
-        url="$(vercel deploy --prod --prebuilt --token=${{ env.VERCEL_TOKEN }} --scope=${{ env.VERCEL_SCOPE }})"
-        vercel alias "$url" ${{ env.ALIAS_DOMAIN_URL }} --token=${{ env.VERCEL_TOKEN }} --scope=${{ env.VERCEL_SCOPE }}
+        vercel build --yes --prod --token=$VERCEL_TOKEN --scope=$VERCEL_SCOPE
+        url="$(vercel deploy --prod --prebuilt --token=$VERCEL_TOKEN --scope=$VERCEL_SCOPE)"
+        vercel alias "$url" $ALIAS_DOMAIN_URL --token=$VERCEL_TOKEN --scope=$VERCEL_SCOPE
