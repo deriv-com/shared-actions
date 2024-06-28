@@ -1,0 +1,49 @@
+name: Deploy to Vercel
+description: Deploy to Vercel
+inputs:
+  VERCEL_ORG_ID:
+    description: Vercel organization ID
+    required: true
+  VERCEL_PROJECT_ID:
+    description: Vercel project ID
+    required: true
+  VERCEL_TOKEN:
+    description: Vercel token
+    required: true
+  ENVIRONMENT:
+    description: Environment
+    required: true
+  VERCEL_SCOPE:
+    description: Vercel scope
+    required: true
+  ALIAS_DOMAIN_PATH:
+    description: Alias domain
+    required: false
+
+runs:
+  using: composite
+  steps:
+    - name: Install Vercel CLI
+      run: npm install -g vercel
+      shell: bash
+
+    - name: Pull Vercel project
+      shell: bash
+      run: |
+        vercel pull --yes --token=${{ inputs.VERCEL_TOKEN }} --scope=${{ inputs.VERCEL_SCOPE }}
+
+    - name: Deploy to Vercel (Staging)
+      if: ${{ inputs.ENVIRONMENT == 'Staging' }}
+      shell: bash
+      run: |
+        vercel build --yes --token=${{ inputs.VERCEL_TOKEN }} --scope=${{ inputs.VERCEL_SCOPE }}
+        url="$(vercel deploy --prebuilt --token=${{ inputs.VERCEL_TOKEN }} --scope=${{ inputs.VERCEL_SCOPE }})"
+        vercel alias "$url" ${{ inputs.ALIAS_DOMAIN_URL }} --token=${{ inputs.VERCEL_TOKEN }} --scope=${{ inputs.VERCEL_SCOPE }}
+
+    - name: Deploy to Vercel (Production)
+      if: ${{ inputs.ENVIRONMENT == 'Production' }}
+      shell: bash
+      run: |
+        vercel build --yes --prod --token=${{ inputs.VERCEL_TOKEN }} --scope=${{ inputs.VERCEL_SCOPE }}
+        url="$(vercel deploy --prod --prebuilt --token=${{ inputs.VERCEL_TOKEN }} --scope=${{ inputs.VERCEL_SCOPE }})"
+        vercel alias "$url" ${{ inputs.ALIAS_DOMAIN_URL }} --token=${{ inputs.VERCEL_TOKEN }} --scope=${{ inputs.VERCEL_SCOPE }}
