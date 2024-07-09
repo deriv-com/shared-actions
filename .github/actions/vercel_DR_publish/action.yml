@@ -23,6 +23,10 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Replace the vercel.dr.json with vercel.json
+      run: cp -f vercel.dr.json vercel.json
+      shell: bash
+
     - name: Install Vercel CLI
       run: npm install -g vercel
       shell: bash
