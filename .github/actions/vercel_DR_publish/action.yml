@@ -31,6 +31,15 @@ runs:
       run: npm install -g vercel
       shell: bash
 
+    - name: Setup Vercel project
+      run: |
+        mkdir -p .vercel
+        echo '{
+          "projectId": "${{ inputs.VERCEL_PROJECT_ID }}",
+          "orgId": "${{ inputs.VERCEL_ORG_ID }}"
+        }' > .vercel/project.json
+      shell: bash
+
     - name: Pull Vercel project
       shell: bash
       env:
@@ -44,7 +53,6 @@ runs:
         VERCEL_TOKEN: ${{ inputs.VERCEL_TOKEN }}
         VERCEL_SCOPE: ${{ inputs.VERCEL_SCOPE }}
         ALIAS_DOMAIN_URL: ${{ inputs.ALIAS_DOMAIN_URL }}
-  
       if: ${{ inputs.ENVIRONMENT }} == 'Staging'
       shell: bash
       run: |
