@@ -48,6 +48,10 @@ runs:
       run: |
         vercel pull --yes --token=$VERCEL_TOKEN --scope=$VERCEL_SCOPE
 
+    - name: Create deployment.txt file
+      run: echo "This is being published from Vercel" > deployment.txt
+      shell: bash
+
     - name: Deploy to Vercel (Staging)
       env:
         VERCEL_TOKEN: ${{ inputs.VERCEL_TOKEN }}
