@@ -42,7 +42,7 @@ jobs:
       PR_HEAD_SHA: ${{ inputs.target_ref || github.event.pull_request.head.sha }}
       PR_BASE_REF: ${{ inputs.base_ref || github.event.pull_request.base.ref }}
       GITHUB_TOKEN_INPUT: ${{ inputs.github_token || github.token }}
-      PAT_TOKEN: ${{ inputs.personal_access_token || secrets.PERSONAL_ACCESS_TOKEN }}
+      PAT_TOKEN: ${{ inputs.personal_access_token }}
     
     steps:
       - name: Verify user
