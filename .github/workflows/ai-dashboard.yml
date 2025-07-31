@@ -20,9 +20,6 @@ on:
         type: string
         default: ''
     secrets:
-      GH_TOKEN:
-        description: 'GitHub token for repository operations'
-        required: false
       SHIFTAI_TOKEN:
         description: 'ShiftAI token for auto-merge operations'
         required: false
@@ -61,7 +58,7 @@ jobs:
       PR_NUMBER: ${{ inputs.pr_number || github.event.number || 'manual' }}
       REPO_NAME: ${{ inputs.repository_name || github.repository }}
       TARGET_BRANCH: ${{ inputs.target_branch || github.event.repository.default_branch || 'master' }}
-      GITHUB_TOKEN_INPUT: ${{ secrets.GH_TOKEN || github.token }}
+      GITHUB_TOKEN_INPUT: ${{ secrets.GITHUB_TOKEN || github.token }}
       SHIFTAI_TOKEN_INPUT: ${{ secrets.SHIFTAI_TOKEN }}
     
     steps:
