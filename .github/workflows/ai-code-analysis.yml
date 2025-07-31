@@ -18,9 +18,6 @@ on:
       PERSONAL_ACCESS_TOKEN:
         description: 'Personal access token for user verification'
         required: true
-      GITHUB_TOKEN:
-        description: 'GitHub token (inherited automatically)'
-        required: false
   
   # Still support direct usage on pull requests
   pull_request_target:
