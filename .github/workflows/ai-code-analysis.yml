@@ -15,7 +15,7 @@ on:
         type: string
         default: ''
     secrets:
-      GITHUB_TOKEN:
+      GH_TOKEN:
         description: 'GitHub token for API access'
         required: false
       PERSONAL_ACCESS_TOKEN:
@@ -39,7 +39,7 @@ jobs:
       PR_USER_LOGIN: ${{ github.event.pull_request.user.login }}
       PR_HEAD_SHA: ${{ inputs.target_ref || github.event.pull_request.head.sha }}
       PR_BASE_REF: ${{ inputs.base_ref || github.event.pull_request.base.ref }}
-      GITHUB_TOKEN_INPUT: ${{ secrets.GITHUB_TOKEN || github.token }}
+      GITHUB_TOKEN_INPUT: ${{ secrets.GH_TOKEN || github.token }}
       PAT_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
     
     steps:
