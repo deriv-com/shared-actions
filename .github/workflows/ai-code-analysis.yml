@@ -4,15 +4,6 @@ on:
   # Make this a reusable workflow
   workflow_call:
     inputs:
-      github_token:
-        description: 'GitHub token for API access'
-        required: false
-        type: string
-        default: ''
-      personal_access_token:
-        description: 'Personal access token for user verification'
-        required: true
-        type: string
       target_ref:
         description: 'Target ref to analyze (default: PR head)'
         required: false
@@ -23,6 +14,13 @@ on:
         required: false
         type: string
         default: ''
+    secrets:
+      GITHUB_TOKEN:
+        description: 'GitHub token for API access'
+        required: false
+      PERSONAL_ACCESS_TOKEN:
+        description: 'Personal access token for user verification'
+        required: true
   
   # Still support direct usage on pull requests
   pull_request_target:
@@ -41,8 +39,8 @@ jobs:
       PR_USER_LOGIN: ${{ github.event.pull_request.user.login }}
       PR_HEAD_SHA: ${{ inputs.target_ref || github.event.pull_request.head.sha }}
       PR_BASE_REF: ${{ inputs.base_ref || github.event.pull_request.base.ref }}
-      GITHUB_TOKEN_INPUT: ${{ inputs.github_token || github.token }}
-      PAT_TOKEN: ${{ inputs.personal_access_token }}
+      GITHUB_TOKEN_INPUT: ${{ secrets.GITHUB_TOKEN || github.token }}
+      PAT_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
     
     steps:
       - name: Verify user
