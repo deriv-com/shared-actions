@@ -23,24 +23,6 @@ on:
       SHIFTAI_TOKEN:
         description: 'ShiftAI token for auto-merge operations'
         required: false
-  
-  # Still support direct triggers
-  pull_request_target:
-    types: [closed]
-    branches: [main, master]
-  
-  # Allow manual trigger
-  workflow_dispatch:
-    inputs:
-      force_refresh:
-        description: 'Force dashboard refresh'
-        required: false
-        type: boolean
-        default: false
-  
-  # Weekly refresh
-  schedule:
-    - cron: '0 6 * * 0'
 
 permissions:
   contents: write
@@ -288,26 +270,162 @@ jobs:
             echo "No PR data to add to history (manual/scheduled run)"
           fi
 
-      - name: Prepare dashboard generation script
-        if: steps.check-skip.outputs.should-skip == 'false'
-        run: |
-          mkdir -p .github/scripts
-          
-          # If the script doesn't exist locally, copy from the workflow repo
-          if [ ! -f ".github/scripts/generate-dashboard.js" ]; then
-            echo "Copying dashboard script from workflow repository..."
-            WORKFLOW_REPO="${{ github.repository }}"
-            if [[ "$WORKFLOW_REPO" != *"shift-ai"* ]]; then
-              WORKFLOW_REPO="${{ github.repository_owner }}/shift-ai"
-            fi
-            curl -sL "https://raw.githubusercontent.com/${WORKFLOW_REPO}/main/.github/scripts/generate-dashboard.js" > .github/scripts/generate-dashboard.js
-            chmod +x .github/scripts/generate-dashboard.js
-          fi
-
       - name: Generate updated dashboard
         if: steps.check-skip.outputs.should-skip == 'false'
         run: |
-          node .github/scripts/generate-dashboard.js
+          # Create the dashboard generation script inline
+          cat << 'EOF' > generate-dashboard.js
+          #!/usr/bin/env node
+          const fs = require('fs');
+
+          function generateMarkdown(stats, analyses, repo) {
+            const lastUpdate = new Date().toISOString().split('T')[0];
+            
+            function createStatsProgressBar(percentage) {
+              const width = 10;
+              const filled = Math.round((percentage / 100) * width);
+              const empty = width - filled;
+              
+              let filledEmoji = '🟥';
+              if (percentage >= 80) filledEmoji = '🟩';
+              else if (percentage >= 50) filledEmoji = '🟨';
+              else if (percentage >= 21) filledEmoji = '🟧';
+              
+              const filledBar = filledEmoji.repeat(filled);
+              const emptyBar = '⬜'.repeat(empty);
+              const bar = filledBar + emptyBar;
+              
+              return `${bar} ${percentage}%`;
+            }
+            
+            return `# 🤖 AI Code Analysis Dashboard
+
+          <div align="center">
+
+          **${repo}**  
+          📅 Last updated: ${lastUpdate} • 🔄 Tracking merged PRs to main/master
+
+          </div>
+
+          ---
+
+          ## 📊 Quick Stats
+
+          | Metric | Value | Metric | Value |
+          |--------|-------|--------|-------|
+          | **📁 Total Merged PRs** | ${stats.totalMergedPRs} | **📈 Average AI Code** | ${createStatsProgressBar(stats.averageAiPercentage)} |
+          | **🤖 PRs with AI Analysis** | ${stats.totalAnalyzedPRs} | **🎯 Overall AI Percentage** | ${createStatsProgressBar(Math.round((stats.totalAiCharacters / stats.totalCharacters) * 100) || 0)} |
+          | **📄 Files Analyzed** | ${stats.totalFiles.toLocaleString()} | **⚡ Total AI Characters** | ${stats.totalAiCharacters.toLocaleString()} |
+
+          ---
+
+          ${analyses.length === 0 ? \`
+          ## 📈 Ready to Track AI Code
+
+          > 🚀 **Getting Started**: When you merge PRs with AI analysis, they'll appear here!  
+          > 💡 Create a PR with \\\`[AI]\\\` wrapped code to get started.
+
+          ---
+          \` : \`
+          ## 🚀 Recent Merged Pull Requests
+
+          > 📊 Showing the 10 most recent merged PRs (stats above include all ${analyses.length} PRs)
+
+          | PR | Author | Date | Files | AI Content | Percentage |
+          |----|--------|------|-------|------------|------------|${analyses.slice(0, 10).map(analysis => {
+            const percentage = analysis.summary ? analysis.summary.percentage : 0;
+            const date = new Date(analysis.mergedAt || analysis.timestamp).toLocaleDateString();
+            const hasAnalysis = analysis.hasAnalysis !== false;
+            
+            const createProgressBar = (pct) => {
+              const width = 15;
+              const filled = Math.round((pct / 100) * width);
+              const empty = width - filled;
+              
+              let filledEmoji = '🟥';
+              if (pct >= 80) filledEmoji = '🟩';
+              else if (pct >= 50) filledEmoji = '🟨';
+              else if (pct >= 21) filledEmoji = '🟧';
+              
+              const filledBar = filledEmoji.repeat(filled);
+              const emptyBar = '⬜'.repeat(empty);
+              const bar = filledBar + emptyBar;
+              
+              const paddedPercentage = pct.toString().padStart(3, ' ');
+              
+              return \`\${bar} \${paddedPercentage}%\`;
+            };
+            
+            return \`
+          | [#\${analysis.pullRequest}](\${analysis.prUrl}) **\${analysis.prTitle}** | [@\${analysis.author}](https://github.com/\${analysis.author}) | \${date} | \${hasAnalysis ? analysis.files.length : 'N/A'} | \${hasAnalysis ? (analysis.summary.aiCharacters || 0).toLocaleString() + ' / ' + (analysis.summary.totalCharacters || 0).toLocaleString() + ' chars' : 'No data'} | \${createProgressBar(percentage)} |\`;
+          }).join('')}
+
+          \`}
+
+          ---
+
+          <div align="center">
+
+          🚀 **Generated by ShiftAI**
+
+          </div>\`;
+          }
+
+          async function main() {
+            const REPO = process.env.GITHUB_REPOSITORY || 'your-org/repo';
+            
+            console.log('🚀 Generating AI Dashboard for ' + REPO + ' (from stored data)');
+            
+            if (!fs.existsSync('.github/data/ai-analysis-history.json')) {
+              console.log('⚠️  No historical data found, creating empty dashboard');
+              
+              const emptyStats = {
+                totalMergedPRs: 0,
+                totalAnalyzedPRs: 0,
+                totalFiles: 0,
+                totalCharacters: 0,
+                totalAiCharacters: 0,
+                averageAiPercentage: 0
+              };
+              
+              const markdown = generateMarkdown(emptyStats, [], REPO);
+              fs.writeFileSync('AI-DASHBOARD.md', markdown);
+              console.log('✅ Empty dashboard generated');
+              return;
+            }
+            
+            const history = JSON.parse(fs.readFileSync('.github/data/ai-analysis-history.json', 'utf8'));
+            
+            const analyses = history.analyses.filter(a => a.hasAnalysis !== false);
+            const stats = {
+              totalMergedPRs: history.totalMergedPRs,
+              totalAnalyzedPRs: analyses.length,
+              totalFiles: analyses.reduce((sum, a) => sum + (a.files ? a.files.length : 0), 0),
+              totalCharacters: analyses.reduce((sum, a) => sum + (a.summary ? a.summary.totalCharacters : 0), 0),
+              totalAiCharacters: analyses.reduce((sum, a) => sum + (a.summary ? a.summary.aiCharacters : 0), 0),
+              averageAiPercentage: analyses.length ? Math.round(analyses.reduce((sum, a) => sum + (a.summary ? a.summary.percentage : 0), 0) / analyses.length) : 0
+            };
+            
+            console.log('📊 Dashboard stats:');
+            console.log('   Total merged PRs: ' + stats.totalMergedPRs);
+            console.log('   PRs with analysis: ' + stats.totalAnalyzedPRs);
+            console.log('   Average AI %: ' + stats.averageAiPercentage + '%');
+            
+            const markdown = generateMarkdown(stats, history.analyses, REPO);
+            
+            fs.writeFileSync('AI-DASHBOARD.md', markdown);
+            console.log('✅ Dashboard generated from ' + history.totalMergedPRs + ' stored PRs (no API calls needed!)');
+          }
+
+          if (require.main === module) {
+            main().catch(console.error);
+          }
+
+          module.exports = { generateMarkdown };
+          EOF
+          
+          # Run the script
+          node generate-dashboard.js
 
       - name: Create/Update Dashboard PR  
         if: steps.check-skip.outputs.should-skip == 'false'
