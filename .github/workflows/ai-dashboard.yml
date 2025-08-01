@@ -132,18 +132,15 @@ jobs:
             if (!comment.body.includes('🤖 AI Code Analysis')) return null;
             
             const body = comment.body;
-            console.log('🔍 DEBUG: Processing AI analysis comment, length:', body.length);
             
-            // Try to extract JSON data from comment with better parsing
-            const jsonMatch = body.match(/```json\s*\n([\s\S]*?)\n\s*```/);
-            if (jsonMatch) {
+            // Try to extract JSON data from comment - using indexOf for safer parsing
+            const jsonStart = body.indexOf('```json');
+            const jsonEnd = body.indexOf('```', jsonStart + 7);
+            if (jsonStart !== -1 && jsonEnd !== -1) {
               try {
-                const jsonContent = jsonMatch[1].trim();
-                console.log('🔍 DEBUG: Found JSON block, length:', jsonContent.length);
+                const jsonContent = body.substring(jsonStart + 7, jsonEnd).trim();
                 const data = JSON.parse(jsonContent);
-                console.log('🔍 DEBUG: Parsed JSON successfully');
-                console.log('🔍 DEBUG: Data structure:', JSON.stringify(data, null, 2));
-                
+                console.log('Extracted JSON data from AI analysis comment');
                 return {
                   percentage: data.summary ? data.summary.percentage : (data.percentage || 0),
                   totalCharacters: data.summary ? data.summary.totalCharacters : (data.totalCharacters || 0),
@@ -151,25 +148,19 @@ jobs:
                   files: data.files || []
                 };
               } catch (e) {
-                console.log('🔍 DEBUG: JSON parsing failed:', e.message);
-                console.log('🔍 DEBUG: JSON content was:', jsonMatch[1]);
+                console.log('Failed to parse JSON from AI analysis, falling back to regex');
               }
-            } else {
-              console.log('🔍 DEBUG: No JSON block found, trying regex fallback');
             }
             
             // Fallback to regex parsing if JSON extraction fails
             const percentageMatch = body.match(/(\d+(?:\.\d+)?)%\s+AI-generated/);
             const percentage = percentageMatch ? parseFloat(percentageMatch[1]) : 0;
-            console.log('🔍 DEBUG: Regex percentage:', percentage);
             
             const totalMatch = body.match(/(\d+)\s+total\s+characters/);
             const totalCharacters = totalMatch ? parseInt(totalMatch[1]) : 0;
-            console.log('🔍 DEBUG: Regex totalCharacters:', totalCharacters);
             
             const aiMatch = body.match(/(\d+)\s+(?:of\s+\d+\s+)?characters.*AI-generated/);
             const aiCharacters = aiMatch ? parseInt(aiMatch[1]) : Math.round((percentage / 100) * totalCharacters);
-            console.log('🔍 DEBUG: Regex aiCharacters:', aiCharacters);
             
             return {
               percentage: percentage,
