@@ -181,11 +181,9 @@ jobs:
                 author: process.env.PR_AUTHOR,
                 prTitle: process.env.PR_TITLE,
                 hasAnalysis: false,
-                summary: {
-                  percentage: 0,
-                  totalCharacters: 0,
-                  aiCharacters: 0
-                },
+                percentage: 0,
+                totalCharacters: 0,
+                aiCharacters: 0,
                 files: []
               };
               
@@ -321,7 +319,7 @@ jobs:
           '| PR | Author | Date | Files | AI Content | Percentage |\n' +
           '|----|--------|------|-------|------------|------------|' + 
           analyses.slice(0, 10).map(analysis => {
-            const percentage = analysis.summary ? analysis.summary.percentage : 0;
+            const percentage = analysis.percentage || 0;
             const date = new Date(analysis.mergedAt || analysis.timestamp).toLocaleDateString();
             const hasAnalysis = analysis.hasAnalysis !== false;
             
@@ -344,7 +342,10 @@ jobs:
               return bar + ' ' + paddedPercentage + '%';
             };
             
-            return '\n| [#' + analysis.pullRequest + '](' + analysis.prUrl + ') **' + analysis.prTitle + '** | [@' + analysis.author + '](https://github.com/' + analysis.author + ') | ' + date + ' | ' + (hasAnalysis ? analysis.files.length : 'N/A') + ' | ' + (hasAnalysis ? (analysis.summary.aiCharacters || 0).toLocaleString() + ' / ' + (analysis.summary.totalCharacters || 0).toLocaleString() + ' chars' : 'No data') + ' | ' + createProgressBar(percentage) + ' |';
+            const aiChars = analysis.aiCharacters || 0;
+            const totalChars = analysis.totalCharacters || 0;
+            
+            return '\n| [#' + analysis.pullRequest + '](' + (analysis.prUrl || '#') + ') **' + (analysis.prTitle || 'Unknown') + '** | [@' + (analysis.author || 'unknown') + '](https://github.com/' + (analysis.author || 'unknown') + ') | ' + date + ' | ' + (hasAnalysis ? (analysis.files ? analysis.files.length : 0) : 'N/A') + ' | ' + (hasAnalysis ? (aiChars.toLocaleString() + ' / ' + totalChars.toLocaleString() + ' chars') : 'No data') + ' | ' + createProgressBar(percentage) + ' |';
           }).join('') + '\n\n')) +
           '---\n\n' +
           '<div align="center">\n\n' +
@@ -382,9 +383,9 @@ jobs:
               totalMergedPRs: history.totalMergedPRs,
               totalAnalyzedPRs: analyses.length,
               totalFiles: analyses.reduce((sum, a) => sum + (a.files ? a.files.length : 0), 0),
-              totalCharacters: analyses.reduce((sum, a) => sum + (a.summary ? a.summary.totalCharacters : 0), 0),
-              totalAiCharacters: analyses.reduce((sum, a) => sum + (a.summary ? a.summary.aiCharacters : 0), 0),
-              averageAiPercentage: analyses.length ? Math.round(analyses.reduce((sum, a) => sum + (a.summary ? a.summary.percentage : 0), 0) / analyses.length) : 0
+              totalCharacters: analyses.reduce((sum, a) => sum + (a.totalCharacters || 0), 0),
+              totalAiCharacters: analyses.reduce((sum, a) => sum + (a.aiCharacters || 0), 0),
+              averageAiPercentage: analyses.length ? Math.round(analyses.reduce((sum, a) => sum + (a.percentage || 0), 0) / analyses.length) : 0
             };
             
             console.log('📊 Dashboard stats:');
