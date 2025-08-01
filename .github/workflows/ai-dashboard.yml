@@ -133,11 +133,13 @@ jobs:
             
             const body = comment.body;
             
-            // Try to extract JSON data from comment
-            const jsonMatch = body.match(/```json\s*\n([\s\S]*?)\n\s*```/);
-            if (jsonMatch) {
+            // Try to extract JSON data from comment - using indexOf for safer parsing
+            const jsonStart = body.indexOf('```json');
+            const jsonEnd = body.indexOf('```', jsonStart + 7);
+            if (jsonStart !== -1 && jsonEnd !== -1) {
               try {
-                const data = JSON.parse(jsonMatch[1]);
+                const jsonContent = body.substring(jsonStart + 7, jsonEnd).trim();
+                const data = JSON.parse(jsonContent);
                 console.log('Extracted JSON data from AI analysis comment');
                 return {
                   percentage: data.summary ? data.summary.percentage : (data.percentage || 0),
