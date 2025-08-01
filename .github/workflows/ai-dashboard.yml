@@ -94,7 +94,7 @@ jobs:
         if: steps.check-skip.outputs.should-skip == 'false' && github.event_name == 'pull_request_target'
         id: extract-analysis
         run: |
-          node -e "
+          cat << 'EOF' > extract_ai_analysis.js
           const https = require('https');
           const fs = require('fs');
           
@@ -230,7 +230,9 @@ jobs:
           }
           
           main().catch(console.error);
-          "
+          EOF
+          
+          node extract_ai_analysis.js
 
       - name: Update historical data
         if: steps.check-skip.outputs.should-skip == 'false'
@@ -245,7 +247,7 @@ jobs:
           
           # Add new entry to history (only if we have PR data)
           if [ -f "merged_pr_data.json" ]; then
-            node -e "
+            cat << 'EOF' > update_history.js
             const fs = require('fs');
             
             // Read existing history
@@ -280,7 +282,9 @@ jobs:
             fs.writeFileSync('.github/data/ai-analysis-history.json', JSON.stringify(history, null, 2));
             
             console.log('History updated: ' + history.totalMergedPRs + ' total merged PRs tracked');
-            "
+            EOF
+            
+            node update_history.js
           else
             echo "No PR data to add to history (manual/scheduled run)"
           fi
