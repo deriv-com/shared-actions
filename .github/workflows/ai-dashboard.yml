@@ -247,44 +247,42 @@ jobs:
           
           # Add new entry to history (only if we have PR data)
           if [ -f "merged_pr_data.json" ]; then
-            cat << 'EOF' > update_history.js
-            const fs = require('fs');
-            
-            // Read existing history
-            const history = JSON.parse(fs.readFileSync('.github/data/ai-analysis-history.json', 'utf8'));
-            
-            // Read new PR data
-            const newEntry = JSON.parse(fs.readFileSync('merged_pr_data.json', 'utf8'));
-            
-            // Check if this PR is already in history (avoid duplicates)
-            const existingIndex = history.analyses.findIndex(
-              a => a.repository === newEntry.repository && a.pullRequest === newEntry.pullRequest
-            );
-            
-            if (existingIndex >= 0) {
-              // Update existing entry
-              history.analyses[existingIndex] = newEntry;
-              console.log('📝 Updated existing entry for PR #' + newEntry.pullRequest);
-            } else {
-              // Add new entry
-              history.analyses.push(newEntry);
-              console.log('➕ Added new entry for PR #' + newEntry.pullRequest);
-            }
-            
-            // Sort by merged date (newest first)
-            history.analyses.sort((a, b) => new Date(b.mergedAt || b.timestamp) - new Date(a.mergedAt || a.timestamp));
-            
-            // Update metadata
-            history.lastUpdated = new Date().toISOString();
-            history.totalMergedPRs = history.analyses.length;
-            
-            // Save updated history
-            fs.writeFileSync('.github/data/ai-analysis-history.json', JSON.stringify(history, null, 2));
-            
-            console.log('History updated: ' + history.totalMergedPRs + ' total merged PRs tracked');
-            EOF
-            
-            node update_history.js
+            node -e "
+              const fs = require('fs');
+              
+              // Read existing history
+              const history = JSON.parse(fs.readFileSync('.github/data/ai-analysis-history.json', 'utf8'));
+              
+              // Read new PR data
+              const newEntry = JSON.parse(fs.readFileSync('merged_pr_data.json', 'utf8'));
+              
+              // Check if this PR is already in history (avoid duplicates)
+              const existingIndex = history.analyses.findIndex(
+                a => a.repository === newEntry.repository && a.pullRequest === newEntry.pullRequest
+              );
+              
+              if (existingIndex >= 0) {
+                // Update existing entry
+                history.analyses[existingIndex] = newEntry;
+                console.log('📝 Updated existing entry for PR #' + newEntry.pullRequest);
+              } else {
+                // Add new entry
+                history.analyses.push(newEntry);
+                console.log('➕ Added new entry for PR #' + newEntry.pullRequest);
+              }
+              
+              // Sort by merged date (newest first)
+              history.analyses.sort((a, b) => new Date(b.mergedAt || b.timestamp) - new Date(a.mergedAt || a.timestamp));
+              
+              // Update metadata
+              history.lastUpdated = new Date().toISOString();
+              history.totalMergedPRs = history.analyses.length;
+              
+              // Save updated history
+              fs.writeFileSync('.github/data/ai-analysis-history.json', JSON.stringify(history, null, 2));
+              
+              console.log('History updated: ' + history.totalMergedPRs + ' total merged PRs tracked');
+            "
           else
             echo "No PR data to add to history (manual/scheduled run)"
           fi
