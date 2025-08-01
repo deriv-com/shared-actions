@@ -23,10 +23,6 @@ on:
       PERSONAL_ACCESS_TOKEN:
         description: 'Personal access token for user verification'
         required: true
-  
-  # Still support direct usage on pull requests
-  pull_request_target:
-    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
