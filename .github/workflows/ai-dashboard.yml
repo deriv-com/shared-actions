@@ -279,7 +279,7 @@ jobs:
           const fs = require('fs');
 
           function generateMarkdown(stats, analyses, repo) {
-            const lastUpdate = new Date().toISOString().split('T')[0];
+            const lastUpdate = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
             
             function createStatsProgressBar(percentage) {
               const width = 10;
