@@ -133,15 +133,30 @@ jobs:
             
             const body = comment.body;
             
-            // Extract percentage
+            // Try to extract JSON data from comment
+            const jsonMatch = body.match(/```json\s*\n([\s\S]*?)\n\s*```/);
+            if (jsonMatch) {
+              try {
+                const data = JSON.parse(jsonMatch[1]);
+                console.log('Extracted JSON data from AI analysis comment');
+                return {
+                  percentage: data.summary ? data.summary.percentage : (data.percentage || 0),
+                  totalCharacters: data.summary ? data.summary.totalCharacters : (data.totalCharacters || 0),
+                  aiCharacters: data.summary ? data.summary.aiCharacters : (data.aiCharacters || 0),
+                  files: data.files || []
+                };
+              } catch (e) {
+                console.log('Failed to parse JSON from AI analysis, falling back to regex');
+              }
+            }
+            
+            // Fallback to regex parsing if JSON extraction fails
             const percentageMatch = body.match(/(\d+(?:\.\d+)?)%\s+AI-generated/);
             const percentage = percentageMatch ? parseFloat(percentageMatch[1]) : 0;
             
-            // Extract total characters
             const totalMatch = body.match(/(\d+)\s+total\s+characters/);
             const totalCharacters = totalMatch ? parseInt(totalMatch[1]) : 0;
             
-            // Extract AI characters  
             const aiMatch = body.match(/(\d+)\s+(?:of\s+\d+\s+)?characters.*AI-generated/);
             const aiCharacters = aiMatch ? parseInt(aiMatch[1]) : Math.round((percentage / 100) * totalCharacters);
             
@@ -149,7 +164,7 @@ jobs:
               percentage: percentage,
               totalCharacters: totalCharacters,
               aiCharacters: aiCharacters,
-              files: [] // Could extract file list if needed
+              files: [] // No JSON found, regex can't extract files
             };
           }
           
