@@ -24,16 +24,16 @@ on:
         description: 'ShiftAI token for auto-merge operations'
         required: false
 
-permissions:
-  contents: write
-  pull-requests: write
-
 jobs:
   ai-dashboard-update:
     # Only run if PR was actually merged (or manual/schedule trigger)
     if: github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event_name == 'workflow_call'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     env:
+      # Security: Move GitHub context to environment variables to prevent injection
       PR_TITLE: ${{ github.event.pull_request.title || inputs.pr_title || 'Manual/Scheduled Run' }}
       PR_HEAD_REF: ${{ github.event.pull_request.head.ref || 'manual' }}
       PR_AUTHOR: ${{ github.event.pull_request.user.login || 'system' }}
@@ -42,6 +42,9 @@ jobs:
       TARGET_BRANCH: ${{ inputs.target_branch || github.event.repository.default_branch || 'master' }}
       GITHUB_TOKEN_INPUT: ${{ github.token }}
       SHIFTAI_TOKEN_INPUT: ${{ secrets.SHIFTAI_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      GITHUB_EVENT_NAME: ${{ github.event_name }}
+      PR_MERGED_AT: ${{ github.event.pull_request.merged_at }}
     
     steps:
       - name: Check if this is a dashboard update PR (prevent loops)
@@ -469,17 +472,17 @@ jobs:
           # Add the preserved changes
           git add .github/data/ai-analysis-history.json AI-DASHBOARD.md
           
-          # Commit changes
+          # Commit changes - using environment variables to prevent injection
           if [[ "$PR_NUMBER" == "manual" ]]; then
             COMMIT_MSG="📊 Manual Dashboard Update
             
             - Updated: $(date -u +"%Y-%m-%d %H:%M UTC")
-            - Trigger: ${{ github.event_name }}
+            - Trigger: $GITHUB_EVENT_NAME
             - Manual dashboard refresh"
           else
             COMMIT_MSG="📊 Track merged PR #$PR_NUMBER: $PR_TITLE
             
-            - Merged: ${{ github.event.pull_request.merged_at }}
+            - Merged: $PR_MERGED_AT
             - Author: $PR_AUTHOR
             - Updated dashboard with historical data"
           fi
@@ -503,6 +506,7 @@ jobs:
             const prTitle = process.env.PR_TITLE;
             const prAuthor = process.env.PR_AUTHOR;
             const targetBranch = process.env.TARGET_BRANCH;
+            const eventName = process.env.GITHUB_EVENT_NAME;
             const { owner, repo } = context.repo;
             
             console.log('Environment check:');
@@ -545,7 +549,7 @@ jobs:
                   '- Historical data file (if any new data available)',
                   '',
                   '### 🔄 Update Details:',
-                  '- **Trigger**: ' + context.eventName,
+                  '- **Trigger**: ' + eventName,
                   '- **Updated**: ' + new Date().toISOString(),
                   '',
                   '---',
@@ -616,11 +620,14 @@ jobs:
       - name: Auto-merge Dashboard PR
         if: steps.check-skip.outputs.should-skip == 'false' && steps.create-pr.outputs.dashboard-pr-number && (github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event_name == 'workflow_call')
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          DASHBOARD_PR_NUMBER: ${{ steps.create-pr.outputs.dashboard-pr-number }}
         with:
           github-token: ${{ env.SHIFTAI_TOKEN_INPUT || env.GITHUB_TOKEN_INPUT }}
           script: |
-            const dashboardPrNumber = '${{ steps.create-pr.outputs.dashboard-pr-number }}';
+            const dashboardPrNumber = process.env.DASHBOARD_PR_NUMBER;
             const shiftaiToken = process.env.SHIFTAI_TOKEN_INPUT;
+            const targetBranch = process.env.TARGET_BRANCH;
             const { owner, repo } = context.repo;
             
             if (!shiftaiToken) {
@@ -698,7 +705,6 @@ jobs:
               }
               
               // SECURITY CHECK 5: Validate base branch
-              const targetBranch = process.env.TARGET_BRANCH || 'master';
               if (prData.base.ref !== targetBranch) {
                 console.log('❌ SECURITY: PR base is not target branch - aborting force merge');
                 console.log('   Base branch:', prData.base.ref);
@@ -733,7 +739,7 @@ jobs:
               console.log('🔒 Confirmed: This is a legitimate dashboard PR created by GitHub Actions');
               
               // SECURITY CHECK 7: Validate workflow trigger event
-              const currentEvent = context.eventName;
+              const currentEvent = process.env.GITHUB_EVENT_NAME;
               const allowedTriggers = ['pull_request_target', 'workflow_dispatch', 'schedule', 'workflow_call'];
               
               if (!allowedTriggers.includes(currentEvent)) {
@@ -783,7 +789,7 @@ jobs:
           if [[ "$PR_NUMBER" != "manual" ]]; then
             echo "✅ Tracked PR #$PR_NUMBER: $PR_TITLE"
             echo "👤 Author: $PR_AUTHOR"
-            echo "🕐 Merged: ${{ github.event.pull_request.merged_at }}"
+            echo "🕐 Merged: $PR_MERGED_AT"
           else
             echo "🔄 Manual/scheduled dashboard refresh"
           fi
@@ -798,7 +804,7 @@ jobs:
             echo "   • ⏳ Waiting for manual review and merge"
           fi
           echo ""
-          echo "🔗 View dashboard: https://github.com/${{ github.repository }}/blob/$TARGET_BRANCH/AI-DASHBOARD.md"
+          echo "🔗 View dashboard: https://github.com/$GITHUB_REPOSITORY/blob/$TARGET_BRANCH/AI-DASHBOARD.md"
 
       - name: Skip notification
         if: steps.check-skip.outputs.should-skip == 'true'
