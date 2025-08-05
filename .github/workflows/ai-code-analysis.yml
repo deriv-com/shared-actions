@@ -24,21 +24,27 @@ on:
         description: 'Personal access token for user verification'
         required: true
 
-permissions:
-  contents: read
-  pull-requests: write
-  issues: write
-
 jobs:
   analyze-ai-code:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
     env:
-      # Security: Move GitHub context to environment variables to prevent injection
       PR_USER_LOGIN: ${{ github.event.pull_request.user.login }}
       PR_HEAD_SHA: ${{ inputs.target_ref || github.event.pull_request.head.sha }}
       PR_BASE_REF: ${{ inputs.base_ref || github.event.pull_request.base.ref }}
       GITHUB_TOKEN_INPUT: ${{ inputs.github_token || github.token }}
       PAT_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      GITHUB_EVENT_NAME: ${{ github.event_name }}
+      PR_MERGED_AT: ${{ github.event.pull_request.merged_at }}
+      PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_USER_TYPE: ${{ github.event.pull_request.user.type }}
+      ISSUE_NUMBER: ${{ github.event.number }}
+      REPO_OWNER: ${{ github.repository_owner }}
+      REPO_NAME: ${{ github.event.repository.name }}
     
     steps:
       - name: Verify user
@@ -231,6 +237,14 @@ jobs:
           script: |
             const fs = require('fs');
             
+         
+            const repository = process.env.GITHUB_REPOSITORY;
+            const eventName = process.env.GITHUB_EVENT_NAME;
+            const prMergedAt = process.env.PR_MERGED_AT;
+            const prHeadRef = process.env.PR_HEAD_REF;
+            const prUserLogin = process.env.PR_USER_LOGIN;
+            const issueNumber = process.env.ISSUE_NUMBER;
+            
             // Read analysis results
             const results = JSON.parse(fs.readFileSync('ai_analysis_results.json', 'utf8'));
             
@@ -364,10 +378,10 @@ jobs:
               comment += `<details>\n<summary>📊 Raw Data (for dashboard)</summary>\n\n\`\`\`json\n`;
               comment += JSON.stringify({
                 timestamp: new Date().toISOString(),
-                repository: context.repo.full_name,
-                pullRequest: context.issue.number,
-                branch: context.payload.pull_request.head.ref,
-                author: context.payload.pull_request.user.login,
+                repository: repository,
+                pullRequest: issueNumber,
+                branch: prHeadRef,
+                author: prUserLogin,
                 ...results
               }, null, 2);
               comment += `\n\`\`\`\n\n</details>\n\n`;
