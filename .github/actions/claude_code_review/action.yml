@@ -41,14 +41,6 @@ inputs:
       - Inline comments for specific issues
       - A summary comment with high/medium/low priority items
       - Concrete fix suggestions and quick patches where safe
-  timeout_minutes:
-    description: "Timeout in minutes for Claude review"
-    required: false
-    default: "60"
-  track_progress:
-    description: "Track progress of the review"
-    required: false
-    default: "true"
 
 runs:
   using: composite
@@ -78,11 +70,11 @@ runs:
 
     - name: Run Claude Code Action
       uses: anthropics/claude-code-action@v1
-      timeout-minutes: ${{ inputs.timeout_minutes }}
+      timeout-minutes: 60
       with:
         github_token: ${{ inputs.github_token }}
         anthropic_api_key: ${{ inputs.anthropic_api_key }}
-        track_progress: ${{ inputs.track_progress }}
+        track_progress: true
         prompt: |
           REPO: ${{ inputs.repository }}
           PR NUMBER: ${{ inputs.pr_number }}
