@@ -7,7 +7,7 @@ A reusable GitHub Action that uses Claude AI to review pull requests with organi
 - Automated PR reviews using Claude AI
 - Organization member verification before running reviews
 - Customizable review prompts
-- Configurable timeout and progress tracking
+- Progress tracking
 - Works with forked repositories
 
 ## Usage
@@ -54,28 +54,28 @@ jobs:
 
 ## Inputs
 
-| Input | Description | Required | Default |
-|-------|-------------|----------|---------|
-| `github_token` | GitHub token for PR operations | Yes | - |
-| `anthropic_api_key` | Anthropic API key for Claude | Yes | - |
-| `personal_access_token` | Personal access token for organization verification | Yes | - |
-| `pr_number` | Pull request number | Yes | - |
-| `pr_user_login` | Pull request author username | Yes | - |
-| `pr_head_repo` | Pull request head repository full name | Yes | - |
-| `pr_head_ref` | Pull request head ref | Yes | - |
-| `repository` | Repository name (owner/repo) | Yes | - |
-| `review_prompt` | Custom review prompt | No | Default review criteria |
-| `timeout_minutes` | Timeout in minutes for Claude review | No | `60` |
-| `track_progress` | Track progress of the review | No | `true` |
+| Input                   | Description                                         | Required | Default                 |
+| ----------------------- | --------------------------------------------------- | -------- | ----------------------- |
+| `github_token`          | GitHub token for PR operations                      | Yes      | -                       |
+| `anthropic_api_key`     | Anthropic API key for Claude                        | Yes      | -                       |
+| `personal_access_token` | Personal access token for organization verification | Yes      | -                       |
+| `pr_number`             | Pull request number                                 | Yes      | -                       |
+| `pr_user_login`         | Pull request author username                        | Yes      | -                       |
+| `pr_head_repo`          | Pull request head repository full name              | Yes      | -                       |
+| `pr_head_ref`           | Pull request head ref                               | Yes      | -                       |
+| `repository`            | Repository name (owner/repo)                        | Yes      | -                       |
+| `review_prompt`         | Custom review prompt                                | No       | Default review criteria |
 
 ## Required Secrets
 
 You need to configure the following secrets in your repository:
 
 1. **`ANTHROPIC_API_KEY`**: Your Anthropic API key for Claude
+
    - Get it from: https://console.anthropic.com/
 
 2. **`PERSONAL_ACCESS_TOKEN`**: GitHub Personal Access Token with `read:org` permission
+
    - Used for verifying organization membership
    - Create one at: https://github.com/settings/tokens
 
@@ -105,11 +105,11 @@ The workflow calling this action needs these permissions:
 
 ```yaml
 permissions:
-  contents: read          # Read repository code
-  pull-requests: write    # Comment on PRs
-  issues: write           # Create/update comments
-  id-token: write         # For authentication
-  actions: read           # Read workflow information
+  contents: read # Read repository code
+  pull-requests: write # Comment on PRs
+  issues: write # Create/update comments
+  id-token: write # For authentication
+  actions: read # Read workflow information
 ```
 
 ## How It Works
@@ -124,4 +124,4 @@ permissions:
 - The action only runs for organization members (deriv-com)
 - It automatically handles forked repositories
 - Concurrent runs for the same PR are cancelled when new commits arrive
-- Default timeout is 60 minutes (configurable)
+- Timeout is handled by the underlying Claude Code Action
