@@ -1,11 +1,10 @@
 # Claude Code Review Assistant
 
-A reusable GitHub Action that uses Claude AI to review pull requests with organization member verification.
+A reusable GitHub Action that uses Claude AI to review pull requests.
 
 ## Features
 
 - Automated PR reviews using Claude AI
-- Organization member verification before running reviews
 - Customizable review prompts
 - Progress tracking
 - Works with forked repositories
@@ -44,9 +43,7 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          personal_access_token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           pr_number: ${{ github.event.pull_request.number }}
-          pr_user_login: ${{ github.event.pull_request.user.login }}
           pr_head_repo: ${{ github.event.pull_request.head.repo.full_name }}
           pr_head_ref: ${{ github.event.pull_request.head.ref }}
           repository: ${{ github.repository }}
@@ -54,17 +51,15 @@ jobs:
 
 ## Inputs
 
-| Input                   | Description                                         | Required | Default                 |
-| ----------------------- | --------------------------------------------------- | -------- | ----------------------- |
-| `github_token`          | GitHub token for PR operations                      | Yes      | -                       |
-| `anthropic_api_key`     | Anthropic API key for Claude                        | Yes      | -                       |
-| `personal_access_token` | Personal access token for organization verification | Yes      | -                       |
-| `pr_number`             | Pull request number                                 | Yes      | -                       |
-| `pr_user_login`         | Pull request author username                        | Yes      | -                       |
-| `pr_head_repo`          | Pull request head repository full name              | Yes      | -                       |
-| `pr_head_ref`           | Pull request head ref                               | Yes      | -                       |
-| `repository`            | Repository name (owner/repo)                        | Yes      | -                       |
-| `review_prompt`         | Custom review prompt                                | No       | Default review criteria |
+| Input               | Description                            | Required | Default                 |
+| ------------------- | -------------------------------------- | -------- | ----------------------- |
+| `github_token`      | GitHub token for PR operations         | Yes      | -                       |
+| `anthropic_api_key` | Anthropic API key for Claude           | Yes      | -                       |
+| `pr_number`         | Pull request number                    | Yes      | -                       |
+| `pr_head_repo`      | Pull request head repository full name | Yes      | -                       |
+| `pr_head_ref`       | Pull request head ref                  | Yes      | -                       |
+| `repository`        | Repository name (owner/repo)           | Yes      | -                       |
+| `review_prompt`     | Custom review prompt                   | No       | Default review criteria |
 
 ## Required Secrets
 
@@ -74,12 +69,7 @@ You need to configure the following secrets in your repository:
 
    - Get it from: https://console.anthropic.com/
 
-2. **`PERSONAL_ACCESS_TOKEN`**: GitHub Personal Access Token with `read:org` permission
-
-   - Used for verifying organization membership
-   - Create one at: https://github.com/settings/tokens
-
-3. **`GITHUB_TOKEN`**: Automatically provided by GitHub Actions
+2. **`GITHUB_TOKEN`**: Automatically provided by GitHub Actions
    - No manual setup needed
 
 ## Custom Review Prompt
@@ -114,14 +104,13 @@ permissions:
 
 ## How It Works
 
-1. **User Verification**: Verifies that the PR author is a member of the deriv-com organization
-2. **Checkout**: Checks out the PR head (works with forks)
+1. **Checkout**: Checks out the PR head (works with forks)
+2. **Workspace Verification**: Ensures the git workspace is properly set up
 3. **Review**: Runs Claude Code Action to review the PR
 4. **Feedback**: Posts inline comments and a summary on the PR
 
 ## Notes
 
-- The action only runs for organization members (deriv-com)
 - It automatically handles forked repositories
 - Concurrent runs for the same PR are cancelled when new commits arrive
 - Timeout is handled by the underlying Claude Code Action

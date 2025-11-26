@@ -8,14 +8,8 @@ inputs:
   anthropic_api_key:
     description: "Anthropic API key for Claude"
     required: true
-  personal_access_token:
-    description: "Personal access token for organization verification"
-    required: true
   pr_number:
     description: "Pull request number"
-    required: true
-  pr_user_login:
-    description: "Pull request author username"
     required: true
   pr_head_repo:
     description: "Pull request head repository full name"
@@ -45,12 +39,6 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Verify user
-      uses: deriv-com/shared-actions/.github/actions/verify_user_in_organization@master
-      with:
-        username: ${{ inputs.pr_user_login }}
-        token: ${{ inputs.personal_access_token }}
-
     # Ensure we have a real git repo at the PR HEAD (works for forks)
     - name: Checkout PR head
       uses: actions/checkout@v4
