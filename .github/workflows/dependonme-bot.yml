@@ -422,77 +422,66 @@ jobs:
           PR_NUMBER: ${{ steps.create-pr.outputs.pr_number }}
           PR_URL: ${{ steps.create-pr.outputs.pr_url }}
           PACKAGES: ${{ steps.analyze.outputs.packages }}
-          SAFE_TO_MERGE: ${{ steps.verify-files.outputs.safe_to_merge }}
           SKIPPED_PACKAGES: ${{ steps.update.outputs.skipped_packages }}
           SKIPPED_COUNT: ${{ steps.update.outputs.skipped_count }}
+          SLACK_USERS: ${{ inputs.slack_users_to_tag }}
         run: |
-          # Build package list (each on new line, escaped for JSON)
-          PACKAGE_LIST=$(echo "$PACKAGES" | jq -r '.[] | "• *\(.name)* → latest (fixes >= \(.version))"' | head -10 | tr '\n' '§' | sed 's/§/\\n/g' | sed 's/\\n$//')
+          # Format Slack user mentions
+          FORMATTED_USERS=$(echo "$SLACK_USERS" | tr ',' '\n' | sed 's/^/<@/' | sed 's/$/>/' | tr '\n' ' ')
           
-          # Determine status emoji and message
-          if [ "$SAFE_TO_MERGE" = "true" ] && [ "$AUTO_MERGE" = "true" ]; then
-            STATUS_EMOJI="✅"
-            STATUS_TEXT="Auto-merge enabled. PR will merge automatically once CI passes."
-          else
-            STATUS_EMOJI="⚠️"
-            # Format Slack user mentions
-            FORMATTED_USERS=$(echo "$SLACK_USERS" | tr ',' '\n' | sed 's/^/<@/' | sed 's/$/>/' | tr '\n' ' ')
-            STATUS_TEXT="Manual review required. ${FORMATTED_USERS}Please review and merge the PR."
+          # Build updated packages list
+          UPDATED_LIST=$(echo "$PACKAGES" | jq -r '.[] | "- \(.name) → latest (fixes >= \(.version))"')
+          
+          # Build skipped packages list (if any) - format: "pkg (reason)" → "- pkg → (reason)"
+          SKIPPED_LIST=""
+          if [ -n "$SKIPPED_PACKAGES" ] && [ "$SKIPPED_COUNT" != "0" ]; then
+            SKIPPED_LIST=$(echo "$SKIPPED_PACKAGES" | tr ',' '\n' | sed '/^$/d' | sed 's/^/- /' | sed 's/ (/ → (/')
           fi
           
-          # Build skipped packages section if any
-          SKIPPED_BLOCK=""
-          if [ -n "$SKIPPED_PACKAGES" ] && [ "$SKIPPED_COUNT" != "0" ]; then
-            SKIPPED_LIST=$(echo "$SKIPPED_PACKAGES" | tr ',' '\n' | sed '/^$/d' | sed 's/^/• /' | tr '\n' '§' | sed 's/§/\\n/g' | sed 's/\\n$//')
-            SKIPPED_BLOCK=',
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "*⚠️ Could Not Auto-Fix:*\\n'"$SKIPPED_LIST"'\\n_These packages require manual intervention._"
-                }
-              }'
+          # Combine both lists
+          if [ -n "$SKIPPED_LIST" ]; then
+            FULL_LIST="$UPDATED_LIST"$'\n'"$SKIPPED_LIST"
+          else
+            FULL_LIST="$UPDATED_LIST"
           fi
           
           # Send Slack notification
           curl -X POST "$SLACK_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -d @- << EOF
-          {
-            "blocks": [
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "🔧 *Security Fix PR Created*\n*Repo:* \`${{ github.repository }}\`\n*<$PR_URL|PR #$PR_NUMBER>* has been created to fix Dependabot security vulnerabilities."
-                }
-              },
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "*Updated Packages:*\n$PACKAGE_LIST"
-                }
-              }$SKIPPED_BLOCK,
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "*Status:* $STATUS_EMOJI $STATUS_TEXT"
-                }
-              },
-              {
-                "type": "context",
-                "elements": [
+            -d "$(jq -n \
+              --arg users "$FORMATTED_USERS" \
+              --arg repo "${{ github.repository }}" \
+              --arg pr_url "$PR_URL" \
+              --arg pr_num "$PR_NUMBER" \
+              --arg packages "$FULL_LIST" \
+              '{
+                "blocks": [
                   {
-                    "type": "mrkdwn",
-                    "text": "🤖 Automated by Dependonme Bot | <https://github.com/${{ github.repository }}/security/dependabot|View all alerts>"
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "\($users)\n*<\($pr_url)|PR #\($pr_num)>* in `\($repo)`"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": $packages
+                    }
+                  },
+                  {
+                    "type": "context",
+                    "elements": [
+                      {
+                        "type": "mrkdwn",
+                        "text": "🤖 Dependonme Bot | <https://github.com/\($repo)/security/dependabot|View alerts>"
+                      }
+                    ]
                   }
                 ]
-              }
-            ]
-          }
-          EOF
+              }'
+            )"
           
           echo "📢 Slack notification sent" >> $GITHUB_STEP_SUMMARY
 
@@ -514,48 +503,53 @@ jobs:
           # Format Slack user mentions
           FORMATTED_USERS=$(echo "$SLACK_USERS" | tr ',' '\n' | sed 's/^/<@/' | sed 's/$/>/' | tr '\n' ' ')
           
-          # Build skipped packages list
-          SKIPPED_LIST=$(echo "$SKIPPED_PACKAGES" | tr ',' '\n' | sed '/^$/d' | sed 's/^/• /' | tr '\n' '§' | sed 's/§/\\n/g' | sed 's/\\n$//')
+          # Build skipped packages list - format: "pkg (reason)" → "- pkg → (reason)"
+          SKIPPED_LIST=$(echo "$SKIPPED_PACKAGES" | tr ',' '\n' | sed '/^$/d' | sed 's/^/- /' | sed 's/ (/ → (/')
+          
+          # Handle singular/plural
+          if [ "$ALERT_COUNT" = "1" ]; then
+            ALERT_WORD="alert"
+          else
+            ALERT_WORD="alerts"
+          fi
           
           # Send Slack notification
           curl -X POST "$SLACK_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -d @- << EOF
-          {
-            "blocks": [
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "${FORMATTED_USERS}\n*Repo:* \`${{ github.repository }}\`\nThe bot detected *$ALERT_COUNT Dependabot alert(s)* but could not automatically fix any of them."
-                }
-              },
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "*Packages that failed to update:*\n$SKIPPED_LIST"
-                }
-              },
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "⚠️ *Action Required:* Please manually review and fix these security vulnerabilities."
-                }
-              },
-              {
-                "type": "context",
-                "elements": [
+            -d "$(jq -n \
+              --arg users "$FORMATTED_USERS" \
+              --arg repo "${{ github.repository }}" \
+              --arg count "$ALERT_COUNT" \
+              --arg word "$ALERT_WORD" \
+              --arg packages "$SKIPPED_LIST" \
+              '{
+                "blocks": [
                   {
-                    "type": "mrkdwn",
-                    "text": "🤖 Automated by Dependonme Bot | <https://github.com/${{ github.repository }}/security/dependabot|View all alerts>"
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "\($users) :alert_1:\n*\($count) \($word)* in `\($repo)` could not be auto-fixed"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": $packages
+                    }
+                  },
+                  {
+                    "type": "context",
+                    "elements": [
+                      {
+                        "type": "mrkdwn",
+                        "text": "🤖 Dependonme Bot | <https://github.com/\($repo)/security/dependabot|View alerts>"
+                      }
+                    ]
                   }
                 ]
-              }
-            ]
-          }
-          EOF
+              }'
+            )"
           
           echo "🚨 Slack alert sent - all updates failed, manual intervention required" >> $GITHUB_STEP_SUMMARY
 
