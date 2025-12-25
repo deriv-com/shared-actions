@@ -1,0 +1,571 @@
+name: 🦾 Dependonme Bot
+
+on:
+  workflow_call:
+    inputs:
+      slack_users_to_tag:
+        description: 'Comma-separated Slack user IDs to tag when manual fix is needed'
+        required: true
+        type: string
+      base_branch:
+        description: 'Base branch for PR (e.g., master or main)'
+        required: false
+        default: 'master'
+        type: string
+      auto_merge:
+        description: 'Enable auto-merge for safe PRs (requires repo settings)'
+        required: false
+        default: true
+        type: boolean
+      dry_run:
+        description: 'Preview changes without creating PR'
+        required: false
+        default: false
+        type: boolean
+      pr_labels:
+        description: 'Comma-separated labels for PR'
+        required: false
+        default: 'security,dependencies'
+        type: string
+      node_version:
+        description: 'Node.js version to use'
+        required: false
+        default: '20'
+        type: string
+      npm_legacy_peer_deps:
+        description: 'Use --legacy-peer-deps flag for npm install'
+        required: false
+        default: true
+        type: boolean
+      exclude_packages:
+        description: 'Comma-separated packages to exclude from updates'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      DEPENDONME_BOT_TOKEN:
+        description: 'GitHub PAT for PR creation & auto-merge (repo-specific)'
+        required: true
+
+concurrency:
+  group: dependonme-bot-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  fix-alerts:
+    name: 🔧 Fix Security Vulnerabilities
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      pull-requests: write
+      security-events: read
+
+    outputs:
+      has_alerts: ${{ steps.analyze.outputs.has_alerts }}
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
+
+    env:
+      NODE_VERSION: ${{ inputs.node_version }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      BASE_BRANCH: ${{ inputs.base_branch }}
+      AUTO_MERGE: ${{ inputs.auto_merge }}
+      PR_LABELS: ${{ inputs.pr_labels }}
+      NPM_LEGACY_PEER_DEPS: ${{ inputs.npm_legacy_peer_deps }}
+      EXCLUDE_PACKAGES: ${{ inputs.exclude_packages }}
+      SLACK_USERS: ${{ inputs.slack_users_to_tag }}
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          token: ${{ secrets.DEPENDONME_BOT_TOKEN }}
+          ref: ${{ inputs.base_branch }}
+
+      - name: 🏗️ Setup Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 🔍 Analyze Dependabot Alerts
+        id: analyze
+        env:
+          GH_TOKEN: ${{ secrets.DEPENDONME_BOT_TOKEN }}
+        run: |
+          echo "## 🔍 Analyzing Dependabot Alerts" >> $GITHUB_STEP_SUMMARY
+          echo "Repository: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+
+          # Get all open Dependabot alerts
+          ALERTS=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ github.repository }}/dependabot/alerts?state=open&per_page=100" \
+            2>&1) || true
+          
+          # Debug: Check if response is valid JSON array
+          if ! echo "$ALERTS" | jq -e 'type == "array"' > /dev/null 2>&1; then
+            echo "⚠️ API returned unexpected response:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "$ALERTS" | head -5 >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "has_alerts=false" >> $GITHUB_OUTPUT
+            echo "alert_count=0" >> $GITHUB_OUTPUT
+            echo "packages=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          ALERT_COUNT=$(echo "$ALERTS" | jq -r 'length' | tr -d '[:space:]')
+          if ! [[ "$ALERT_COUNT" =~ ^[0-9]+$ ]]; then
+            ALERT_COUNT=0
+          fi
+
+          echo "alert_count=$ALERT_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$ALERT_COUNT" -eq 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **No open Dependabot alerts!** All clear! 🎉" >> $GITHUB_STEP_SUMMARY
+            echo "has_alerts=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "has_alerts=true" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Found **$ALERT_COUNT** open alerts" >> $GITHUB_STEP_SUMMARY
+
+          # Build exclusion filter
+          EXCLUDE_FILTER=""
+          if [ -n "$EXCLUDE_PACKAGES" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Excluded packages:** $EXCLUDE_PACKAGES" >> $GITHUB_STEP_SUMMARY
+            # Convert comma-separated to jq filter
+            EXCLUDE_FILTER=$(echo "$EXCLUDE_PACKAGES" | tr ',' '\n' | sed 's/^/"/' | sed 's/$/"/' | tr '\n' ',' | sed 's/,$//')
+          fi
+
+          # Group alerts by package and find highest required version
+          if [ -n "$EXCLUDE_FILTER" ]; then
+            echo "$ALERTS" | jq -r --argjson exclude "[$EXCLUDE_FILTER]" '
+              group_by(.dependency.package.name) |
+              map({
+                package: .[0].dependency.package.name,
+                required_version: (map(.security_vulnerability.first_patched_version.identifier | select(. != null)) | sort | last),
+                alert_count: length,
+                severities: (map(.security_advisory.severity) | unique | join(", "))
+              }) |
+              .[] | select(.required_version != null) | select(.package as $p | $exclude | index($p) | not) |
+              "\(.package)|\(.required_version)|\(.alert_count)|\(.severities)"
+            ' > /tmp/packages_to_fix.txt
+          else
+            echo "$ALERTS" | jq -r '
+              group_by(.dependency.package.name) |
+              map({
+                package: .[0].dependency.package.name,
+                required_version: (map(.security_vulnerability.first_patched_version.identifier | select(. != null)) | sort | last),
+                alert_count: length,
+                severities: (map(.security_advisory.severity) | unique | join(", "))
+              }) |
+              .[] | select(.required_version != null) |
+              "\(.package)|\(.required_version)|\(.alert_count)|\(.severities)"
+            ' > /tmp/packages_to_fix.txt
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Packages to Update" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | Min Version | Alerts | Severity |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------------|--------|----------|" >> $GITHUB_STEP_SUMMARY
+
+          PACKAGES_JSON="[]"
+          while IFS='|' read -r pkg ver count sev; do
+            if [ -n "$pkg" ] && [ -n "$ver" ]; then
+              echo "| \`$pkg\` | \`>= $ver\` | $count | $sev |" >> $GITHUB_STEP_SUMMARY
+              PACKAGES_JSON=$(echo "$PACKAGES_JSON" | jq --arg p "$pkg" --arg v "$ver" '. + [{"name": $p, "version": $v}]')
+            fi
+          done < /tmp/packages_to_fix.txt
+
+          echo "packages=$(echo "$PACKAGES_JSON" | jq -c '.')" >> $GITHUB_OUTPUT
+
+      - name: 📦 Install Dependencies
+        if: steps.analyze.outputs.has_alerts == 'true'
+        run: |
+          if [ "$NPM_LEGACY_PEER_DEPS" = "true" ]; then
+            npm ci --legacy-peer-deps
+          else
+            npm ci
+          fi
+
+      - name: 🔧 Update Vulnerable Packages
+        id: update
+        if: steps.analyze.outputs.has_alerts == 'true'
+        run: |
+          PACKAGES='${{ steps.analyze.outputs.packages }}'
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔧 Updates" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "**🔍 DRY RUN MODE**" >> $GITHUB_STEP_SUMMARY
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "$PACKAGES" | jq -r '.[] | "- Would update \(.name) to latest"' >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # Determine npm install flags
+          NPM_FLAGS="--save"
+          if [ "$NPM_LEGACY_PEER_DEPS" = "true" ]; then
+            NPM_FLAGS="$NPM_FLAGS --legacy-peer-deps"
+          fi
+
+          # Update each package to LATEST version (skip failures gracefully)
+          UPDATED_COUNT=0
+          SKIPPED_COUNT=0
+          SKIPPED_PACKAGES=""
+          UPDATED_PACKAGES=""
+          
+          for pkg in $(echo "$PACKAGES" | jq -r '.[] | .name'); do
+            LATEST=$(npm view "$pkg" version 2>/dev/null || echo "")
+            if [ -z "$LATEST" ]; then
+              echo "- ⚠️ Could not find \`$pkg\` on npm" >> $GITHUB_STEP_SUMMARY
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              SKIPPED_PACKAGES="$SKIPPED_PACKAGES$pkg (not found on npm),"
+              continue
+            fi
+            
+            echo "Updating $pkg to $LATEST..."
+            # Save current state before attempting update
+            cp package.json package.json.bak
+            cp package-lock.json package-lock.json.bak
+            
+            if npm install "$pkg@$LATEST" $NPM_FLAGS 2>&1; then
+              echo "- ✅ \`$pkg\` → \`$LATEST\`" >> $GITHUB_STEP_SUMMARY
+              UPDATED_COUNT=$((UPDATED_COUNT + 1))
+              UPDATED_PACKAGES="$UPDATED_PACKAGES$pkg@$LATEST,"
+              # Remove backups on success
+              rm -f package.json.bak package-lock.json.bak
+            else
+              echo "- ⏭️ \`$pkg\` skipped (override conflict or incompatible)" >> $GITHUB_STEP_SUMMARY
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              SKIPPED_PACKAGES="$SKIPPED_PACKAGES$pkg (override conflict),"
+              # Restore only this failed package's changes, keep previous successful updates
+              mv package.json.bak package.json
+              mv package-lock.json.bak package-lock.json
+            fi
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Summary:** $UPDATED_COUNT updated, $SKIPPED_COUNT skipped" >> $GITHUB_STEP_SUMMARY
+          
+          # Output skipped packages for Slack notification
+          echo "skipped_packages=${SKIPPED_PACKAGES%,}" >> $GITHUB_OUTPUT
+          echo "skipped_count=$SKIPPED_COUNT" >> $GITHUB_OUTPUT
+          echo "updated_packages=${UPDATED_PACKAGES%,}" >> $GITHUB_OUTPUT
+
+          # Check for changes
+          if git diff --quiet package.json package-lock.json 2>/dev/null; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🔍 Verify with npm audit
+        if: steps.update.outputs.has_changes == 'true'
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔍 Audit Results" >> $GITHUB_STEP_SUMMARY
+          npm audit --json 2>/dev/null | jq -r '
+            "- Critical: \(.metadata.vulnerabilities.critical // 0)\n- High: \(.metadata.vulnerabilities.high // 0)\n- Moderate: \(.metadata.vulnerabilities.moderate // 0)\n- Low: \(.metadata.vulnerabilities.low // 0)"
+          ' >> $GITHUB_STEP_SUMMARY || echo "Audit complete" >> $GITHUB_STEP_SUMMARY
+
+      - name: 🔒 Verify Only Package Files Changed
+        id: verify-files
+        if: steps.update.outputs.has_changes == 'true'
+        run: |
+          # Get list of changed files
+          CHANGED_FILES=$(git diff --name-only HEAD)
+          
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+          
+          # Check if ONLY package.json and package-lock.json are changed
+          ALLOWED_FILES="package.json
+          package-lock.json"
+          
+          INVALID_FILES=""
+          while IFS= read -r file; do
+            if [ -n "$file" ]; then
+              if ! echo "$ALLOWED_FILES" | grep -qx "$file"; then
+                INVALID_FILES="$INVALID_FILES $file"
+              fi
+            fi
+          done <<< "$CHANGED_FILES"
+          
+          if [ -n "$INVALID_FILES" ]; then
+            echo "❌ ERROR: Unexpected files changed:$INVALID_FILES" >> $GITHUB_STEP_SUMMARY
+            echo "Auto-merge BLOCKED for safety." >> $GITHUB_STEP_SUMMARY
+            echo "safe_to_merge=false" >> $GITHUB_OUTPUT
+            echo "::error::Unexpected files changed:$INVALID_FILES - Auto-merge blocked"
+          else
+            echo "✅ Only package.json and package-lock.json changed - safe to auto-merge" >> $GITHUB_STEP_SUMMARY
+            echo "safe_to_merge=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🗑️ Close Existing Security Fix PRs
+        if: steps.update.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.DEPENDONME_BOT_TOKEN }}
+        run: |
+          echo "Checking for existing security fix PRs..."
+          
+          # Find and close any existing auto-fix PRs
+          EXISTING_PRS=$(gh pr list --search "Auto-fix: Dependabot Security" --state open --json number --jq '.[].number' 2>/dev/null || echo "")
+          
+          if [ -n "$EXISTING_PRS" ]; then
+            echo "Found existing PRs to close:"
+            for pr in $EXISTING_PRS; do
+              echo "  Closing PR #$pr..."
+              gh pr close "$pr" --comment "🔄 Closing stale PR. A fresh security fix PR will be created." --delete-branch 2>/dev/null || echo "  Could not close PR #$pr"
+            done
+            echo "🗑️ Closed $(echo "$EXISTING_PRS" | wc -w | tr -d ' ') existing PR(s)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No existing security fix PRs found"
+          fi
+
+      - name: 🔀 Create Pull Request
+        id: create-pr
+        if: steps.update.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.DEPENDONME_BOT_TOKEN }}
+          SAFE_TO_MERGE: ${{ steps.verify-files.outputs.safe_to_merge }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="fix/security-auto-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
+          git add package.json package-lock.json
+          git commit --no-verify -m "🔒 Auto-fix Dependabot security vulnerabilities
+
+          Updated packages:
+          $(echo '${{ steps.analyze.outputs.packages }}' | jq -r '.[] | "- \(.name) (>= \(.version))"')
+
+          [auto-merge]"
+
+          git push origin "$BRANCH"
+
+          # Determine if auto-merge should be enabled
+          if [ "$SAFE_TO_MERGE" = "true" ] && [ "$AUTO_MERGE" = "true" ]; then
+            LABELS="${PR_LABELS},auto-merge"
+            AUTO_MERGE_NOTE="✅ **Auto-merge enabled** - Only package files changed"
+          else
+            LABELS="${PR_LABELS},review-required"
+            if [ "$AUTO_MERGE" != "true" ]; then
+              AUTO_MERGE_NOTE="ℹ️ **Auto-merge disabled** - Manual review required per configuration"
+            else
+              AUTO_MERGE_NOTE="⚠️ **Manual review required** - Unexpected files detected"
+            fi
+          fi
+
+          # Create PR (without labels - add them separately to avoid failure if labels don't exist)
+          PR_URL=$(gh pr create \
+            --title "🔒 Auto-fix: Dependabot Security Vulnerabilities" \
+            --body "## 🔒 Automated Security Fix
+
+          This PR automatically fixes security vulnerabilities detected by Dependabot.
+
+          ### 📦 Updated Packages
+          $(echo '${{ steps.analyze.outputs.packages }}' | jq -r '.[] | "- **\(.name)** → latest (fixes >= \(.version))"')
+
+          ### 🔒 Safety Check
+          $AUTO_MERGE_NOTE
+
+          ### ♻️ Auto-Heal Process
+          After this PR is merged, the workflow will automatically:
+          1. Re-check for remaining Dependabot alerts
+          2. Create another fix PR if needed
+          3. Repeat until all alerts are resolved
+
+          ---
+          🤖 *Automated by Dependonme Bot*
+          " \
+            --base "$BASE_BRANCH" \
+            --head "$BRANCH")
+          
+          # Try to add labels (ignore errors if labels don't exist)
+          PR_NUMBER_TEMP=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+          for label in $(echo "$LABELS" | tr ',' ' '); do
+            gh pr edit "$PR_NUMBER_TEMP" --add-label "$label" 2>/dev/null || echo "Label '$label' not found, skipping"
+          done
+
+          PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔀 PR Created: #$PR_NUMBER" >> $GITHUB_STEP_SUMMARY
+          echo "$PR_URL" >> $GITHUB_STEP_SUMMARY
+
+      - name: 🤖 Enable Auto-Merge (if safe)
+        if: steps.update.outputs.has_changes == 'true' && steps.verify-files.outputs.safe_to_merge == 'true' && inputs.auto_merge == true
+        env:
+          GH_TOKEN: ${{ secrets.DEPENDONME_BOT_TOKEN }}
+        run: |
+          PR_NUMBER="${{ steps.create-pr.outputs.pr_number }}"
+          echo "Enabling auto-merge for PR #$PR_NUMBER..."
+          gh pr merge "$PR_NUMBER" --auto --squash || echo "Auto-merge queued (waiting for CI)"
+          echo "✅ Auto-merge enabled" >> $GITHUB_STEP_SUMMARY
+
+      - name: 📢 Send Slack Notification - PR Created
+        if: steps.create-pr.outputs.pr_number != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.DEPENDONME_BOT_SLACK }}
+          PR_NUMBER: ${{ steps.create-pr.outputs.pr_number }}
+          PR_URL: ${{ steps.create-pr.outputs.pr_url }}
+          PACKAGES: ${{ steps.analyze.outputs.packages }}
+          SAFE_TO_MERGE: ${{ steps.verify-files.outputs.safe_to_merge }}
+          SKIPPED_PACKAGES: ${{ steps.update.outputs.skipped_packages }}
+          SKIPPED_COUNT: ${{ steps.update.outputs.skipped_count }}
+        run: |
+          # Build package list (each on new line, escaped for JSON)
+          PACKAGE_LIST=$(echo "$PACKAGES" | jq -r '.[] | "• *\(.name)* → latest (fixes >= \(.version))"' | head -10 | tr '\n' '§' | sed 's/§/\\n/g' | sed 's/\\n$//')
+          
+          # Determine status emoji and message
+          if [ "$SAFE_TO_MERGE" = "true" ] && [ "$AUTO_MERGE" = "true" ]; then
+            STATUS_EMOJI="✅"
+            STATUS_TEXT="Auto-merge enabled. PR will merge automatically once CI passes."
+          else
+            STATUS_EMOJI="⚠️"
+            # Format Slack user mentions
+            FORMATTED_USERS=$(echo "$SLACK_USERS" | tr ',' '\n' | sed 's/^/<@/' | sed 's/$/>/' | tr '\n' ' ')
+            STATUS_TEXT="Manual review required. ${FORMATTED_USERS}Please review and merge the PR."
+          fi
+          
+          # Build skipped packages section if any
+          SKIPPED_BLOCK=""
+          if [ -n "$SKIPPED_PACKAGES" ] && [ "$SKIPPED_COUNT" != "0" ]; then
+            SKIPPED_LIST=$(echo "$SKIPPED_PACKAGES" | tr ',' '\n' | sed '/^$/d' | sed 's/^/• /' | tr '\n' '§' | sed 's/§/\\n/g' | sed 's/\\n$//')
+            SKIPPED_BLOCK=',
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*⚠️ Could Not Auto-Fix:*\\n'"$SKIPPED_LIST"'\\n_These packages require manual intervention._"
+                }
+              }'
+          fi
+          
+          # Send Slack notification
+          curl -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d @- << EOF
+          {
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "🔧 *Security Fix PR Created*\n*Repo:* \`${{ github.repository }}\`\n*<$PR_URL|PR #$PR_NUMBER>* has been created to fix Dependabot security vulnerabilities."
+                }
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Updated Packages:*\n$PACKAGE_LIST"
+                }
+              }$SKIPPED_BLOCK,
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Status:* $STATUS_EMOJI $STATUS_TEXT"
+                }
+              },
+              {
+                "type": "context",
+                "elements": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "🤖 Automated by Dependonme Bot | <https://github.com/${{ github.repository }}/security/dependabot|View all alerts>"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          
+          echo "📢 Slack notification sent" >> $GITHUB_STEP_SUMMARY
+
+      - name: ⚠️ Manual Review Required
+        if: steps.update.outputs.has_changes == 'true' && steps.verify-files.outputs.safe_to_merge == 'false'
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ⚠️ Manual Review Required" >> $GITHUB_STEP_SUMMARY
+          echo "Auto-merge was **blocked** because files other than package.json/package-lock.json were modified." >> $GITHUB_STEP_SUMMARY
+          echo "Please review the PR manually before merging." >> $GITHUB_STEP_SUMMARY
+
+      - name: 🚨 Send Slack Alert - All Updates Failed
+        if: steps.analyze.outputs.has_alerts == 'true' && steps.update.outputs.has_changes == 'false' && steps.update.outputs.skipped_count != '0'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.DEPENDONME_BOT_SLACK }}
+          SKIPPED_PACKAGES: ${{ steps.update.outputs.skipped_packages }}
+          ALERT_COUNT: ${{ steps.analyze.outputs.alert_count }}
+        run: |
+          # Format Slack user mentions
+          FORMATTED_USERS=$(echo "$SLACK_USERS" | tr ',' '\n' | sed 's/^/<@/' | sed 's/$/>/' | tr '\n' ' ')
+          
+          # Build skipped packages list
+          SKIPPED_LIST=$(echo "$SKIPPED_PACKAGES" | tr ',' '\n' | sed '/^$/d' | sed 's/^/• /' | tr '\n' '§' | sed 's/§/\\n/g' | sed 's/\\n$//')
+          
+          # Send Slack notification
+          curl -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d @- << EOF
+          {
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "${FORMATTED_USERS}\n*Repo:* \`${{ github.repository }}\`\nThe bot detected *$ALERT_COUNT Dependabot alert(s)* but could not automatically fix any of them."
+                }
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Packages that failed to update:*\n$SKIPPED_LIST"
+                }
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "⚠️ *Action Required:* Please manually review and fix these security vulnerabilities."
+                }
+              },
+              {
+                "type": "context",
+                "elements": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "🤖 Automated by Dependonme Bot | <https://github.com/${{ github.repository }}/security/dependabot|View all alerts>"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          
+          echo "🚨 Slack alert sent - all updates failed, manual intervention required" >> $GITHUB_STEP_SUMMARY
+
+      - name: 📋 Summary
+        if: always()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Alerts Found | ${{ steps.analyze.outputs.alert_count || '0' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Base Branch | ${{ inputs.base_branch }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Auto-Merge | ${{ inputs.auto_merge }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dry Run | ${{ inputs.dry_run }} |" >> $GITHUB_STEP_SUMMARY
+
