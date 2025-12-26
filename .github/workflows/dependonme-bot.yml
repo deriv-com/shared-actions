@@ -555,14 +555,20 @@ jobs:
 
       - name: 📋 Summary
         if: always()
+        env:
+          ALERT_COUNT: ${{ steps.analyze.outputs.alert_count || '0' }}
+          JOB_STATUS: ${{ job.status }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          AUTO_MERGE: ${{ inputs.auto_merge }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Alerts Found | ${{ steps.analyze.outputs.alert_count || '0' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Status | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Base Branch | ${{ inputs.base_branch }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Auto-Merge | ${{ inputs.auto_merge }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Dry Run | ${{ inputs.dry_run }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Alerts Found | $ALERT_COUNT |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | $JOB_STATUS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Base Branch | $BASE_BRANCH |" >> $GITHUB_STEP_SUMMARY
+          echo "| Auto-Merge | $AUTO_MERGE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dry Run | $DRY_RUN |" >> $GITHUB_STEP_SUMMARY
 
