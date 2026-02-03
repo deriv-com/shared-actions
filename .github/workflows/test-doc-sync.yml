@@ -17,6 +17,9 @@ jobs:
       pull-requests: write
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Run Doc Sync Agent
         uses: ./.github/actions/doc_sync_agent  # Uses local version
         with:
