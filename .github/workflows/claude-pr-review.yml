@@ -1,0 +1,275 @@
+name: Claude PR Review
+
+on:
+  workflow_call:
+    inputs:
+      claude_model:
+        description: "Claude model to use for review"
+        required: false
+        default: "claude-sonnet-4-20250514"
+        type: string
+      claude_temperature:
+        description: "Temperature for Claude responses (0-1)"
+        required: false
+        default: "0"
+        type: string
+      claude_max_tokens:
+        description: "Maximum tokens for Claude response"
+        required: false
+        default: "8192"
+        type: string
+      prompt_gist_url:
+        description: "URL to fetch prompt template from"
+        required: false
+        default: "https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/claude-review-format.md"
+        type: string
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: "Anthropic API key for Claude"
+        required: true
+
+jobs:
+  claude-review-api:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+
+    concurrency:
+      group: claude-pr-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+
+    env:
+      CLAUDE_MODEL: ${{ inputs.claude_model }}
+      CLAUDE_TEMPERATURE: ${{ inputs.claude_temperature }}
+      CLAUDE_MAX_TOKENS: ${{ inputs.claude_max_tokens }}
+
+    steps:
+      - name: Security Check - Validate User Access
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ACTOR="${{ github.actor }}"
+          echo "🔒 Validating access for user: $ACTOR"
+
+          MEMBERSHIP=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/orgs/regentmarkets/members/$ACTOR" -w "%{http_code}" -o /dev/null)
+          [[ "$MEMBERSHIP" == "204" ]] && echo "✅ Verified org member" && exit 0
+
+          COLLAB=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/collaborators/$ACTOR" -w "%{http_code}" -o /dev/null)
+          [[ "$COLLAB" == "204" ]] && echo "✅ Verified collaborator" && exit 0
+
+          echo "❌ Access denied for user: $ACTOR" && exit 1
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 20
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch prompt template from Gist
+        id: fetch-prompt
+        env:
+          PROMPT_GIST_URL: ${{ inputs.prompt_gist_url }}
+        run: |
+          PROMPT_TEMPLATE=$(curl -sL "$PROMPT_GIST_URL")
+          [[ -z "$PROMPT_TEMPLATE" ]] && echo "❌ Failed to fetch prompt" && exit 1
+
+          PROMPT_TEMPLATE=$(echo "$PROMPT_TEMPLATE" | sed '1s/^prompt:[[:space:]]*|[[:space:]]*//' | sed 's/^____$//g' | sed 's/____$//g')
+
+          PR_URL="https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
+          PR_HASH=$(echo -n "$PR_URL" | base64 -w0 | tr '+/' '-_' | tr -d '=')
+          PROMPT_TEMPLATE=$(echo "$PROMPT_TEMPLATE" | sed "s|{{AUTO_FIX_URL}}|https://click2fix.internal-gcp-ai-agents.deriv.dev/?hash=${PR_HASH}|g")
+
+          { echo 'prompt<<EOF'; echo "$PROMPT_TEMPLATE"; echo 'EOF'; } >> $GITHUB_OUTPUT
+
+      - name: Capture and cleanup previous review
+        id: previous-review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          # Capture previous review before deleting
+          PREVIOUS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("Claude PR Review Complete"))) | .body' 2>/dev/null || echo "")
+
+          if [ -n "$PREVIOUS" ]; then
+            echo "$PREVIOUS" > /tmp/previous_review.txt
+            echo "has_previous=true" >> $GITHUB_OUTPUT
+          else
+            echo "" > /tmp/previous_review.txt
+            echo "has_previous=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Delete old comments
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("Claude PR Review Complete"))) | .id' 2>/dev/null | \
+            xargs -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE 2>/dev/null || true
+
+      - name: Fetch acknowledged suggestions
+        id: acknowledged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          echo "🔍 Scanning for Click2Fix - Acknowledge comments..."
+
+          # Find comments containing "Click2Fix - Acknowledge" and extract bullet points
+          ACKNOWLEDGE_COMMENT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.body | contains("Click2Fix - Acknowledge")) | .body' 2>/dev/null || echo "")
+
+          if [ -n "$ACKNOWLEDGE_COMMENT" ]; then
+            echo "✅ Found acknowledge comment"
+
+            # Extract bullet points (lines starting with - or *) using printf for safer handling
+            ACKNOWLEDGED_ITEMS=$(printf '%s\n' "$ACKNOWLEDGE_COMMENT" | grep -E '^\s*[-*]\s+' | sed 's/^\s*[-*]\s*//' || echo "")
+
+            if [ -n "$ACKNOWLEDGED_ITEMS" ]; then
+              printf '%s\n' "$ACKNOWLEDGED_ITEMS" > /tmp/acknowledged_items.txt
+              echo "has_acknowledged=true" >> $GITHUB_OUTPUT
+              echo "📋 Acknowledged items:"
+              printf '%s\n' "$ACKNOWLEDGED_ITEMS"
+            else
+              echo "" > /tmp/acknowledged_items.txt
+              echo "has_acknowledged=false" >> $GITHUB_OUTPUT
+              echo "ℹ️ No bullet items found in acknowledge comment"
+            fi
+          else
+            echo "" > /tmp/acknowledged_items.txt
+            echo "has_acknowledged=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No Click2Fix - Acknowledge comment found"
+          fi
+
+      - name: Get PR context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr diff "$PR_NUMBER" --repo "$REPO" > /tmp/pr_diff.txt 2>/dev/null || echo "Unable to fetch diff" > /tmp/pr_diff.txt
+          gh pr view "$PR_NUMBER" --repo "$REPO" --json files --jq '.files[].path' 2>/dev/null | head -50 > /tmp/changed_files.txt || true
+          echo "$PR_TITLE" > /tmp/pr_title.txt
+          echo "$PR_AUTHOR" > /tmp/pr_author.txt
+          echo "$PR_BRANCH" > /tmp/pr_branch.txt
+
+      - name: Call Claude API
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PROMPT_TEMPLATE: ${{ steps.fetch-prompt.outputs.prompt }}
+          HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
+          HAS_ACKNOWLEDGED: ${{ steps.acknowledged.outputs.has_acknowledged }}
+        run: |
+          echo "🤖 Calling Claude API..."
+
+          PR_DIFF=$(cat /tmp/pr_diff.txt)
+          CHANGED_FILES=$(cat /tmp/changed_files.txt)
+          PR_TITLE=$(cat /tmp/pr_title.txt)
+          PR_AUTHOR=$(cat /tmp/pr_author.txt)
+          PR_BRANCH=$(cat /tmp/pr_branch.txt)
+          PREVIOUS_REVIEW=$(cat /tmp/previous_review.txt)
+          ACKNOWLEDGED_ITEMS=$(cat /tmp/acknowledged_items.txt)
+
+          SYSTEM_PROMPT="You are an expert code reviewer. Follow the review mode instructions in the prompt template."
+
+          # Build prompt - include previous review section only if exists
+          if [[ "$HAS_PREVIOUS" == "true" ]]; then
+            echo "📋 Follow-up review mode"
+            PREV_SECTION="---PREVIOUS_REVIEW---
+          ${PREVIOUS_REVIEW}
+          ---END_PREVIOUS_REVIEW---"
+          else
+            echo "📋 Initial review mode"
+            PREV_SECTION=""
+          fi
+
+          # Build acknowledged section if exists
+          if [[ "$HAS_ACKNOWLEDGED" == "true" ]]; then
+            echo "✅ Including acknowledged items to skip"
+            ACKNOWLEDGED_SECTION="---ACKNOWLEDGED_SUGGESTIONS---
+          The following suggestions have been acknowledged by the developer and should NOT be included in your review. Do not mention or suggest these items again:
+          ${ACKNOWLEDGED_ITEMS}
+          ---END_ACKNOWLEDGED_SUGGESTIONS---"
+          else
+            ACKNOWLEDGED_SECTION=""
+          fi
+
+          USER_PROMPT="${PROMPT_TEMPLATE}
+
+          ${PREV_SECTION}
+
+          ${ACKNOWLEDGED_SECTION}
+
+          ## Pull Request Information
+          - **Title:** ${PR_TITLE}
+          - **Author:** ${PR_AUTHOR}
+          - **Branch:** ${PR_BRANCH}
+
+          ## Changed Files
+          ${CHANGED_FILES}
+
+          ## Diff
+          \`\`\`diff
+          ${PR_DIFF}
+          \`\`\`"
+
+          PAYLOAD=$(jq -n \
+            --arg model "$CLAUDE_MODEL" \
+            --argjson max_tokens "$CLAUDE_MAX_TOKENS" \
+            --argjson temperature "$CLAUDE_TEMPERATURE" \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg user "$USER_PROMPT" \
+            '{model: $model, max_tokens: ($max_tokens | tonumber), temperature: ($temperature | tonumber), system: $system, messages: [{role: "user", content: $user}]}')
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" "https://api.anthropic.com/v1/messages" \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "$PAYLOAD")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          [[ "$HTTP_CODE" != "200" ]] && echo "❌ API failed: $HTTP_CODE" && echo "$BODY" && exit 1
+
+          REVIEW=$(echo "$BODY" | jq -r '.content[0].text // empty')
+          [[ -z "$REVIEW" ]] && echo "❌ Empty response" && exit 1
+
+          echo "$REVIEW" > /tmp/review.txt
+          echo "✅ Review generated"
+
+      - name: Post Review Comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
+        run: |
+          REVIEW=$(cat /tmp/review.txt)
+          [[ "$HAS_PREVIOUS" == "true" ]] && REVIEW_TYPE="🔄 Follow-up Review" || REVIEW_TYPE="📋 Initial Review"
+
+          COMMENT="## 🤖 Claude PR Review Complete
+
+          **Model:** \`$CLAUDE_MODEL\` | **Review Type:** ${REVIEW_TYPE}
+
+          ---
+
+          $REVIEW
+
+          ---
+          *Review generated via Claude API*"
+
+          gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body "$COMMENT"
+          echo "✅ Posted"
