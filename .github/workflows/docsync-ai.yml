@@ -1,0 +1,258 @@
+name: 📚 DocSync AI - Documentation Sync
+
+on:
+  workflow_call:
+    inputs:
+      base_branch:
+        description: 'Base branch for documentation PR (e.g., master or main)'
+        required: false
+        default: 'master'
+        type: string
+      pr_labels:
+        description: 'Comma-separated labels for the documentation PR'
+        required: false
+        default: 'documentation,automated'
+        type: string
+      slack_webhook_url:
+        description: 'Slack webhook URL for notifications (optional, can use secret instead)'
+        required: false
+        default: ''
+        type: string
+      repository_owner:
+        description: 'Repository owner name for Slack notifications'
+        required: false
+        default: ''
+        type: string
+      trigger_type:
+        description: 'Trigger type: "merge" for PR merge, "comment" for PR comment'
+        required: false
+        default: 'merge'
+        type: string
+      comment_body:
+        description: 'Comment body (only for comment trigger, must start with "docsync:")'
+        required: false
+        default: ''
+        type: string
+      comment_pr_number:
+        description: 'PR number where comment was made (only for comment trigger)'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      DOCSYNC_GITHUB_TOKEN:
+        description: 'GitHub PAT for PR creation (repo-specific, needs repo and pull_requests permissions)'
+        required: true
+      DOCSYNC_ANTHROPIC_API_KEY:
+        description: 'Anthropic API key for Claude AI'
+        required: true
+      DOCSYNC_SLACK_WEBHOOK:
+        description: 'Slack webhook URL for notifications (optional if provided via input)'
+        required: false
+
+concurrency:
+  group: docsync-ai-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync-documentation:
+    name: 📚 Sync Documentation
+    runs-on: ubuntu-latest
+
+    # Only run when a PR is merged to the base branch
+    if: github.event.pull_request.merged == true
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    outputs:
+      doc_pr_created: ${{ steps.docsync.outputs.doc_pr_created }}
+      doc_pr_number: ${{ steps.docsync.outputs.doc_pr_number }}
+      doc_pr_url: ${{ steps.docsync.outputs.doc_pr_url }}
+
+    env:
+      BASE_BRANCH: ${{ inputs.base_branch }}
+      PR_LABELS: ${{ inputs.pr_labels }}
+      SLACK_WEBHOOK: ${{ inputs.slack_webhook_url || secrets.DOCSYNC_SLACK_WEBHOOK }}
+      REPO_OWNER: ${{ inputs.repository_owner }}
+
+    steps:
+      - name: 🔍 Debug - Workflow Trigger Info
+        run: |
+          echo "## 🔍 Workflow Trigger Info" >> $GITHUB_STEP_SUMMARY
+          echo "Event: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "Action: ${{ github.event.action }}" >> $GITHUB_STEP_SUMMARY
+          echo "PR Merged: ${{ github.event.pull_request.merged }}" >> $GITHUB_STEP_SUMMARY
+          echo "PR Number: ${{ github.event.pull_request.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "PR Title: ${{ github.event.pull_request.title }}" >> $GITHUB_STEP_SUMMARY
+          echo "Base Branch: ${{ inputs.base_branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "Repository: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
+          ref: ${{ inputs.base_branch }}
+
+      - name: 🤖 Run DocSync AI Action
+        id: docsync
+        uses: akash-deriv/shared-actions/.github/actions/docsync_ai@master
+        with:
+          github_token: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
+          anthropic_api_key: ${{ secrets.DOCSYNC_ANTHROPIC_API_KEY }}
+          repository: ${{ github.repository }}
+          pr_number: ${{ github.event.pull_request.number }}
+          pr_title: ${{ github.event.pull_request.title }}
+          pr_body: ${{ github.event.pull_request.body }}
+          base_branch: ${{ inputs.base_branch }}
+          pr_labels: ${{ inputs.pr_labels }}
+
+      - name: 📢 Send Slack Notification - Documentation PR Created
+        if: steps.docsync.outputs.doc_pr_created == 'true' && env.SLACK_WEBHOOK != ''
+        env:
+          DOC_PR_NUMBER: ${{ steps.docsync.outputs.doc_pr_number }}
+          DOC_PR_URL: ${{ steps.docsync.outputs.doc_pr_url }}
+          MERGED_PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGED_PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -e
+
+          # Validate webhook URL format
+          if [[ ! "$SLACK_WEBHOOK" =~ ^https://hooks\.slack\.com/services/ ]]; then
+            echo "⚠️ Warning: Invalid Slack webhook URL format, skipping notification" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # Sanitize inputs for Slack message
+          MERGED_PR_TITLE_CLEAN=$(echo "$MERGED_PR_TITLE" | tr -d '\000-\037' | head -c 200)
+          DOC_PR_URL_CLEAN=$(echo "$DOC_PR_URL" | head -c 500)
+
+          # Validate PR numbers
+          if ! [[ "$DOC_PR_NUMBER" =~ ^[0-9]+$ ]] || ! [[ "$MERGED_PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "⚠️ Warning: Invalid PR numbers, skipping notification" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # Format repository owner mention for Slack
+          OWNER_MENTION=""
+          if [ -n "$REPO_OWNER" ]; then
+            # Sanitize owner mention
+            REPO_OWNER_CLEAN=$(echo "$REPO_OWNER" | tr -d '\000-\037' | head -c 50)
+            OWNER_MENTION="<@$REPO_OWNER_CLEAN> "
+          fi
+
+          # Create Slack payload safely using jq
+          SLACK_PAYLOAD=$(jq -n \
+            --arg owner "$OWNER_MENTION" \
+            --arg repo "${{ github.repository }}" \
+            --arg doc_pr_url "$DOC_PR_URL_CLEAN" \
+            --arg doc_pr_num "$DOC_PR_NUMBER" \
+            --arg merged_pr_num "$MERGED_PR_NUMBER" \
+            --arg merged_pr_title "$MERGED_PR_TITLE_CLEAN" \
+            '{
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "\($owner):book: *Documentation Update Ready*\n*<\($doc_pr_url)|PR #\($doc_pr_num)>* in `\($repo)`"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "Documentation has been automatically updated based on:\n- *PR #\($merged_pr_num)*: \($merged_pr_title)"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "🤖 DocSync AI | <\($doc_pr_url)|Review documentation updates>"
+                    }
+                  ]
+                }
+              ]
+            }')
+
+          # Create temporary file for response
+          TEMP_RESPONSE=$(mktemp)
+          trap "rm -f '$TEMP_RESPONSE'" EXIT
+
+          # Send Slack notification with error handling
+          HTTP_CODE=$(curl -s -w "%{http_code}" -o "$TEMP_RESPONSE" \
+            -X POST "$SLACK_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "$SLACK_PAYLOAD")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "📢 Slack notification sent successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Warning: Failed to send Slack notification (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+            # Don't fail the workflow on notification failure
+          fi
+
+      - name: ✅ Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          DOC_PR_CREATED: ${{ steps.docsync.outputs.doc_pr_created }}
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Source PR | #${{ github.event.pull_request.number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Documentation PR Created | ${DOC_PR_CREATED:-false} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | $JOB_STATUS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Base Branch | $BASE_BRANCH |" >> $GITHUB_STEP_SUMMARY
+
+  update-from-comment:
+    name: 💬 Update Documentation from Comment
+    runs-on: ubuntu-latest
+
+    # Only run when trigger_type is 'comment'
+    if: inputs.trigger_type == 'comment'
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: 🔍 Debug - Comment Trigger Info
+        run: |
+          echo "## 🔍 Comment Trigger Info" >> $GITHUB_STEP_SUMMARY
+          echo "Trigger Type: ${{ inputs.trigger_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "PR Number: ${{ inputs.comment_pr_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "Repository: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: 🤖 Run DocSync AI Comment Action
+        id: docsync-comment
+        uses: akash-deriv/shared-actions/.github/actions/docsync_ai_comment@master
+        with:
+          github_token: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
+          anthropic_api_key: ${{ secrets.DOCSYNC_ANTHROPIC_API_KEY }}
+          repository: ${{ github.repository }}
+          pr_number: ${{ inputs.comment_pr_number }}
+          comment_body: ${{ inputs.comment_body }}
+          base_branch: ${{ inputs.base_branch }}
+
+      - name: ✅ Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          UPDATED: ${{ steps.docsync-comment.outputs.updated }}
+          VALID: ${{ steps.docsync-comment.outputs.suggestion_valid }}
+          IS_DOCSYNC_PR: ${{ steps.docsync-comment.outputs.is_docsync_pr }}
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Number | #${{ inputs.comment_pr_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Valid Comment | ${VALID:-false} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Is DocSync PR | ${IS_DOCSYNC_PR:-false} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Documentation Updated | ${UPDATED:-false} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | $JOB_STATUS |" >> $GITHUB_STEP_SUMMARY
