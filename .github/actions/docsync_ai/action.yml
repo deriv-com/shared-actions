@@ -135,7 +135,7 @@ runs:
         echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
 
-    - name: 🤖 Run Claude 3.7 Sonnet Documentation Analysis
+    - name: 🤖 Run Claude Sonnet 4.5 Documentation Analysis
       id: claude-analysis
       shell: bash
       env:
@@ -149,8 +149,8 @@ runs:
       run: |
         set -e
 
-        echo "## 🤖 Claude 3.7 Sonnet Analysis" >> $GITHUB_STEP_SUMMARY
-        echo "Model: claude-3-7-sonnet-latest" >> $GITHUB_STEP_SUMMARY
+        echo "## 🤖 Claude Sonnet 4.5 Analysis" >> $GITHUB_STEP_SUMMARY
+        echo "Model: claude-sonnet-4-5-latest" >> $GITHUB_STEP_SUMMARY
 
         # Sanitize user inputs (remove null bytes, control characters, limit size)
         PR_TITLE_CLEAN=$(echo "$PR_TITLE" | tr -d '\000-\037' | head -c 1000)
@@ -272,6 +272,17 @@ runs:
           # Read current documentation
           DOC_CONTENT=$(cat "$DOC_FILE")
 
+          # Extract project title/name for validation (from first heading)
+          PROJECT_TITLE=$(echo "$DOC_CONTENT" | head -n 30 | grep -E "^#\s+" | head -n 1 | sed 's/^#*\s*//' | tr -d '\000-\037' | head -c 200)
+          if [ -z "$PROJECT_TITLE" ]; then
+            PROJECT_TITLE="Unknown Project"
+          fi
+
+          # Extract key terms from existing documentation for validation
+          KEY_TERMS=$(echo "$DOC_CONTENT" | head -n 100 | grep -oE '\b[A-Z][A-Za-z0-9]{3,}\b' | sort -u | head -n 20 | tr '\n' ',' | sed 's/,$//')
+
+          echo "  📌 Project: $PROJECT_TITLE" >> $GITHUB_STEP_SUMMARY
+
           # Validate content size
           CONTENT_SIZE=${#DOC_CONTENT}
           MAX_CONTENT_SIZE=524288  # 512KB
@@ -292,44 +303,89 @@ runs:
 
           # Build prompt with safe variable substitution
           cat > "$PROMPT_FILE" << 'EOF'
-        You are a technical documentation expert. Analyze the PR changes and update the documentation if needed.
+        You are a technical documentation expert tasked with updating documentation based on recent code changes.
 
-        # Context
+        ## IMPORTANT: PROJECT IDENTITY
+        This documentation is for: '"$PROJECT_TITLE"'
         Repository: '"$REPO_NAME"'
+
+        **CRITICAL**: You MUST maintain the project identity. This is NOT a different project. Do NOT replace this documentation with content about any other project, library, or tool.
+
+        ## Context
         PR #'"$PR_NUMBER"': '"$PR_TITLE_CLEAN"'
         PR Description: '"$PR_BODY_CLEAN"'
 
-        # Current '"$DOC_FILE"':
+        ## Current Documentation Content:
+        ```
         '"$DOC_CONTENT"'
+        ```
 
-        # PR Changes (Diff):
+        ## PR Changes (Code Diff):
+        ```diff
         '"$PR_DIFF"'
+        ```
 
-        # Repository Structure (sample):
+        ## Repository Structure:
+        ```
         '"$REPO_STRUCTURE"'
+        ```
 
-        # Format Requirements:
+        ## Format Requirements:
         '"$FORMAT_INSTRUCTION"'
 
-        # Documentation Context:
+        ## Additional Context:
         '"$OTHER_FILES_NOTE"'
 
-        # Your Task
-        Update the '"$DOC_FILE"' based on the PR changes.
+        ## Your Task
+        Analyze the PR changes and determine if the '"$DOC_FILE"' needs updates.
 
-        ## CRITICAL RULES - MUST FOLLOW:
-        1. **Direct output only**: Output ONLY the updated documentation content. NO acknowledgments like "I will analyze", "I understand", "Here's the updated", or any explanatory text.
-        2. **Maintain format**: Keep the exact same documentation style and structure as the current file.
-        3. **Update relevant sections**: Only modify sections that relate to the PR changes. Keep everything else exactly as is.
-        4. **Significance check**: Only update if changes are significant (new features, major fixes, API changes, workflow updates). Skip minor changes (typos, formatting tweaks, small refactors).
-        5. **Complete file output**: Provide the COMPLETE updated file content, not just the changed sections.
-        6. **No meta-commentary**: No phrases like "I've updated", "Changes made", or section summaries.
+        ## ABSOLUTE REQUIREMENTS - VIOLATION WILL BE REJECTED:
 
-        ## Decision:
-        - If significant updates are needed: Output the COMPLETE updated '"$DOC_FILE"' content immediately, with no preamble
-        - If no significant updates needed: Output exactly: NO_UPDATES_NEEDED
+        1. **PRESERVE PROJECT IDENTITY**:
+           - The project name "'"$PROJECT_TITLE"'" MUST remain unchanged
+           - Do NOT replace this with documentation for a different project
+           - Maintain all existing project-specific information
 
-        Start your response immediately with either the updated documentation content or "NO_UPDATES_NEEDED". Nothing else.
+        2. **ONLY ADD, NEVER REMOVE**:
+           - You may ONLY add new information based on PR changes
+           - NEVER remove existing sections, features, or content
+           - NEVER replace existing content with unrelated information
+           - Keep all existing headings, sections, and structure intact
+
+        3. **STAY RELEVANT TO PR CHANGES**:
+           - Only update sections directly related to the code changes in the PR diff
+           - If the PR adds a feature, document that feature
+           - If the PR changes behavior, update that specific behavior section
+           - Do NOT make unrelated changes
+
+        4. **VERIFY PROJECT MATCH**:
+           - Cross-reference the PR diff with the current documentation
+           - Ensure the technologies, frameworks, and tools mentioned in the PR match those in the documentation
+           - If there's a mismatch, output NO_UPDATES_NEEDED
+
+        5. **OUTPUT FORMAT**:
+           - Output ONLY the complete updated documentation content
+           - NO preambles, acknowledgments, or explanatory text
+           - NO phrases like "Here's the updated", "I've analyzed", etc.
+           - Start directly with the documentation content
+
+        6. **SIGNIFICANCE CHECK**:
+           - Only update for significant changes: new features, major fixes, API changes, new dependencies, workflow changes
+           - Skip minor changes: typos, code formatting, small refactors, comment updates
+
+        ## Decision Process:
+
+        1. Verify this PR is for the project "'"$PROJECT_TITLE"'" in repository "'"$REPO_NAME"'"
+        2. Analyze what changed in the PR diff
+        3. Determine if those changes require documentation updates
+        4. If yes: Add new information to relevant sections WITHOUT removing existing content
+        5. If no: Output exactly "NO_UPDATES_NEEDED"
+
+        ## Response:
+        - If significant, relevant updates are needed: Output the COMPLETE updated documentation (with additions only)
+        - If no updates needed OR project mismatch detected: Output exactly: NO_UPDATES_NEEDED
+
+        Begin your response now:
         EOF
 
           chmod 600 "$PROMPT_FILE"
@@ -341,7 +397,7 @@ runs:
           # Create secure request body file
           REQUEST_FILE="$TEMP_DIR/request_$(openssl rand -hex 8).json"
           jq -n \
-            --arg model "claude-3-7-sonnet-latest" \
+            --arg model "claude-sonnet-4-5-latest" \
             --argjson max_tokens 8192 \
             --arg content "$FULL_PROMPT" \
             '{
@@ -403,13 +459,72 @@ runs:
           if echo "$CLAUDE_OUTPUT" | grep -q "NO_UPDATES_NEEDED"; then
             echo "  ℹ️ No updates needed for $DOC_FILE" >> $GITHUB_STEP_SUMMARY
             return 0
-          else
-            echo "  ✅ Updating $DOC_FILE" >> $GITHUB_STEP_SUMMARY
-            # Write the updated documentation
-            echo "$CLAUDE_OUTPUT" > "$DOC_FILE"
-            ANY_UPDATES=true
-            return 0
           fi
+
+          # ===== HALLUCINATION PREVENTION VALIDATION =====
+          echo "  🔍 Validating output for hallucination..." >> $GITHUB_STEP_SUMMARY
+
+          # Validation 1: Check project title is preserved
+          if [ "$PROJECT_TITLE" != "Unknown Project" ]; then
+            PROJECT_NAME_CORE=$(echo "$PROJECT_TITLE" | cut -d: -f1 | cut -d- -f1 | xargs)
+            if ! echo "$CLAUDE_OUTPUT" | head -n 50 | grep -qi "$PROJECT_NAME_CORE"; then
+              echo "  ❌ VALIDATION FAILED: Project title '$PROJECT_TITLE' not found in output" >> $GITHUB_STEP_SUMMARY
+              echo "  ⚠️ Possible hallucination detected - rejecting update" >> $GITHUB_STEP_SUMMARY
+              return 1
+            fi
+          fi
+
+          # Validation 2: Check output length isn't drastically different (hallucination indicator)
+          INPUT_LENGTH=${#DOC_CONTENT}
+          OUTPUT_LENGTH=${#CLAUDE_OUTPUT}
+
+          # Allow output to be 50%-200% of input length (prevent complete rewrites)
+          MIN_LENGTH=$((INPUT_LENGTH * 50 / 100))
+          MAX_LENGTH=$((INPUT_LENGTH * 200 / 100))
+
+          if [ $OUTPUT_LENGTH -lt $MIN_LENGTH ]; then
+            echo "  ❌ VALIDATION FAILED: Output too short ($OUTPUT_LENGTH vs $INPUT_LENGTH chars)" >> $GITHUB_STEP_SUMMARY
+            echo "  ⚠️ Possible content removal detected - rejecting update" >> $GITHUB_STEP_SUMMARY
+            return 1
+          fi
+
+          if [ $OUTPUT_LENGTH -gt $MAX_LENGTH ]; then
+            echo "  ❌ VALIDATION FAILED: Output too long ($OUTPUT_LENGTH vs $INPUT_LENGTH chars)" >> $GITHUB_STEP_SUMMARY
+            echo "  ⚠️ Possible hallucination detected - rejecting update" >> $GITHUB_STEP_SUMMARY
+            return 1
+          fi
+
+          # Validation 3: Check that first heading is preserved
+          ORIGINAL_HEADING=$(echo "$DOC_CONTENT" | grep -E "^#\s+" | head -n 1 | sed 's/^#*\s*//')
+          NEW_HEADING=$(echo "$CLAUDE_OUTPUT" | grep -E "^#\s+" | head -n 1 | sed 's/^#*\s*//')
+
+          if [ -n "$ORIGINAL_HEADING" ] && [ "$ORIGINAL_HEADING" != "$NEW_HEADING" ]; then
+            echo "  ⚠️ WARNING: First heading changed from '$ORIGINAL_HEADING' to '$NEW_HEADING'" >> $GITHUB_STEP_SUMMARY
+            echo "  ❌ VALIDATION FAILED: Project heading must not change - rejecting update" >> $GITHUB_STEP_SUMMARY
+            return 1
+          fi
+
+          # Validation 4: Check key structural elements are preserved
+          ORIGINAL_HEADING_COUNT=$(echo "$DOC_CONTENT" | grep -cE "^##\s+" || echo "0")
+          NEW_HEADING_COUNT=$(echo "$CLAUDE_OUTPUT" | grep -cE "^##\s+" || echo "0")
+
+          # Allow ±3 heading difference (for additions, not wholesale changes)
+          HEADING_DIFF=$((NEW_HEADING_COUNT - ORIGINAL_HEADING_COUNT))
+          if [ $HEADING_DIFF -lt -3 ]; then
+            echo "  ❌ VALIDATION FAILED: Too many sections removed ($HEADING_DIFF headings)" >> $GITHUB_STEP_SUMMARY
+            echo "  ⚠️ Content removal detected - rejecting update" >> $GITHUB_STEP_SUMMARY
+            return 1
+          fi
+
+          # All validations passed
+          echo "  ✅ Validation passed - updating $DOC_FILE" >> $GITHUB_STEP_SUMMARY
+          echo "  📊 Length: $INPUT_LENGTH → $OUTPUT_LENGTH chars ($(( (OUTPUT_LENGTH * 100) / INPUT_LENGTH ))%)" >> $GITHUB_STEP_SUMMARY
+          echo "  📊 Sections: $ORIGINAL_HEADING_COUNT → $NEW_HEADING_COUNT headings" >> $GITHUB_STEP_SUMMARY
+
+          # Write the updated documentation
+          echo "$CLAUDE_OUTPUT" > "$DOC_FILE"
+          ANY_UPDATES=true
+          return 0
         }
 
         # === PHASE 2: UPDATE ALL DETECTED DOCUMENTATION FILES ===

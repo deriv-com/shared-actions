@@ -187,7 +187,7 @@ runs:
         ref: ${{ steps.verify-pr.outputs.pr_branch }}
         fetch-depth: 0
 
-    - name: 🤖 Run Claude 3.7 Sonnet Documentation Analysis
+    - name: 🤖 Run Claude Sonnet 4.5 Documentation Analysis
       id: claude-analysis
       if: steps.verify-pr.outputs.is_docsync_pr == 'true'
       shell: bash
@@ -199,8 +199,8 @@ runs:
       run: |
         set -e
 
-        echo "## 🤖 Claude 3.7 Sonnet Analysis" >> $GITHUB_STEP_SUMMARY
-        echo "Model: claude-3-7-sonnet-latest" >> $GITHUB_STEP_SUMMARY
+        echo "## 🤖 Claude Sonnet 4.5 Analysis" >> $GITHUB_STEP_SUMMARY
+        echo "Model: claude-sonnet-4-5-latest" >> $GITHUB_STEP_SUMMARY
 
         # Create secure temporary directory
         TEMP_DIR=$(mktemp -d -t docsync-comment-XXXXXXXXXX)
@@ -289,6 +289,17 @@ runs:
           # Read current documentation
           DOC_CONTENT=$(cat "$DOC_FILE")
 
+          # Extract project title/name for validation (from first heading)
+          PROJECT_TITLE=$(echo "$DOC_CONTENT" | head -n 30 | grep -E "^#\s+" | head -n 1 | sed 's/^#*\s*//' | tr -d '\000-\037' | head -c 200)
+          if [ -z "$PROJECT_TITLE" ]; then
+            PROJECT_TITLE="Unknown Project"
+          fi
+
+          # Extract key terms from existing documentation for validation
+          KEY_TERMS=$(echo "$DOC_CONTENT" | head -n 100 | grep -oE '\b[A-Z][A-Za-z0-9]{3,}\b' | sort -u | head -n 20 | tr '\n' ',' | sed 's/,$//')
+
+          echo "  📌 Project: $PROJECT_TITLE" >> $GITHUB_STEP_SUMMARY
+
           # Validate content size
           CONTENT_SIZE=${#DOC_CONTENT}
           MAX_CONTENT_SIZE=524288  # 512KB
@@ -311,36 +322,74 @@ runs:
           cat > "$PROMPT_FILE" << 'EOF'
         You are a technical documentation expert. A user has provided a suggestion for improving the documentation in a DocSync PR.
 
-        # Context
+        ## IMPORTANT: PROJECT IDENTITY
+        This documentation is for: '"$PROJECT_TITLE"'
         Repository: '"$REPO_NAME"'
+
+        **CRITICAL**: You MUST maintain the project identity. This is NOT a different project. Do NOT replace this documentation with content about any other project, library, or tool.
+
+        ## Context
         PR #'"$PR_NUMBER"' (DocSync Documentation PR)
 
-        # Current '"$DOC_FILE"':
+        ## Current Documentation Content:
+        ```
         '"$DOC_CONTENT"'
+        ```
 
-        # User Suggestion:
+        ## User Suggestion:
+        ```
         '"$USER_SUGGESTION_CLEAN"'
+        ```
 
-        # Format Requirements:
+        ## Format Requirements:
         '"$FORMAT_INSTRUCTION"'
 
-        # Documentation Context:
+        ## Additional Context:
         '"$OTHER_FILES_NOTE"'
 
-        # Your Task
-        Apply the user'\''s suggestion to update the '"$DOC_FILE"'.
+        ## Your Task
+        Apply the user'\''s suggestion to update the '"$DOC_FILE"' while maintaining project identity and existing content.
 
-        ## CRITICAL RULES - MUST FOLLOW:
-        1. **Direct output only**: Output ONLY the updated documentation content. NO acknowledgments like "I will apply", "I understand", "Here'\''s the updated", or any explanatory text.
-        2. **Maintain format**: Keep the exact same documentation style and structure as the current file.
-        3. **Follow user intent**: Carefully interpret and apply the user'\''s suggestion. If the suggestion is vague, make reasonable improvements.
-        4. **Update relevant sections**: Only modify sections relevant to the suggestion. Keep everything else exactly as is.
-        5. **Complete file output**: Provide the COMPLETE updated file content, not just the changed sections.
-        6. **No meta-commentary**: No phrases like "I'\''ve updated", "Changes made", or section summaries.
-        7. **Quality standards**: Ensure updates are accurate, clear, and improve documentation quality.
+        ## ABSOLUTE REQUIREMENTS - VIOLATION WILL BE REJECTED:
 
-        Start your response immediately with the complete updated '"$DOC_FILE"' content. Nothing else.
-        'EOF'
+        1. **PRESERVE PROJECT IDENTITY**:
+           - The project name "'"$PROJECT_TITLE"'" MUST remain unchanged
+           - Do NOT replace this with documentation for a different project
+           - Maintain all existing project-specific information
+
+        2. **ONLY ADD OR REFINE, NEVER REMOVE**:
+           - Apply the user'\''s suggestion by adding or refining content
+           - NEVER remove existing sections, features, or content unless explicitly requested
+           - NEVER replace existing content with unrelated information
+           - Keep all existing headings, sections, and structure intact
+
+        3. **FOLLOW USER INTENT**:
+           - Carefully interpret and apply the user'\''s suggestion
+           - If the suggestion is about adding content, add it to the appropriate section
+           - If it'\''s about improving clarity, refine the existing text
+           - If it'\''s vague, make conservative, relevant improvements
+
+        4. **VERIFY PROJECT MATCH**:
+           - Ensure any additions are relevant to "'"$PROJECT_TITLE"'" in "'"$REPO_NAME"'"
+           - Do NOT add information about unrelated projects or technologies
+           - Maintain consistency with existing content
+
+        5. **OUTPUT FORMAT**:
+           - Output ONLY the complete updated documentation content
+           - NO preambles, acknowledgments, or explanatory text
+           - NO phrases like "Here'\''s the updated", "I'\''ve applied", etc.
+           - Start directly with the documentation content
+
+        6. **QUALITY STANDARDS**:
+           - Ensure updates are accurate and clear
+           - Maintain consistent formatting and style
+           - Improve documentation quality based on the suggestion
+
+        ## Response:
+        Output the COMPLETE updated documentation with the user'\''s suggestion applied.
+
+        Begin your response now:
+        EOF
 
           chmod 600 "$PROMPT_FILE"
           FULL_PROMPT=$(cat "$PROMPT_FILE")
@@ -351,7 +400,7 @@ runs:
           # Create secure request body file
           REQUEST_FILE="$TEMP_DIR/request_$(openssl rand -hex 8).json"
           jq -n \
-            --arg model "claude-3-7-sonnet-latest" \
+            --arg model "claude-sonnet-4-5-latest" \
             --argjson max_tokens 8192 \
             --arg content "$FULL_PROMPT" \
             '{
@@ -409,7 +458,66 @@ runs:
           # Sanitize output (remove null bytes, validate UTF-8)
           CLAUDE_OUTPUT=$(echo "$CLAUDE_OUTPUT" | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
 
-          echo "  ✅ Updating $DOC_FILE" >> $GITHUB_STEP_SUMMARY
+          # ===== HALLUCINATION PREVENTION VALIDATION =====
+          echo "  🔍 Validating output for hallucination..." >> $GITHUB_STEP_SUMMARY
+
+          # Validation 1: Check project title is preserved
+          if [ "$PROJECT_TITLE" != "Unknown Project" ]; then
+            PROJECT_NAME_CORE=$(echo "$PROJECT_TITLE" | cut -d: -f1 | cut -d- -f1 | xargs)
+            if ! echo "$CLAUDE_OUTPUT" | head -n 50 | grep -qi "$PROJECT_NAME_CORE"; then
+              echo "  ❌ VALIDATION FAILED: Project title '$PROJECT_TITLE' not found in output" >> $GITHUB_STEP_SUMMARY
+              echo "  ⚠️ Possible hallucination detected - rejecting update" >> $GITHUB_STEP_SUMMARY
+              return 1
+            fi
+          fi
+
+          # Validation 2: Check output length isn't drastically different (hallucination indicator)
+          INPUT_LENGTH=${#DOC_CONTENT}
+          OUTPUT_LENGTH=${#CLAUDE_OUTPUT}
+
+          # Allow output to be 50%-200% of input length (prevent complete rewrites)
+          MIN_LENGTH=$((INPUT_LENGTH * 50 / 100))
+          MAX_LENGTH=$((INPUT_LENGTH * 200 / 100))
+
+          if [ $OUTPUT_LENGTH -lt $MIN_LENGTH ]; then
+            echo "  ❌ VALIDATION FAILED: Output too short ($OUTPUT_LENGTH vs $INPUT_LENGTH chars)" >> $GITHUB_STEP_SUMMARY
+            echo "  ⚠️ Possible content removal detected - rejecting update" >> $GITHUB_STEP_SUMMARY
+            return 1
+          fi
+
+          if [ $OUTPUT_LENGTH -gt $MAX_LENGTH ]; then
+            echo "  ❌ VALIDATION FAILED: Output too long ($OUTPUT_LENGTH vs $INPUT_LENGTH chars)" >> $GITHUB_STEP_SUMMARY
+            echo "  ⚠️ Possible hallucination detected - rejecting update" >> $GITHUB_STEP_SUMMARY
+            return 1
+          fi
+
+          # Validation 3: Check that first heading is preserved
+          ORIGINAL_HEADING=$(echo "$DOC_CONTENT" | grep -E "^#\s+" | head -n 1 | sed 's/^#*\s*//')
+          NEW_HEADING=$(echo "$CLAUDE_OUTPUT" | grep -E "^#\s+" | head -n 1 | sed 's/^#*\s*//')
+
+          if [ -n "$ORIGINAL_HEADING" ] && [ "$ORIGINAL_HEADING" != "$NEW_HEADING" ]; then
+            echo "  ⚠️ WARNING: First heading changed from '$ORIGINAL_HEADING' to '$NEW_HEADING'" >> $GITHUB_STEP_SUMMARY
+            echo "  ❌ VALIDATION FAILED: Project heading must not change - rejecting update" >> $GITHUB_STEP_SUMMARY
+            return 1
+          fi
+
+          # Validation 4: Check key structural elements are preserved
+          ORIGINAL_HEADING_COUNT=$(echo "$DOC_CONTENT" | grep -cE "^##\s+" || echo "0")
+          NEW_HEADING_COUNT=$(echo "$CLAUDE_OUTPUT" | grep -cE "^##\s+" || echo "0")
+
+          # Allow ±3 heading difference (for additions, not wholesale changes)
+          HEADING_DIFF=$((NEW_HEADING_COUNT - ORIGINAL_HEADING_COUNT))
+          if [ $HEADING_DIFF -lt -3 ]; then
+            echo "  ❌ VALIDATION FAILED: Too many sections removed ($HEADING_DIFF headings)" >> $GITHUB_STEP_SUMMARY
+            echo "  ⚠️ Content removal detected - rejecting update" >> $GITHUB_STEP_SUMMARY
+            return 1
+          fi
+
+          # All validations passed
+          echo "  ✅ Validation passed - updating $DOC_FILE" >> $GITHUB_STEP_SUMMARY
+          echo "  📊 Length: $INPUT_LENGTH → $OUTPUT_LENGTH chars ($(( (OUTPUT_LENGTH * 100) / INPUT_LENGTH ))%)" >> $GITHUB_STEP_SUMMARY
+          echo "  📊 Sections: $ORIGINAL_HEADING_COUNT → $NEW_HEADING_COUNT headings" >> $GITHUB_STEP_SUMMARY
+
           # Write the updated documentation
           echo "$CLAUDE_OUTPUT" > "$DOC_FILE"
           ANY_UPDATES=true
