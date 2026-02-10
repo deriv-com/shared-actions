@@ -112,6 +112,14 @@ runs:
         # Sanitize and validate diff content
         PR_DIFF=$(echo "$PR_DIFF" | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
 
+        # Filter out .github/workflows diffs (don't include workflow changes in analysis)
+        PR_DIFF=$(echo "$PR_DIFF" | awk '
+          BEGIN { skip=0 }
+          /^diff --git.*\.github\/workflows\// { skip=1; next }
+          /^diff --git/ { skip=0 }
+          !skip { print }
+        ')
+
         # Save PR diff to secure temp file
         PR_DIFF_FILE="$TEMP_DIR/pr_diff.txt"
         echo "$PR_DIFF" > "$PR_DIFF_FILE"
@@ -123,20 +131,31 @@ runs:
           "/repos/$REPO_NAME/pulls/$PR_NUMBER/files" \
           --jq '.[].filename' 2>&1 || echo "")
 
-        # Sanitize changed files list (truncate for summary)
-        CHANGED_FILES_SUMMARY=$(echo "$CHANGED_FILES" | head -n 50)
+        # Filter out .github/workflows files (don't document workflow changes)
+        CHANGED_FILES_FILTERED=$(echo "$CHANGED_FILES" | grep -v '^\.github/workflows/' || echo "")
 
-        echo "### Changed Files:" >> $GITHUB_STEP_SUMMARY
+        # Check if all changes were in workflows (if so, skip documentation)
+        if [ -n "$CHANGED_FILES" ] && [ -z "$CHANGED_FILES_FILTERED" ]; then
+          echo "⏭️ All changes are in .github/workflows - skipping documentation update" >> $GITHUB_STEP_SUMMARY
+          echo "skip_analysis=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Sanitize changed files list (truncate for summary)
+        CHANGED_FILES_SUMMARY=$(echo "$CHANGED_FILES_FILTERED" | head -n 50)
+
+        echo "### Changed Files (excluding workflows):" >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
         echo "$CHANGED_FILES_SUMMARY" >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
 
         echo "changed_files<<EOF" >> $GITHUB_OUTPUT
-        echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+        echo "$CHANGED_FILES_FILTERED" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
 
     - name: 🤖 Run Claude Sonnet 4.5 Documentation Analysis
       id: claude-analysis
+      if: steps.pr-details.outputs.skip_analysis != 'true'
       shell: bash
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
@@ -742,7 +761,7 @@ runs:
         echo "$PR_URL" >> $GITHUB_STEP_SUMMARY
 
     - name: ✅ No Updates Needed
-      if: steps.claude-analysis.outputs.skip_analysis == 'true' || steps.check-changes.outputs.has_changes == 'false'
+      if: steps.pr-details.outputs.skip_analysis == 'true' || steps.claude-analysis.outputs.skip_analysis == 'true' || steps.check-changes.outputs.has_changes == 'false'
       shell: bash
       run: |
         echo "pr_created=false" >> $GITHUB_OUTPUT

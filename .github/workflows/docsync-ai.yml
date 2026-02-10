@@ -58,8 +58,11 @@ jobs:
     name: 📚 Sync Documentation
     runs-on: ubuntu-latest
 
-    # Only run when a PR is merged to the base branch
-    if: github.event.pull_request.merged == true
+    # Only run when a PR is merged to the base branch (but not DocSync AI's own PRs)
+    if: |
+      github.event.pull_request.merged == true &&
+      !contains(github.event.pull_request.title, 'DocSync AI') &&
+      !contains(github.event.pull_request.labels.*.name, 'automated')
 
     permissions:
       contents: write
