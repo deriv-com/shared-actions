@@ -1,0 +1,327 @@
+name: DocSync AI - Documentation Sync
+
+on:
+  workflow_call:
+    inputs:
+      base_branch:
+        description: 'Base branch for documentation PR (e.g., master or main)'
+        required: false
+        default: 'master'
+        type: string
+      pr_labels:
+        description: 'Comma-separated labels for the documentation PR'
+        required: false
+        default: 'documentation,automated'
+        type: string
+      slack_channel_id:
+        description: 'Slack channel ID to post notifications (e.g., C01234ABCDE)'
+        required: false
+        default: ''
+        type: string
+      slack_mention_user_id:
+        description: 'Slack user ID to mention in notifications (e.g., U01234ABCDE)'
+        required: false
+        default: ''
+        type: string
+      trigger_type:
+        description: 'Trigger type: "scheduled" for weekly cron, "comment" for PR comment'
+        required: false
+        default: 'scheduled'
+        type: string
+      comment_body:
+        description: 'Comment body (only for comment trigger, must start with "docsync:")'
+        required: false
+        default: ''
+        type: string
+      comment_pr_number:
+        description: 'PR number where comment was made (only for comment trigger)'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      DOCSYNC_GITHUB_TOKEN:
+        description: 'GitHub PAT for PR creation (repo-specific, needs repo and pull_requests permissions)'
+        required: true
+      DOCSYNC_ANTHROPIC_API_KEY:
+        description: 'Anthropic API key for Claude AI'
+        required: true
+      DOCSYNC_SLACK_TOKEN:
+        description: 'Slack OAuth bot token for notifications (xoxb-...)'
+        required: false
+
+concurrency:
+  group: docsync-ai-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync-documentation:
+    name: Sync Documentation (Weekly)
+    runs-on: ubuntu-latest
+
+    # Only run when trigger_type is 'scheduled'
+    if: inputs.trigger_type == 'scheduled'
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    outputs:
+      doc_pr_created: ${{ steps.docsync.outputs.doc_pr_created }}
+      doc_pr_number: ${{ steps.docsync.outputs.doc_pr_number }}
+      doc_pr_url: ${{ steps.docsync.outputs.doc_pr_url }}
+
+    env:
+      BASE_BRANCH: ${{ inputs.base_branch }}
+      PR_LABELS: ${{ inputs.pr_labels }}
+      SLACK_TOKEN: ${{ secrets.DOCSYNC_SLACK_TOKEN }}
+      SLACK_CHANNEL: ${{ inputs.slack_channel_id }}
+
+    steps:
+      - name: Debug - Workflow Trigger Info
+        run: |
+          echo "## Workflow Trigger Info" >> $GITHUB_STEP_SUMMARY
+          echo "Event: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "Trigger Type: ${{ inputs.trigger_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "Base Branch: ${{ inputs.base_branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "Repository: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
+          ref: ${{ inputs.base_branch }}
+
+      - name: Run DocSync AI Action
+        id: docsync
+        uses: deriv-com/shared-actions/.github/actions/docsync_ai@master
+        with:
+          github_token: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
+          anthropic_api_key: ${{ secrets.DOCSYNC_ANTHROPIC_API_KEY }}
+          repository: ${{ github.repository }}
+          base_branch: ${{ inputs.base_branch }}
+          pr_labels: ${{ inputs.pr_labels }}
+
+      - name: Send Slack Notification - Documentation PR Created
+        if: steps.docsync.outputs.doc_pr_created == 'true' && env.SLACK_TOKEN != '' && env.SLACK_CHANNEL != ''
+        env:
+          DOC_PR_NUMBER: ${{ steps.docsync.outputs.doc_pr_number }}
+          DOC_PR_URL: ${{ steps.docsync.outputs.doc_pr_url }}
+          SLACK_MENTION_USER: ${{ inputs.slack_mention_user_id }}
+        run: |
+          set -e
+
+          echo "### Slack Notification" >> $GITHUB_STEP_SUMMARY
+          echo "Channel: $SLACK_CHANNEL" >> $GITHUB_STEP_SUMMARY
+          echo "PR: #$DOC_PR_NUMBER" >> $GITHUB_STEP_SUMMARY
+
+          # Sanitize inputs
+          DOC_PR_URL_CLEAN=$(echo "$DOC_PR_URL" | head -c 500)
+
+          # Build mention text if user ID is provided
+          MENTION_TEXT=""
+          if [ -n "$SLACK_MENTION_USER" ]; then
+            MENTION_TEXT="<@$SLACK_MENTION_USER> "
+          fi
+
+          # Create Slack payload with text fallback (required by Slack API)
+          SLACK_PAYLOAD=$(jq -n \
+            --arg channel "$SLACK_CHANNEL" \
+            --arg repo "${{ github.repository }}" \
+            --arg doc_pr_url "$DOC_PR_URL_CLEAN" \
+            --arg doc_pr_num "$DOC_PR_NUMBER" \
+            --arg mention "$MENTION_TEXT" \
+            '{
+              "channel": $channel,
+              "text": ($mention + "Weekly Documentation Update Ready - PR #" + $doc_pr_num + " in " + $repo),
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ($mention + ":book: *Weekly Documentation Update Ready*\n*<" + $doc_pr_url + "|PR #" + $doc_pr_num + ">* in `" + $repo + "`")
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "Documentation has been automatically updated based on all PRs merged this week."
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": ("DocSync AI (Weekly Sync) | <" + $doc_pr_url + "|Review documentation updates>")
+                    }
+                  ]
+                }
+              ]
+            }')
+
+          # Send Slack notification via API with OAuth token
+          RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer $SLACK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$SLACK_PAYLOAD")
+
+          # Check response
+          SLACK_OK=$(echo "$RESPONSE" | jq -r '.ok' 2>/dev/null || echo "false")
+          if [ "$SLACK_OK" = "true" ]; then
+            echo "Slack notification sent successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            SLACK_ERROR=$(echo "$RESPONSE" | jq -r '.error // "unknown"' 2>/dev/null)
+            echo "Warning: Slack API error: $SLACK_ERROR" >> $GITHUB_STEP_SUMMARY
+            echo "Response: $RESPONSE" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          DOC_PR_CREATED: ${{ steps.docsync.outputs.doc_pr_created }}
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger | Weekly Scheduled |" >> $GITHUB_STEP_SUMMARY
+          echo "| Documentation PR Created | ${DOC_PR_CREATED:-false} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | $JOB_STATUS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Base Branch | $BASE_BRANCH |" >> $GITHUB_STEP_SUMMARY
+
+  update-from-comment:
+    name: Update Documentation from Comment
+    runs-on: ubuntu-latest
+
+    # Only run when trigger_type is 'comment'
+    if: inputs.trigger_type == 'comment'
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    env:
+      SLACK_TOKEN: ${{ secrets.DOCSYNC_SLACK_TOKEN }}
+      SLACK_CHANNEL: ${{ inputs.slack_channel_id }}
+
+    steps:
+      - name: Debug - Comment Trigger Info
+        run: |
+          echo "## Comment Trigger Info" >> $GITHUB_STEP_SUMMARY
+          echo "Trigger Type: ${{ inputs.trigger_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "PR Number: ${{ inputs.comment_pr_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "Repository: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Run DocSync AI Comment Action
+        id: docsync-comment
+        uses: deriv-com/shared-actions/.github/actions/docsync_ai_comment@master
+        with:
+          github_token: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
+          anthropic_api_key: ${{ secrets.DOCSYNC_ANTHROPIC_API_KEY }}
+          repository: ${{ github.repository }}
+          pr_number: ${{ inputs.comment_pr_number }}
+          comment_body: ${{ inputs.comment_body }}
+          base_branch: ${{ inputs.base_branch }}
+
+      - name: Send Slack Notification - Documentation Updated
+        if: steps.docsync-comment.outputs.updated == 'true' && env.SLACK_TOKEN != '' && env.SLACK_CHANNEL != ''
+        env:
+          COMMENT_PR_NUMBER: ${{ inputs.comment_pr_number }}
+          IS_DOCSYNC_PR: ${{ steps.docsync-comment.outputs.is_docsync_pr }}
+          SLACK_MENTION_USER: ${{ inputs.slack_mention_user_id }}
+        run: |
+          set -e
+
+          echo "### Slack Notification" >> $GITHUB_STEP_SUMMARY
+          echo "Channel: $SLACK_CHANNEL" >> $GITHUB_STEP_SUMMARY
+          echo "PR: #$COMMENT_PR_NUMBER" >> $GITHUB_STEP_SUMMARY
+
+          # Build PR URL
+          PR_URL="https://github.com/${{ github.repository }}/pull/$COMMENT_PR_NUMBER"
+
+          # Choose message based on PR type
+          if [ "$IS_DOCSYNC_PR" = "true" ]; then
+            UPDATE_TYPE="User suggestion applied to DocSync PR"
+          else
+            UPDATE_TYPE="Documentation updated from PR comment"
+          fi
+
+          # Build mention text if user ID is provided
+          MENTION_TEXT=""
+          if [ -n "$SLACK_MENTION_USER" ]; then
+            MENTION_TEXT="<@$SLACK_MENTION_USER> "
+          fi
+
+          # Create Slack payload with text fallback (required by Slack API)
+          SLACK_PAYLOAD=$(jq -n \
+            --arg channel "$SLACK_CHANNEL" \
+            --arg repo "${{ github.repository }}" \
+            --arg pr_url "$PR_URL" \
+            --arg pr_num "$COMMENT_PR_NUMBER" \
+            --arg update_type "$UPDATE_TYPE" \
+            --arg mention "$MENTION_TEXT" \
+            '{
+              "channel": $channel,
+              "text": ($mention + $update_type + " - PR #" + $pr_num + " in " + $repo),
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ($mention + ":memo: *Documentation Updated via Comment*\n*<" + $pr_url + "|PR #" + $pr_num + ">* in `" + $repo + "`")
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": $update_type
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": ("DocSync AI | <" + $pr_url + "|View PR>")
+                    }
+                  ]
+                }
+              ]
+            }')
+
+          # Send Slack notification via API with OAuth token
+          RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer $SLACK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$SLACK_PAYLOAD")
+
+          # Check response
+          SLACK_OK=$(echo "$RESPONSE" | jq -r '.ok' 2>/dev/null || echo "false")
+          if [ "$SLACK_OK" = "true" ]; then
+            echo "Slack notification sent successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            SLACK_ERROR=$(echo "$RESPONSE" | jq -r '.error // "unknown"' 2>/dev/null)
+            echo "Warning: Slack API error: $SLACK_ERROR" >> $GITHUB_STEP_SUMMARY
+            echo "Response: $RESPONSE" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          UPDATED: ${{ steps.docsync-comment.outputs.updated }}
+          VALID: ${{ steps.docsync-comment.outputs.suggestion_valid }}
+          IS_DOCSYNC_PR: ${{ steps.docsync-comment.outputs.is_docsync_pr }}
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Number | #${{ inputs.comment_pr_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Valid Comment | ${VALID:-false} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Is DocSync PR | ${IS_DOCSYNC_PR:-false} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Documentation Updated | ${UPDATED:-false} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | $JOB_STATUS |" >> $GITHUB_STEP_SUMMARY
