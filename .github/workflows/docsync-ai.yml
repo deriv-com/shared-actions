@@ -19,7 +19,7 @@ on:
         default: ''
         type: string
       slack_mention_user_id:
-        description: 'Slack user ID to mention in notifications (e.g., U01234ABCDE)'
+        description: 'Slack user ID(s) to mention in notifications (e.g., U01234ABCDE or U01234ABCDE,U56789FGHIJ for multiple users)'
         required: false
         default: ''
         type: string
@@ -117,10 +117,18 @@ jobs:
           # Sanitize inputs
           DOC_PR_URL_CLEAN=$(echo "$DOC_PR_URL" | head -c 500)
 
-          # Build mention text if user ID is provided
+          # Build mention text if user ID(s) are provided
           MENTION_TEXT=""
           if [ -n "$SLACK_MENTION_USER" ]; then
-            MENTION_TEXT="<@$SLACK_MENTION_USER> "
+            # Split comma-separated user IDs and build mentions
+            IFS=',' read -ra USER_IDS <<< "$SLACK_MENTION_USER"
+            for user_id in "${USER_IDS[@]}"; do
+              # Trim whitespace
+              user_id=$(echo "$user_id" | xargs)
+              if [ -n "$user_id" ]; then
+                MENTION_TEXT="${MENTION_TEXT}<@${user_id}> "
+              fi
+            done
           fi
 
           # Create Slack payload with text fallback (required by Slack API)
@@ -248,10 +256,18 @@ jobs:
             UPDATE_TYPE="Documentation updated from PR comment"
           fi
 
-          # Build mention text if user ID is provided
+          # Build mention text if user ID(s) are provided
           MENTION_TEXT=""
           if [ -n "$SLACK_MENTION_USER" ]; then
-            MENTION_TEXT="<@$SLACK_MENTION_USER> "
+            # Split comma-separated user IDs and build mentions
+            IFS=',' read -ra USER_IDS <<< "$SLACK_MENTION_USER"
+            for user_id in "${USER_IDS[@]}"; do
+              # Trim whitespace
+              user_id=$(echo "$user_id" | xargs)
+              if [ -n "$user_id" ]; then
+                MENTION_TEXT="${MENTION_TEXT}<@${user_id}> "
+              fi
+            done
           fi
 
           # Create Slack payload with text fallback (required by Slack API)
