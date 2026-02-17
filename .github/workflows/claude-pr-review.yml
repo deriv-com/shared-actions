@@ -106,9 +106,14 @@ jobs:
           if [ -n "$PREVIOUS" ]; then
             echo "$PREVIOUS" > /tmp/previous_review.txt
             echo "has_previous=true" >> $GITHUB_OUTPUT
+
+            # Extract the last reviewed commit SHA from the previous review metadata
+            LAST_REVIEWED_SHA=$(echo "$PREVIOUS" | grep -oP '(?<=<!-- reviewed-commit: )[a-f0-9]+(?= -->)' || echo "")
+            echo "last_reviewed_sha=$LAST_REVIEWED_SHA" >> $GITHUB_OUTPUT
           else
             echo "" > /tmp/previous_review.txt
             echo "has_previous=false" >> $GITHUB_OUTPUT
+            echo "last_reviewed_sha=" >> $GITHUB_OUTPUT
           fi
 
           # Delete old comments
@@ -160,12 +165,35 @@ jobs:
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          LAST_REVIEWED_SHA: ${{ steps.previous-review.outputs.last_reviewed_sha }}
+          HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
         run: |
           gh pr diff "$PR_NUMBER" --repo "$REPO" > /tmp/pr_diff.txt 2>/dev/null || echo "Unable to fetch diff" > /tmp/pr_diff.txt
           gh pr view "$PR_NUMBER" --repo "$REPO" --json files --jq '.files[].path' 2>/dev/null | head -50 > /tmp/changed_files.txt || true
           echo "$PR_TITLE" > /tmp/pr_title.txt
           echo "$PR_AUTHOR" > /tmp/pr_author.txt
           echo "$PR_BRANCH" > /tmp/pr_branch.txt
+
+          # Generate incremental diff (changes since last review) for follow-up reviews
+          echo "" > /tmp/incremental_diff.txt
+          if [[ "$HAS_PREVIOUS" == "true" && -n "$LAST_REVIEWED_SHA" ]]; then
+            echo "📋 Generating incremental diff since last reviewed commit: $LAST_REVIEWED_SHA"
+            if git cat-file -e "$LAST_REVIEWED_SHA" 2>/dev/null; then
+              git diff "$LAST_REVIEWED_SHA"..HEAD > /tmp/incremental_diff.txt 2>/dev/null || echo "" > /tmp/incremental_diff.txt
+              if [ -s /tmp/incremental_diff.txt ]; then
+                echo "✅ Incremental diff generated"
+              else
+                echo "ℹ️ No changes since last reviewed commit"
+              fi
+            else
+              echo "⚠️ Last reviewed commit $LAST_REVIEWED_SHA not found in history (fetch-depth may be too shallow)"
+            fi
+          fi
+
+          # Store current HEAD SHA for embedding in the review comment
+          CURRENT_SHA=$(git rev-parse HEAD)
+          echo "$CURRENT_SHA" > /tmp/current_sha.txt
+          echo "📌 Current HEAD: $CURRENT_SHA"
 
       - name: Call Claude API
         env:
@@ -183,6 +211,7 @@ jobs:
           PR_BRANCH=$(cat /tmp/pr_branch.txt)
           PREVIOUS_REVIEW=$(cat /tmp/previous_review.txt)
           ACKNOWLEDGED_ITEMS=$(cat /tmp/acknowledged_items.txt)
+          INCREMENTAL_DIFF=$(cat /tmp/incremental_diff.txt)
 
           SYSTEM_PROMPT="You are an expert code reviewer. Follow the review mode instructions in the prompt template."
 
@@ -208,9 +237,26 @@ jobs:
             ACKNOWLEDGED_SECTION=""
           fi
 
+          # Build incremental diff section for follow-up reviews
+          if [[ "$HAS_PREVIOUS" == "true" && -s /tmp/incremental_diff.txt ]]; then
+            echo "📋 Including incremental diff"
+            INCREMENTAL_SECTION="---INCREMENTAL_DIFF---
+          The following diff shows ONLY the changes made since the last review. Use this to identify what was explicitly fixed.
+          If a problematic code pattern appears in a \`-\` line here, it was removed by the fix commit.
+          If a pattern does NOT appear here at all, the fix commit did NOT touch it.
+          \`\`\`diff
+          ${INCREMENTAL_DIFF}
+          \`\`\`
+          ---END_INCREMENTAL_DIFF---"
+          else
+            INCREMENTAL_SECTION=""
+          fi
+
           USER_PROMPT="${PROMPT_TEMPLATE}
 
           ${PREV_SECTION}
+
+          ${INCREMENTAL_SECTION}
 
           ${ACKNOWLEDGED_SECTION}
 
@@ -258,6 +304,7 @@ jobs:
           HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
         run: |
           REVIEW=$(cat /tmp/review.txt)
+          CURRENT_SHA=$(cat /tmp/current_sha.txt)
           [[ "$HAS_PREVIOUS" == "true" ]] && REVIEW_TYPE="🔄 Follow-up Review" || REVIEW_TYPE="📋 Initial Review"
 
           COMMENT="## 🤖 Claude PR Review Complete
@@ -269,7 +316,8 @@ jobs:
           $REVIEW
 
           ---
-          *Review generated via Claude API*"
+          *Review generated via Claude API*
+          <!-- reviewed-commit: ${CURRENT_SHA} -->"
 
           gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body "$COMMENT"
-          echo "✅ Posted"
+          echo "✅ Posted (reviewed commit: ${CURRENT_SHA})"
