@@ -168,18 +168,44 @@ jobs:
           LAST_REVIEWED_SHA: ${{ steps.previous-review.outputs.last_reviewed_sha }}
           HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
         run: |
-          gh pr diff "$PR_NUMBER" --repo "$REPO" > /tmp/pr_diff.txt 2>/dev/null || echo "Unable to fetch diff" > /tmp/pr_diff.txt
+          gh pr diff "$PR_NUMBER" --repo "$REPO" > /tmp/pr_diff_raw.txt 2>/dev/null || echo "Unable to fetch diff" > /tmp/pr_diff_raw.txt
           gh pr view "$PR_NUMBER" --repo "$REPO" --json files --jq '.files[].path' 2>/dev/null | head -50 > /tmp/changed_files.txt || true
           echo "$PR_TITLE" > /tmp/pr_title.txt
           echo "$PR_AUTHOR" > /tmp/pr_author.txt
           echo "$PR_BRANCH" > /tmp/pr_branch.txt
+
+          # Filter noise files from the diff — generated, vendored, and lock files
+          # add bulk with zero review value. We strip their hunks entirely, keeping
+          # only the "diff --git" header line so the changed-files list stays accurate.
+          NOISE_PATTERN='package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.snap|\.min\.js|\.min\.css|dist/|build/|\.generated\.|__generated__|/vendor/|\.pb\.go|_test\.snap'
+          awk -v noise="$NOISE_PATTERN" '
+            /^diff --git / {
+              in_noise = ($0 ~ noise)
+              if (!in_noise) print
+              next
+            }
+            !in_noise { print }
+          ' /tmp/pr_diff_raw.txt > /tmp/pr_diff.txt
+
+          RAW_SIZE=$(wc -c < /tmp/pr_diff_raw.txt)
+          FILTERED_SIZE=$(wc -c < /tmp/pr_diff.txt)
+          echo "📊 Diff: ${RAW_SIZE} bytes raw → ${FILTERED_SIZE} bytes after noise filtering"
 
           # Generate incremental diff (changes since last review) for follow-up reviews
           echo "" > /tmp/incremental_diff.txt
           if [[ "$HAS_PREVIOUS" == "true" && -n "$LAST_REVIEWED_SHA" ]]; then
             echo "📋 Generating incremental diff since last reviewed commit: $LAST_REVIEWED_SHA"
             if git cat-file -e "$LAST_REVIEWED_SHA" 2>/dev/null; then
-              git diff "$LAST_REVIEWED_SHA"..HEAD > /tmp/incremental_diff.txt 2>/dev/null || echo "" > /tmp/incremental_diff.txt
+              git diff "$LAST_REVIEWED_SHA"..HEAD > /tmp/incremental_diff_raw.txt 2>/dev/null || echo "" > /tmp/incremental_diff_raw.txt
+              # Apply same noise filter to incremental diff
+              awk -v noise="$NOISE_PATTERN" '
+                /^diff --git / {
+                  in_noise = ($0 ~ noise)
+                  if (!in_noise) print
+                  next
+                }
+                !in_noise { print }
+              ' /tmp/incremental_diff_raw.txt > /tmp/incremental_diff.txt
               if [ -s /tmp/incremental_diff.txt ]; then
                 echo "✅ Incremental diff generated"
               else
@@ -204,20 +230,41 @@ jobs:
         run: |
           echo "🤖 Calling Claude API..."
 
-          PR_DIFF=$(cat /tmp/pr_diff.txt)
           CHANGED_FILES=$(cat /tmp/changed_files.txt)
           PR_TITLE=$(cat /tmp/pr_title.txt)
           PR_AUTHOR=$(cat /tmp/pr_author.txt)
           PR_BRANCH=$(cat /tmp/pr_branch.txt)
-          PREVIOUS_REVIEW=$(cat /tmp/previous_review.txt)
           ACKNOWLEDGED_ITEMS=$(cat /tmp/acknowledged_items.txt)
-          INCREMENTAL_DIFF=$(cat /tmp/incremental_diff.txt)
 
-          SYSTEM_PROMPT="You are an expert code reviewer. Follow the review mode instructions in the prompt template."
+          # Move full prompt template to system prompt — cleanly separates instructions
+          # from data and enables Anthropic prompt caching across repeated calls
+          printf '%s' "$PROMPT_TEMPLATE" > /tmp/system_prompt.txt
 
-          # Build prompt - include previous review section only if exists
+          # Cap the diff at 150 KB to keep the payload manageable for large PRs.
+          # GitHub's Compare API can return multi-MB diffs that serve no extra value
+          # once Claude's effective review window is saturated.
+          DIFF_SIZE=$(wc -c < /tmp/pr_diff.txt)
+          DIFF_CAP=150000
+          if [ "$DIFF_SIZE" -gt "$DIFF_CAP" ]; then
+            echo "⚠️ Diff is ${DIFF_SIZE} bytes — truncating to ${DIFF_CAP} bytes"
+            PR_DIFF=$(head -c "$DIFF_CAP" /tmp/pr_diff.txt)
+            PR_DIFF="${PR_DIFF}
+
+          [...diff truncated at ${DIFF_CAP} bytes (${DIFF_SIZE} total). Review remaining files manually.]"
+          else
+            PR_DIFF=$(cat /tmp/pr_diff.txt)
+          fi
+
+          # Build previous-review section (follow-up mode only).
+          # Strip bot comment boilerplate before re-sending to reduce token cost.
           if [[ "$HAS_PREVIOUS" == "true" ]]; then
             echo "📋 Follow-up review mode"
+            PREVIOUS_REVIEW=$(sed \
+              -e '/^## 🤖 Claude PR Review Complete$/d' \
+              -e '/^\*\*Model:\*\*/d' \
+              -e '/^\*Review generated via Claude API\*$/d' \
+              -e '/^<!-- reviewed-commit:.*-->$/d' \
+              /tmp/previous_review.txt)
             PREV_SECTION="---PREVIOUS_REVIEW---
           ${PREVIOUS_REVIEW}
           ---END_PREVIOUS_REVIEW---"
@@ -240,6 +287,7 @@ jobs:
           # Build incremental diff section for follow-up reviews
           if [[ "$HAS_PREVIOUS" == "true" && -s /tmp/incremental_diff.txt ]]; then
             echo "📋 Including incremental diff"
+            INCREMENTAL_DIFF=$(cat /tmp/incremental_diff.txt)
             INCREMENTAL_SECTION="---INCREMENTAL_DIFF---
           The following diff shows ONLY the changes made since the last review. Use this to identify what was explicitly fixed.
           If a problematic code pattern appears in a \`-\` line here, it was removed by the fix commit.
@@ -252,9 +300,8 @@ jobs:
             INCREMENTAL_SECTION=""
           fi
 
-          USER_PROMPT="${PROMPT_TEMPLATE}
-
-          ${PREV_SECTION}
+          # User message contains only dynamic PR data; instructions live in system prompt
+          USER_PROMPT="${PREV_SECTION}
 
           ${INCREMENTAL_SECTION}
 
@@ -273,6 +320,7 @@ jobs:
           ${PR_DIFF}
           \`\`\`"
 
+<<<<<<< Updated upstream
           PAYLOAD=$(jq -n \
             --arg model "$CLAUDE_MODEL" \
             --argjson max_tokens "$CLAUDE_MAX_TOKENS" \
@@ -282,21 +330,38 @@ jobs:
             '{model: $model, max_tokens: ($max_tokens | tonumber), temperature: ($temperature | tonumber), system: $system, messages: [{role: "user", content: $user}]}')
 
           RESPONSE=$(curl -s -w "\n%{http_code}" "https://api.anthropic.com/v1/messages" \
+=======
+          printf '%s' "$USER_PROMPT" > /tmp/user_prompt.txt
+          echo "📏 System: $(wc -c < /tmp/system_prompt.txt) bytes | User: $(wc -c < /tmp/user_prompt.txt) bytes"
+
+          # Build JSON payload using --rawfile so large strings are never passed as
+          # CLI arguments — avoids the ARG_MAX (E2BIG) error on large diffs
+          jq -n \
+            --arg model "$CLAUDE_MODEL" \
+            --argjson max_tokens "$CLAUDE_MAX_TOKENS" \
+            --argjson temperature "$CLAUDE_TEMPERATURE" \
+            --rawfile system /tmp/system_prompt.txt \
+            --rawfile user /tmp/user_prompt.txt \
+            '{model: $model, max_tokens: ($max_tokens | tonumber), temperature: ($temperature | tonumber), system: $system, messages: [{role: "user", content: $user}]}' \
+            > /tmp/payload.json
+
+          # Send payload from file — avoids ARG_MAX on `curl -d` with large payloads
+          HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/api_response.json \
+            "https://api.anthropic.com/v1/messages" \
+>>>>>>> Stashed changes
             -H "Content-Type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -d "$PAYLOAD")
 
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
+          [[ "$HTTP_CODE" != "200" ]] && echo "❌ API failed: $HTTP_CODE" && cat /tmp/api_response.json && exit 1
 
-          [[ "$HTTP_CODE" != "200" ]] && echo "❌ API failed: $HTTP_CODE" && echo "$BODY" && exit 1
-
-          REVIEW=$(echo "$BODY" | jq -r '.content[0].text // empty')
+          # Parse response from file — avoids ARG_MAX on large API responses
+          REVIEW=$(jq -r '.content[0].text // empty' /tmp/api_response.json)
           [[ -z "$REVIEW" ]] && echo "❌ Empty response" && exit 1
 
           echo "$REVIEW" > /tmp/review.txt
-          echo "✅ Review generated"
+          echo "✅ Review generated ($(wc -c < /tmp/review.txt) bytes)"
 
       - name: Post Review Comment
         env:
