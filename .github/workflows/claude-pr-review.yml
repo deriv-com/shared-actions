@@ -273,19 +273,24 @@ jobs:
           ${PR_DIFF}
           \`\`\`"
 
+          printf '%s' "$SYSTEM_PROMPT" > /tmp/system_prompt.txt
+          printf '%s' "$USER_PROMPT" > /tmp/user_prompt.txt
+
           PAYLOAD=$(jq -n \
             --arg model "$CLAUDE_MODEL" \
             --argjson max_tokens "$CLAUDE_MAX_TOKENS" \
             --argjson temperature "$CLAUDE_TEMPERATURE" \
-            --arg system "$SYSTEM_PROMPT" \
-            --arg user "$USER_PROMPT" \
+            --rawfile system /tmp/system_prompt.txt \
+            --rawfile user /tmp/user_prompt.txt \
             '{model: $model, max_tokens: ($max_tokens | tonumber), temperature: ($temperature | tonumber), system: $system, messages: [{role: "user", content: $user}]}')
+
+          printf '%s' "$PAYLOAD" > /tmp/payload.json
 
           RESPONSE=$(curl -s -w "\n%{http_code}" "https://api.anthropic.com/v1/messages" \
             -H "Content-Type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
-            -d "$PAYLOAD")
+            -d @/tmp/payload.json)
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
