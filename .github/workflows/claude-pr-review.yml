@@ -320,17 +320,6 @@ jobs:
           ${PR_DIFF}
           \`\`\`"
 
-<<<<<<< Updated upstream
-          PAYLOAD=$(jq -n \
-            --arg model "$CLAUDE_MODEL" \
-            --argjson max_tokens "$CLAUDE_MAX_TOKENS" \
-            --argjson temperature "$CLAUDE_TEMPERATURE" \
-            --arg system "$SYSTEM_PROMPT" \
-            --arg user "$USER_PROMPT" \
-            '{model: $model, max_tokens: ($max_tokens | tonumber), temperature: ($temperature | tonumber), system: $system, messages: [{role: "user", content: $user}]}')
-
-          RESPONSE=$(curl -s -w "\n%{http_code}" "https://api.anthropic.com/v1/messages" \
-=======
           printf '%s' "$USER_PROMPT" > /tmp/user_prompt.txt
           echo "📏 System: $(wc -c < /tmp/system_prompt.txt) bytes | User: $(wc -c < /tmp/user_prompt.txt) bytes"
 
@@ -348,7 +337,6 @@ jobs:
           # Send payload from file — avoids ARG_MAX on `curl -d` with large payloads
           HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/api_response.json \
             "https://api.anthropic.com/v1/messages" \
->>>>>>> Stashed changes
             -H "Content-Type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
