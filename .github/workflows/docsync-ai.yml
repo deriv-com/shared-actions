@@ -98,7 +98,7 @@ jobs:
 
       - name: Run DocSync AI Action
         id: docsync
-        uses: akash-deriv/shared-actions/.github/actions/docsync_ai@master
+        uses: deriv-com/shared-actions/.github/actions/docsync_ai@master
         with:
           github_token: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
           anthropic_api_key: ${{ secrets.DOCSYNC_ANTHROPIC_API_KEY }}
@@ -251,7 +251,7 @@ jobs:
 
       - name: Run DocSync AI Comment Action
         id: docsync-comment
-        uses: akash-deriv/shared-actions/.github/actions/docsync_ai_comment@master
+        uses: deriv-com/shared-actions/.github/actions/docsync_ai_comment@master
         with:
           github_token: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
           anthropic_api_key: ${{ secrets.DOCSYNC_ANTHROPIC_API_KEY }}
