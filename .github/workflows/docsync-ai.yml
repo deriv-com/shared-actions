@@ -29,12 +29,17 @@ on:
         default: 'scheduled'
         type: string
       comment_body:
-        description: 'Comment body (only for comment trigger, must start with "docsync:")'
+        description: 'Comment body (only for comment trigger, must start with "@docbot")'
         required: false
         default: ''
         type: string
       comment_pr_number:
         description: 'PR number where comment was made (only for comment trigger)'
+        required: false
+        default: ''
+        type: string
+      comment_id:
+        description: 'Comment ID for adding thumbs-up reaction (only for comment trigger)'
         required: false
         default: ''
         type: string
@@ -93,7 +98,7 @@ jobs:
 
       - name: Run DocSync AI Action
         id: docsync
-        uses: deriv-com/shared-actions/.github/actions/docsync_ai@master
+        uses: akash-deriv/shared-actions/.github/actions/docsync_ai@master
         with:
           github_token: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
           anthropic_api_key: ${{ secrets.DOCSYNC_ANTHROPIC_API_KEY }}
@@ -215,22 +220,45 @@ jobs:
       SLACK_CHANNEL: ${{ inputs.slack_channel_id }}
 
     steps:
+      # ── Instant thumbs-up so user knows the bot is processing ──
+      - name: Acknowledge Comment with 👍
+        if: inputs.comment_id != ''
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
+          script: |
+            const commentId = `${{ inputs.comment_id }}`;
+            if (!commentId || !/^\d+$/.test(commentId)) {
+              core.info('No valid comment ID, skipping reaction');
+              return;
+            }
+            const [owner, repo] = `${{ github.repository }}`.split('/');
+            await github.rest.reactions.createForIssueComment({
+              owner,
+              repo,
+              comment_id: Number(commentId),
+              content: '+1'
+            });
+            core.info(`👍 Reaction added to comment ${commentId}`);
+
       - name: Debug - Comment Trigger Info
         run: |
           echo "## Comment Trigger Info" >> $GITHUB_STEP_SUMMARY
           echo "Trigger Type: ${{ inputs.trigger_type }}" >> $GITHUB_STEP_SUMMARY
           echo "PR Number: ${{ inputs.comment_pr_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "Comment ID: ${{ inputs.comment_id }}" >> $GITHUB_STEP_SUMMARY
           echo "Repository: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
 
       - name: Run DocSync AI Comment Action
         id: docsync-comment
-        uses: deriv-com/shared-actions/.github/actions/docsync_ai_comment@master
+        uses: akash-deriv/shared-actions/.github/actions/docsync_ai_comment@master
         with:
           github_token: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
           anthropic_api_key: ${{ secrets.DOCSYNC_ANTHROPIC_API_KEY }}
           repository: ${{ github.repository }}
           pr_number: ${{ inputs.comment_pr_number }}
           comment_body: ${{ inputs.comment_body }}
+          comment_id: ${{ inputs.comment_id }}
           base_branch: ${{ inputs.base_branch }}
 
       - name: Send Slack Notification - Documentation Updated
@@ -329,7 +357,8 @@ jobs:
         env:
           JOB_STATUS: ${{ job.status }}
           UPDATED: ${{ steps.docsync-comment.outputs.updated }}
-          VALID: ${{ steps.docsync-comment.outputs.suggestion_valid }}
+          VALID: ${{ steps.docsync-comment.outputs.command_valid }}
+          COMMAND: ${{ steps.docsync-comment.outputs.command }}
           IS_DOCSYNC_PR: ${{ steps.docsync-comment.outputs.is_docsync_pr }}
         run: |
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -337,7 +366,8 @@ jobs:
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| PR Number | #${{ inputs.comment_pr_number }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Valid Comment | ${VALID:-false} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Valid Command | ${VALID:-false} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Command | ${COMMAND:-none} |" >> $GITHUB_STEP_SUMMARY
           echo "| Is DocSync PR | ${IS_DOCSYNC_PR:-false} |" >> $GITHUB_STEP_SUMMARY
           echo "| Documentation Updated | ${UPDATED:-false} |" >> $GITHUB_STEP_SUMMARY
           echo "| Status | $JOB_STATUS |" >> $GITHUB_STEP_SUMMARY
