@@ -441,20 +441,44 @@ runs:
             echo '   - NO phrases like "Here is the updated", "I have analyzed", etc.'
             echo "   - Start directly with the documentation content"
             echo ""
-            echo "6. **SIGNIFICANCE CHECK**:"
-            echo "   - UPDATE documentation for: new files/modules, new features, API changes, new dependencies, configuration changes, new functionality, data structures, workflow changes"
-            echo "   - ALSO consider: multiple small changes that collectively add up to meaningful updates"
-            echo "   - Skip ONLY: isolated typos, minor code comments, whitespace formatting"
-            echo "   - When in doubt, UPDATE - it is better to document changes than miss them"
-            echo "   - Consider the COMBINED impact of all PRs from the week"
+            echo "6. **SIGNIFICANCE CHECK (STRICT - When in doubt, SKIP)**:"
+            if [ "$DOC_FORMAT" = "README" ]; then
+              echo "   - UPDATE README.md ONLY for:"
+              echo "     * New user-facing features or capabilities"
+              echo "     * API changes (new endpoints, changed parameters, new response fields)"
+              echo "     * New external dependencies users need to install or configure"
+              echo "     * Breaking changes that affect user behavior or require migration"
+              echo "     * New configuration options users need to know about"
+              echo "   - DO NOT update README.md for:"
+              echo "     * Internal code refactoring or restructuring"
+              echo "     * Small bug fixes that do not change documented behavior"
+              echo "     * Test additions or test refactoring"
+              echo "     * CI/CD pipeline changes"
+              echo "     * Code style, linting, or formatting changes"
+              echo "     * Internal module reorganization"
+            else
+              echo "   - UPDATE CLAUDE.md ONLY for:"
+              echo "     * New architectural patterns or design decisions"
+              echo "     * New modules, systems, or major structural components"
+              echo "     * Significant structural changes to the codebase layout"
+              echo "     * New development workflows or build processes"
+              echo "   - DO NOT update CLAUDE.md for:"
+              echo "     * Code-level tweaks within existing modules"
+              echo "     * Minor refactors that do not change architecture"
+              echo "     * Bug fixes within existing patterns"
+              echo "     * Test changes"
+              echo "     * Dependency version bumps"
+            fi
+            echo "   - If changes do not clearly meet the above thresholds, output NO_UPDATES_NEEDED"
             echo ""
-            echo "7. **CONCISENESS**:"
-            echo "   - Keep all additions brief, direct, and to the point"
-            echo "   - Use short sentences and bullet points over lengthy paragraphs"
-            echo "   - Add ONLY the essential information needed to understand the change"
-            echo "   - Do NOT rewrite, expand, or rephrase existing content"
-            echo "   - A few precise lines are better than verbose explanations"
-            echo "   - Avoid redundant details, filler text, or over-documentation"
+            echo "7. **CONCISENESS (CRITICAL)**:"
+            echo "   - Every addition must earn its place - no filler, no redundancy"
+            echo "   - Add ONLY the most important details about each change"
+            echo "   - Use short bullet points, not paragraphs"
+            echo "   - Do NOT rewrite, expand, rephrase, or reorganize existing content"
+            echo "   - Do NOT add examples, explanations, or extra context unless absolutely essential"
+            echo "   - If information is already implied by existing docs, do not add it"
+            echo "   - Verbose or padded output WILL BE REJECTED"
             echo ""
             echo "## Decision Process:"
             echo ""
@@ -463,7 +487,7 @@ runs:
             echo "3. Check if ANY new files, modules, functions, or features were added"
             echo "4. Look for changes to existing functionality that users should know about"
             echo "5. If ANY of the above exist: Add new information to relevant sections WITHOUT removing existing content"
-            echo '6. ONLY output "NO_UPDATES_NEEDED" if the changes are truly insignificant (like pure formatting)'
+            echo '6. Output "NO_UPDATES_NEEDED" unless changes clearly meet the significance thresholds above'
             echo ""
             echo "## Response:"
             echo "- If significant, relevant updates are needed: Output the COMPLETE updated documentation (with additions only)"
@@ -730,6 +754,17 @@ runs:
         - [ ] No unrelated sections were modified
         - [ ] Formatting and style are consistent
         - [ ] Examples and code snippets are up to date
+
+        ### Quick Actions
+        Copy and paste any of these comments to interact with DocSync AI:
+
+        | Command | Description |
+        |---------|-------------|
+        | \`docsync: update only readme\` | Update only README.md |
+        | \`docsync: update only claude\` | Update only CLAUDE.md |
+        | \`docsync: make it more concise\` | Make documentation updates more concise |
+        | \`docsync: revert to previous commit\` | Revert to the previous DocSync update |
+        | \`docsync: [your instruction]\` | Custom instruction for documentation changes |
 
         ---
         *Automated by DocSync AI (Weekly Sync)*"

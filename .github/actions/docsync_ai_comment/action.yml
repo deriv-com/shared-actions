@@ -25,7 +25,7 @@ inputs:
 outputs:
   updated:
     description: "Whether documentation was updated"
-    value: "${{ steps.commit-changes.outputs.updated }}"
+    value: "${{ steps.handle-revert.outputs.revert_done == 'true' && 'true' || steps.commit-changes.outputs.updated }}"
   suggestion_valid:
     description: "Whether the comment had valid docsync prefix"
     value: "${{ steps.validate.outputs.valid }}"
@@ -84,6 +84,37 @@ runs:
             echo "... (truncated for display)" >> $GITHUB_STEP_SUMMARY
           fi
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+          # Detect file targeting keywords in suggestion
+          TARGET_FILE="both"
+          SUGGESTION_LOWER=$(echo "$SUGGESTION" | tr '[:upper:]' '[:lower:]')
+
+          # Explicit targeting keywords (highest priority)
+          if echo "$SUGGESTION_LOWER" | grep -qiE '(only readme|readme only|update only readme|update readme only)'; then
+            TARGET_FILE="readme"
+          elif echo "$SUGGESTION_LOWER" | grep -qiE '(only claude|claude only|update only claude|update claude only)'; then
+            TARGET_FILE="claude"
+          # Natural language: if suggestion mentions one file but not the other
+          elif echo "$SUGGESTION_LOWER" | grep -qE '\breadme\b' && ! echo "$SUGGESTION_LOWER" | grep -qE '\bclaude\b'; then
+            TARGET_FILE="readme"
+          elif echo "$SUGGESTION_LOWER" | grep -qE '\bclaude\b' && ! echo "$SUGGESTION_LOWER" | grep -qE '\breadme\b'; then
+            TARGET_FILE="claude"
+          fi
+
+          echo "target_file=$TARGET_FILE" >> $GITHUB_OUTPUT
+          if [ "$TARGET_FILE" != "both" ]; then
+            echo "File targeting detected: $TARGET_FILE only" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Detect revert command
+          IS_REVERT=false
+          SUGGESTION_TRIMMED=$(echo "$SUGGESTION_LOWER" | xargs)
+          if echo "$SUGGESTION_TRIMMED" | grep -qiE '^(revert to previous commit|revert|undo last update|undo|revert to previous)$'; then
+            IS_REVERT=true
+            echo "Revert command detected" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "is_revert=$IS_REVERT" >> $GITHUB_OUTPUT
         else
           echo "valid=false" >> $GITHUB_OUTPUT
           echo "Comment does not start with 'docsync:' - skipping" >> $GITHUB_STEP_SUMMARY
@@ -186,9 +217,141 @@ runs:
         ref: ${{ steps.verify-pr.outputs.pr_branch }}
         fetch-depth: 0
 
+    - name: Handle Revert Command
+      id: handle-revert
+      if: steps.validate.outputs.valid == 'true' && steps.validate.outputs.is_revert == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        REPO_NAME: ${{ inputs.repository }}
+        IS_DOCSYNC_PR: ${{ steps.verify-pr.outputs.is_docsync_pr }}
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        set -e
+
+        echo "## Revert Command Detected" >> $GITHUB_STEP_SUMMARY
+
+        # Revert is ONLY available on DocSync PRs
+        if [ "$IS_DOCSYNC_PR" != "true" ]; then
+          echo "Revert is only available on DocSync documentation PRs" >> $GITHUB_STEP_SUMMARY
+
+          COMMENT_BODY="**DocSync AI**: The revert command is only available on DocSync documentation PRs. On regular PRs, please use \`docsync: [your instruction]\` to update documentation."
+
+          gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
+
+          echo "revert_done=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Find DocSync AI commits on this branch only (not base branch commits)
+        git fetch origin "$BASE_BRANCH"
+        DOCSYNC_COMMITS=$(git log "origin/$BASE_BRANCH..HEAD" --format="%H %s" | grep "DocSync AI:" || echo "")
+
+        echo "### DocSync Commits on PR Branch:" >> $GITHUB_STEP_SUMMARY
+        if [ -n "$DOCSYNC_COMMITS" ]; then
+          echo "$DOCSYNC_COMMITS" | head -5 | while IFS= read -r line; do
+            HASH=$(echo "$line" | cut -c1-8)
+            MSG=$(echo "$line" | cut -d' ' -f2-)
+            echo "- \`$HASH\` $MSG" >> $GITHUB_STEP_SUMMARY
+          done
+        else
+          echo "No DocSync commits found" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Count DocSync commits
+        COMMIT_COUNT=0
+        if [ -n "$DOCSYNC_COMMITS" ]; then
+          COMMIT_COUNT=$(echo "$DOCSYNC_COMMITS" | wc -l | tr -d ' ')
+        fi
+
+        if [ "$COMMIT_COUNT" -lt 2 ]; then
+          echo "Not enough DocSync commits to revert (found $COMMIT_COUNT, need at least 2)" >> $GITHUB_STEP_SUMMARY
+
+          COMMENT_BODY="**DocSync AI**: Cannot revert - there is no previous DocSync commit to revert to. This branch needs at least 2 DocSync commits for the revert feature to work."
+
+          gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
+
+          echo "revert_done=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Get the second DocSync commit (the previous one to revert TO)
+        PREVIOUS_COMMIT=$(echo "$DOCSYNC_COMMITS" | sed -n '2p' | awk '{print $1}')
+
+        # Validate commit hash
+        if ! [[ "$PREVIOUS_COMMIT" =~ ^[a-f0-9]{40}$ ]]; then
+          echo "Invalid commit hash: $PREVIOUS_COMMIT" >> $GITHUB_STEP_SUMMARY
+          echo "revert_done=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+        echo "Reverting to DocSync commit: ${PREVIOUS_COMMIT:0:8}" >> $GITHUB_STEP_SUMMARY
+
+        # Restore documentation files from the previous DocSync commit
+        REVERTED_FILES=""
+
+        for doc_file in $(find . -maxdepth 1 -type f \( -iname "readme.md" -o -iname "claude.md" \) -print); do
+          doc_file="${doc_file#./}"
+          # Try to restore the file from the previous commit
+          if git show "$PREVIOUS_COMMIT:$doc_file" > /dev/null 2>&1; then
+            git show "$PREVIOUS_COMMIT:$doc_file" > "$doc_file"
+            REVERTED_FILES="$REVERTED_FILES $doc_file"
+            echo "  Reverted $doc_file to state from ${PREVIOUS_COMMIT:0:8}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "  $doc_file not found in commit ${PREVIOUS_COMMIT:0:8}, skipping" >> $GITHUB_STEP_SUMMARY
+          fi
+        done
+
+        if [ -z "$REVERTED_FILES" ]; then
+          echo "No documentation files could be reverted" >> $GITHUB_STEP_SUMMARY
+
+          COMMENT_BODY="**DocSync AI**: Could not revert - no documentation files found in the previous DocSync commit."
+
+          gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
+
+          echo "revert_done=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Stage, commit, and push
+        git config --local user.name "github-actions[bot]"
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+
+        git add $REVERTED_FILES
+
+        git commit -m "$(cat <<'COMMITEOF'
+        DocSync AI: Revert documentation to previous state
+
+        Reverted documentation to the previous DocSync update.
+
+        Generated by DocSync AI
+        COMMITEOF
+        )"
+
+        git push origin HEAD
+
+        # Post confirmation comment
+        CHANGED_FILES_LIST=$(echo "$REVERTED_FILES" | xargs -n1 | sed 's/^/- /')
+        COMMENT_BODY="**DocSync AI: Documentation Reverted**
+
+        Documentation has been reverted to the previous DocSync update (commit \`${PREVIOUS_COMMIT:0:8}\`).
+
+        **Reverted Files:**
+        $CHANGED_FILES_LIST
+
+        ---
+        *Automated by DocSync AI*"
+
+        gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
+
+        echo "revert_done=true" >> $GITHUB_OUTPUT
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Revert completed successfully" >> $GITHUB_STEP_SUMMARY
+
     - name: Fetch PR Diff for Regular PRs
       id: fetch-diff
-      if: steps.validate.outputs.valid == 'true' && steps.verify-pr.outputs.is_docsync_pr != 'true'
+      if: steps.validate.outputs.valid == 'true' && steps.verify-pr.outputs.is_docsync_pr != 'true' && steps.validate.outputs.is_revert != 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
@@ -248,7 +411,7 @@ runs:
 
     - name: Run Claude Sonnet 4.5 Documentation Analysis
       id: claude-analysis
-      if: steps.validate.outputs.valid == 'true' && steps.fetch-diff.outputs.skip_diff != 'true'
+      if: steps.validate.outputs.valid == 'true' && steps.fetch-diff.outputs.skip_diff != 'true' && steps.validate.outputs.is_revert != 'true'
       shell: bash
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
@@ -258,6 +421,7 @@ runs:
         IS_DOCSYNC_PR: ${{ steps.verify-pr.outputs.is_docsync_pr }}
         PR_TITLE: ${{ steps.verify-pr.outputs.pr_title }}
         DIFF_TEMP_DIR: ${{ steps.fetch-diff.outputs.temp_dir }}
+        TARGET_FILE: ${{ steps.validate.outputs.target_file }}
       run: |
         set -e
 
@@ -428,6 +592,11 @@ runs:
               echo ""
               echo "## Additional Context:"
               echo "$OTHER_FILES_NOTE"
+              if [ "$TARGET_FILE" != "both" ]; then
+                echo ""
+                echo "## FILE TARGETING:"
+                echo "The user has specifically requested updates to $DOC_FILE ONLY. Focus exclusively on this file."
+              fi
               echo ""
               echo "## Your Task"
               echo "Apply the user suggestion to update the $DOC_FILE while maintaining project identity and existing content."
@@ -467,13 +636,14 @@ runs:
               echo "   - Maintain consistent formatting and style"
               echo "   - Improve documentation quality based on the suggestion"
               echo ""
-              echo "7. **CONCISENESS**:"
-              echo "   - Keep all additions brief, direct, and to the point"
-              echo "   - Use short sentences and bullet points over lengthy paragraphs"
-              echo "   - Add ONLY the essential information needed to understand the change"
-              echo "   - Do NOT rewrite, expand, or rephrase existing content"
-              echo "   - A few precise lines are better than verbose explanations"
-              echo "   - Avoid redundant details, filler text, or over-documentation"
+              echo "7. **CONCISENESS (CRITICAL)**:"
+              echo "   - Every addition must earn its place - no filler, no redundancy"
+              echo "   - Add ONLY the most important details about each change"
+              echo "   - Use short bullet points, not paragraphs"
+              echo "   - Do NOT rewrite, expand, rephrase, or reorganize existing content"
+              echo "   - Do NOT add examples, explanations, or extra context unless absolutely essential"
+              echo "   - If information is already implied by existing docs, do not add it"
+              echo "   - Verbose or padded output WILL BE REJECTED"
               echo ""
               echo "## Response:"
               echo "Output the COMPLETE updated documentation with the user suggestion applied."
@@ -520,6 +690,11 @@ runs:
               echo ""
               echo "## Additional Context:"
               echo "$OTHER_FILES_NOTE"
+              if [ "$TARGET_FILE" != "both" ]; then
+                echo ""
+                echo "## FILE TARGETING:"
+                echo "The user has specifically requested updates to $DOC_FILE ONLY. Focus exclusively on this file."
+              fi
               echo ""
               echo "## Your Task"
               echo "Analyze the PR changes and the user instruction, then determine if the $DOC_FILE needs updates."
@@ -555,19 +730,44 @@ runs:
               echo '   - NO phrases like "Here is the updated", "I have analyzed", etc.'
               echo "   - Start directly with the documentation content"
               echo ""
-              echo "6. **SIGNIFICANCE CHECK**:"
-              echo "   - UPDATE documentation for: new files/modules, new features, API changes, new dependencies, configuration changes, new functionality, data structures, workflow changes"
-              echo "   - ALSO consider: multiple small changes that collectively add up to meaningful updates"
-              echo "   - Skip ONLY: isolated typos, minor code comments, whitespace formatting"
-              echo "   - When in doubt, UPDATE - it is better to document changes than miss them"
+              echo "6. **SIGNIFICANCE CHECK (STRICT - When in doubt, SKIP)**:"
+              if [ "$DOC_FORMAT" = "README" ]; then
+                echo "   - UPDATE README.md ONLY for:"
+                echo "     * New user-facing features or capabilities"
+                echo "     * API changes (new endpoints, changed parameters, new response fields)"
+                echo "     * New external dependencies users need to install or configure"
+                echo "     * Breaking changes that affect user behavior or require migration"
+                echo "     * New configuration options users need to know about"
+                echo "   - DO NOT update README.md for:"
+                echo "     * Internal code refactoring or restructuring"
+                echo "     * Small bug fixes that do not change documented behavior"
+                echo "     * Test additions or test refactoring"
+                echo "     * CI/CD pipeline changes"
+                echo "     * Code style, linting, or formatting changes"
+                echo "     * Internal module reorganization"
+              else
+                echo "   - UPDATE CLAUDE.md ONLY for:"
+                echo "     * New architectural patterns or design decisions"
+                echo "     * New modules, systems, or major structural components"
+                echo "     * Significant structural changes to the codebase layout"
+                echo "     * New development workflows or build processes"
+                echo "   - DO NOT update CLAUDE.md for:"
+                echo "     * Code-level tweaks within existing modules"
+                echo "     * Minor refactors that do not change architecture"
+                echo "     * Bug fixes within existing patterns"
+                echo "     * Test changes"
+                echo "     * Dependency version bumps"
+              fi
+              echo "   - If changes do not clearly meet the above thresholds, output NO_UPDATES_NEEDED"
               echo ""
-              echo "7. **CONCISENESS**:"
-              echo "   - Keep all additions brief, direct, and to the point"
-              echo "   - Use short sentences and bullet points over lengthy paragraphs"
-              echo "   - Add ONLY the essential information needed to understand the change"
-              echo "   - Do NOT rewrite, expand, or rephrase existing content"
-              echo "   - A few precise lines are better than verbose explanations"
-              echo "   - Avoid redundant details, filler text, or over-documentation"
+              echo "7. **CONCISENESS (CRITICAL)**:"
+              echo "   - Every addition must earn its place - no filler, no redundancy"
+              echo "   - Add ONLY the most important details about each change"
+              echo "   - Use short bullet points, not paragraphs"
+              echo "   - Do NOT rewrite, expand, rephrase, or reorganize existing content"
+              echo "   - Do NOT add examples, explanations, or extra context unless absolutely essential"
+              echo "   - If information is already implied by existing docs, do not add it"
+              echo "   - Verbose or padded output WILL BE REJECTED"
               echo ""
               echo "## Decision Process:"
               echo ""
@@ -577,7 +777,7 @@ runs:
               echo "4. Look for changes to existing functionality that users should know about"
               echo "5. Consider the user instruction for guidance on what to focus on"
               echo "6. If ANY of the above exist: Add new information to relevant sections WITHOUT removing existing content"
-              echo '7. ONLY output "NO_UPDATES_NEEDED" if the changes are truly insignificant (like pure formatting)'
+              echo '7. Output "NO_UPDATES_NEEDED" unless changes clearly meet the significance thresholds above'
               echo ""
               echo "## Response:"
               echo "- If significant, relevant updates are needed: Output the COMPLETE updated documentation (with additions only)"
@@ -664,20 +864,45 @@ runs:
           return 0
         }
 
-        # === PHASE 2: UPDATE ALL DETECTED DOCUMENTATION FILES ===
+        # === PHASE 2: UPDATE TARGETED DOCUMENTATION FILES ===
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### Updating Documentation Files:" >> $GITHUB_STEP_SUMMARY
+        echo "File targeting: $TARGET_FILE" >> $GITHUB_STEP_SUMMARY
 
-        if [ "$HAS_README" = true ] && [ "$HAS_CLAUDE" = true ]; then
+        # Determine which files to update based on targeting
+        UPDATE_README=false
+        UPDATE_CLAUDE=false
+
+        if [ "$TARGET_FILE" = "readme" ]; then
+          if [ "$HAS_README" = true ]; then
+            UPDATE_README=true
+          else
+            echo "WARNING: README requested but not found in repository" >> $GITHUB_STEP_SUMMARY
+          fi
+        elif [ "$TARGET_FILE" = "claude" ]; then
+          if [ "$HAS_CLAUDE" = true ]; then
+            UPDATE_CLAUDE=true
+          else
+            echo "WARNING: CLAUDE.md requested but not found in repository" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          # Default: update both if they exist
+          UPDATE_README=$HAS_README
+          UPDATE_CLAUDE=$HAS_CLAUDE
+        fi
+
+        if [ "$UPDATE_README" = true ] && [ "$UPDATE_CLAUDE" = true ]; then
           echo "Both $README_FILE and $CLAUDE_FILE detected - updating both" >> $GITHUB_STEP_SUMMARY
           update_doc_file "$README_FILE" "README" "$CLAUDE_FILE also exists in this repository and is being updated separately for AI/Claude Code context. Focus this $README_FILE update on user-facing documentation only." || echo "  Failed to update $README_FILE" >> $GITHUB_STEP_SUMMARY
           update_doc_file "$CLAUDE_FILE" "CLAUDE" "$README_FILE also exists in this repository and is being updated separately for user-facing documentation. Focus this $CLAUDE_FILE update on AI/Claude Code technical context only." || echo "  Failed to update $CLAUDE_FILE" >> $GITHUB_STEP_SUMMARY
-        elif [ "$HAS_README" = true ]; then
-          echo "Only $README_FILE detected - updating $README_FILE" >> $GITHUB_STEP_SUMMARY
-          update_doc_file "$README_FILE" "README" "This is the only documentation file in the repository." || echo "  Failed to update $README_FILE" >> $GITHUB_STEP_SUMMARY
-        elif [ "$HAS_CLAUDE" = true ]; then
-          echo "Only $CLAUDE_FILE detected - updating $CLAUDE_FILE" >> $GITHUB_STEP_SUMMARY
-          update_doc_file "$CLAUDE_FILE" "CLAUDE" "This is the only documentation file in the repository." || echo "  Failed to update $CLAUDE_FILE" >> $GITHUB_STEP_SUMMARY
+        elif [ "$UPDATE_README" = true ]; then
+          echo "Targeting $README_FILE only" >> $GITHUB_STEP_SUMMARY
+          update_doc_file "$README_FILE" "README" "Only README.md is being updated per user request." || echo "  Failed to update $README_FILE" >> $GITHUB_STEP_SUMMARY
+        elif [ "$UPDATE_CLAUDE" = true ]; then
+          echo "Targeting $CLAUDE_FILE only" >> $GITHUB_STEP_SUMMARY
+          update_doc_file "$CLAUDE_FILE" "CLAUDE" "Only CLAUDE.md is being updated per user request." || echo "  Failed to update $CLAUDE_FILE" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "No documentation files to update" >> $GITHUB_STEP_SUMMARY
         fi
 
         # Set final output
@@ -698,7 +923,7 @@ runs:
 
     - name: Commit Changes to PR
       id: commit-changes
-      if: steps.claude-analysis.outputs.skip_analysis != 'true'
+      if: steps.claude-analysis.outputs.skip_analysis != 'true' && steps.validate.outputs.is_revert != 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
@@ -817,9 +1042,16 @@ runs:
         VALID: ${{ steps.validate.outputs.valid }}
         IS_DOCSYNC: ${{ steps.verify-pr.outputs.is_docsync_pr }}
         UPDATED: ${{ steps.commit-changes.outputs.updated }}
+        IS_REVERT: ${{ steps.validate.outputs.is_revert }}
+        REVERT_DONE: ${{ steps.handle-revert.outputs.revert_done }}
       run: |
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "## Action Summary" >> $GITHUB_STEP_SUMMARY
         echo "- **Comment Valid**: ${VALID:-false}" >> $GITHUB_STEP_SUMMARY
         echo "- **Is DocSync PR**: ${IS_DOCSYNC:-false}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Documentation Updated**: ${UPDATED:-false}" >> $GITHUB_STEP_SUMMARY
+        if [ "${IS_REVERT}" = "true" ]; then
+          echo "- **Revert Requested**: true" >> $GITHUB_STEP_SUMMARY
+          echo "- **Revert Completed**: ${REVERT_DONE:-false}" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- **Documentation Updated**: ${UPDATED:-false}" >> $GITHUB_STEP_SUMMARY
+        fi
