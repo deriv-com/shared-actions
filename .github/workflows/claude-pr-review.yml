@@ -174,10 +174,10 @@ jobs:
           echo "$PR_AUTHOR" > /tmp/pr_author.txt
           echo "$PR_BRANCH" > /tmp/pr_branch.txt
 
-          # Filter noise files from the diff — generated, vendored, and lock files
-          # add bulk with zero review value. We strip their hunks entirely, keeping
-          # only the "diff --git" header line so the changed-files list stays accurate.
-          NOISE_PATTERN='package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.snap|\.min\.js|\.min\.css|dist/|build/|\.generated\.|__generated__|/vendor/|\.pb\.go|_test\.snap'
+          # Filter noise files from the diff — generated, vendored, lock, test, and
+          # style files add bulk with zero review value. We strip their hunks entirely,
+          # keeping only the "diff --git" header line so the changed-files list stays accurate.
+          NOISE_PATTERN='package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.snap|\.min\.js|\.min\.css|dist/|build/|\.generated\.|__generated__|/vendor/|\.pb\.go|_test\.snap|\.spec\.(tsx?|jsx?)|/__tests__/|\.scss$|\.md$'
           awk -v noise="$NOISE_PATTERN" '
             /^diff --git / {
               in_noise = ($0 ~ noise)
@@ -240,11 +240,11 @@ jobs:
           # from data and enables Anthropic prompt caching across repeated calls
           printf '%s' "$PROMPT_TEMPLATE" > /tmp/system_prompt.txt
 
-          # Cap the diff at 150 KB to keep the payload manageable for large PRs.
-          # GitHub's Compare API can return multi-MB diffs that serve no extra value
-          # once Claude's effective review window is saturated.
+          # Cap the diff at 500 KB — at ~4 chars/token this is ~125K tokens, well within
+          # Claude Sonnet's 200K context window while leaving room for system prompt + output.
+          # Noise filtering above handles most large PRs before this cap is ever reached.
           DIFF_SIZE=$(wc -c < /tmp/pr_diff.txt)
-          DIFF_CAP=150000
+          DIFF_CAP=500000
           if [ "$DIFF_SIZE" -gt "$DIFF_CAP" ]; then
             echo "⚠️ Diff is ${DIFF_SIZE} bytes — truncating to ${DIFF_CAP} bytes"
             PR_DIFF=$(head -c "$DIFF_CAP" /tmp/pr_diff.txt)
@@ -340,7 +340,7 @@ jobs:
             -H "Content-Type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
-            -d "$PAYLOAD")
+            -d @/tmp/payload.json)
 
           [[ "$HTTP_CODE" != "200" ]] && echo "❌ API failed: $HTTP_CODE" && cat /tmp/api_response.json && exit 1
 
