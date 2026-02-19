@@ -6,7 +6,7 @@ on:
       claude_model:
         description: "Claude model to use for review"
         required: false
-        default: "claude-sonnet-4-20250514"
+        default: "claude-sonnet-4-6"
         type: string
       claude_temperature:
         description: "Temperature for Claude responses (0-1)"
