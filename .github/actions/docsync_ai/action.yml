@@ -110,6 +110,7 @@ runs:
         if [ "$PR_COUNT" -eq 0 ]; then
           echo "No merged PRs found in the last 7 days - skipping documentation update" >> $GITHUB_STEP_SUMMARY
           echo "skip_analysis=true" >> $GITHUB_OUTPUT
+          rm -rf "$TEMP_DIR"
           exit 0
         fi
 
@@ -230,6 +231,7 @@ runs:
         CHANGED_FILES: ${{ steps.pr-details.outputs.changed_files }}
       run: |
         set -e
+        trap '[ $? -ne 0 ] && rm -rf "$TEMP_DIR" 2>/dev/null' EXIT
 
         echo "## Claude Sonnet 4.5 Analysis" >> $GITHUB_STEP_SUMMARY
         echo "Model: claude-sonnet-4-5" >> $GITHUB_STEP_SUMMARY
@@ -314,6 +316,139 @@ runs:
           PR_DIFF="No diff available"
         fi
 
+        # === DIFF SIZE MANAGEMENT ===
+        # If the combined diff exceeds Claude's context window, chunk and summarize
+        MAX_DIFF_CHARS=600000
+        CHUNK_MAX_CHARS=500000
+        DIFF_SIZE=${#PR_DIFF}
+
+        if [ "$DIFF_SIZE" -gt "$MAX_DIFF_CHARS" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Large Diff Detected" >> $GITHUB_STEP_SUMMARY
+          echo "Combined diff is $DIFF_SIZE chars (limit: $MAX_DIFF_CHARS). Chunking and summarizing..." >> $GITHUB_STEP_SUMMARY
+
+          CHUNK_DIR="$TEMP_DIR/diff_chunks"
+          rm -rf "$CHUNK_DIR"
+          mkdir -p "$CHUNK_DIR"
+
+          # Split diff into chunks at "diff --git" boundaries, each ≤ CHUNK_MAX_CHARS
+          awk -v max="$CHUNK_MAX_CHARS" -v dir="$CHUNK_DIR" '
+            BEGIN { chunk=1; size=0; file=dir "/chunk_1.txt" }
+            /^diff --git / {
+              if (size > max && size > 0) {
+                close(file)
+                chunk++
+                size=0
+                file=dir "/chunk_" chunk ".txt"
+              }
+            }
+            { print >> file; size += length($0) + 1 }
+            END { close(file); print chunk > dir "/chunk_count.txt" }
+          ' "$TEMP_DIR/pr_diff.txt"
+
+          TOTAL_CHUNKS=$(cat "$CHUNK_DIR/chunk_count.txt" 2>/dev/null || echo "1")
+          echo "Split into $TOTAL_CHUNKS chunk(s)" >> $GITHUB_STEP_SUMMARY
+
+          ALL_SUMMARIES=""
+          for i in $(seq 1 "$TOTAL_CHUNKS"); do
+            CHUNK_PATH="$CHUNK_DIR/chunk_${i}.txt"
+            [ -f "$CHUNK_PATH" ] || continue
+            CHUNK_BYTES=$(wc -c < "$CHUNK_PATH" | tr -d ' ')
+            echo "  Summarizing chunk $i/$TOTAL_CHUNKS (~$CHUNK_BYTES chars)..." >> $GITHUB_STEP_SUMMARY
+
+            # Build summarization prompt
+            SPROMPT_FILE="$TEMP_DIR/sprompt_${i}.txt"
+            {
+              echo "You are analyzing code changes to identify documentation-relevant updates for root-level project documentation (README.md / CLAUDE.md)."
+              echo ""
+              echo "Repository: $REPO_NAME"
+              echo ""
+              echo "Review the code diff below and extract ONLY changes that would affect root-level project documentation:"
+              echo "- New features, modules, or public APIs"
+              echo "- Breaking changes or changed behavior"
+              echo "- New dependencies"
+              echo "- Major configuration changes"
+              echo "- Changes to project setup, installation, or usage"
+              echo ""
+              echo "For each doc-relevant change found, provide:"
+              echo "1. A concise description of what changed"
+              echo "2. The files involved"
+              echo "3. Why it matters for root-level documentation"
+              echo ""
+              echo "If nothing in this diff chunk is relevant to root-level documentation, output exactly: NO_DOC_RELEVANT_CHANGES"
+              echo ""
+              echo "Code diff (chunk $i of $TOTAL_CHUNKS):"
+              echo '```diff'
+              cat "$CHUNK_PATH"
+              echo '```'
+            } > "$SPROMPT_FILE"
+            chmod 600 "$SPROMPT_FILE"
+
+            # Build API request
+            SREQUEST_FILE="$TEMP_DIR/srequest_${i}.json"
+            jq -n \
+              --arg model "claude-sonnet-4-5" \
+              --argjson max_tokens 4096 \
+              --rawfile content "$SPROMPT_FILE" \
+              '{
+                model: $model,
+                max_tokens: $max_tokens,
+                messages: [{
+                  role: "user",
+                  content: $content
+                }]
+              }' > "$SREQUEST_FILE"
+            chmod 600 "$SREQUEST_FILE"
+
+            # Call Claude API for chunk summarization
+            SRESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+              -H "content-type: application/json" \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -d @"$SREQUEST_FILE")
+
+            rm -f "$SREQUEST_FILE" "$SPROMPT_FILE"
+
+            # Validate response
+            if ! echo "$SRESPONSE" | jq empty 2>/dev/null; then
+              echo "  Warning: Invalid response for chunk $i" >> $GITHUB_STEP_SUMMARY
+              continue
+            fi
+
+            if echo "$SRESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+              SERR_TYPE=$(echo "$SRESPONSE" | jq -r '.error.type // "unknown"')
+              echo "  Warning: API error for chunk $i: $SERR_TYPE" >> $GITHUB_STEP_SUMMARY
+              continue
+            fi
+
+            CHUNK_SUMMARY=$(echo "$SRESPONSE" | jq -r '.content[0].text // ""' | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
+
+            if [ -n "$CHUNK_SUMMARY" ] && ! echo "$CHUNK_SUMMARY" | grep -q "NO_DOC_RELEVANT_CHANGES"; then
+              ALL_SUMMARIES="${ALL_SUMMARIES}
+
+              --- Chunk $i Analysis ---
+              ${CHUNK_SUMMARY}"
+              echo "  Chunk $i: doc-relevant changes found" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "  Chunk $i: no doc-relevant changes" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          rm -rf "$CHUNK_DIR"
+
+          # Replace PR_DIFF with summaries for the update prompt
+          if [ -n "$ALL_SUMMARIES" ]; then
+            PR_DIFF="[SUMMARIZED — Original diff was ${DIFF_SIZE} chars. Each chunk was analyzed by Claude Sonnet 4.5 for documentation-relevant changes.]
+            ${ALL_SUMMARIES}"
+            echo "Diff chunking complete — summaries ready for update prompt" >> $GITHUB_STEP_SUMMARY
+          else
+            PR_DIFF="[ANALYZED — Original diff was ${DIFF_SIZE} chars across $TOTAL_CHUNKS chunks. No documentation-relevant changes were identified in any chunk.]"
+            echo "No doc-relevant changes found in any chunk" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "Diff size: $DIFF_SIZE chars (within context limits)" >> $GITHUB_STEP_SUMMARY
+        fi
+
         # Get repository structure (more restrictive search)
         REPO_STRUCTURE=$(find . -maxdepth 3 -type f \
           \( -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" -o -name "*.py" -o -name "*.go" -o -name "*.java" -o -name "*.yml" -o -name "*.yaml" \) \
@@ -375,6 +510,8 @@ runs:
             echo "Repository: $REPO_NAME"
             echo ""
             echo "**CRITICAL**: You MUST maintain the project identity. This is NOT a different project. Do NOT replace this documentation with content about any other project, library, or tool."
+            echo ""
+            echo "**ROOT-LEVEL DOCS**: These are the root-level documentation files for the entire repository. They should contain only high-level, project-wide information that matters to users and contributors — NOT granular implementation details of individual files, functions, or internal logic."
             echo ""
             echo "## Context - Weekly PR Summary"
             echo "The following PRs were merged to $BASE_BRANCH in the past week:"
@@ -441,44 +578,20 @@ runs:
             echo '   - NO phrases like "Here is the updated", "I have analyzed", etc.'
             echo "   - Start directly with the documentation content"
             echo ""
-            echo "6. **SIGNIFICANCE CHECK (STRICT - When in doubt, SKIP)**:"
-            if [ "$DOC_FORMAT" = "README" ]; then
-              echo "   - UPDATE README.md ONLY for:"
-              echo "     * New user-facing features or capabilities"
-              echo "     * API changes (new endpoints, changed parameters, new response fields)"
-              echo "     * New external dependencies users need to install or configure"
-              echo "     * Breaking changes that affect user behavior or require migration"
-              echo "     * New configuration options users need to know about"
-              echo "   - DO NOT update README.md for:"
-              echo "     * Internal code refactoring or restructuring"
-              echo "     * Small bug fixes that do not change documented behavior"
-              echo "     * Test additions or test refactoring"
-              echo "     * CI/CD pipeline changes"
-              echo "     * Code style, linting, or formatting changes"
-              echo "     * Internal module reorganization"
-            else
-              echo "   - UPDATE CLAUDE.md ONLY for:"
-              echo "     * New architectural patterns or design decisions"
-              echo "     * New modules, systems, or major structural components"
-              echo "     * Significant structural changes to the codebase layout"
-              echo "     * New development workflows or build processes"
-              echo "   - DO NOT update CLAUDE.md for:"
-              echo "     * Code-level tweaks within existing modules"
-              echo "     * Minor refactors that do not change architecture"
-              echo "     * Bug fixes within existing patterns"
-              echo "     * Test changes"
-              echo "     * Dependency version bumps"
-            fi
-            echo "   - If changes do not clearly meet the above thresholds, output NO_UPDATES_NEEDED"
+            echo "6. **SIGNIFICANCE CHECK — THINK LIKE A SOFTWARE ARCHITECT**:"
+            echo "   - Evaluate each change from the perspective of a software architect deciding what belongs in root-level project documentation"
+            echo "   - UPDATE for changes that alter the project's public surface: new features, breaking changes, new modules, API changes, new dependencies, major configuration changes"
+            echo "   - SKIP changes that are internal to the codebase: refactors, minor bug fixes, test additions, code comments, whitespace, file reorganization, CI/CD pipeline tweaks, implementation details"
+            echo "   - When in doubt, assess whether a user or new contributor NEEDS this information at the project level — if not, do not update"
+            echo "   - Output NO_UPDATES_NEEDED unless the changes genuinely warrant documentation at the root level"
             echo ""
-            echo "7. **CONCISENESS (CRITICAL)**:"
-            echo "   - Every addition must earn its place - no filler, no redundancy"
-            echo "   - Add ONLY the most important details about each change"
-            echo "   - Use short bullet points, not paragraphs"
-            echo "   - Do NOT rewrite, expand, rephrase, or reorganize existing content"
-            echo "   - Do NOT add examples, explanations, or extra context unless absolutely essential"
-            echo "   - If information is already implied by existing docs, do not add it"
-            echo "   - Verbose or padded output WILL BE REJECTED"
+            echo "7. **CONCISENESS — THIS IS CRITICAL**:"
+            echo "   - Add ONLY the most important, user-facing information"
+            echo "   - One or two bullet points per feature/change is sufficient"
+            echo "   - NEVER add verbose explanations, background context, or implementation details"
+            echo "   - Do NOT rewrite, expand, or rephrase existing content"
+            echo "   - If a change can be described in one line, use one line"
+            echo "   - Omit anything a developer could infer from the code itself"
             echo ""
             echo "## Decision Process:"
             echo ""
@@ -487,7 +600,7 @@ runs:
             echo "3. Check if ANY new files, modules, functions, or features were added"
             echo "4. Look for changes to existing functionality that users should know about"
             echo "5. If ANY of the above exist: Add new information to relevant sections WITHOUT removing existing content"
-            echo '6. Output "NO_UPDATES_NEEDED" unless changes clearly meet the significance thresholds above'
+            echo '6. Output "NO_UPDATES_NEEDED" if no changes warrant root-level documentation updates, applying the architectural judgment from the significance check above'
             echo ""
             echo "## Response:"
             echo "- If significant, relevant updates are needed: Output the COMPLETE updated documentation (with additions only)"
@@ -598,8 +711,7 @@ runs:
           echo "No documentation updates needed" >> $GITHUB_STEP_SUMMARY
         fi
 
-        # Clean up temporary directory
-        rm -rf "$TEMP_DIR"
+        # Note: TEMP_DIR cleanup deferred — PR creation step still needs pr_numbers.txt
 
     - name: Check for Documentation Changes
       id: check-changes
@@ -755,17 +867,6 @@ runs:
         - [ ] Formatting and style are consistent
         - [ ] Examples and code snippets are up to date
 
-        ### Quick Actions
-        Copy and paste any of these comments to interact with DocSync AI:
-
-        | Command | Description |
-        |---------|-------------|
-        | \`docsync: update only readme\` | Update only README.md |
-        | \`docsync: update only claude\` | Update only CLAUDE.md |
-        | \`docsync: make it more concise\` | Make documentation updates more concise |
-        | \`docsync: revert to previous commit\` | Revert to the previous DocSync update |
-        | \`docsync: [your instruction]\` | Custom instruction for documentation changes |
-
         ---
         *Automated by DocSync AI (Weekly Sync)*"
 
@@ -796,9 +897,83 @@ runs:
         echo "### Documentation PR Created: #$PR_NUMBER" >> $GITHUB_STEP_SUMMARY
         echo "$PR_URL" >> $GITHUB_STEP_SUMMARY
 
+        # Clean up temporary directory now that pr_numbers.txt has been read
+        rm -rf "$TEMP_DIR" 2>/dev/null || true
+
+    - name: Post Command Reference on DocSync PR
+      if: steps.create-doc-pr.outputs.pr_created == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ steps.create-doc-pr.outputs.pr_number }}
+      run: |
+        # Build the welcome comment with individually copyable commands
+        {
+          echo "## 🤖 DocSync AI — Command Reference"
+          echo ""
+          echo "Interact with this PR using the commands below. Each command is individually copyable."
+          echo ""
+          echo "---"
+          echo ""
+          echo "**Undo the last documentation update**"
+          echo '```'
+          echo "@docbot revert last change"
+          echo '```'
+          echo ""
+          echo "**Restore docs to a specific commit**"
+          echo '```'
+          echo "@docbot revert to <commit-hash>"
+          echo '```'
+          echo ""
+          echo "**Update only README.md**"
+          echo '```'
+          echo "@docbot update only readme.md <your instruction here>"
+          echo '```'
+          echo ""
+          echo "**Update only CLAUDE.md**"
+          echo '```'
+          echo "@docbot update only claude.md <your instruction here>"
+          echo '```'
+          echo ""
+          echo "**Update all docs with a free-form instruction**"
+          echo '```'
+          echo "@docbot <your instruction here>"
+          echo '```'
+          echo ""
+          echo "---"
+          echo ""
+          echo "### 💡 Examples"
+          echo ""
+          echo "Add usage examples for the auth API:"
+          echo '```'
+          echo "@docbot add usage examples for the auth API"
+          echo '```'
+          echo ""
+          echo "Fix installation steps in README only:"
+          echo '```'
+          echo "@docbot update only readme.md fix the installation steps"
+          echo '```'
+          echo ""
+          echo "Add architecture notes in CLAUDE.md only:"
+          echo '```'
+          echo "@docbot update only claude.md add architecture details for the new module"
+          echo '```'
+          echo ""
+          echo "---"
+          echo "_A 👍 reaction on your comment means DocSync AI is processing your request._"
+        } > /tmp/docbot_welcome.md
+
+        gh pr comment "$PR_NUMBER" --body-file /tmp/docbot_welcome.md
+        rm -f /tmp/docbot_welcome.md
+
+        echo "📋 Posted command reference on PR #$PR_NUMBER" >> $GITHUB_STEP_SUMMARY
+
     - name: No Updates Needed
       if: steps.pr-details.outputs.skip_analysis == 'true' || steps.claude-analysis.outputs.skip_analysis == 'true' || steps.check-changes.outputs.has_changes == 'false'
       shell: bash
+      env:
+        TEMP_DIR: ${{ steps.pr-details.outputs.temp_dir }}
       run: |
         echo "pr_created=false" >> $GITHUB_OUTPUT
         echo "Documentation is up to date - no changes needed" >> $GITHUB_STEP_SUMMARY
+        rm -rf "$TEMP_DIR" 2>/dev/null || true
