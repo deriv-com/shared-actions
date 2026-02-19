@@ -239,6 +239,7 @@ jobs:
           # Move full prompt template to system prompt — cleanly separates instructions
           # from data and enables Anthropic prompt caching across repeated calls
           printf '%s' "$PROMPT_TEMPLATE" > /tmp/system_prompt.txt
+          unset PROMPT_TEMPLATE  # free env space to avoid E2BIG when exec'ing jq
 
           # Cap the diff at 500 KB — at ~4 chars/token this is ~125K tokens, well within
           # Claude Sonnet's 200K context window while leaving room for system prompt + output.
