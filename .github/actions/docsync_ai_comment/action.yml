@@ -1,5 +1,5 @@
 name: "DocSync AI - Update from Comment"
-description: "Update documentation based on user comment suggestions on any PR"
+description: "Update documentation based on @docbot commands on any PR"
 
 inputs:
   github_token:
@@ -15,8 +15,12 @@ inputs:
     description: "PR number where comment was made"
     required: true
   comment_body:
-    description: "Comment body with user suggestion (must start with 'docsync:')"
+    description: "Comment body (must start with '@docbot')"
     required: true
+  comment_id:
+    description: "Comment ID for adding thumbs-up reaction"
+    required: false
+    default: ""
   base_branch:
     description: "Base branch for documentation PR (e.g., master or main)"
     required: false
@@ -25,10 +29,13 @@ inputs:
 outputs:
   updated:
     description: "Whether documentation was updated"
-    value: "${{ steps.handle-revert.outputs.revert_done == 'true' && 'true' || steps.commit-changes.outputs.updated }}"
-  suggestion_valid:
-    description: "Whether the comment had valid docsync prefix"
-    value: "${{ steps.validate.outputs.valid }}"
+    value: "${{ steps.commit-changes.outputs.updated == 'true' || steps.revert-changes.outputs.updated == 'true' }}"
+  command_valid:
+    description: "Whether the comment had a valid @docbot command"
+    value: "${{ steps.parse-command.outputs.valid }}"
+  command:
+    description: "The parsed command type"
+    value: "${{ steps.parse-command.outputs.command }}"
   is_docsync_pr:
     description: "Whether the PR is a DocSync PR"
     value: "${{ steps.verify-pr.outputs.is_docsync_pr }}"
@@ -36,15 +43,21 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Validate Comment Prefix
-      id: validate
+    # ──────────────────────────────────────────────
+    # STEP 1: Parse the @docbot command
+    # (👍 reaction is handled at the workflow level for instant feedback)
+    # ──────────────────────────────────────────────
+    - name: Parse Command
+      id: parse-command
       shell: bash
       env:
         COMMENT_BODY: ${{ inputs.comment_body }}
+        COMMENT_ID: ${{ inputs.comment_id }}
       run: |
         set -e
 
-        echo "## Validating Comment" >> $GITHUB_STEP_SUMMARY
+        echo "## Parsing @docbot Command" >> $GITHUB_STEP_SUMMARY
+        echo "**Comment ID:** \`${COMMENT_ID:-N/A}\`" >> $GITHUB_STEP_SUMMARY
 
         # Sanitize comment body (remove null bytes, limit size)
         COMMENT_BODY_CLEAN=$(echo "$COMMENT_BODY" | tr -d '\000' | iconv -c -t UTF-8//IGNORE | head -c 10000)
@@ -52,78 +65,104 @@ runs:
         # Validate for suspicious patterns
         if echo "$COMMENT_BODY_CLEAN" | grep -qE '\$\(|\`|;[[:space:]]*curl|;[[:space:]]*wget|eval|exec'; then
           echo "Warning: Suspicious pattern detected in comment" >> $GITHUB_STEP_SUMMARY
-          # Continue but log warning
         fi
 
-        # Check if comment starts with "docsync:" (case-insensitive)
-        if echo "$COMMENT_BODY_CLEAN" | grep -qiE "^docsync:[[:space:]]"; then
-          echo "valid=true" >> $GITHUB_OUTPUT
-          echo "Valid docsync comment detected" >> $GITHUB_STEP_SUMMARY
-
-          # Extract suggestion safely (everything after "docsync:")
-          SUGGESTION=$(echo "$COMMENT_BODY_CLEAN" | sed -E 's/^[Dd][Oo][Cc][Ss][Yy][Nn][Cc]:[[:space:]]*//')
-
-          # Validate suggestion is not empty
-          if [ -z "$SUGGESTION" ]; then
-            echo "valid=false" >> $GITHUB_OUTPUT
-            echo "Comment suggestion is empty" >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
-
-          # Limit suggestion size for output
-          SUGGESTION_DISPLAY=$(echo "$SUGGESTION" | head -c 500)
-
-          echo "suggestion<<EOF" >> $GITHUB_OUTPUT
-          echo "$SUGGESTION" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-          echo "### User Suggestion:" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "$SUGGESTION_DISPLAY" >> $GITHUB_STEP_SUMMARY
-          if [ ${#SUGGESTION} -gt 500 ]; then
-            echo "... (truncated for display)" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
-          # Detect file targeting keywords in suggestion
-          TARGET_FILE="both"
-          SUGGESTION_LOWER=$(echo "$SUGGESTION" | tr '[:upper:]' '[:lower:]')
-
-          # Explicit targeting keywords (highest priority)
-          if echo "$SUGGESTION_LOWER" | grep -qiE '(only readme|readme only|update only readme|update readme only)'; then
-            TARGET_FILE="readme"
-          elif echo "$SUGGESTION_LOWER" | grep -qiE '(only claude|claude only|update only claude|update claude only)'; then
-            TARGET_FILE="claude"
-          # Natural language: if suggestion mentions one file but not the other
-          elif echo "$SUGGESTION_LOWER" | grep -qE '\breadme\b' && ! echo "$SUGGESTION_LOWER" | grep -qE '\bclaude\b'; then
-            TARGET_FILE="readme"
-          elif echo "$SUGGESTION_LOWER" | grep -qE '\bclaude\b' && ! echo "$SUGGESTION_LOWER" | grep -qE '\breadme\b'; then
-            TARGET_FILE="claude"
-          fi
-
-          echo "target_file=$TARGET_FILE" >> $GITHUB_OUTPUT
-          if [ "$TARGET_FILE" != "both" ]; then
-            echo "File targeting detected: $TARGET_FILE only" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # Detect revert command
-          IS_REVERT=false
-          SUGGESTION_TRIMMED=$(echo "$SUGGESTION_LOWER" | xargs)
-          if echo "$SUGGESTION_TRIMMED" | grep -qiE '^(revert to previous commit|revert|undo last update|undo|revert to previous)$'; then
-            IS_REVERT=true
-            echo "Revert command detected" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          echo "is_revert=$IS_REVERT" >> $GITHUB_OUTPUT
-        else
+        # Check if first line starts with "@docbot" (case-insensitive)
+        FIRST_LINE=$(echo "$COMMENT_BODY_CLEAN" | head -1)
+        if ! echo "$FIRST_LINE" | grep -qiE "^@docbot([[:space:]]|$)"; then
           echo "valid=false" >> $GITHUB_OUTPUT
-          echo "Comment does not start with 'docsync:' - skipping" >> $GITHUB_STEP_SUMMARY
+          echo "command=none" >> $GITHUB_OUTPUT
+          echo "Comment does not start with '@docbot' - skipping" >> $GITHUB_STEP_SUMMARY
           exit 0
         fi
 
+        echo "valid=true" >> $GITHUB_OUTPUT
+
+        # Extract everything after "@docbot "
+        INSTRUCTION=$(echo "$COMMENT_BODY_CLEAN" | sed -E '1s/^@[Dd][Oo][Cc][Bb][Oo][Tt][[:space:]]*//')
+        # Trim leading blank lines
+        INSTRUCTION=$(echo "$INSTRUCTION" | sed '/./,$!d')
+
+        # Parse structured commands (case-insensitive)
+        INSTRUCTION_LOWER=$(echo "$INSTRUCTION" | tr '[:upper:]' '[:lower:]' | head -1)
+
+        # ─── revert last change ───
+        if echo "$INSTRUCTION_LOWER" | grep -qE "^revert[[:space:]]+last[[:space:]]+change[s]?[[:space:]]*$"; then
+          echo "command=revert_last" >> $GITHUB_OUTPUT
+          echo "target_file=all" >> $GITHUB_OUTPUT
+          echo "### Command: \`revert last change\`" >> $GITHUB_STEP_SUMMARY
+
+        # ─── revert to <commit-hash> ───
+        elif echo "$INSTRUCTION_LOWER" | grep -qE "^revert[[:space:]]+to[[:space:]]"; then
+          TARGET_HASH=$(echo "$INSTRUCTION" | head -1 | sed -E "s/^[Rr][Ee][Vv][Ee][Rr][Tt][[:space:]]+[Tt][Oo][[:space:]]+['\"]?([a-fA-F0-9]+)['\"]?[[:space:]]*$/\1/")
+          if [[ "$TARGET_HASH" =~ ^[a-fA-F0-9]{7,40}$ ]]; then
+            echo "command=revert_to" >> $GITHUB_OUTPUT
+            echo "target_hash=$TARGET_HASH" >> $GITHUB_OUTPUT
+            echo "target_file=all" >> $GITHUB_OUTPUT
+            echo "### Command: \`revert to $TARGET_HASH\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "valid=false" >> $GITHUB_OUTPUT
+            echo "command=none" >> $GITHUB_OUTPUT
+            echo "Invalid commit hash format" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+        # ─── update only readme.md <instruction> ───
+        elif echo "$INSTRUCTION_LOWER" | grep -qE "^update[[:space:]]+only[[:space:]]+readme(\.md)?([[:space:]]|$)"; then
+          SUGGESTION=$(echo "$INSTRUCTION" | sed -E 's/^[Uu][Pp][Dd][Aa][Tt][Ee][[:space:]]+[Oo][Nn][Ll][Yy][[:space:]]+[Rr][Ee][Aa][Dd][Mm][Ee](\.md)?[[:space:]]*//')
+          if [ -z "$SUGGESTION" ]; then
+            SUGGESTION="Update and improve the documentation"
+          fi
+          echo "command=update" >> $GITHUB_OUTPUT
+          echo "target_file=readme" >> $GITHUB_OUTPUT
+          echo "suggestion<<EOF" >> $GITHUB_OUTPUT
+          echo "$SUGGESTION" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "### Command: \`update only readme.md\`" >> $GITHUB_STEP_SUMMARY
+
+        # ─── update only claude.md <instruction> ───
+        elif echo "$INSTRUCTION_LOWER" | grep -qE "^update[[:space:]]+only[[:space:]]+claude(\.md)?([[:space:]]|$)"; then
+          SUGGESTION=$(echo "$INSTRUCTION" | sed -E 's/^[Uu][Pp][Dd][Aa][Tt][Ee][[:space:]]+[Oo][Nn][Ll][Yy][[:space:]]+[Cc][Ll][Aa][Uu][Dd][Ee](\.md)?[[:space:]]*//')
+          if [ -z "$SUGGESTION" ]; then
+            SUGGESTION="Update and improve the technical documentation"
+          fi
+          echo "command=update" >> $GITHUB_OUTPUT
+          echo "target_file=claude" >> $GITHUB_OUTPUT
+          echo "suggestion<<EOF" >> $GITHUB_OUTPUT
+          echo "$SUGGESTION" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "### Command: \`update only claude.md\`" >> $GITHUB_STEP_SUMMARY
+
+        # ─── general update <instruction> ───
+        else
+          if [ -z "$INSTRUCTION" ]; then
+            echo "valid=false" >> $GITHUB_OUTPUT
+            echo "command=none" >> $GITHUB_OUTPUT
+            echo "Empty instruction after @docbot" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          echo "command=update" >> $GITHUB_OUTPUT
+          echo "target_file=all" >> $GITHUB_OUTPUT
+          echo "suggestion<<EOF" >> $GITHUB_OUTPUT
+          echo "$INSTRUCTION" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "### Command: \`update\`" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Display instruction for summary
+        INSTRUCTION_DISPLAY=$(echo "$INSTRUCTION" | head -c 500)
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Instruction:**" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "$INSTRUCTION_DISPLAY" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+    # ──────────────────────────────────────────────
+    # STEP 3: Verify PR type
+    # ──────────────────────────────────────────────
     - name: Verify PR Type
       id: verify-pr
-      if: steps.validate.outputs.valid == 'true'
+      if: steps.parse-command.outputs.valid == 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
@@ -203,155 +242,188 @@ runs:
 
         if [ "$IS_DOCSYNC_PR" = true ]; then
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**DocSync PR detected** - will apply user suggestion directly" >> $GITHUB_STEP_SUMMARY
+          echo "**DocSync PR detected** - will apply user instruction directly" >> $GITHUB_STEP_SUMMARY
         else
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Regular PR detected** - will analyze PR changes and update documentation" >> $GITHUB_STEP_SUMMARY
         fi
 
+    # ──────────────────────────────────────────────
+    # STEP 4: Checkout PR branch
+    # ──────────────────────────────────────────────
     - name: Checkout PR Branch
-      if: steps.validate.outputs.valid == 'true'
+      if: steps.parse-command.outputs.valid == 'true'
       uses: actions/checkout@v4
       with:
         token: ${{ inputs.github_token }}
         ref: ${{ steps.verify-pr.outputs.pr_branch }}
         fetch-depth: 0
 
-    - name: Handle Revert Command
-      id: handle-revert
-      if: steps.validate.outputs.valid == 'true' && steps.validate.outputs.is_revert == 'true'
+    # ──────────────────────────────────────────────
+    # STEP 5: Handle revert commands
+    # ──────────────────────────────────────────────
+    - name: Handle Revert Commands
+      id: revert-changes
+      if: steps.parse-command.outputs.valid == 'true' && (steps.parse-command.outputs.command == 'revert_last' || steps.parse-command.outputs.command == 'revert_to')
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
         PR_NUMBER: ${{ inputs.pr_number }}
         REPO_NAME: ${{ inputs.repository }}
-        IS_DOCSYNC_PR: ${{ steps.verify-pr.outputs.is_docsync_pr }}
-        BASE_BRANCH: ${{ inputs.base_branch }}
+        COMMAND: ${{ steps.parse-command.outputs.command }}
+        TARGET_HASH: ${{ steps.parse-command.outputs.target_hash }}
       run: |
         set -e
 
-        echo "## Revert Command Detected" >> $GITHUB_STEP_SUMMARY
+        echo "## Handling Revert" >> $GITHUB_STEP_SUMMARY
 
-        # Revert is ONLY available on DocSync PRs
-        if [ "$IS_DOCSYNC_PR" != "true" ]; then
-          echo "Revert is only available on DocSync documentation PRs" >> $GITHUB_STEP_SUMMARY
-
-          COMMENT_BODY="**DocSync AI**: The revert command is only available on DocSync documentation PRs. On regular PRs, please use \`docsync: [your instruction]\` to update documentation."
-
-          gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
-
-          echo "revert_done=false" >> $GITHUB_OUTPUT
-          exit 0
-        fi
-
-        # Find DocSync AI commits on this branch only (not base branch commits)
-        git fetch origin "$BASE_BRANCH"
-        DOCSYNC_COMMITS=$(git log "origin/$BASE_BRANCH..HEAD" --format="%H %s" | grep "DocSync AI:" || echo "")
-
-        echo "### DocSync Commits on PR Branch:" >> $GITHUB_STEP_SUMMARY
-        if [ -n "$DOCSYNC_COMMITS" ]; then
-          echo "$DOCSYNC_COMMITS" | head -5 | while IFS= read -r line; do
-            HASH=$(echo "$line" | cut -c1-8)
-            MSG=$(echo "$line" | cut -d' ' -f2-)
-            echo "- \`$HASH\` $MSG" >> $GITHUB_STEP_SUMMARY
-          done
-        else
-          echo "No DocSync commits found" >> $GITHUB_STEP_SUMMARY
-        fi
-
-        # Count DocSync commits
-        COMMIT_COUNT=0
-        if [ -n "$DOCSYNC_COMMITS" ]; then
-          COMMIT_COUNT=$(echo "$DOCSYNC_COMMITS" | wc -l | tr -d ' ')
-        fi
-
-        if [ "$COMMIT_COUNT" -lt 2 ]; then
-          echo "Not enough DocSync commits to revert (found $COMMIT_COUNT, need at least 2)" >> $GITHUB_STEP_SUMMARY
-
-          COMMENT_BODY="**DocSync AI**: Cannot revert - there is no previous DocSync commit to revert to. This branch needs at least 2 DocSync commits for the revert feature to work."
-
-          gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
-
-          echo "revert_done=false" >> $GITHUB_OUTPUT
-          exit 0
-        fi
-
-        # Get the second DocSync commit (the previous one to revert TO)
-        PREVIOUS_COMMIT=$(echo "$DOCSYNC_COMMITS" | sed -n '2p' | awk '{print $1}')
-
-        # Validate commit hash
-        if ! [[ "$PREVIOUS_COMMIT" =~ ^[a-f0-9]{40}$ ]]; then
-          echo "Invalid commit hash: $PREVIOUS_COMMIT" >> $GITHUB_STEP_SUMMARY
-          echo "revert_done=false" >> $GITHUB_OUTPUT
-          exit 1
-        fi
-
-        echo "Reverting to DocSync commit: ${PREVIOUS_COMMIT:0:8}" >> $GITHUB_STEP_SUMMARY
-
-        # Restore documentation files from the previous DocSync commit
-        REVERTED_FILES=""
-
-        for doc_file in $(find . -maxdepth 1 -type f \( -iname "readme.md" -o -iname "claude.md" \) -print); do
-          doc_file="${doc_file#./}"
-          # Try to restore the file from the previous commit
-          if git show "$PREVIOUS_COMMIT:$doc_file" > /dev/null 2>&1; then
-            git show "$PREVIOUS_COMMIT:$doc_file" > "$doc_file"
-            REVERTED_FILES="$REVERTED_FILES $doc_file"
-            echo "  Reverted $doc_file to state from ${PREVIOUS_COMMIT:0:8}" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "  $doc_file not found in commit ${PREVIOUS_COMMIT:0:8}, skipping" >> $GITHUB_STEP_SUMMARY
-          fi
-        done
-
-        if [ -z "$REVERTED_FILES" ]; then
-          echo "No documentation files could be reverted" >> $GITHUB_STEP_SUMMARY
-
-          COMMENT_BODY="**DocSync AI**: Could not revert - no documentation files found in the previous DocSync commit."
-
-          gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
-
-          echo "revert_done=false" >> $GITHUB_OUTPUT
-          exit 0
-        fi
-
-        # Stage, commit, and push
+        # Configure git
         git config --local user.name "github-actions[bot]"
         git config --local user.email "github-actions[bot]@users.noreply.github.com"
 
-        git add $REVERTED_FILES
+        if [ "$COMMAND" = "revert_last" ]; then
+          echo "### Reverting last DocSync change" >> $GITHUB_STEP_SUMMARY
 
-        git commit -m "$(cat <<'COMMITEOF'
-        DocSync AI: Revert documentation to previous state
+          # Find the last DocSync AI commit on this branch
+          LAST_DOCSYNC_COMMIT=$(git log --author="github-actions\[bot\]" --grep="DocSync AI" --format="%H" -1 2>/dev/null || echo "")
 
-        Reverted documentation to the previous DocSync update.
+          if [ -z "$LAST_DOCSYNC_COMMIT" ]; then
+            echo "No DocSync AI commit found to revert" >> $GITHUB_STEP_SUMMARY
+            echo "updated=false" >> $GITHUB_OUTPUT
 
-        Generated by DocSync AI
-        COMMITEOF
-        )"
+            # Post comment informing user
+            gh pr comment "$PR_NUMBER" --body "**@docbot** No previous DocSync AI commit found to revert on this branch."
+            exit 0
+          fi
 
-        git push origin HEAD
+          COMMIT_MSG=$(git log --format="%s" -1 "$LAST_DOCSYNC_COMMIT" | head -c 200)
+          COMMIT_SHORT=$(echo "$LAST_DOCSYNC_COMMIT" | cut -c1-7)
+          echo "Found commit: \`$COMMIT_SHORT\` — $COMMIT_MSG" >> $GITHUB_STEP_SUMMARY
 
-        # Post confirmation comment
-        CHANGED_FILES_LIST=$(echo "$REVERTED_FILES" | xargs -n1 | sed 's/^/- /')
-        COMMENT_BODY="**DocSync AI: Documentation Reverted**
+          # Revert the commit
+          if git revert --no-edit "$LAST_DOCSYNC_COMMIT"; then
+            git push origin HEAD
 
-        Documentation has been reverted to the previous DocSync update (commit \`${PREVIOUS_COMMIT:0:8}\`).
+            echo "updated=true" >> $GITHUB_OUTPUT
+            echo "✅ Successfully reverted" >> $GITHUB_STEP_SUMMARY
 
-        **Reverted Files:**
-        $CHANGED_FILES_LIST
+            # Post confirmation comment
+            COMMENT_BODY="**DocSync AI — Revert Applied** :rewind:
+
+        Reverted commit \`$COMMIT_SHORT\`: $COMMIT_MSG
 
         ---
         *Automated by DocSync AI*"
+            gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
+          else
+            echo "updated=false" >> $GITHUB_OUTPUT
+            echo "❌ Revert failed (possible conflicts)" >> $GITHUB_STEP_SUMMARY
+            git revert --abort 2>/dev/null || true
 
-        gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
+            gh pr comment "$PR_NUMBER" --body "**@docbot** Revert failed due to conflicts. Please revert manually."
+          fi
 
-        echo "revert_done=true" >> $GITHUB_OUTPUT
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### Revert completed successfully" >> $GITHUB_STEP_SUMMARY
+        elif [ "$COMMAND" = "revert_to" ]; then
+          echo "### Reverting documentation to commit \`$TARGET_HASH\`" >> $GITHUB_STEP_SUMMARY
 
+          # Validate hash format
+          if ! [[ "$TARGET_HASH" =~ ^[a-fA-F0-9]{7,40}$ ]]; then
+            echo "Invalid commit hash format" >> $GITHUB_STEP_SUMMARY
+            echo "updated=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          # Validate the commit exists
+          if ! git cat-file -e "$TARGET_HASH" 2>/dev/null; then
+            echo "Commit \`$TARGET_HASH\` not found in history" >> $GITHUB_STEP_SUMMARY
+            echo "updated=false" >> $GITHUB_OUTPUT
+            gh pr comment "$PR_NUMBER" --body "**@docbot** Commit \`$TARGET_HASH\` not found in this branch's history."
+            exit 0
+          fi
+
+          TARGET_SHORT=$(echo "$TARGET_HASH" | cut -c1-7)
+
+          # Find documentation files in the current checkout
+          README_FILE=$(find . -maxdepth 1 -type f -iname "readme.md" -print -quit 2>/dev/null)
+          CLAUDE_FILE=$(find . -maxdepth 1 -type f -iname "claude.md" -print -quit 2>/dev/null)
+
+          RESTORED_FILES=""
+
+          # Restore doc files from the target commit
+          if [ -n "$README_FILE" ]; then
+            README_FILE="${README_FILE#./}"
+            if git checkout "$TARGET_HASH" -- "$README_FILE" 2>/dev/null; then
+              RESTORED_FILES="$RESTORED_FILES $README_FILE"
+            fi
+          fi
+
+          if [ -n "$CLAUDE_FILE" ]; then
+            CLAUDE_FILE="${CLAUDE_FILE#./}"
+            if git checkout "$TARGET_HASH" -- "$CLAUDE_FILE" 2>/dev/null; then
+              RESTORED_FILES="$RESTORED_FILES $CLAUDE_FILE"
+            fi
+          fi
+
+          if [ -z "$RESTORED_FILES" ]; then
+            echo "No documentation files found at commit \`$TARGET_SHORT\`" >> $GITHUB_STEP_SUMMARY
+            echo "updated=false" >> $GITHUB_OUTPUT
+            gh pr comment "$PR_NUMBER" --body "**@docbot** No documentation files (README.md / CLAUDE.md) found at commit \`$TARGET_SHORT\`."
+            exit 0
+          fi
+
+          # Verify only doc files changed
+          git add -A
+          CHANGED=$(git diff --cached --name-only)
+          for file in $CHANGED; do
+            FILE_LOWER=$(echo "$file" | tr '[:upper:]' '[:lower:]')
+            if [[ "$FILE_LOWER" != "readme.md" ]] && [[ "$FILE_LOWER" != "claude.md" ]]; then
+              echo "ERROR: Non-documentation file changed: $file" >> $GITHUB_STEP_SUMMARY
+              git reset --hard
+              echo "updated=false" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          done
+
+          if git diff --cached --quiet; then
+            echo "Documentation already matches commit \`$TARGET_SHORT\`" >> $GITHUB_STEP_SUMMARY
+            echo "updated=false" >> $GITHUB_OUTPUT
+            gh pr comment "$PR_NUMBER" --body "**@docbot** Documentation already matches commit \`$TARGET_SHORT\`. No changes needed."
+            exit 0
+          fi
+
+          git commit -m "DocSync AI: Revert documentation to $TARGET_SHORT
+
+        Restored documentation files to the state at commit $TARGET_HASH.
+
+        Generated by DocSync AI"
+          git push origin HEAD
+
+          echo "updated=true" >> $GITHUB_OUTPUT
+          echo "✅ Restored documentation to \`$TARGET_SHORT\`" >> $GITHUB_STEP_SUMMARY
+
+          # Post confirmation comment
+          CHANGED_LIST=$(echo "$RESTORED_FILES" | tr ' ' '\n' | sed '/^$/d' | sed 's/^/- /')
+          COMMENT_BODY="**DocSync AI — Reverted to \`$TARGET_SHORT\`** :rewind:
+
+        Documentation files restored to commit \`$TARGET_HASH\`.
+
+        **Restored Files:**
+        $CHANGED_LIST
+
+        ---
+        *Automated by DocSync AI*"
+          gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
+        fi
+
+    # ──────────────────────────────────────────────
+    # STEP 6: Fetch PR diff (update on regular PRs)
+    # ──────────────────────────────────────────────
     - name: Fetch PR Diff for Regular PRs
       id: fetch-diff
-      if: steps.validate.outputs.valid == 'true' && steps.verify-pr.outputs.is_docsync_pr != 'true' && steps.validate.outputs.is_revert != 'true'
+      if: >
+        steps.parse-command.outputs.valid == 'true' &&
+        steps.parse-command.outputs.command == 'update' &&
+        steps.verify-pr.outputs.is_docsync_pr != 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
@@ -366,7 +438,7 @@ runs:
         TEMP_DIR=$(mktemp -d -t docsync-diff-XXXXXXXXXX)
         echo "temp_dir=$TEMP_DIR" >> $GITHUB_OUTPUT
 
-        # Get full PR diff (no size limit)
+        # Get full PR diff
         PR_DIFF=$(gh api \
           -H "Accept: application/vnd.github.v3.diff" \
           "/repos/$REPO_NAME/pulls/$PR_NUMBER" 2>&1)
@@ -374,14 +446,14 @@ runs:
         # Sanitize and validate diff content
         PR_DIFF=$(echo "$PR_DIFF" | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
 
-        # Filter out .github/workflows diffs (don't include workflow changes in analysis)
+        # Filter out .github/workflows diffs
         PR_DIFF=$(echo "$PR_DIFF" | awk '
           BEGIN { skip=0 }
           /^diff --git.*\.github\/workflows\// { skip=1; next }
           /^diff --git/ { skip=0 }
           !skip { print }
         ')
-      
+
         # Save PR diff to secure temp file
         echo "$PR_DIFF" > "$TEMP_DIR/pr_diff.txt"
         chmod 600 "$TEMP_DIR/pr_diff.txt"
@@ -399,6 +471,7 @@ runs:
         if [ -n "$CHANGED_FILES" ] && [ -z "$CHANGED_FILES_FILTERED" ]; then
           echo "All changes are in .github/workflows - skipping documentation update" >> $GITHUB_STEP_SUMMARY
           echo "skip_diff=true" >> $GITHUB_OUTPUT
+          rm -rf "$TEMP_DIR"
           exit 0
         fi
 
@@ -409,24 +482,31 @@ runs:
         echo "$CHANGED_FILES_FILTERED" | head -n 50 >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
 
+    # ──────────────────────────────────────────────
+    # STEP 7: Run Claude analysis (update)
+    # ──────────────────────────────────────────────
     - name: Run Claude Sonnet 4.5 Documentation Analysis
       id: claude-analysis
-      if: steps.validate.outputs.valid == 'true' && steps.fetch-diff.outputs.skip_diff != 'true' && steps.validate.outputs.is_revert != 'true'
+      if: >
+        steps.parse-command.outputs.valid == 'true' &&
+        steps.parse-command.outputs.command == 'update' &&
+        steps.fetch-diff.outputs.skip_diff != 'true'
       shell: bash
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
         REPO_NAME: ${{ inputs.repository }}
         PR_NUMBER: ${{ inputs.pr_number }}
-        USER_SUGGESTION: ${{ steps.validate.outputs.suggestion }}
+        USER_SUGGESTION: ${{ steps.parse-command.outputs.suggestion }}
         IS_DOCSYNC_PR: ${{ steps.verify-pr.outputs.is_docsync_pr }}
         PR_TITLE: ${{ steps.verify-pr.outputs.pr_title }}
         DIFF_TEMP_DIR: ${{ steps.fetch-diff.outputs.temp_dir }}
-        TARGET_FILE: ${{ steps.validate.outputs.target_file }}
+        TARGET_FILE: ${{ steps.parse-command.outputs.target_file }}
       run: |
         set -e
 
         echo "## Claude Sonnet 4.5 Analysis" >> $GITHUB_STEP_SUMMARY
         echo "Model: claude-sonnet-4-5" >> $GITHUB_STEP_SUMMARY
+        echo "Target: $TARGET_FILE" >> $GITHUB_STEP_SUMMARY
 
         # Create secure temporary directory
         TEMP_DIR=$(mktemp -d -t docsync-comment-XXXXXXXXXX)
@@ -441,13 +521,156 @@ runs:
           PR_DIFF=$(cat "$DIFF_TEMP_DIR/pr_diff.txt")
         fi
 
+        # === DIFF SIZE MANAGEMENT ===
+        # If the PR diff exceeds Claude's context window, chunk and summarize
+        MAX_DIFF_CHARS=600000
+        CHUNK_MAX_CHARS=500000
+        DIFF_SIZE=${#PR_DIFF}
+
+        if [ "$DIFF_SIZE" -gt "$MAX_DIFF_CHARS" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Large Diff Detected" >> $GITHUB_STEP_SUMMARY
+          echo "PR diff is $DIFF_SIZE chars (limit: $MAX_DIFF_CHARS). Chunking and summarizing..." >> $GITHUB_STEP_SUMMARY
+
+          CHUNK_DIR="$TEMP_DIR/diff_chunks"
+          rm -rf "$CHUNK_DIR"
+          mkdir -p "$CHUNK_DIR"
+
+          # Determine diff source file
+          DIFF_SOURCE_FILE=""
+          if [ -n "$DIFF_TEMP_DIR" ] && [ -f "$DIFF_TEMP_DIR/pr_diff.txt" ]; then
+            DIFF_SOURCE_FILE="$DIFF_TEMP_DIR/pr_diff.txt"
+          else
+            DIFF_SOURCE_FILE="$TEMP_DIR/diff_source.txt"
+            printf '%s' "$PR_DIFF" > "$DIFF_SOURCE_FILE"
+          fi
+
+          # Split diff into chunks at "diff --git" boundaries, each ≤ CHUNK_MAX_CHARS
+          awk -v max="$CHUNK_MAX_CHARS" -v dir="$CHUNK_DIR" '
+            BEGIN { chunk=1; size=0; file=dir "/chunk_1.txt" }
+            /^diff --git / {
+              if (size > max && size > 0) {
+                close(file)
+                chunk++
+                size=0
+                file=dir "/chunk_" chunk ".txt"
+              }
+            }
+            { print >> file; size += length($0) + 1 }
+            END { close(file); print chunk > dir "/chunk_count.txt" }
+          ' "$DIFF_SOURCE_FILE"
+
+          TOTAL_CHUNKS=$(cat "$CHUNK_DIR/chunk_count.txt" 2>/dev/null || echo "1")
+          echo "Split into $TOTAL_CHUNKS chunk(s)" >> $GITHUB_STEP_SUMMARY
+
+          ALL_SUMMARIES=""
+          for i in $(seq 1 "$TOTAL_CHUNKS"); do
+            CHUNK_PATH="$CHUNK_DIR/chunk_${i}.txt"
+            [ -f "$CHUNK_PATH" ] || continue
+            CHUNK_BYTES=$(wc -c < "$CHUNK_PATH" | tr -d ' ')
+            echo "  Summarizing chunk $i/$TOTAL_CHUNKS (~$CHUNK_BYTES chars)..." >> $GITHUB_STEP_SUMMARY
+
+            # Build summarization prompt
+            SPROMPT_FILE="$TEMP_DIR/sprompt_${i}.txt"
+            {
+              echo "You are analyzing code changes to identify documentation-relevant updates for root-level project documentation (README.md / CLAUDE.md)."
+              echo ""
+              echo "Repository: $REPO_NAME"
+              echo ""
+              echo "Review the code diff below and extract ONLY changes that would affect root-level project documentation:"
+              echo "- New features, modules, or public APIs"
+              echo "- Breaking changes or changed behavior"
+              echo "- New dependencies"
+              echo "- Major configuration changes"
+              echo "- Changes to project setup, installation, or usage"
+              echo ""
+              echo "For each doc-relevant change found, provide:"
+              echo "1. A concise description of what changed"
+              echo "2. The files involved"
+              echo "3. Why it matters for root-level documentation"
+              echo ""
+              echo "If nothing in this diff chunk is relevant to root-level documentation, output exactly: NO_DOC_RELEVANT_CHANGES"
+              echo ""
+              echo "Code diff (chunk $i of $TOTAL_CHUNKS):"
+              echo '```diff'
+              cat "$CHUNK_PATH"
+              echo '```'
+            } > "$SPROMPT_FILE"
+            chmod 600 "$SPROMPT_FILE"
+
+            # Build API request
+            SREQUEST_FILE="$TEMP_DIR/srequest_${i}.json"
+            jq -n \
+              --arg model "claude-sonnet-4-5" \
+              --argjson max_tokens 4096 \
+              --rawfile content "$SPROMPT_FILE" \
+              '{
+                model: $model,
+                max_tokens: $max_tokens,
+                messages: [{
+                  role: "user",
+                  content: $content
+                }]
+              }' > "$SREQUEST_FILE"
+            chmod 600 "$SREQUEST_FILE"
+
+            # Call Claude API for chunk summarization
+            SRESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+              -H "content-type: application/json" \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -d @"$SREQUEST_FILE")
+
+            rm -f "$SREQUEST_FILE" "$SPROMPT_FILE"
+
+            # Validate response
+            if ! echo "$SRESPONSE" | jq empty 2>/dev/null; then
+              echo "  Warning: Invalid response for chunk $i" >> $GITHUB_STEP_SUMMARY
+              continue
+            fi
+
+            if echo "$SRESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+              SERR_TYPE=$(echo "$SRESPONSE" | jq -r '.error.type // "unknown"')
+              echo "  Warning: API error for chunk $i: $SERR_TYPE" >> $GITHUB_STEP_SUMMARY
+              continue
+            fi
+
+            CHUNK_SUMMARY=$(echo "$SRESPONSE" | jq -r '.content[0].text // ""' | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
+
+            if [ -n "$CHUNK_SUMMARY" ] && ! echo "$CHUNK_SUMMARY" | grep -q "NO_DOC_RELEVANT_CHANGES"; then
+              ALL_SUMMARIES="${ALL_SUMMARIES}
+
+        --- Chunk $i Analysis ---
+        ${CHUNK_SUMMARY}"
+              echo "  Chunk $i: doc-relevant changes found" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "  Chunk $i: no doc-relevant changes" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          rm -rf "$CHUNK_DIR"
+
+          # Replace PR_DIFF with summaries for the update prompt
+          if [ -n "$ALL_SUMMARIES" ]; then
+            PR_DIFF="[SUMMARIZED — Original diff was ${DIFF_SIZE} chars. Each chunk was analyzed by Claude Sonnet 4.5 for documentation-relevant changes.]
+        ${ALL_SUMMARIES}"
+            echo "Diff chunking complete — summaries ready for update prompt" >> $GITHUB_STEP_SUMMARY
+          else
+            PR_DIFF="[ANALYZED — Original diff was ${DIFF_SIZE} chars across $TOTAL_CHUNKS chunks. No documentation-relevant changes were identified in any chunk.]"
+            echo "No doc-relevant changes found in any chunk" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          if [ "$DIFF_SIZE" -gt 0 ]; then
+            echo "Diff size: $DIFF_SIZE chars (within context limits)" >> $GITHUB_STEP_SUMMARY
+          fi
+        fi
+
         # Sanitize PR title
         PR_TITLE_CLEAN=$(echo "$PR_TITLE" | tr -d '\000-\037' | head -c 200)
 
         # Validate file paths helper function
         validate_doc_file() {
           local file=$1
-          # Must be in current directory, not a symlink, and match expected names
           if [[ ! -f "$file" ]] || [[ -L "$file" ]]; then
             return 1
           fi
@@ -456,7 +679,6 @@ runs:
           if [[ "$basename_lower" != "readme.md" ]] && [[ "$basename_lower" != "claude.md" ]]; then
             return 1
           fi
-          # Ensure file is in repo root (no directory traversal)
           local realpath=$(realpath "$file" 2>/dev/null || echo "")
           local workdir=$(realpath . 2>/dev/null || echo "")
           if [[ ! "$realpath" == "$workdir"/* ]]; then
@@ -465,12 +687,10 @@ runs:
           return 0
         }
 
-        # === PHASE 1: DETECT ALL DOCUMENTATION FILES ===
-        # Check for BOTH files before updating anything
+        # === PHASE 1: DETECT DOCUMENTATION FILES ===
         HAS_README=false
         HAS_CLAUDE=false
 
-        # Case-insensitive check for README.md
         README_FILE=$(find . -maxdepth 1 -type f -iname "readme.md" -print -quit 2>/dev/null)
         if [ -n "$README_FILE" ]; then
           README_FILE="${README_FILE#./}"
@@ -482,7 +702,6 @@ runs:
           fi
         fi
 
-        # Case-insensitive check for CLAUDE.md
         CLAUDE_FILE=$(find . -maxdepth 1 -type f -iname "claude.md" -print -quit 2>/dev/null)
         if [ -n "$CLAUDE_FILE" ]; then
           CLAUDE_FILE="${CLAUDE_FILE#./}"
@@ -494,13 +713,21 @@ runs:
           fi
         fi
 
-        # Log detection results for both files
+        # Apply target file filter
+        if [ "$TARGET_FILE" = "readme" ]; then
+          HAS_CLAUDE=false
+          echo "🎯 Target file filter: **README.md only**" >> $GITHUB_STEP_SUMMARY
+        elif [ "$TARGET_FILE" = "claude" ]; then
+          HAS_README=false
+          echo "🎯 Target file filter: **CLAUDE.md only**" >> $GITHUB_STEP_SUMMARY
+        fi
+
         echo "### Documentation File Detection:" >> $GITHUB_STEP_SUMMARY
-        echo "- README.md: $([ "$HAS_README" = true ] && echo "Found ($README_FILE)" || echo 'Not found')" >> $GITHUB_STEP_SUMMARY
-        echo "- CLAUDE.md: $([ "$HAS_CLAUDE" = true ] && echo "Found ($CLAUDE_FILE)" || echo 'Not found')" >> $GITHUB_STEP_SUMMARY
+        echo "- README.md: $([ "$HAS_README" = true ] && echo "Found ($README_FILE)" || echo 'Skipped / Not found')" >> $GITHUB_STEP_SUMMARY
+        echo "- CLAUDE.md: $([ "$HAS_CLAUDE" = true ] && echo "Found ($CLAUDE_FILE)" || echo 'Skipped / Not found')" >> $GITHUB_STEP_SUMMARY
 
         if [ "$HAS_README" = false ] && [ "$HAS_CLAUDE" = false ]; then
-          echo "No documentation file found (README.md or CLAUDE.md)" >> $GITHUB_STEP_SUMMARY
+          echo "No matching documentation file found" >> $GITHUB_STEP_SUMMARY
           echo "skip_analysis=true" >> $GITHUB_OUTPUT
           exit 0
         fi
@@ -531,40 +758,31 @@ runs:
 
           echo "Processing $DOC_FILE..." >> $GITHUB_STEP_SUMMARY
 
-          # Validate doc file path
           if ! validate_doc_file "$DOC_FILE"; then
             echo "  Invalid doc file: $DOC_FILE" >> $GITHUB_STEP_SUMMARY
             return 1
           fi
 
-          # Read current documentation
           DOC_CONTENT=$(cat "$DOC_FILE")
 
-          # Extract project title/name for validation (from first heading)
           PROJECT_TITLE=$(echo "$DOC_CONTENT" | head -n 30 | grep -E "^#\s+" | head -n 1 | sed 's/^#*\s*//' | tr -d '\000-\037' | head -c 200)
           if [ -z "$PROJECT_TITLE" ]; then
             PROJECT_TITLE="Unknown Project"
           fi
 
-          # Extract key terms from existing documentation for validation
           KEY_TERMS=$(echo "$DOC_CONTENT" | head -n 100 | grep -oE '\b[A-Z][A-Za-z0-9]{3,}\b' | sort -u | head -n 20 | tr '\n' ',' | sed 's/,$//')
 
           echo "  Project: $PROJECT_TITLE" >> $GITHUB_STEP_SUMMARY
 
-          # Prepare the prompt based on file type
           if [ "$DOC_FORMAT" = "README" ]; then
             FORMAT_INSTRUCTION="This is a README.md file. Maintain standard README format with clear sections, proper markdown formatting, badges, installation instructions, usage examples, and project overview. Keep the professional, user-facing documentation style."
           else
             FORMAT_INSTRUCTION="This is a CLAUDE.md file for AI assistance. Maintain the technical, detailed format suitable for AI context with implementation details, architecture notes, and development guidelines. Keep the detailed, technical documentation style."
           fi
 
-          # Create secure prompt file using echo for proper variable expansion
-          # NOTE: heredoc with 'EOF' (quoted) does NOT expand variables - use echo instead
           PROMPT_FILE="$TEMP_DIR/claude_prompt_$(openssl rand -hex 8).txt"
 
-          # Build prompt based on PR type
           if [ "$IS_DOCSYNC_PR" = "true" ]; then
-            # === DocSync PR: Apply user suggestion (existing behavior) ===
             {
               echo "You are a technical documentation expert. A user has provided a suggestion for improving the documentation in a DocSync PR."
               echo ""
@@ -574,6 +792,8 @@ runs:
               echo ""
               echo "**CRITICAL**: You MUST maintain the project identity. This is NOT a different project. Do NOT replace this documentation with content about any other project, library, or tool."
               echo ""
+              echo "**ROOT-LEVEL DOCS**: These are the root-level documentation files for the entire repository. They should contain only high-level, project-wide information that matters to users and contributors — NOT granular implementation details of individual files, functions, or internal logic."
+              echo ""
               echo "## Context"
               echo "PR #$PR_NUMBER (DocSync Documentation PR)"
               echo ""
@@ -582,7 +802,7 @@ runs:
               echo "$DOC_CONTENT"
               echo '```'
               echo ""
-              echo "## User Suggestion:"
+              echo "## User Instruction:"
               echo '```'
               echo "$USER_SUGGESTION_CLEAN"
               echo '```'
@@ -592,14 +812,9 @@ runs:
               echo ""
               echo "## Additional Context:"
               echo "$OTHER_FILES_NOTE"
-              if [ "$TARGET_FILE" != "both" ]; then
-                echo ""
-                echo "## FILE TARGETING:"
-                echo "The user has specifically requested updates to $DOC_FILE ONLY. Focus exclusively on this file."
-              fi
               echo ""
               echo "## Your Task"
-              echo "Apply the user suggestion to update the $DOC_FILE while maintaining project identity and existing content."
+              echo "Apply the user instruction to update the $DOC_FILE while maintaining project identity and existing content."
               echo ""
               echo "## ABSOLUTE REQUIREMENTS - VIOLATION WILL BE REJECTED:"
               echo ""
@@ -609,14 +824,14 @@ runs:
               echo "   - Maintain all existing project-specific information"
               echo ""
               echo "2. **ONLY ADD OR REFINE, NEVER REMOVE**:"
-              echo "   - Apply the user suggestion by adding or refining content"
+              echo "   - Apply the user instruction by adding or refining content"
               echo "   - NEVER remove existing sections, features, or content unless explicitly requested"
               echo "   - NEVER replace existing content with unrelated information"
               echo "   - Keep all existing headings, sections, and structure intact"
               echo ""
               echo "3. **FOLLOW USER INTENT**:"
-              echo "   - Carefully interpret and apply the user suggestion"
-              echo "   - If the suggestion is about adding content, add it to the appropriate section"
+              echo "   - Carefully interpret and apply the user instruction"
+              echo "   - If the instruction is about adding content, add it to the appropriate section"
               echo "   - If it is about improving clarity, refine the existing text"
               echo "   - If it is vague, make conservative, relevant improvements"
               echo ""
@@ -634,24 +849,22 @@ runs:
               echo "6. **QUALITY STANDARDS**:"
               echo "   - Ensure updates are accurate and clear"
               echo "   - Maintain consistent formatting and style"
-              echo "   - Improve documentation quality based on the suggestion"
+              echo "   - Improve documentation quality based on the instruction"
               echo ""
-              echo "7. **CONCISENESS (CRITICAL)**:"
-              echo "   - Every addition must earn its place - no filler, no redundancy"
-              echo "   - Add ONLY the most important details about each change"
-              echo "   - Use short bullet points, not paragraphs"
-              echo "   - Do NOT rewrite, expand, rephrase, or reorganize existing content"
-              echo "   - Do NOT add examples, explanations, or extra context unless absolutely essential"
-              echo "   - If information is already implied by existing docs, do not add it"
-              echo "   - Verbose or padded output WILL BE REJECTED"
+              echo "7. **CONCISENESS — THIS IS CRITICAL**:"
+              echo "   - Add ONLY the most important, user-facing information"
+              echo "   - One or two bullet points per feature/change is sufficient"
+              echo "   - NEVER add verbose explanations, background context, or implementation details"
+              echo "   - Do NOT rewrite, expand, or rephrase existing content"
+              echo "   - If a change can be described in one line, use one line"
+              echo "   - Omit anything a developer could infer from the code itself"
               echo ""
               echo "## Response:"
-              echo "Output the COMPLETE updated documentation with the user suggestion applied."
+              echo "Output the COMPLETE updated documentation with the user instruction applied."
               echo ""
               echo "Begin your response now:"
             } > "$PROMPT_FILE"
           else
-            # === Regular PR: Analyze diff + user instruction ===
             {
               echo "You are a technical documentation expert tasked with updating documentation based on code changes in a PR."
               echo ""
@@ -660,6 +873,8 @@ runs:
               echo "Repository: $REPO_NAME"
               echo ""
               echo "**CRITICAL**: You MUST maintain the project identity. This is NOT a different project. Do NOT replace this documentation with content about any other project, library, or tool."
+              echo ""
+              echo "**ROOT-LEVEL DOCS**: These are the root-level documentation files for the entire repository. They should contain only high-level, project-wide information that matters to users and contributors — NOT granular implementation details of individual files, functions, or internal logic."
               echo ""
               echo "## Context"
               echo "PR #$PR_NUMBER: $PR_TITLE_CLEAN"
@@ -690,11 +905,6 @@ runs:
               echo ""
               echo "## Additional Context:"
               echo "$OTHER_FILES_NOTE"
-              if [ "$TARGET_FILE" != "both" ]; then
-                echo ""
-                echo "## FILE TARGETING:"
-                echo "The user has specifically requested updates to $DOC_FILE ONLY. Focus exclusively on this file."
-              fi
               echo ""
               echo "## Your Task"
               echo "Analyze the PR changes and the user instruction, then determine if the $DOC_FILE needs updates."
@@ -730,44 +940,20 @@ runs:
               echo '   - NO phrases like "Here is the updated", "I have analyzed", etc.'
               echo "   - Start directly with the documentation content"
               echo ""
-              echo "6. **SIGNIFICANCE CHECK (STRICT - When in doubt, SKIP)**:"
-              if [ "$DOC_FORMAT" = "README" ]; then
-                echo "   - UPDATE README.md ONLY for:"
-                echo "     * New user-facing features or capabilities"
-                echo "     * API changes (new endpoints, changed parameters, new response fields)"
-                echo "     * New external dependencies users need to install or configure"
-                echo "     * Breaking changes that affect user behavior or require migration"
-                echo "     * New configuration options users need to know about"
-                echo "   - DO NOT update README.md for:"
-                echo "     * Internal code refactoring or restructuring"
-                echo "     * Small bug fixes that do not change documented behavior"
-                echo "     * Test additions or test refactoring"
-                echo "     * CI/CD pipeline changes"
-                echo "     * Code style, linting, or formatting changes"
-                echo "     * Internal module reorganization"
-              else
-                echo "   - UPDATE CLAUDE.md ONLY for:"
-                echo "     * New architectural patterns or design decisions"
-                echo "     * New modules, systems, or major structural components"
-                echo "     * Significant structural changes to the codebase layout"
-                echo "     * New development workflows or build processes"
-                echo "   - DO NOT update CLAUDE.md for:"
-                echo "     * Code-level tweaks within existing modules"
-                echo "     * Minor refactors that do not change architecture"
-                echo "     * Bug fixes within existing patterns"
-                echo "     * Test changes"
-                echo "     * Dependency version bumps"
-              fi
-              echo "   - If changes do not clearly meet the above thresholds, output NO_UPDATES_NEEDED"
+              echo "6. **SIGNIFICANCE CHECK — THINK LIKE A SOFTWARE ARCHITECT**:"
+              echo "   - Evaluate each change from the perspective of a software architect deciding what belongs in root-level project documentation"
+              echo "   - UPDATE for changes that alter the project's public surface: new features, breaking changes, new modules, API changes, new dependencies, major configuration changes"
+              echo "   - SKIP changes that are internal to the codebase: refactors, minor bug fixes, test additions, code comments, whitespace, file reorganization, CI/CD pipeline tweaks, implementation details"
+              echo "   - When in doubt, assess whether a user or new contributor NEEDS this information at the project level — if not, do not update"
+              echo "   - Output NO_UPDATES_NEEDED unless the changes genuinely warrant documentation at the root level"
               echo ""
-              echo "7. **CONCISENESS (CRITICAL)**:"
-              echo "   - Every addition must earn its place - no filler, no redundancy"
-              echo "   - Add ONLY the most important details about each change"
-              echo "   - Use short bullet points, not paragraphs"
-              echo "   - Do NOT rewrite, expand, rephrase, or reorganize existing content"
-              echo "   - Do NOT add examples, explanations, or extra context unless absolutely essential"
-              echo "   - If information is already implied by existing docs, do not add it"
-              echo "   - Verbose or padded output WILL BE REJECTED"
+              echo "7. **CONCISENESS — THIS IS CRITICAL**:"
+              echo "   - Add ONLY the most important, user-facing information"
+              echo "   - One or two bullet points per feature/change is sufficient"
+              echo "   - NEVER add verbose explanations, background context, or implementation details"
+              echo "   - Do NOT rewrite, expand, or rephrase existing content"
+              echo "   - If a change can be described in one line, use one line"
+              echo "   - Omit anything a developer could infer from the code itself"
               echo ""
               echo "## Decision Process:"
               echo ""
@@ -777,7 +963,7 @@ runs:
               echo "4. Look for changes to existing functionality that users should know about"
               echo "5. Consider the user instruction for guidance on what to focus on"
               echo "6. If ANY of the above exist: Add new information to relevant sections WITHOUT removing existing content"
-              echo '7. Output "NO_UPDATES_NEEDED" unless changes clearly meet the significance thresholds above'
+              echo '7. Output "NO_UPDATES_NEEDED" if no changes warrant root-level documentation updates, applying the architectural judgment from the significance check above'
               echo ""
               echo "## Response:"
               echo "- If significant, relevant updates are needed: Output the COMPLETE updated documentation (with additions only)"
@@ -789,10 +975,8 @@ runs:
 
           chmod 600 "$PROMPT_FILE"
 
-          # Call Claude API with secure header handling
           echo "  Calling Claude API for $DOC_FILE..." >> $GITHUB_STEP_SUMMARY
 
-          # Create secure request body file using jq --rawfile for safe prompt handling
           REQUEST_FILE="$TEMP_DIR/request_$(openssl rand -hex 8).json"
           jq -n \
             --arg model "claude-sonnet-4-5" \
@@ -809,23 +993,19 @@ runs:
 
           chmod 600 "$REQUEST_FILE"
 
-          # Call API
           RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
             -H "content-type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -d @"$REQUEST_FILE")
 
-          # Clean up request file
           rm -f "$REQUEST_FILE"
 
-          # Validate response is valid JSON
           if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
             echo "  Invalid JSON response from API" >> $GITHUB_STEP_SUMMARY
             return 1
           fi
 
-          # Check for API errors
           if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
             ERROR_TYPE=$(echo "$RESPONSE" | jq -r '.error.type // "unknown"')
             ERROR_CODE=$(echo "$RESPONSE" | jq -r '.error.code // "unknown"')
@@ -833,19 +1013,14 @@ runs:
             return 1
           fi
 
-          # Validate response structure
           if ! echo "$RESPONSE" | jq -e '.content[0].text' > /dev/null 2>&1; then
             echo "  API response missing expected content field" >> $GITHUB_STEP_SUMMARY
             return 1
           fi
 
-          # Extract the response content
           CLAUDE_OUTPUT=$(echo "$RESPONSE" | jq -r '.content[0].text')
-
-          # Sanitize output (remove null bytes, validate UTF-8)
           CLAUDE_OUTPUT=$(echo "$CLAUDE_OUTPUT" | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
 
-          # For regular PRs, check if NO_UPDATES_NEEDED
           if [ "$IS_DOCSYNC_PR" != "true" ]; then
             if echo "$CLAUDE_OUTPUT" | grep -q "NO_UPDATES_NEEDED"; then
               echo "  No updates needed for $DOC_FILE" >> $GITHUB_STEP_SUMMARY
@@ -853,59 +1028,31 @@ runs:
             fi
           fi
 
-          # Log output stats
           INPUT_LENGTH=${#DOC_CONTENT}
           OUTPUT_LENGTH=${#CLAUDE_OUTPUT}
           echo "  Updating $DOC_FILE ($INPUT_LENGTH -> $OUTPUT_LENGTH chars)" >> $GITHUB_STEP_SUMMARY
 
-          # Write the updated documentation
           echo "$CLAUDE_OUTPUT" > "$DOC_FILE"
           ANY_UPDATES=true
           return 0
         }
 
-        # === PHASE 2: UPDATE TARGETED DOCUMENTATION FILES ===
+        # === PHASE 2: UPDATE DOCUMENTATION FILES ===
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### Updating Documentation Files:" >> $GITHUB_STEP_SUMMARY
-        echo "File targeting: $TARGET_FILE" >> $GITHUB_STEP_SUMMARY
 
-        # Determine which files to update based on targeting
-        UPDATE_README=false
-        UPDATE_CLAUDE=false
-
-        if [ "$TARGET_FILE" = "readme" ]; then
-          if [ "$HAS_README" = true ]; then
-            UPDATE_README=true
-          else
-            echo "WARNING: README requested but not found in repository" >> $GITHUB_STEP_SUMMARY
-          fi
-        elif [ "$TARGET_FILE" = "claude" ]; then
-          if [ "$HAS_CLAUDE" = true ]; then
-            UPDATE_CLAUDE=true
-          else
-            echo "WARNING: CLAUDE.md requested but not found in repository" >> $GITHUB_STEP_SUMMARY
-          fi
-        else
-          # Default: update both if they exist
-          UPDATE_README=$HAS_README
-          UPDATE_CLAUDE=$HAS_CLAUDE
-        fi
-
-        if [ "$UPDATE_README" = true ] && [ "$UPDATE_CLAUDE" = true ]; then
+        if [ "$HAS_README" = true ] && [ "$HAS_CLAUDE" = true ]; then
           echo "Both $README_FILE and $CLAUDE_FILE detected - updating both" >> $GITHUB_STEP_SUMMARY
           update_doc_file "$README_FILE" "README" "$CLAUDE_FILE also exists in this repository and is being updated separately for AI/Claude Code context. Focus this $README_FILE update on user-facing documentation only." || echo "  Failed to update $README_FILE" >> $GITHUB_STEP_SUMMARY
           update_doc_file "$CLAUDE_FILE" "CLAUDE" "$README_FILE also exists in this repository and is being updated separately for user-facing documentation. Focus this $CLAUDE_FILE update on AI/Claude Code technical context only." || echo "  Failed to update $CLAUDE_FILE" >> $GITHUB_STEP_SUMMARY
-        elif [ "$UPDATE_README" = true ]; then
-          echo "Targeting $README_FILE only" >> $GITHUB_STEP_SUMMARY
-          update_doc_file "$README_FILE" "README" "Only README.md is being updated per user request." || echo "  Failed to update $README_FILE" >> $GITHUB_STEP_SUMMARY
-        elif [ "$UPDATE_CLAUDE" = true ]; then
-          echo "Targeting $CLAUDE_FILE only" >> $GITHUB_STEP_SUMMARY
-          update_doc_file "$CLAUDE_FILE" "CLAUDE" "Only CLAUDE.md is being updated per user request." || echo "  Failed to update $CLAUDE_FILE" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "No documentation files to update" >> $GITHUB_STEP_SUMMARY
+        elif [ "$HAS_README" = true ]; then
+          echo "Only $README_FILE detected - updating $README_FILE" >> $GITHUB_STEP_SUMMARY
+          update_doc_file "$README_FILE" "README" "This is the only documentation file in the repository." || echo "  Failed to update $README_FILE" >> $GITHUB_STEP_SUMMARY
+        elif [ "$HAS_CLAUDE" = true ]; then
+          echo "Only $CLAUDE_FILE detected - updating $CLAUDE_FILE" >> $GITHUB_STEP_SUMMARY
+          update_doc_file "$CLAUDE_FILE" "CLAUDE" "This is the only documentation file in the repository." || echo "  Failed to update $CLAUDE_FILE" >> $GITHUB_STEP_SUMMARY
         fi
 
-        # Set final output
         if [ "$ANY_UPDATES" = true ]; then
           echo "skip_analysis=false" >> $GITHUB_OUTPUT
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -916,23 +1063,30 @@ runs:
           echo "No documentation updates were applied" >> $GITHUB_STEP_SUMMARY
         fi
 
-        # Clean up diff temp directory if it exists
+        # Clean up diff temp directory
         if [ -n "$DIFF_TEMP_DIR" ] && [ -d "$DIFF_TEMP_DIR" ]; then
           rm -rf "$DIFF_TEMP_DIR"
         fi
 
+    # ──────────────────────────────────────────────
+    # STEP 8: Commit changes (update)
+    # ──────────────────────────────────────────────
     - name: Commit Changes to PR
       id: commit-changes
-      if: steps.claude-analysis.outputs.skip_analysis != 'true' && steps.validate.outputs.is_revert != 'true'
+      if: >
+        steps.claude-analysis.outputs.skip_analysis != 'true' &&
+        steps.parse-command.outputs.command != 'revert_last' &&
+        steps.parse-command.outputs.command != 'revert_to'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
         PR_NUMBER: ${{ inputs.pr_number }}
         IS_DOCSYNC_PR: ${{ steps.verify-pr.outputs.is_docsync_pr }}
+        COMMAND: ${{ steps.parse-command.outputs.command }}
+        TARGET_FILE: ${{ steps.parse-command.outputs.target_file }}
       run: |
         set -e
 
-        # Check if documentation files were modified
         git add -A
 
         if git diff --cached --quiet; then
@@ -942,7 +1096,6 @@ runs:
           echo "updated=true" >> $GITHUB_OUTPUT
           echo "Documentation updates detected" >> $GITHUB_STEP_SUMMARY
 
-          # Show what changed
           echo "### Changed Files:" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           git diff --cached --name-only >> $GITHUB_STEP_SUMMARY
@@ -967,32 +1120,37 @@ runs:
             exit 1
           fi
 
-          # Commit changes with secure git config
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Verify configuration was set
           CONFIGURED_NAME=$(git config --local user.name)
           if [ "$CONFIGURED_NAME" != "github-actions[bot]" ]; then
             echo "Failed to set git user configuration" >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
-          # Validate PR number for commit message
           if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
             echo "Invalid PR number for commit" >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
-          # Choose commit message based on PR type
-          if [ "$IS_DOCSYNC_PR" = "true" ]; then
-            COMMIT_MSG="DocSync AI: Apply user suggestion from comment
+          # Build descriptive commit message
+          if [ "$TARGET_FILE" = "readme" ]; then
+            TARGET_DESC="README.md"
+          elif [ "$TARGET_FILE" = "claude" ]; then
+            TARGET_DESC="CLAUDE.md"
+          else
+            TARGET_DESC="documentation"
+          fi
 
-        Applied documentation updates based on user comment.
+          if [ "$IS_DOCSYNC_PR" = "true" ]; then
+            COMMIT_MSG="DocSync AI: Apply @docbot instruction to $TARGET_DESC
+
+        Applied documentation updates based on user command.
 
         Generated by DocSync AI"
           else
-            COMMIT_MSG="DocSync AI: Update documentation from PR comment
+            COMMIT_MSG="DocSync AI: Update $TARGET_DESC from @docbot command
 
         Applied documentation updates based on PR changes and user instruction.
 
@@ -1000,33 +1158,30 @@ runs:
           fi
 
           git commit -m "$COMMIT_MSG"
-
           git push origin HEAD
 
-          # Get list of changed files for comment
           CHANGED_FILES=$(git diff HEAD~1 --name-only | head -10 | sed 's/^/- /')
 
-          # Add confirmation comment to PR using safe format
           if [ "$IS_DOCSYNC_PR" = "true" ]; then
-            COMMENT_BODY="**DocSync AI Update Applied**
+            COMMENT_BODY="**DocSync AI — Update Applied** :white_check_mark:
 
-          Your documentation suggestion has been applied and committed to this PR.
+        Your documentation instruction has been applied and committed.
 
-          **Updated Files:**
-          $CHANGED_FILES
+        **Updated Files:**
+        $CHANGED_FILES
 
-          ---
-          *Automated by DocSync AI*"
+        ---
+        *Automated by DocSync AI*"
           else
-            COMMENT_BODY="**DocSync AI Documentation Update**
+            COMMENT_BODY="**DocSync AI — Documentation Updated** :white_check_mark:
 
-          Documentation has been updated based on the changes in this PR and your instruction.
+        Documentation has been updated based on the changes in this PR and your instruction.
 
-          **Updated Files:**
-          $CHANGED_FILES
+        **Updated Files:**
+        $CHANGED_FILES
 
-          ---
-          *Automated by DocSync AI*"
+        ---
+        *Automated by DocSync AI*"
           fi
 
           gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
@@ -1035,23 +1190,24 @@ runs:
           echo "### Changes Committed and Comment Added" >> $GITHUB_STEP_SUMMARY
         fi
 
+    # ──────────────────────────────────────────────
+    # STEP 9: Summary
+    # ──────────────────────────────────────────────
     - name: Summary
       if: always()
       shell: bash
       env:
-        VALID: ${{ steps.validate.outputs.valid }}
+        VALID: ${{ steps.parse-command.outputs.valid }}
+        COMMAND: ${{ steps.parse-command.outputs.command }}
+        TARGET_FILE: ${{ steps.parse-command.outputs.target_file }}
         IS_DOCSYNC: ${{ steps.verify-pr.outputs.is_docsync_pr }}
-        UPDATED: ${{ steps.commit-changes.outputs.updated }}
-        IS_REVERT: ${{ steps.validate.outputs.is_revert }}
-        REVERT_DONE: ${{ steps.handle-revert.outputs.revert_done }}
+        UPDATED_COMMIT: ${{ steps.commit-changes.outputs.updated }}
+        UPDATED_REVERT: ${{ steps.revert-changes.outputs.updated }}
       run: |
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "## Action Summary" >> $GITHUB_STEP_SUMMARY
-        echo "- **Comment Valid**: ${VALID:-false}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Command Valid**: ${VALID:-false}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Command**: ${COMMAND:-none}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Target File**: ${TARGET_FILE:-all}" >> $GITHUB_STEP_SUMMARY
         echo "- **Is DocSync PR**: ${IS_DOCSYNC:-false}" >> $GITHUB_STEP_SUMMARY
-        if [ "${IS_REVERT}" = "true" ]; then
-          echo "- **Revert Requested**: true" >> $GITHUB_STEP_SUMMARY
-          echo "- **Revert Completed**: ${REVERT_DONE:-false}" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "- **Documentation Updated**: ${UPDATED:-false}" >> $GITHUB_STEP_SUMMARY
-        fi
+        echo "- **Documentation Updated**: $([ '$UPDATED_COMMIT' = 'true' ] || [ '$UPDATED_REVERT' = 'true' ] && echo 'true' || echo 'false')" >> $GITHUB_STEP_SUMMARY
