@@ -13,16 +13,6 @@ on:
         required: false
         default: 'documentation,automated'
         type: string
-      slack_channel_id:
-        description: 'Slack channel ID to post notifications (e.g., C01234ABCDE)'
-        required: false
-        default: ''
-        type: string
-      slack_mention_user_id:
-        description: 'Slack user ID(s) to mention in notifications (e.g., U01234ABCDE or U01234ABCDE,U56789FGHIJ for multiple users)'
-        required: false
-        default: ''
-        type: string
       trigger_type:
         description: 'Trigger type: "scheduled" for weekly cron, "comment" for PR comment'
         required: false
@@ -53,6 +43,12 @@ on:
       DOCSYNC_SLACK_TOKEN:
         description: 'Slack OAuth bot token for notifications (xoxb-...)'
         required: false
+      DOCSYNC_SLACK_CHANNEL_ID:
+        description: 'Slack channel ID to post notifications'
+        required: false
+      DOCSYNC_SLACK_MENTION_USER_IDS:
+        description: 'Slack user ID(s) to mention in notifications'
+        required: false
 
 concurrency:
   group: docsync-ai-${{ github.repository }}
@@ -79,7 +75,7 @@ jobs:
       BASE_BRANCH: ${{ inputs.base_branch }}
       PR_LABELS: ${{ inputs.pr_labels }}
       SLACK_TOKEN: ${{ secrets.DOCSYNC_SLACK_TOKEN }}
-      SLACK_CHANNEL: ${{ inputs.slack_channel_id }}
+      SLACK_CHANNEL: ${{ secrets.DOCSYNC_SLACK_CHANNEL_ID }}
 
     steps:
       - name: Debug - Workflow Trigger Info
@@ -111,7 +107,7 @@ jobs:
         env:
           DOC_PR_NUMBER: ${{ steps.docsync.outputs.doc_pr_number }}
           DOC_PR_URL: ${{ steps.docsync.outputs.doc_pr_url }}
-          SLACK_MENTION_USER: ${{ inputs.slack_mention_user_id }}
+          SLACK_MENTION_USER: ${{ secrets.DOCSYNC_SLACK_MENTION_USER_IDS }}
         run: |
           set -e
 
@@ -217,7 +213,7 @@ jobs:
 
     env:
       SLACK_TOKEN: ${{ secrets.DOCSYNC_SLACK_TOKEN }}
-      SLACK_CHANNEL: ${{ inputs.slack_channel_id }}
+      SLACK_CHANNEL: ${{ secrets.DOCSYNC_SLACK_CHANNEL_ID }}
 
     steps:
       # ── Instant thumbs-up so user knows the bot is processing ──
@@ -266,7 +262,7 @@ jobs:
         env:
           COMMENT_PR_NUMBER: ${{ inputs.comment_pr_number }}
           IS_DOCSYNC_PR: ${{ steps.docsync-comment.outputs.is_docsync_pr }}
-          SLACK_MENTION_USER: ${{ inputs.slack_mention_user_id }}
+          SLACK_MENTION_USER: ${{ secrets.DOCSYNC_SLACK_MENTION_USER_IDS }}
         run: |
           set -e
 
