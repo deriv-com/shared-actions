@@ -27,6 +27,9 @@ on:
       ANTHROPIC_API_KEY:
         description: "Anthropic API key for Claude"
         required: true
+      AGENT_METRICS_API_URL:
+        description: "Base URL for the OneAboveAll metrics dashboard API (e.g. https://dashboard.example.com). Leave unset to skip POSTing events."
+        required: false
 
 jobs:
   claude-review-api:
@@ -375,3 +378,82 @@ jobs:
 
           gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body "$COMMENT"
           echo "✅ Posted (reviewed commit: ${CURRENT_SHA})"
+
+      - name: Emit review event to metrics dashboard
+        if: always()
+        env:
+          HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
+          AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+          CURRENT_SHA=$(cat /tmp/current_sha.txt 2>/dev/null || echo "")
+          REVIEW_SIZE=$(wc -c < /tmp/review.txt 2>/dev/null || echo "0")
+
+          [[ "$HAS_PREVIOUS" == "true" ]] && EVENT_TYPE="followup_review" || EVENT_TYPE="initial_review"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Build the event payload with jq so all values are safely escaped
+          EVENT_PAYLOAD=$(jq -n \
+            --arg agent "claude_review" \
+            --arg event_type "$EVENT_TYPE" \
+            --arg timestamp "$TIMESTAMP" \
+            --arg pr_number "$PR_NUMBER" \
+            --arg repo "$REPO" \
+            --arg commit_sha "$CURRENT_SHA" \
+            --argjson review_size_bytes "$REVIEW_SIZE" \
+            --arg model "$CLAUDE_MODEL" \
+            '{
+              agent: $agent,
+              event_type: $event_type,
+              timestamp: $timestamp,
+              pr_number: $pr_number,
+              repo: $repo,
+              payload: {
+                commit_sha: $commit_sha,
+                review_size_bytes: $review_size_bytes,
+                model: $model
+              }
+            }')
+
+          # Always write to job summary so every run is "logged" regardless of dashboard state
+          echo "### Claude Review Event" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **agent** | \`claude_review\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **event_type** | \`$EVENT_TYPE\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **pr_number** | \`$PR_NUMBER\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **repo** | \`$REPO\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **commit_sha** | \`$CURRENT_SHA\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **model** | \`$CLAUDE_MODEL\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **review_size_bytes** | $REVIEW_SIZE |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **timestamp** | $TIMESTAMP |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<details><summary>Raw JSON payload</summary>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          echo "$EVENT_PAYLOAD" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+          # POST to the metrics dashboard only when AGENT_METRICS_API_URL is set
+          if [[ -n "$AGENT_METRICS_API_URL" ]]; then
+            echo "📡 Sending event to metrics dashboard..."
+            echo "$EVENT_PAYLOAD" > /tmp/event_payload.json
+
+            HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/event_response.json \
+              "${AGENT_METRICS_API_URL}/api/v1/events" \
+              -X POST \
+              -H "Content-Type: application/json" \
+              -d @/tmp/event_payload.json)
+
+            if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "201" ]]; then
+              echo "✅ Event sent to dashboard (HTTP $HTTP_CODE)"
+            else
+              echo "⚠️ Dashboard POST returned HTTP $HTTP_CODE — event is still logged in job summary"
+              cat /tmp/event_response.json || true
+            fi
+          else
+            echo "ℹ️ AGENT_METRICS_API_URL not set — event logged to job summary only"
+          fi
