@@ -4,50 +4,50 @@ on:
   workflow_call:
     inputs:
       base_branch:
-        description: 'Base branch for documentation PR (e.g., master or main)'
+        description: "Base branch for documentation PR (e.g., master or main)"
         required: false
-        default: 'master'
+        default: "master"
         type: string
       pr_labels:
-        description: 'Comma-separated labels for the documentation PR'
+        description: "Comma-separated labels for the documentation PR"
         required: false
-        default: 'documentation,automated'
+        default: "documentation,automated"
         type: string
       trigger_type:
         description: 'Trigger type: "scheduled" for weekly cron, "comment" for PR comment'
         required: false
-        default: 'scheduled'
+        default: "scheduled"
         type: string
       comment_body:
         description: 'Comment body (only for comment trigger, must start with "@docbot")'
         required: false
-        default: ''
+        default: ""
         type: string
       comment_pr_number:
-        description: 'PR number where comment was made (only for comment trigger)'
+        description: "PR number where comment was made (only for comment trigger)"
         required: false
-        default: ''
+        default: ""
         type: string
       comment_id:
-        description: 'Comment ID for adding thumbs-up reaction (only for comment trigger)'
+        description: "Comment ID for adding thumbs-up reaction (only for comment trigger)"
         required: false
-        default: ''
+        default: ""
         type: string
     secrets:
       DOCSYNC_GITHUB_TOKEN:
-        description: 'GitHub PAT for PR creation (repo-specific, needs repo and pull_requests permissions)'
+        description: "GitHub PAT for PR creation (repo-specific, needs repo and pull_requests permissions)"
         required: true
       DOCSYNC_ANTHROPIC_API_KEY:
-        description: 'Anthropic API key for Claude AI'
+        description: "Anthropic API key for Claude AI"
         required: true
       DOCSYNC_SLACK_TOKEN:
-        description: 'Slack OAuth bot token for notifications (xoxb-...)'
+        description: "Slack OAuth bot token for notifications (xoxb-...)"
         required: false
       DOCSYNC_SLACK_CHANNEL_ID:
-        description: 'Slack channel ID to post notifications'
+        description: "Slack channel ID to post notifications"
         required: false
       DOCSYNC_SLACK_MENTION_USER_IDS:
-        description: 'Slack user ID(s) to mention in notifications'
+        description: "Slack user ID(s) to mention in notifications"
         required: false
 
 concurrency:
@@ -79,12 +79,34 @@ jobs:
 
     steps:
       - name: Debug - Workflow Trigger Info
+        id: trigger-info
         run: |
+          WORKFLOW_START_TIME=$(date +%s)
+          echo "start_time=$WORKFLOW_START_TIME" >> $GITHUB_OUTPUT
           echo "## Workflow Trigger Info" >> $GITHUB_STEP_SUMMARY
           echo "Event: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
           echo "Trigger Type: ${{ inputs.trigger_type }}" >> $GITHUB_STEP_SUMMARY
           echo "Base Branch: ${{ inputs.base_branch }}" >> $GITHUB_STEP_SUMMARY
           echo "Repository: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+
+          # Log workflow_triggered event
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg repo "${{ github.repository }}" \
+            --arg base_branch "${{ inputs.base_branch }}" \
+            '{
+              agent: "DocSync AI",
+              event_type: "workflow_triggered",
+              run_id: $run_id,
+              trigger_type: "scheduled",
+              timestamp: (now | todate),
+              payload: {
+                repository: $repo,
+                base_branch: $base_branch,
+                workflow_name: "docsync-ai"
+              }
+            }' >> "$EVENTS_FILE"
 
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -133,7 +155,7 @@ jobs:
           fi
 
           # Create Slack payload with text fallback (required by Slack API)
-          SLACK_PAYLOAD=$(jq -n \
+          SLACK_PAYLOAD=$(jq -cn \
             --arg channel "$SLACK_CHANNEL" \
             --arg repo "${{ github.repository }}" \
             --arg doc_pr_url "$DOC_PR_URL_CLEAN" \
@@ -185,11 +207,36 @@ jobs:
             echo "Response: $RESPONSE" >> $GITHUB_STEP_SUMMARY
           fi
 
+          # Log slack_notification_sent event
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          SLACK_STATUS=$([ "$SLACK_OK" = "true" ] && echo "success" || echo "failed")
+          PR_LINK="https://github.com/${{ github.repository }}/pull/$DOC_PR_NUMBER"
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg status "$SLACK_STATUS" \
+            --arg channel "$SLACK_CHANNEL" \
+            --arg pr_link "$PR_LINK" \
+            '{
+              agent: "DocSync AI",
+              event_type: "slack_notification_sent",
+              run_id: $run_id,
+              trigger_type: "scheduled",
+              timestamp: (now | todate),
+              payload: {
+                status: $status,
+                channel: $channel,
+                message_type: "documentation_update",
+                pr_link: $pr_link
+              }
+            }' >> "$EVENTS_FILE"
+
       - name: Summary
         if: always()
         env:
           JOB_STATUS: ${{ job.status }}
           DOC_PR_CREATED: ${{ steps.docsync.outputs.doc_pr_created }}
+          DOC_PR_URL: ${{ steps.docsync.outputs.doc_pr_url }}
+          WORKFLOW_START_TIME: ${{ steps.trigger-info.outputs.start_time }}
         run: |
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
@@ -199,6 +246,67 @@ jobs:
           echo "| Documentation PR Created | ${DOC_PR_CREATED:-false} |" >> $GITHUB_STEP_SUMMARY
           echo "| Status | $JOB_STATUS |" >> $GITHUB_STEP_SUMMARY
           echo "| Base Branch | $BASE_BRANCH |" >> $GITHUB_STEP_SUMMARY
+
+          # Compute duration
+          END_TIME=$(date +%s)
+          START_TIME="${WORKFLOW_START_TIME:-$END_TIME}"
+          DURATION_SECONDS=$((END_TIME - START_TIME))
+
+          # Log workflow_completed event
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          STATUS_VAL=$([ "$JOB_STATUS" = "success" ] && echo "success" || echo "failed")
+          DOC_PR_BOOL=$([ "${DOC_PR_CREATED:-false}" = "true" ] && echo "true" || echo "false")
+          if [ "$JOB_STATUS" = "success" ]; then
+            ERROR_JSON="null"
+          else
+            ERROR_JSON="\"Job failed with status: $JOB_STATUS\""
+          fi
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg status "$STATUS_VAL" \
+            --argjson duration "$DURATION_SECONDS" \
+            --argjson doc_pr_created "$DOC_PR_BOOL" \
+            --argjson changes_made "$DOC_PR_BOOL" \
+            --argjson error "$ERROR_JSON" \
+            '{
+              agent: "DocSync AI",
+              event_type: "workflow_completed",
+              run_id: $run_id,
+              trigger_type: "scheduled",
+              timestamp: (now | todate),
+              payload: {
+                status: $status,
+                duration_seconds: $duration,
+                doc_pr_created: $doc_pr_created,
+                changes_made: $changes_made,
+                error: $error
+              }
+            }' >> "$EVENTS_FILE"
+
+          # Display accumulated event log
+          if [ -f "$EVENTS_FILE" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "## 📊 DocSync AI — Event Log" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            EVENT_NUM=0
+            while IFS= read -r EVENT_LINE; do
+              EVENT_NUM=$((EVENT_NUM + 1))
+              EVENT_TYPE=$(echo "$EVENT_LINE" | jq -r '.event_type // "unknown"')
+              {
+                echo "<details>"
+                printf "<summary>📋 Event %d: <code>%s</code></summary>\n" "$EVENT_NUM" "$EVENT_TYPE"
+                echo ""
+                echo '```json'
+                echo "$EVENT_LINE" | jq '.'
+                echo '```'
+                echo ""
+                echo "</details>"
+                echo ""
+              } >> "$GITHUB_STEP_SUMMARY"
+            done < "$EVENTS_FILE"
+            rm -f "$EVENTS_FILE"
+          fi
 
   update-from-comment:
     name: Update Documentation from Comment
@@ -238,12 +346,34 @@ jobs:
             core.info(`👍 Reaction added to comment ${commentId}`);
 
       - name: Debug - Comment Trigger Info
+        id: trigger-info
         run: |
+          WORKFLOW_START_TIME=$(date +%s)
+          echo "start_time=$WORKFLOW_START_TIME" >> $GITHUB_OUTPUT
           echo "## Comment Trigger Info" >> $GITHUB_STEP_SUMMARY
           echo "Trigger Type: ${{ inputs.trigger_type }}" >> $GITHUB_STEP_SUMMARY
           echo "PR Number: ${{ inputs.comment_pr_number }}" >> $GITHUB_STEP_SUMMARY
           echo "Comment ID: ${{ inputs.comment_id }}" >> $GITHUB_STEP_SUMMARY
           echo "Repository: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+
+          # Log workflow_triggered event
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg repo "${{ github.repository }}" \
+            --arg base_branch "${{ inputs.base_branch }}" \
+            '{
+              agent: "DocSync AI",
+              event_type: "workflow_triggered",
+              run_id: $run_id,
+              trigger_type: "comment",
+              timestamp: (now | todate),
+              payload: {
+                repository: $repo,
+                base_branch: $base_branch,
+                workflow_name: "docsync-ai"
+              }
+            }' >> "$EVENTS_FILE"
 
       - name: Run DocSync AI Comment Action
         id: docsync-comment
@@ -295,7 +425,7 @@ jobs:
           fi
 
           # Create Slack payload with text fallback (required by Slack API)
-          SLACK_PAYLOAD=$(jq -n \
+          SLACK_PAYLOAD=$(jq -cn \
             --arg channel "$SLACK_CHANNEL" \
             --arg repo "${{ github.repository }}" \
             --arg pr_url "$PR_URL" \
@@ -348,6 +478,29 @@ jobs:
             echo "Response: $RESPONSE" >> $GITHUB_STEP_SUMMARY
           fi
 
+          # Log slack_notification_sent event
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          SLACK_STATUS=$([ "$SLACK_OK" = "true" ] && echo "success" || echo "failed")
+          PR_LINK="https://github.com/${{ github.repository }}/pull/$COMMENT_PR_NUMBER"
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg status "$SLACK_STATUS" \
+            --arg channel "$SLACK_CHANNEL" \
+            --arg pr_link "$PR_LINK" \
+            '{
+              agent: "DocSync AI",
+              event_type: "slack_notification_sent",
+              run_id: $run_id,
+              trigger_type: "comment",
+              timestamp: (now | todate),
+              payload: {
+                status: $status,
+                channel: $channel,
+                message_type: "documentation_update",
+                pr_link: $pr_link
+              }
+            }' >> "$EVENTS_FILE"
+
       - name: Summary
         if: always()
         env:
@@ -356,6 +509,7 @@ jobs:
           VALID: ${{ steps.docsync-comment.outputs.command_valid }}
           COMMAND: ${{ steps.docsync-comment.outputs.command }}
           IS_DOCSYNC_PR: ${{ steps.docsync-comment.outputs.is_docsync_pr }}
+          WORKFLOW_START_TIME: ${{ steps.trigger-info.outputs.start_time }}
         run: |
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
@@ -367,3 +521,64 @@ jobs:
           echo "| Is DocSync PR | ${IS_DOCSYNC_PR:-false} |" >> $GITHUB_STEP_SUMMARY
           echo "| Documentation Updated | ${UPDATED:-false} |" >> $GITHUB_STEP_SUMMARY
           echo "| Status | $JOB_STATUS |" >> $GITHUB_STEP_SUMMARY
+
+          # Compute duration
+          END_TIME=$(date +%s)
+          START_TIME="${WORKFLOW_START_TIME:-$END_TIME}"
+          DURATION_SECONDS=$((END_TIME - START_TIME))
+
+          # Log workflow_completed event
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          STATUS_VAL=$([ "$JOB_STATUS" = "success" ] && echo "success" || echo "failed")
+          CHANGES_BOOL=$([ "${UPDATED:-false}" = "true" ] && echo "true" || echo "false")
+          if [ "$JOB_STATUS" = "success" ]; then
+            ERROR_JSON="null"
+          else
+            ERROR_JSON="\"Job failed with status: $JOB_STATUS\""
+          fi
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg status "$STATUS_VAL" \
+            --argjson duration "$DURATION_SECONDS" \
+            --argjson doc_pr_created "false" \
+            --argjson changes_made "$CHANGES_BOOL" \
+            --argjson error "$ERROR_JSON" \
+            '{
+              agent: "DocSync AI",
+              event_type: "workflow_completed",
+              run_id: $run_id,
+              trigger_type: "comment",
+              timestamp: (now | todate),
+              payload: {
+                status: $status,
+                duration_seconds: $duration,
+                doc_pr_created: $doc_pr_created,
+                changes_made: $changes_made,
+                error: $error
+              }
+            }' >> "$EVENTS_FILE"
+
+          # Display accumulated event log
+          if [ -f "$EVENTS_FILE" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "## 📊 DocSync AI — Event Log" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            EVENT_NUM=0
+            while IFS= read -r EVENT_LINE; do
+              EVENT_NUM=$((EVENT_NUM + 1))
+              EVENT_TYPE=$(echo "$EVENT_LINE" | jq -r '.event_type // "unknown"')
+              {
+                echo "<details>"
+                printf "<summary>📋 Event %d: <code>%s</code></summary>\n" "$EVENT_NUM" "$EVENT_TYPE"
+                echo ""
+                echo '```json'
+                echo "$EVENT_LINE" | jq '.'
+                echo '```'
+                echo ""
+                echo "</details>"
+                echo ""
+              } >> "$GITHUB_STEP_SUMMARY"
+            done < "$EVENTS_FILE"
+            rm -f "$EVENTS_FILE"
+          fi
