@@ -110,6 +110,26 @@ runs:
         if [ "$PR_COUNT" -eq 0 ]; then
           echo "No merged PRs found in the last 7 days - skipping documentation update" >> $GITHUB_STEP_SUMMARY
           echo "skip_analysis=true" >> $GITHUB_OUTPUT
+
+          # Log prs_fetched event (no PRs found)
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            '{
+              agent: "DocSync AI",
+              event_type: "prs_fetched",
+              run_id: $run_id,
+              trigger_type: "scheduled",
+              timestamp: (now | todate),
+              payload: {
+                pr_count: 0,
+                pr_numbers: [],
+                period_days: 7,
+                changed_files_count: 0,
+                changed_files: []
+              }
+            }' >> "$EVENTS_FILE"
+
           rm -rf "$TEMP_DIR"
           exit 0
         fi
@@ -191,6 +211,29 @@ runs:
           if [ -z "$NON_WORKFLOW_DIFF" ]; then
             echo "All changes are in .github/workflows - skipping documentation update" >> $GITHUB_STEP_SUMMARY
             echo "skip_analysis=true" >> $GITHUB_OUTPUT
+
+            # Log prs_fetched event (workflow-only changes)
+            EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+            PR_NUMS_JSON=$(cat "$TEMP_DIR/pr_numbers.txt" 2>/dev/null | jq -R '"PR-" + .' | jq -s '.' 2>/dev/null || echo '[]')
+            jq -cn \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --argjson count "$PR_COUNT" \
+              --argjson nums "$PR_NUMS_JSON" \
+              '{
+                agent: "DocSync AI",
+                event_type: "prs_fetched",
+                run_id: $run_id,
+                trigger_type: "scheduled",
+                timestamp: (now | todate),
+                payload: {
+                  pr_count: $count,
+                  pr_numbers: $nums,
+                  period_days: 7,
+                  changed_files_count: 0,
+                  changed_files: []
+                }
+              }' >> "$EVENTS_FILE"
+
             exit 0
           fi
         fi
@@ -218,6 +261,32 @@ runs:
         echo "$ALL_CHANGED_FILES" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
 
+        # Log prs_fetched event
+        EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+        PR_NUMS_JSON=$(cat "$TEMP_DIR/pr_numbers.txt" 2>/dev/null | jq -R '"PR-" + .' | jq -s '.' 2>/dev/null || echo '[]')
+        CHANGED_FILES_COUNT=$(echo "$ALL_CHANGED_FILES" | grep -v '^$' | wc -l | tr -d ' ')
+        CHANGED_FILES_JSON=$(echo "$ALL_CHANGED_FILES" | head -n 50 | grep -v '^$' | jq -R '.' | jq -s '.' 2>/dev/null || echo '[]')
+        jq -cn \
+          --arg run_id "$GITHUB_RUN_ID" \
+          --argjson count "$PR_COUNT" \
+          --argjson nums "$PR_NUMS_JSON" \
+          --argjson fc "$CHANGED_FILES_COUNT" \
+          --argjson files "$CHANGED_FILES_JSON" \
+          '{
+            agent: "DocSync AI",
+            event_type: "prs_fetched",
+            run_id: $run_id,
+            trigger_type: "scheduled",
+            timestamp: (now | todate),
+            payload: {
+              pr_count: $count,
+              pr_numbers: $nums,
+              period_days: 7,
+              changed_files_count: $fc,
+              changed_files: $files
+            }
+          }' >> "$EVENTS_FILE"
+
     - name: Run Claude Sonnet 4.5 Documentation Analysis
       id: claude-analysis
       if: steps.pr-details.outputs.skip_analysis != 'true'
@@ -236,6 +305,30 @@ runs:
         echo "## Claude Sonnet 4.5 Analysis" >> $GITHUB_STEP_SUMMARY
         echo "Model: claude-sonnet-4-5" >> $GITHUB_STEP_SUMMARY
         echo "Analyzing $PR_COUNT merged PR(s) from the past week" >> $GITHUB_STEP_SUMMARY
+
+        # Token accumulation across all Claude API calls in this step
+        TOTAL_INPUT_TOKENS=0
+        TOTAL_OUTPUT_TOKENS=0
+        UPDATED_FILES_LIST=""
+        EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+
+        # Log claude_analysis_started event
+        jq -cn \
+          --arg run_id "$GITHUB_RUN_ID" \
+          --argjson pr_count "${PR_COUNT:-0}" \
+          '{
+            agent: "DocSync AI",
+            event_type: "claude_analysis_started",
+            run_id: $run_id,
+            trigger_type: "scheduled",
+            timestamp: (now | todate),
+            payload: {
+              model: "claude-sonnet-4-5",
+              max_tokens: 16384,
+              pr_count: $pr_count,
+              mode: "pr_analysis"
+            }
+          }' >> "$EVENTS_FILE"
 
         # Read PR summary from secure temp file
         PR_SUMMARY=""
@@ -304,6 +397,30 @@ runs:
         if [ "$HAS_README" = false ] && [ "$HAS_CLAUDE" = false ]; then
           echo "No documentation file found (README.md or CLAUDE.md)" >> $GITHUB_STEP_SUMMARY
           echo "skip_analysis=true" >> $GITHUB_OUTPUT
+
+          # Log claude_analysis_completed (skipped — no doc files)
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --argjson input_tok "$TOTAL_INPUT_TOKENS" \
+            --argjson output_tok "$TOTAL_OUTPUT_TOKENS" \
+            --argjson total_tok "$((TOTAL_INPUT_TOKENS + TOTAL_OUTPUT_TOKENS))" \
+            '{
+              agent: "DocSync AI",
+              event_type: "claude_analysis_completed",
+              run_id: $run_id,
+              trigger_type: "scheduled",
+              timestamp: (now | todate),
+              payload: {
+                status: "success",
+                skip_analysis: true,
+                reason: "No documentation files found",
+                input_tokens: $input_tok,
+                output_tokens: $output_tok,
+                total_tokens: $total_tok,
+                files_to_update: []
+              }
+            }' >> "$EVENTS_FILE"
+
           rm -rf "$TEMP_DIR"
           exit 0
         fi
@@ -386,7 +503,7 @@ runs:
 
             # Build API request
             SREQUEST_FILE="$TEMP_DIR/srequest_${i}.json"
-            jq -n \
+            jq -cn \
               --arg model "claude-sonnet-4-5" \
               --argjson max_tokens 4096 \
               --rawfile content "$SPROMPT_FILE" \
@@ -422,6 +539,12 @@ runs:
             fi
 
             CHUNK_SUMMARY=$(echo "$SRESPONSE" | jq -r '.content[0].text // ""' | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
+
+            # Accumulate token usage from chunk summarization
+            CHUNK_IN=$(echo "$SRESPONSE" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo "0")
+            CHUNK_OUT=$(echo "$SRESPONSE" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo "0")
+            TOTAL_INPUT_TOKENS=$((TOTAL_INPUT_TOKENS + CHUNK_IN))
+            TOTAL_OUTPUT_TOKENS=$((TOTAL_OUTPUT_TOKENS + CHUNK_OUT))
 
             if [ -n "$CHUNK_SUMMARY" ] && ! echo "$CHUNK_SUMMARY" | grep -q "NO_DOC_RELEVANT_CHANGES"; then
               ALL_SUMMARIES="${ALL_SUMMARIES}
@@ -616,7 +739,7 @@ runs:
 
           # Create secure request body file using jq --rawfile for safe prompt handling
           REQUEST_FILE="$TEMP_DIR/request_$(openssl rand -hex 8).json"
-          jq -n \
+          jq -cn \
             --arg model "claude-sonnet-4-5" \
             --argjson max_tokens 16384 \
             --rawfile content "$PROMPT_FILE" \
@@ -678,9 +801,16 @@ runs:
           OUTPUT_LENGTH=${#CLAUDE_OUTPUT}
           echo "  Updating $DOC_FILE ($INPUT_LENGTH -> $OUTPUT_LENGTH chars)" >> $GITHUB_STEP_SUMMARY
 
+          # Accumulate token usage from this Claude API call
+          DOC_IN=$(echo "$RESPONSE" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo "0")
+          DOC_OUT=$(echo "$RESPONSE" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo "0")
+          TOTAL_INPUT_TOKENS=$((TOTAL_INPUT_TOKENS + DOC_IN))
+          TOTAL_OUTPUT_TOKENS=$((TOTAL_OUTPUT_TOKENS + DOC_OUT))
+
           # Write the updated documentation
           echo "$CLAUDE_OUTPUT" > "$DOC_FILE"
           ANY_UPDATES=true
+          UPDATED_FILES_LIST="${UPDATED_FILES_LIST}\"${DOC_FILE}\","
           return 0
         }
 
@@ -710,6 +840,36 @@ runs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "No documentation updates needed" >> $GITHUB_STEP_SUMMARY
         fi
+
+        # Log claude_analysis_completed event
+        TOTAL_TOKENS=$((TOTAL_INPUT_TOKENS + TOTAL_OUTPUT_TOKENS))
+        SKIP_BOOL=$([ "$ANY_UPDATES" = true ] && echo "false" || echo "true")
+        REASON=$([ "$ANY_UPDATES" = true ] && echo "Updates generated" || echo "No documentation changes required")
+        FILES_JSON="[$(echo "$UPDATED_FILES_LIST" | sed 's/,$//')]"
+        jq -cn \
+          --arg run_id "$GITHUB_RUN_ID" \
+          --argjson input_tok "$TOTAL_INPUT_TOKENS" \
+          --argjson output_tok "$TOTAL_OUTPUT_TOKENS" \
+          --argjson total_tok "$TOTAL_TOKENS" \
+          --argjson skip "$SKIP_BOOL" \
+          --arg reason "$REASON" \
+          --argjson files "$FILES_JSON" \
+          '{
+            agent: "DocSync AI",
+            event_type: "claude_analysis_completed",
+            run_id: $run_id,
+            trigger_type: "scheduled",
+            timestamp: (now | todate),
+            payload: {
+              status: "success",
+              skip_analysis: $skip,
+              reason: $reason,
+              input_tokens: $input_tok,
+              output_tokens: $output_tok,
+              total_tokens: $total_tok,
+              files_to_update: $files
+            }
+          }' >> "$EVENTS_FILE"
 
         # Note: TEMP_DIR cleanup deferred — PR creation step still needs pr_numbers.txt
 
@@ -896,6 +1056,31 @@ runs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### Documentation PR Created: #$PR_NUMBER" >> $GITHUB_STEP_SUMMARY
         echo "$PR_URL" >> $GITHUB_STEP_SUMMARY
+
+        # Log doc_pr_created event
+        EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+        UPDATED_DOC_FILES=$(find . -maxdepth 1 -type f \( -iname "readme.md" -o -iname "claude.md" \) 2>/dev/null | sed 's|^\./||' | jq -R '.' | jq -s '.' 2>/dev/null || echo '[]')
+        jq -cn \
+          --arg run_id "$GITHUB_RUN_ID" \
+          --arg pr_num "PR-$PR_NUMBER" \
+          --arg pr_title "DocSync AI: Update Documentation" \
+          --arg pr_url "$PR_URL" \
+          --arg branch "$BRANCH" \
+          --argjson files "$UPDATED_DOC_FILES" \
+          '{
+            agent: "DocSync AI",
+            event_type: "doc_pr_created",
+            run_id: $run_id,
+            trigger_type: "scheduled",
+            timestamp: (now | todate),
+            payload: {
+              pr_number: $pr_num,
+              pr_title: $pr_title,
+              pr_url: $pr_url,
+              branch: $branch,
+              files_updated: $files
+            }
+          }' >> "$EVENTS_FILE"
 
         # Clean up temporary directory now that pr_numbers.txt has been read
         rm -rf "$TEMP_DIR" 2>/dev/null || true
