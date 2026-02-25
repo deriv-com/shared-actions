@@ -8,16 +8,6 @@ on:
         required: false
         default: "claude-sonnet-4-6"
         type: string
-      claude_temperature:
-        description: "[Deprecated — not used by Claude Code Action] Temperature for Claude responses (0-1)"
-        required: false
-        default: "0"
-        type: string
-      claude_max_tokens:
-        description: "[Deprecated — not used by Claude Code Action] Maximum tokens for Claude response"
-        required: false
-        default: "8192"
-        type: string
       prompt_gist_url:
         description: "URL to fetch prompt template from"
         required: false
