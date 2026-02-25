@@ -9,12 +9,12 @@ on:
         default: "claude-sonnet-4-6"
         type: string
       claude_temperature:
-        description: "Temperature for Claude responses (0-1)"
+        description: "[Deprecated — not used by Claude Code Action] Temperature for Claude responses (0-1)"
         required: false
         default: "0"
         type: string
       claude_max_tokens:
-        description: "Maximum tokens for Claude response"
+        description: "[Deprecated — not used by Claude Code Action] Maximum tokens for Claude response"
         required: false
         default: "8192"
         type: string
@@ -48,9 +48,7 @@ jobs:
       cancel-in-progress: true
 
     env:
-      CLAUDE_MODEL: ${{ inputs.claude_model }}
-      CLAUDE_TEMPERATURE: ${{ inputs.claude_temperature }}
-      CLAUDE_MAX_TOKENS: ${{ inputs.claude_max_tokens }}
+      CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-sonnet-4-6' }}
 
     steps:
       - name: Security Check - Validate User Access
@@ -71,7 +69,7 @@ jobs:
           echo "❌ Access denied for user: $ACTOR" && exit 1
 
       - name: Checkout PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.ref }}
@@ -81,18 +79,15 @@ jobs:
       - name: Fetch prompt template from Gist
         id: fetch-prompt
         env:
-          PROMPT_GIST_URL: ${{ inputs.prompt_gist_url }}
+          PROMPT_GIST_URL: ${{ inputs.prompt_gist_url || 'https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/claude-review-format.md' }}
         run: |
           PROMPT_TEMPLATE=$(curl -sL "$PROMPT_GIST_URL")
           [[ -z "$PROMPT_TEMPLATE" ]] && echo "❌ Failed to fetch prompt" && exit 1
 
           PROMPT_TEMPLATE=$(echo "$PROMPT_TEMPLATE" | sed '1s/^prompt:[[:space:]]*|[[:space:]]*//' | sed 's/^____$//g' | sed 's/____$//g')
 
-          PR_URL="https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
-          PR_HASH=$(echo -n "$PR_URL" | base64 -w0 | tr '+/' '-_' | tr -d '=')
-          PROMPT_TEMPLATE=$(echo "$PROMPT_TEMPLATE" | sed "s|{{AUTO_FIX_URL}}|https://click2fix.internal-gcp-ai-agents.deriv.dev/?hash=${PR_HASH}|g")
-
-          { echo 'prompt<<EOF'; echo "$PROMPT_TEMPLATE"; echo 'EOF'; } >> $GITHUB_OUTPUT
+          printf '%s' "$PROMPT_TEMPLATE" > /tmp/prompt_template.txt
+          echo "✅ Prompt template saved ($(wc -c < /tmp/prompt_template.txt) bytes)"
 
       - name: Capture and cleanup previous review
         id: previous-review
@@ -160,238 +155,149 @@ jobs:
             echo "ℹ️ No Click2Fix - Acknowledge comment found"
           fi
 
-      - name: Get PR context
+      - name: Build review context
+        id: build-context
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
+          HAS_ACKNOWLEDGED: ${{ steps.acknowledged.outputs.has_acknowledged }}
+          LAST_REVIEWED_SHA: ${{ steps.previous-review.outputs.last_reviewed_sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-          LAST_REVIEWED_SHA: ${{ steps.previous-review.outputs.last_reviewed_sha }}
-          HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
         run: |
-          gh pr diff "$PR_NUMBER" --repo "$REPO" > /tmp/pr_diff_raw.txt 2>/dev/null || echo "Unable to fetch diff" > /tmp/pr_diff_raw.txt
-          gh pr view "$PR_NUMBER" --repo "$REPO" --json files --jq '.files[].path' 2>/dev/null | head -50 > /tmp/changed_files.txt || true
-          echo "$PR_TITLE" > /tmp/pr_title.txt
-          echo "$PR_AUTHOR" > /tmp/pr_author.txt
-          echo "$PR_BRANCH" > /tmp/pr_branch.txt
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
 
-          # Filter noise files from the diff — generated, vendored, lock, test, and
-          # style files add bulk with zero review value. We strip their hunks entirely,
-          # keeping only the "diff --git" header line so the changed-files list stays accurate.
+          # Compute click2fix URL
+          PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
+          PR_HASH=$(echo -n "$PR_URL" | base64 -w0 | tr '+/' '-_' | tr -d '=')
+          CLICK2FIX_URL="https://click2fix.internal-gcp-ai-agents.deriv.dev/?hash=${PR_HASH}"
+
+          # Store current HEAD SHA (used in review comment metadata + metrics)
+          CURRENT_SHA=$(git rev-parse HEAD)
+          echo "$CURRENT_SHA" > /tmp/current_sha.txt
+          echo "current_sha=$CURRENT_SHA" >> $GITHUB_OUTPUT
+          echo "📌 Current HEAD: $CURRENT_SHA"
+
+          [[ "$HAS_PREVIOUS" == "true" ]] && REVIEW_TYPE="🔄 Follow-up Review" || REVIEW_TYPE="📋 Initial Review"
+          [[ "$HAS_PREVIOUS" == "true" ]] && EVENT_TYPE="followup_review" || EVENT_TYPE="initial_review"
+          echo "event_type=$EVENT_TYPE" >> $GITHUB_OUTPUT
+
+          # Noise pattern for incremental diff filtering — same set as before
           NOISE_PATTERN='package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.snap|\.min\.js|\.min\.css|dist/|build/|\.generated\.|__generated__|/vendor/|\.pb\.go|_test\.snap|\.spec\.(tsx?|jsx?)|/__tests__/|\.scss$|\.md$'
-          awk -v noise="$NOISE_PATTERN" '
-            /^diff --git / {
-              in_noise = ($0 ~ noise)
-              if (!in_noise) print
-              next
-            }
-            !in_noise { print }
-          ' /tmp/pr_diff_raw.txt > /tmp/pr_diff.txt
 
-          RAW_SIZE=$(wc -c < /tmp/pr_diff_raw.txt)
-          FILTERED_SIZE=$(wc -c < /tmp/pr_diff.txt)
-          echo "📊 Diff: ${RAW_SIZE} bytes raw → ${FILTERED_SIZE} bytes after noise filtering"
-
-          # Generate incremental diff (changes since last review) for follow-up reviews
+          # Pre-compute incremental diff (changes since last review) for follow-up mode
           echo "" > /tmp/incremental_diff.txt
           if [[ "$HAS_PREVIOUS" == "true" && -n "$LAST_REVIEWED_SHA" ]]; then
             echo "📋 Generating incremental diff since last reviewed commit: $LAST_REVIEWED_SHA"
             if git cat-file -e "$LAST_REVIEWED_SHA" 2>/dev/null; then
-              git diff "$LAST_REVIEWED_SHA"..HEAD > /tmp/incremental_diff_raw.txt 2>/dev/null || echo "" > /tmp/incremental_diff_raw.txt
-              # Apply same noise filter to incremental diff
-              awk -v noise="$NOISE_PATTERN" '
-                /^diff --git / {
-                  in_noise = ($0 ~ noise)
-                  if (!in_noise) print
-                  next
-                }
+              git diff "$LAST_REVIEWED_SHA"..HEAD | awk -v noise="$NOISE_PATTERN" '
+                /^diff --git / { in_noise = ($0 ~ noise); if (!in_noise) print; next }
                 !in_noise { print }
-              ' /tmp/incremental_diff_raw.txt > /tmp/incremental_diff.txt
-              if [ -s /tmp/incremental_diff.txt ]; then
-                echo "✅ Incremental diff generated"
-              else
-                echo "ℹ️ No changes since last reviewed commit"
-              fi
+              ' > /tmp/incremental_diff.txt
+              [ -s /tmp/incremental_diff.txt ] && echo "✅ Incremental diff generated" || echo "ℹ️ No changes since last reviewed commit"
             else
               echo "⚠️ Last reviewed commit $LAST_REVIEWED_SHA not found in history (fetch-depth may be too shallow)"
             fi
           fi
 
-          # Store current HEAD SHA for embedding in the review comment
-          CURRENT_SHA=$(git rev-parse HEAD)
-          echo "$CURRENT_SHA" > /tmp/current_sha.txt
-          echo "📌 Current HEAD: $CURRENT_SHA"
+          # Build the full context file that Claude Code Action will read
+          {
+            # System instructions from gist with click2fix URL injected
+            sed "s|{{AUTO_FIX_URL}}|${CLICK2FIX_URL}|g" /tmp/prompt_template.txt
+            echo ""
 
-      - name: Call Claude API
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          PROMPT_TEMPLATE: ${{ steps.fetch-prompt.outputs.prompt }}
-          HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
-          HAS_ACKNOWLEDGED: ${{ steps.acknowledged.outputs.has_acknowledged }}
-        run: |
-          echo "🤖 Calling Claude API..."
+            # Previous review section (follow-up mode only)
+            if [[ "$HAS_PREVIOUS" == "true" ]]; then
+              echo "---PREVIOUS_REVIEW---"
+              sed \
+                -e '/^## 🤖 Claude PR Review Complete$/d' \
+                -e '/^\*\*Model:\*\*/d' \
+                -e '/^\*Review generated via Claude Code Action\*$/d' \
+                -e '/^\*Review generated via Claude API\*$/d' \
+                -e '/^<!-- reviewed-commit:.*-->$/d' \
+                /tmp/previous_review.txt
+              echo "---END_PREVIOUS_REVIEW---"
+              echo ""
 
-          CHANGED_FILES=$(cat /tmp/changed_files.txt)
-          PR_TITLE=$(cat /tmp/pr_title.txt)
-          PR_AUTHOR=$(cat /tmp/pr_author.txt)
-          PR_BRANCH=$(cat /tmp/pr_branch.txt)
-          ACKNOWLEDGED_ITEMS=$(cat /tmp/acknowledged_items.txt)
+              # Incremental diff section — helps Claude identify what was explicitly fixed
+              if [ -s /tmp/incremental_diff.txt ]; then
+                echo "---INCREMENTAL_DIFF---"
+                echo "The following diff shows ONLY the changes made since the last review. Use this to confirm what was explicitly fixed."
+                echo "If a pattern appears on a \`-\` line here it was removed. If it does not appear here at all, it was not touched."
+                echo '```diff'
+                cat /tmp/incremental_diff.txt
+                echo '```'
+                echo "---END_INCREMENTAL_DIFF---"
+                echo ""
+              fi
+            fi
 
-          # Move full prompt template to system prompt — cleanly separates instructions
-          # from data and enables Anthropic prompt caching across repeated calls
-          printf '%s' "$PROMPT_TEMPLATE" > /tmp/system_prompt.txt
-          unset PROMPT_TEMPLATE  # free env space to avoid E2BIG when exec'ing jq
+            # Acknowledged suggestions — skip these entirely in the review
+            if [[ "$HAS_ACKNOWLEDGED" == "true" ]]; then
+              echo "---ACKNOWLEDGED_SUGGESTIONS---"
+              echo "The following suggestions have been acknowledged by the developer and must NOT be included in your review. Do not mention or suggest these items again:"
+              cat /tmp/acknowledged_items.txt
+              echo "---END_ACKNOWLEDGED_SUGGESTIONS---"
+              echo ""
+            fi
 
-          # Cap the diff at 500 KB — at ~4 chars/token this is ~125K tokens, well within
-          # Claude Sonnet's 200K context window while leaving room for system prompt + output.
-          # Noise filtering above handles most large PRs before this cap is ever reached.
-          DIFF_SIZE=$(wc -c < /tmp/pr_diff.txt)
-          DIFF_CAP=500000
-          if [ "$DIFF_SIZE" -gt "$DIFF_CAP" ]; then
-            echo "⚠️ Diff is ${DIFF_SIZE} bytes — truncating to ${DIFF_CAP} bytes"
-            PR_DIFF=$(head -c "$DIFF_CAP" /tmp/pr_diff.txt)
-            PR_DIFF="${PR_DIFF}
+            # PR metadata
+            printf '## Pull Request Information\n'
+            printf -- '- **Title:** %s\n' "$PR_TITLE"
+            printf -- '- **Author:** %s\n' "$PR_AUTHOR"
+            printf -- '- **Branch:** %s\n' "$PR_BRANCH"
+            printf -- '- **PR Number:** %s\n' "$PR_NUMBER"
+            printf -- '- **Repository:** %s\n' "$REPO"
+            echo ""
 
-          [...diff truncated at ${DIFF_CAP} bytes (${DIFF_SIZE} total). Review remaining files manually.]"
-          else
-            PR_DIFF=$(cat /tmp/pr_diff.txt)
-          fi
+            # Output format requirements — the header and metadata tag are required for
+            # follow-up review detection on subsequent runs (same mechanism as before)
+            echo "## Review Output Format Requirements"
+            echo "Begin your PR review comment with exactly this header (no extra text before it):"
+            echo ""
+            echo "## 🤖 Claude PR Review Complete"
+            echo ""
+            printf '**Model:** \`%s\` | **Review Type:** %s\n' "$CLAUDE_MODEL" "$REVIEW_TYPE"
+            echo ""
+            echo "End your comment with this hidden metadata tag on its own line — it is required for follow-up review detection on the next push:"
+            printf '<!-- reviewed-commit: %s -->\n' "$CURRENT_SHA"
 
-          # Build previous-review section (follow-up mode only).
-          # Strip bot comment boilerplate before re-sending to reduce token cost.
-          if [[ "$HAS_PREVIOUS" == "true" ]]; then
-            echo "📋 Follow-up review mode"
-            PREVIOUS_REVIEW=$(sed \
-              -e '/^## 🤖 Claude PR Review Complete$/d' \
-              -e '/^\*\*Model:\*\*/d' \
-              -e '/^\*Review generated via Claude API\*$/d' \
-              -e '/^<!-- reviewed-commit:.*-->$/d' \
-              /tmp/previous_review.txt)
-            PREV_SECTION="---PREVIOUS_REVIEW---
-          ${PREVIOUS_REVIEW}
-          ---END_PREVIOUS_REVIEW---"
-          else
-            echo "📋 Initial review mode"
-            PREV_SECTION=""
-          fi
+          } > /tmp/review_context.md
 
-          # Build acknowledged section if exists
-          if [[ "$HAS_ACKNOWLEDGED" == "true" ]]; then
-            echo "✅ Including acknowledged items to skip"
-            ACKNOWLEDGED_SECTION="---ACKNOWLEDGED_SUGGESTIONS---
-          The following suggestions have been acknowledged by the developer and should NOT be included in your review. Do not mention or suggest these items again:
-          ${ACKNOWLEDGED_ITEMS}
-          ---END_ACKNOWLEDGED_SUGGESTIONS---"
-          else
-            ACKNOWLEDGED_SECTION=""
-          fi
+          echo "📋 Review context built ($(wc -c < /tmp/review_context.md) bytes)"
 
-          # Build incremental diff section for follow-up reviews
-          if [[ "$HAS_PREVIOUS" == "true" && -s /tmp/incremental_diff.txt ]]; then
-            echo "📋 Including incremental diff"
-            INCREMENTAL_DIFF=$(cat /tmp/incremental_diff.txt)
-            INCREMENTAL_SECTION="---INCREMENTAL_DIFF---
-          The following diff shows ONLY the changes made since the last review. Use this to identify what was explicitly fixed.
-          If a problematic code pattern appears in a \`-\` line here, it was removed by the fix commit.
-          If a pattern does NOT appear here at all, the fix commit did NOT touch it.
-          \`\`\`diff
-          ${INCREMENTAL_DIFF}
-          \`\`\`
-          ---END_INCREMENTAL_DIFF---"
-          else
-            INCREMENTAL_SECTION=""
-          fi
+      - name: Claude Code PR Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          model: ${{ env.CLAUDE_MODEL }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
 
-          # User message contains only dynamic PR data; instructions live in system prompt
-          USER_PROMPT="${PREV_SECTION}
+            Read /tmp/review_context.md — it contains your complete review instructions, PR context,
+            previous review (if any), acknowledged suggestions to skip, and the required output format.
 
-          ${INCREMENTAL_SECTION}
-
-          ${ACKNOWLEDGED_SECTION}
-
-          ## Pull Request Information
-          - **Title:** ${PR_TITLE}
-          - **Author:** ${PR_AUTHOR}
-          - **Branch:** ${PR_BRANCH}
-
-          ## Changed Files
-          ${CHANGED_FILES}
-
-          ## Diff
-          \`\`\`diff
-          ${PR_DIFF}
-          \`\`\`"
-
-          printf '%s' "$USER_PROMPT" > /tmp/user_prompt.txt
-          echo "📏 System: $(wc -c < /tmp/system_prompt.txt) bytes | User: $(wc -c < /tmp/user_prompt.txt) bytes"
-
-          # Build JSON payload using --rawfile so large strings are never passed as
-          # CLI arguments — avoids the ARG_MAX (E2BIG) error on large diffs
-          jq -n \
-            --arg model "$CLAUDE_MODEL" \
-            --argjson max_tokens "$CLAUDE_MAX_TOKENS" \
-            --argjson temperature "$CLAUDE_TEMPERATURE" \
-            --rawfile system /tmp/system_prompt.txt \
-            --rawfile user /tmp/user_prompt.txt \
-            '{model: $model, max_tokens: ($max_tokens | tonumber), temperature: ($temperature | tonumber), system: $system, messages: [{role: "user", content: $user}]}' \
-            > /tmp/payload.json
-
-          # Send payload from file — avoids ARG_MAX on `curl -d` with large payloads
-          HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/api_response.json \
-            "https://api.anthropic.com/v1/messages" \
-            -H "Content-Type: application/json" \
-            -H "x-api-key: $ANTHROPIC_API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
-            -d @/tmp/payload.json)
-
-          [[ "$HTTP_CODE" != "200" ]] && echo "❌ API failed: $HTTP_CODE" && cat /tmp/api_response.json && exit 1
-
-          # Parse response from file — avoids ARG_MAX on large API responses
-          REVIEW=$(jq -r '.content[0].text // empty' /tmp/api_response.json)
-          [[ -z "$REVIEW" ]] && echo "❌ Empty response" && exit 1
-
-          echo "$REVIEW" > /tmp/review.txt
-          echo "✅ Review generated ($(wc -c < /tmp/review.txt) bytes)"
-
-      - name: Post Review Comment
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
-        run: |
-          REVIEW=$(cat /tmp/review.txt)
-          CURRENT_SHA=$(cat /tmp/current_sha.txt)
-          [[ "$HAS_PREVIOUS" == "true" ]] && REVIEW_TYPE="🔄 Follow-up Review" || REVIEW_TYPE="📋 Initial Review"
-
-          COMMENT="## 🤖 Claude PR Review Complete
-
-          **Model:** \`$CLAUDE_MODEL\` | **Review Type:** ${REVIEW_TYPE}
-
-          ---
-
-          $REVIEW
-
-          ---
-          *Review generated via Claude API*
-          <!-- reviewed-commit: ${CURRENT_SHA} -->"
-
-          gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body "$COMMENT"
-          echo "✅ Posted (reviewed commit: ${CURRENT_SHA})"
+            Then review the PR using your tools.
+            Use `gh pr diff` to get the full diff and read full file contents as needed for deeper context.
+            Use `gh pr comment` to post your review feedback.
+          # Read-only tools: no Edit/Write/NotebookEdit to prevent accidental modifications
+          claude_args: |
+            --allowedTools "Read,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       - name: Emit review event to metrics dashboard
         if: always()
         env:
-          HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
           AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+          CURRENT_SHA: ${{ steps.build-context.outputs.current_sha }}
+          EVENT_TYPE: ${{ steps.build-context.outputs.event_type }}
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
           REPO="${{ github.repository }}"
-          CURRENT_SHA=$(cat /tmp/current_sha.txt 2>/dev/null || echo "")
-          REVIEW_SIZE=$(wc -c < /tmp/review.txt 2>/dev/null || echo "0")
-
-          [[ "$HAS_PREVIOUS" == "true" ]] && EVENT_TYPE="followup_review" || EVENT_TYPE="initial_review"
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          REVIEW_SIZE=$(wc -c < /tmp/review.txt 2>/dev/null || echo "0")
 
           # Build the event payload with jq so all values are safely escaped
           EVENT_PAYLOAD=$(jq -n \
