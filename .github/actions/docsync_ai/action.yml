@@ -169,10 +169,11 @@ runs:
           # Sanitize and validate diff content
           PR_DIFF=$(echo "$PR_DIFF" | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
 
-          # Filter out .github/workflows diffs (don't include workflow changes in analysis)
+          # Filter out workflow diffs and lock file diffs (never relevant to documentation, can be hundreds of KB)
           PR_DIFF=$(echo "$PR_DIFF" | awk '
             BEGIN { skip=0 }
             /^diff --git.*\.github\/workflows\// { skip=1; next }
+            /^diff --git.*(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Gemfile\.lock|composer\.lock|Cargo\.lock|poetry\.lock|go\.sum)/ { skip=1; next }
             /^diff --git/ { skip=0 }
             !skip { print }
           ')
@@ -188,8 +189,8 @@ runs:
             "/repos/$REPO_NAME/pulls/$PR_NUM/files" \
             --jq '.[].filename' 2>&1 || echo "")
 
-          # Filter out .github/workflows files
-          CHANGED_FILES_FILTERED=$(echo "$CHANGED_FILES" | grep -v '^\.github/workflows/' || echo "")
+          # Filter out workflow files and lock files
+          CHANGED_FILES_FILTERED=$(echo "$CHANGED_FILES" | grep -v '^\.github/workflows/' | grep -vE '(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Gemfile\.lock|composer\.lock|Cargo\.lock|poetry\.lock|go\.sum)$' || echo "")
           ALL_CHANGED_FILES="${ALL_CHANGED_FILES}
         ${CHANGED_FILES_FILTERED}"
 
@@ -466,6 +467,19 @@ runs:
           TOTAL_CHUNKS=$(cat "$CHUNK_DIR/chunk_count.txt" 2>/dev/null || echo "1")
           echo "Split into $TOTAL_CHUNKS chunk(s)" >> $GITHUB_STEP_SUMMARY
 
+          # Enforce per-chunk size limit: truncate oversized chunks that couldn't be split further
+          for i in $(seq 1 "$TOTAL_CHUNKS"); do
+            CHUNK_PATH="$CHUNK_DIR/chunk_${i}.txt"
+            [ -f "$CHUNK_PATH" ] || continue
+            CHUNK_SIZE=$(wc -c < "$CHUNK_PATH" | tr -d ' ')
+            if [ "$CHUNK_SIZE" -gt "$CHUNK_MAX_CHARS" ]; then
+              echo "  Chunk $i is ${CHUNK_SIZE} chars (exceeds ${CHUNK_MAX_CHARS}) — truncating" >> $GITHUB_STEP_SUMMARY
+              head -c "$CHUNK_MAX_CHARS" "$CHUNK_PATH" > "${CHUNK_PATH}.tmp"
+              printf '\n[TRUNCATED — chunk exceeded %s char limit, %s chars omitted]\n' "$CHUNK_MAX_CHARS" "$((CHUNK_SIZE - CHUNK_MAX_CHARS))" >> "${CHUNK_PATH}.tmp"
+              mv "${CHUNK_PATH}.tmp" "$CHUNK_PATH"
+            fi
+          done
+
           ALL_SUMMARIES=""
           for i in $(seq 1 "$TOTAL_CHUNKS"); do
             CHUNK_PATH="$CHUNK_DIR/chunk_${i}.txt"
@@ -715,6 +729,12 @@ runs:
             echo "   - Do NOT rewrite, expand, or rephrase existing content"
             echo "   - If a change can be described in one line, use one line"
             echo "   - Omit anything a developer could infer from the code itself"
+            echo ""
+-            echo "8. **NO FABRICATED CODE — ZERO TOLERANCE**:"
+            echo "   - NEVER invent, fabricate, or generate code examples that do not appear verbatim in the provided diff"
+            echo "   - Only include code snippets if they are directly copied from the code changes above"
+            echo "   - If the diff is summarized, truncated, or unavailable, describe changes in plain text only — absolutely no code blocks"
+            echo "   - Do NOT infer or reconstruct what code might look like based on file names, PR titles, or descriptions"
             echo ""
             echo "## Decision Process:"
             echo ""
