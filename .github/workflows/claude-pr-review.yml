@@ -257,6 +257,9 @@ jobs:
 
           echo "📋 Review context built ($(wc -c < /tmp/review_context.md) bytes)"
 
+      - name: Remove CLAUDE.md to prevent project config leaking into review
+        run: rm -f CLAUDE.md
+
       - name: Claude Code PR Review
         uses: anthropics/claude-code-action@v1
         with:
@@ -283,7 +286,9 @@ jobs:
                - Parent components or callers if the changed file exports something modified
                - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps
 
-            4. Use `gh pr comment` to post your review with all findings.
+            4. Compile ALL your findings from every changed file into a single complete review.
+               Then call `gh pr comment` EXACTLY ONCE with the full review.
+               Do NOT post partial comments as you review files — wait until you have reviewed every changed file and all its dependencies before posting.
           # Read-only tools: no Edit/Write/NotebookEdit to prevent accidental modifications
           claude_args: |
             --allowedTools "Read,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
