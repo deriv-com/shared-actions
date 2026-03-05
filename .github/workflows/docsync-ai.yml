@@ -49,6 +49,12 @@ on:
       DOCSYNC_SLACK_MENTION_USER_IDS:
         description: "Slack user ID(s) to mention in notifications"
         required: false
+      AGENT_METRICS_API_URL:
+        description: "Base URL for the OneAboveAll metrics dashboard API (e.g. https://dashboard.example.com). Leave unset to skip POSTing events."
+        required: false
+      AGENT_METRICS_API_KEY:
+        description: "API key for authenticating POST requests to the metrics dashboard. Must match AGENT_METRICS_API_KEY on the backend. Required when AGENT_METRICS_API_URL is set."
+        required: false
 
 concurrency:
   group: docsync-ai-${{ github.repository }}
@@ -237,6 +243,8 @@ jobs:
           DOC_PR_CREATED: ${{ steps.docsync.outputs.doc_pr_created }}
           DOC_PR_URL: ${{ steps.docsync.outputs.doc_pr_url }}
           WORKFLOW_START_TIME: ${{ steps.trigger-info.outputs.start_time }}
+          AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+          AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
         run: |
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
@@ -282,6 +290,39 @@ jobs:
                 error: $error
               }
             }' >> "$EVENTS_FILE"
+
+          # POST accumulated events to the metrics dashboard
+          if [[ -n "$AGENT_METRICS_API_URL" ]] && [ -f "$EVENTS_FILE" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📡 Metrics Dashboard" >> $GITHUB_STEP_SUMMARY
+
+            CURL_HEADERS=(-H "Content-Type: application/json")
+            [[ -n "$AGENT_METRICS_API_KEY" ]] && CURL_HEADERS+=(-H "X-API-Key: $AGENT_METRICS_API_KEY")
+
+            POST_SUCCESS=0
+            POST_FAIL=0
+            while IFS= read -r EVENT_LINE; do
+              HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/api_response.json \
+                "${CURL_HEADERS[@]}" \
+                "${AGENT_METRICS_API_URL}/api/v1/events" \
+                -X POST \
+                -d "$EVENT_LINE")
+
+              if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "201" ]]; then
+                POST_SUCCESS=$((POST_SUCCESS + 1))
+              else
+                POST_FAIL=$((POST_FAIL + 1))
+                echo "⚠️ Event POST returned HTTP $HTTP_CODE" >> $GITHUB_STEP_SUMMARY
+              fi
+            done < "$EVENTS_FILE"
+
+            echo "✅ Events sent to dashboard: $POST_SUCCESS success, $POST_FAIL failed" >> $GITHUB_STEP_SUMMARY
+          else
+            if [[ -z "$AGENT_METRICS_API_URL" ]]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "ℹ️ AGENT_METRICS_API_URL not set — events logged to job summary only" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
 
           # Display accumulated event log
           if [ -f "$EVENTS_FILE" ]; then
@@ -510,6 +551,8 @@ jobs:
           COMMAND: ${{ steps.docsync-comment.outputs.command }}
           IS_DOCSYNC_PR: ${{ steps.docsync-comment.outputs.is_docsync_pr }}
           WORKFLOW_START_TIME: ${{ steps.trigger-info.outputs.start_time }}
+          AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+          AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
         run: |
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
@@ -557,6 +600,39 @@ jobs:
                 error: $error
               }
             }' >> "$EVENTS_FILE"
+
+          # POST accumulated events to the metrics dashboard
+          if [[ -n "$AGENT_METRICS_API_URL" ]] && [ -f "$EVENTS_FILE" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📡 Metrics Dashboard" >> $GITHUB_STEP_SUMMARY
+
+            CURL_HEADERS=(-H "Content-Type: application/json")
+            [[ -n "$AGENT_METRICS_API_KEY" ]] && CURL_HEADERS+=(-H "X-API-Key: $AGENT_METRICS_API_KEY")
+
+            POST_SUCCESS=0
+            POST_FAIL=0
+            while IFS= read -r EVENT_LINE; do
+              HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/api_response.json \
+                "${CURL_HEADERS[@]}" \
+                "${AGENT_METRICS_API_URL}/api/v1/events" \
+                -X POST \
+                -d "$EVENT_LINE")
+
+              if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "201" ]]; then
+                POST_SUCCESS=$((POST_SUCCESS + 1))
+              else
+                POST_FAIL=$((POST_FAIL + 1))
+                echo "⚠️ Event POST returned HTTP $HTTP_CODE" >> $GITHUB_STEP_SUMMARY
+              fi
+            done < "$EVENTS_FILE"
+
+            echo "✅ Events sent to dashboard: $POST_SUCCESS success, $POST_FAIL failed" >> $GITHUB_STEP_SUMMARY
+          else
+            if [[ -z "$AGENT_METRICS_API_URL" ]]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "ℹ️ AGENT_METRICS_API_URL not set — events logged to job summary only" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
 
           # Display accumulated event log
           if [ -f "$EVENTS_FILE" ]; then
