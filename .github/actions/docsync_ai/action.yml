@@ -164,7 +164,7 @@ runs:
           # Get full PR diff (no size limit)
           PR_DIFF=$(gh api \
             -H "Accept: application/vnd.github.v3.diff" \
-            "/repos/$REPO_NAME/pulls/$PR_NUM" 2>&1)
+            "/repos/$REPO_NAME/pulls/$PR_NUM" 2>&1 || echo "")
 
           # Sanitize and validate diff content
           PR_DIFF=$(echo "$PR_DIFF" | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
@@ -265,7 +265,7 @@ runs:
         # Log prs_fetched event
         EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
         PR_NUMS_JSON=$(cat "$TEMP_DIR/pr_numbers.txt" 2>/dev/null | jq -R '"PR-" + .' | jq -s '.' 2>/dev/null || echo '[]')
-        CHANGED_FILES_COUNT=$(echo "$ALL_CHANGED_FILES" | grep -v '^$' | wc -l | tr -d ' ')
+        CHANGED_FILES_COUNT=$(echo "$ALL_CHANGED_FILES" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
         CHANGED_FILES_JSON=$(echo "$ALL_CHANGED_FILES" | head -n 50 | grep -v '^$' | jq -R '.' | jq -s '.' 2>/dev/null || echo '[]')
         jq -cn \
           --arg run_id "$GITHUB_RUN_ID" \
