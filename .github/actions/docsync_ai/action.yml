@@ -730,7 +730,7 @@ runs:
             echo "   - If a change can be described in one line, use one line"
             echo "   - Omit anything a developer could infer from the code itself"
             echo ""
--            echo "8. **NO FABRICATED CODE — ZERO TOLERANCE**:"
+            echo "8. **NO FABRICATED CODE — ZERO TOLERANCE**:"
             echo "   - NEVER invent, fabricate, or generate code examples that do not appear verbatim in the provided diff"
             echo "   - Only include code snippets if they are directly copied from the code changes above"
             echo "   - If the diff is summarized, truncated, or unavailable, describe changes in plain text only — absolutely no code blocks"
