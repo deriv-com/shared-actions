@@ -297,7 +297,7 @@ jobs:
                Do NOT write anything else to disk. Do NOT post any comments.
           # No gh pr comment — workflow posts the review file after Claude finishes
           claude_args: |
-            --allowedTools "Read,Write,Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --allowedTools "Read,Write(/tmp/review_output.md),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       - name: Post review comment
         env:
