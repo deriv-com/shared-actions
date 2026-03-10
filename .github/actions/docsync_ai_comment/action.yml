@@ -712,23 +712,133 @@ runs:
             chmod 600 "$SREQUEST_FILE"
 
             # Call Claude API for chunk summarization
-            SRESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            CALL_START_MS=$(($(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000))
+            SRESPONSE=$(curl -s -w "\n%{http_code}" https://api.anthropic.com/v1/messages \
               -H "content-type: application/json" \
               -H "x-api-key: $ANTHROPIC_API_KEY" \
               -H "anthropic-version: 2023-06-01" \
               -d @"$SREQUEST_FILE")
+            CALL_END_MS=$(($(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000))
+            CALL_LATENCY_MS=$((CALL_END_MS - CALL_START_MS))
+            CURL_HTTP_CODE=$(echo "$SRESPONSE" | tail -1)
+            SRESPONSE=$(echo "$SRESPONSE" | sed '$d')
 
+            PROMPT_CHARS_SENT=$(wc -c < "$SPROMPT_FILE" | tr -d ' ')
             rm -f "$SREQUEST_FILE" "$SPROMPT_FILE"
 
             # Validate response
             if ! echo "$SRESPONSE" | jq empty 2>/dev/null; then
               echo "  Warning: Invalid response for chunk $i" >> $GITHUB_STEP_SUMMARY
+
+              jq -cn \
+                --arg run_id "$GITHUB_RUN_ID" \
+                --argjson chunk_idx "$i" \
+                --argjson total_chunks "$TOTAL_CHUNKS" \
+                --argjson latency "$CALL_LATENCY_MS" \
+                --arg http_status "$CURL_HTTP_CODE" \
+                --argjson prompt_chars "$PROMPT_CHARS_SENT" \
+                '{
+                  agent: "DocSync AI",
+                  event_type: "claude_api_call",
+                  run_id: $run_id,
+                  trigger_type: "comment",
+                  timestamp: (now | todate),
+                  payload: {
+                    call_type: "chunk_summarization",
+                    target_file: null,
+                    chunk_index: $chunk_idx,
+                    total_chunks: $total_chunks,
+                    model: "claude-sonnet-4-5",
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    prompt_chars: $prompt_chars,
+                    response_chars: 0,
+                    latency_ms: $latency,
+                    http_status: $http_status,
+                    api_error_type: "invalid_json",
+                    result: "error"
+                  }
+                }' >> "$EVENTS_FILE"
+
+              jq -cn \
+                --arg run_id "$GITHUB_RUN_ID" \
+                --arg http_status "$CURL_HTTP_CODE" \
+                '{
+                  agent: "DocSync AI",
+                  event_type: "error_occurred",
+                  run_id: $run_id,
+                  trigger_type: "comment",
+                  timestamp: (now | todate),
+                  payload: {
+                    step: "claude_api_call",
+                    target_file: null,
+                    error_type: "invalid_json",
+                    error_message: "Invalid JSON response from Anthropic API during chunk summarization",
+                    http_status: $http_status,
+                    recoverable: true,
+                    continued: true
+                  }
+                }' >> "$EVENTS_FILE"
+
               continue
             fi
 
             if echo "$SRESPONSE" | jq -e '.error' > /dev/null 2>&1; then
               SERR_TYPE=$(echo "$SRESPONSE" | jq -r '.error.type // "unknown"')
               echo "  Warning: API error for chunk $i: $SERR_TYPE" >> $GITHUB_STEP_SUMMARY
+
+              jq -cn \
+                --arg run_id "$GITHUB_RUN_ID" \
+                --argjson chunk_idx "$i" \
+                --argjson total_chunks "$TOTAL_CHUNKS" \
+                --argjson latency "$CALL_LATENCY_MS" \
+                --arg http_status "$CURL_HTTP_CODE" \
+                --argjson prompt_chars "$PROMPT_CHARS_SENT" \
+                --arg err_type "$SERR_TYPE" \
+                '{
+                  agent: "DocSync AI",
+                  event_type: "claude_api_call",
+                  run_id: $run_id,
+                  trigger_type: "comment",
+                  timestamp: (now | todate),
+                  payload: {
+                    call_type: "chunk_summarization",
+                    target_file: null,
+                    chunk_index: $chunk_idx,
+                    total_chunks: $total_chunks,
+                    model: "claude-sonnet-4-5",
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    prompt_chars: $prompt_chars,
+                    response_chars: 0,
+                    latency_ms: $latency,
+                    http_status: $http_status,
+                    api_error_type: $err_type,
+                    result: "error"
+                  }
+                }' >> "$EVENTS_FILE"
+
+              jq -cn \
+                --arg run_id "$GITHUB_RUN_ID" \
+                --arg err_type "$SERR_TYPE" \
+                --arg http_status "$CURL_HTTP_CODE" \
+                '{
+                  agent: "DocSync AI",
+                  event_type: "error_occurred",
+                  run_id: $run_id,
+                  trigger_type: "comment",
+                  timestamp: (now | todate),
+                  payload: {
+                    step: "claude_api_call",
+                    target_file: null,
+                    error_type: "api_error",
+                    error_message: ("Anthropic API error during chunk summarization: " + $err_type),
+                    http_status: $http_status,
+                    recoverable: true,
+                    continued: true
+                  }
+                }' >> "$EVENTS_FILE"
+
               continue
             fi
 
@@ -739,6 +849,46 @@ runs:
             CHUNK_OUT=$(echo "$SRESPONSE" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo "0")
             TOTAL_INPUT_TOKENS=$((TOTAL_INPUT_TOKENS + CHUNK_IN))
             TOTAL_OUTPUT_TOKENS=$((TOTAL_OUTPUT_TOKENS + CHUNK_OUT))
+
+            RESPONSE_CHARS=${#CHUNK_SUMMARY}
+            CHUNK_RESULT="no_updates_needed"
+            if [ -n "$CHUNK_SUMMARY" ] && ! echo "$CHUNK_SUMMARY" | grep -q "NO_DOC_RELEVANT_CHANGES"; then
+              CHUNK_RESULT="updated"
+            fi
+
+            jq -cn \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --argjson chunk_idx "$i" \
+              --argjson total_chunks "$TOTAL_CHUNKS" \
+              --argjson in_tok "$CHUNK_IN" \
+              --argjson out_tok "$CHUNK_OUT" \
+              --argjson prompt_chars "$PROMPT_CHARS_SENT" \
+              --argjson resp_chars "$RESPONSE_CHARS" \
+              --argjson latency "$CALL_LATENCY_MS" \
+              --arg http_status "$CURL_HTTP_CODE" \
+              --arg result "$CHUNK_RESULT" \
+              '{
+                agent: "DocSync AI",
+                event_type: "claude_api_call",
+                run_id: $run_id,
+                trigger_type: "comment",
+                timestamp: (now | todate),
+                payload: {
+                  call_type: "chunk_summarization",
+                  target_file: null,
+                  chunk_index: $chunk_idx,
+                  total_chunks: $total_chunks,
+                  model: "claude-sonnet-4-5",
+                  input_tokens: $in_tok,
+                  output_tokens: $out_tok,
+                  prompt_chars: $prompt_chars,
+                  response_chars: $resp_chars,
+                  latency_ms: $latency,
+                  http_status: $http_status,
+                  api_error_type: null,
+                  result: $result
+                }
+              }' >> "$EVENTS_FILE"
 
             if [ -n "$CHUNK_SUMMARY" ] && ! echo "$CHUNK_SUMMARY" | grep -q "NO_DOC_RELEVANT_CHANGES"; then
               ALL_SUMMARIES="${ALL_SUMMARIES}
@@ -876,6 +1026,13 @@ runs:
         fi
 
         ANY_UPDATES=false
+        DOC_CHANGES_LIST=""
+        DIFF_CHUNKED=false
+        DIFF_TOTAL_CHUNKS=0
+        if [ "${DIFF_SIZE:-0}" -gt "$MAX_DIFF_CHARS" ]; then
+          DIFF_CHUNKED=true
+          DIFF_TOTAL_CHUNKS=${TOTAL_CHUNKS:-0}
+        fi
 
         # Function to call Claude API for documentation update
         update_doc_file() {
@@ -1132,16 +1289,73 @@ runs:
 
           chmod 600 "$REQUEST_FILE"
 
-          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+          DOC_PROMPT_CHARS=$(wc -c < "$PROMPT_FILE" | tr -d ' ')
+          DOC_CALL_START=$(($(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000))
+          RESPONSE=$(curl -s -w "\n%{http_code}" https://api.anthropic.com/v1/messages \
             -H "content-type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -d @"$REQUEST_FILE")
+          DOC_CALL_END=$(($(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000))
+          DOC_CALL_LATENCY=$((DOC_CALL_END - DOC_CALL_START))
+          DOC_HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          RESPONSE=$(echo "$RESPONSE" | sed '$d')
 
           rm -f "$REQUEST_FILE"
 
           if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
             echo "  Invalid JSON response from API" >> $GITHUB_STEP_SUMMARY
+
+            jq -cn \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --arg doc_file "$DOC_FILE" \
+              --argjson latency "$DOC_CALL_LATENCY" \
+              --arg http_status "$DOC_HTTP_CODE" \
+              --argjson prompt_chars "$DOC_PROMPT_CHARS" \
+              '{
+                agent: "DocSync AI",
+                event_type: "claude_api_call",
+                run_id: $run_id,
+                trigger_type: "comment",
+                timestamp: (now | todate),
+                payload: {
+                  call_type: "doc_update",
+                  target_file: $doc_file,
+                  chunk_index: null,
+                  total_chunks: null,
+                  model: "claude-sonnet-4-5",
+                  input_tokens: 0,
+                  output_tokens: 0,
+                  prompt_chars: $prompt_chars,
+                  response_chars: 0,
+                  latency_ms: $latency,
+                  http_status: $http_status,
+                  api_error_type: "invalid_json",
+                  result: "error"
+                }
+              }' >> "$EVENTS_FILE"
+
+            jq -cn \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --arg doc_file "$DOC_FILE" \
+              --arg http_status "$DOC_HTTP_CODE" \
+              '{
+                agent: "DocSync AI",
+                event_type: "error_occurred",
+                run_id: $run_id,
+                trigger_type: "comment",
+                timestamp: (now | todate),
+                payload: {
+                  step: "claude_api_call",
+                  target_file: $doc_file,
+                  error_type: "invalid_json",
+                  error_message: "Invalid JSON response from Anthropic API during doc update",
+                  http_status: $http_status,
+                  recoverable: false,
+                  continued: false
+                }
+              }' >> "$EVENTS_FILE"
+
             return 1
           fi
 
@@ -1149,33 +1363,164 @@ runs:
             ERROR_TYPE=$(echo "$RESPONSE" | jq -r '.error.type // "unknown"')
             ERROR_CODE=$(echo "$RESPONSE" | jq -r '.error.code // "unknown"')
             echo "  Claude API Error for $DOC_FILE: type=$ERROR_TYPE, code=$ERROR_CODE" >> $GITHUB_STEP_SUMMARY
+
+            jq -cn \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --arg doc_file "$DOC_FILE" \
+              --argjson latency "$DOC_CALL_LATENCY" \
+              --arg http_status "$DOC_HTTP_CODE" \
+              --argjson prompt_chars "$DOC_PROMPT_CHARS" \
+              --arg err_type "$ERROR_TYPE" \
+              '{
+                agent: "DocSync AI",
+                event_type: "claude_api_call",
+                run_id: $run_id,
+                trigger_type: "comment",
+                timestamp: (now | todate),
+                payload: {
+                  call_type: "doc_update",
+                  target_file: $doc_file,
+                  chunk_index: null,
+                  total_chunks: null,
+                  model: "claude-sonnet-4-5",
+                  input_tokens: 0,
+                  output_tokens: 0,
+                  prompt_chars: $prompt_chars,
+                  response_chars: 0,
+                  latency_ms: $latency,
+                  http_status: $http_status,
+                  api_error_type: $err_type,
+                  result: "error"
+                }
+              }' >> "$EVENTS_FILE"
+
+            jq -cn \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --arg doc_file "$DOC_FILE" \
+              --arg err_type "$ERROR_TYPE" \
+              --arg http_status "$DOC_HTTP_CODE" \
+              '{
+                agent: "DocSync AI",
+                event_type: "error_occurred",
+                run_id: $run_id,
+                trigger_type: "comment",
+                timestamp: (now | todate),
+                payload: {
+                  step: "claude_api_call",
+                  target_file: $doc_file,
+                  error_type: "api_error",
+                  error_message: ("Anthropic API error during doc update: " + $err_type),
+                  http_status: $http_status,
+                  recoverable: false,
+                  continued: false
+                }
+              }' >> "$EVENTS_FILE"
+
             return 1
           fi
 
           if ! echo "$RESPONSE" | jq -e '.content[0].text' > /dev/null 2>&1; then
             echo "  API response missing expected content field" >> $GITHUB_STEP_SUMMARY
+
+            jq -cn \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --arg doc_file "$DOC_FILE" \
+              --arg http_status "$DOC_HTTP_CODE" \
+              '{
+                agent: "DocSync AI",
+                event_type: "error_occurred",
+                run_id: $run_id,
+                trigger_type: "comment",
+                timestamp: (now | todate),
+                payload: {
+                  step: "claude_api_call",
+                  target_file: $doc_file,
+                  error_type: "invalid_json",
+                  error_message: "API response missing expected content field",
+                  http_status: $http_status,
+                  recoverable: false,
+                  continued: false
+                }
+              }' >> "$EVENTS_FILE"
+
             return 1
           fi
 
           CLAUDE_OUTPUT=$(echo "$RESPONSE" | jq -r '.content[0].text')
           CLAUDE_OUTPUT=$(echo "$CLAUDE_OUTPUT" | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
 
+          # Accumulate token usage from this Claude API call
+          DOC_IN=$(echo "$RESPONSE" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo "0")
+          DOC_OUT=$(echo "$RESPONSE" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo "0")
+          TOTAL_INPUT_TOKENS=$((TOTAL_INPUT_TOKENS + DOC_IN))
+          TOTAL_OUTPUT_TOKENS=$((TOTAL_OUTPUT_TOKENS + DOC_OUT))
+
+          DOC_CALL_RESULT="updated"
           if [ "$IS_DOCSYNC_PR" != "true" ]; then
             if echo "$CLAUDE_OUTPUT" | grep -q "NO_UPDATES_NEEDED"; then
-              echo "  No updates needed for $DOC_FILE" >> $GITHUB_STEP_SUMMARY
-              return 0
+              DOC_CALL_RESULT="no_updates_needed"
             fi
+          fi
+
+          DOC_RESPONSE_CHARS=${#CLAUDE_OUTPUT}
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg doc_file "$DOC_FILE" \
+            --argjson in_tok "$DOC_IN" \
+            --argjson out_tok "$DOC_OUT" \
+            --argjson prompt_chars "$DOC_PROMPT_CHARS" \
+            --argjson resp_chars "$DOC_RESPONSE_CHARS" \
+            --argjson latency "$DOC_CALL_LATENCY" \
+            --arg http_status "$DOC_HTTP_CODE" \
+            --arg result "$DOC_CALL_RESULT" \
+            '{
+              agent: "DocSync AI",
+              event_type: "claude_api_call",
+              run_id: $run_id,
+              trigger_type: "comment",
+              timestamp: (now | todate),
+              payload: {
+                call_type: "doc_update",
+                target_file: $doc_file,
+                chunk_index: null,
+                total_chunks: null,
+                model: "claude-sonnet-4-5",
+                input_tokens: $in_tok,
+                output_tokens: $out_tok,
+                prompt_chars: $prompt_chars,
+                response_chars: $resp_chars,
+                latency_ms: $latency,
+                http_status: $http_status,
+                api_error_type: null,
+                result: $result
+              }
+            }' >> "$EVENTS_FILE"
+
+          if [ "$DOC_CALL_RESULT" = "no_updates_needed" ]; then
+            echo "  No updates needed for $DOC_FILE" >> $GITHUB_STEP_SUMMARY
+            return 0
           fi
 
           INPUT_LENGTH=${#DOC_CONTENT}
           OUTPUT_LENGTH=${#CLAUDE_OUTPUT}
           echo "  Updating $DOC_FILE ($INPUT_LENGTH -> $OUTPUT_LENGTH chars)" >> $GITHUB_STEP_SUMMARY
 
-          # Accumulate token usage from this Claude API call
-          DOC_IN=$(echo "$RESPONSE" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo "0")
-          DOC_OUT=$(echo "$RESPONSE" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo "0")
-          TOTAL_INPUT_TOKENS=$((TOTAL_INPUT_TOKENS + DOC_IN))
-          TOTAL_OUTPUT_TOKENS=$((TOTAL_OUTPUT_TOKENS + DOC_OUT))
+          # Track per-file doc changes for GAP 2 metrics
+          DOC_BEFORE_LINES=$(echo "$DOC_CONTENT" | wc -l | tr -d ' ')
+          DOC_AFTER_LINES=$(echo "$CLAUDE_OUTPUT" | wc -l | tr -d ' ')
+          DOC_BEFORE_CHARS=$INPUT_LENGTH
+          DOC_AFTER_CHARS=$OUTPUT_LENGTH
+          DOC_NET_CHARS=$((DOC_AFTER_CHARS - DOC_BEFORE_CHARS))
+
+          DOC_CHANGES_LIST="${DOC_CHANGES_LIST}$(jq -cn \
+            --arg file "$DOC_FILE" \
+            --argjson bc "$DOC_BEFORE_CHARS" \
+            --argjson ac "$DOC_AFTER_CHARS" \
+            --argjson bl "$DOC_BEFORE_LINES" \
+            --argjson al "$DOC_AFTER_LINES" \
+            --argjson nc "$DOC_NET_CHARS" \
+            '{file:$file,before_chars:$bc,after_chars:$ac,before_lines:$bl,after_lines:$al,net_change_chars:$nc}')
+          "
 
           echo "$CLAUDE_OUTPUT" > "$DOC_FILE"
           ANY_UPDATES=true
@@ -1209,11 +1554,12 @@ runs:
           echo "No documentation updates were applied" >> $GITHUB_STEP_SUMMARY
         fi
 
-        # Log claude_analysis_completed event
+        # Log claude_analysis_completed event (with GAP 2 doc_changes metrics)
         TOTAL_TOKENS=$((TOTAL_INPUT_TOKENS + TOTAL_OUTPUT_TOKENS))
         SKIP_BOOL=$([ "$ANY_UPDATES" = true ] && echo "false" || echo "true")
         REASON=$([ "$ANY_UPDATES" = true ] && echo "Updates generated" || echo "No documentation changes required")
         FILES_JSON="[$(echo "$UPDATED_FILES_LIST" | sed 's/,$//')]"
+        DOC_CHANGES_JSON=$(echo "$DOC_CHANGES_LIST" | grep -v '^$' | jq -s '.' 2>/dev/null || echo '[]')
         jq -cn \
           --arg run_id "$GITHUB_RUN_ID" \
           --argjson input_tok "$TOTAL_INPUT_TOKENS" \
@@ -1222,6 +1568,10 @@ runs:
           --argjson skip "$SKIP_BOOL" \
           --arg reason "$REASON" \
           --argjson files "$FILES_JSON" \
+          --argjson diff_size "$DIFF_SIZE" \
+          --argjson diff_chunked "$DIFF_CHUNKED" \
+          --argjson total_chunks "$DIFF_TOTAL_CHUNKS" \
+          --argjson doc_changes "$DOC_CHANGES_JSON" \
           '{
             agent: "DocSync AI",
             event_type: "claude_analysis_completed",
@@ -1235,7 +1585,11 @@ runs:
               input_tokens: $input_tok,
               output_tokens: $output_tok,
               total_tokens: $total_tok,
-              files_to_update: $files
+              files_to_update: $files,
+              diff_size_chars: $diff_size,
+              diff_chunked: $diff_chunked,
+              total_chunks: $total_chunks,
+              doc_changes: $doc_changes
             }
           }' >> "$EVENTS_FILE"
 
