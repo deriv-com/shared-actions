@@ -273,14 +273,13 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
-            CRITICAL RULES — read before doing anything else:
-            - You may call `gh pr comment` EXACTLY ONE TIME. No test comments, no intermediate comments, no partial comments. One call, at the very end, with the complete review.
-            - Do NOT use `gh pr comment` to test connectivity, dump file contents, or post anything other than the final review.
-            - The single comment MUST begin with exactly this line: ## 🤖 Claude PR Review Complete
+            Your ONLY output is a single markdown file written to /tmp/review_output.md.
+            Do NOT post any GitHub comments. The workflow will post the file after you finish.
 
-            Now follow these steps:
+            Steps:
 
-            1. Read /tmp/review_context.md — it contains full review instructions, PR context, previous review (if any), acknowledged suggestions to skip, and the required output format.
+            1. Read /tmp/review_context.md — it contains your full review instructions, PR context,
+               previous review (if any), acknowledged suggestions to skip, and the required output format.
 
             2. Run `gh pr diff ${{ github.event.pull_request.number }}` to get the changed files and diffs.
 
@@ -293,13 +292,29 @@ jobs:
                - Parent components or callers if the changed file exports something modified
                - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps
 
-            5. After reading ALL files and dependencies, compile your complete review in memory.
-               Then post it in a SINGLE `gh pr comment` call.
-               The comment MUST start with: ## 🤖 Claude PR Review Complete
-               Do NOT call `gh pr comment` more than once under any circumstances.
-          # Read-only tools: no Edit/Write/NotebookEdit to prevent accidental modifications
+            5. After reading ALL files and dependencies, write your complete review to /tmp/review_output.md.
+               The file must start with exactly: ## 🤖 Claude PR Review Complete
+               Do NOT write anything else to disk. Do NOT post any comments.
+          # No gh pr comment — workflow posts the review file after Claude finishes
           claude_args: |
-            --allowedTools "Read,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --allowedTools "Read,Write(/tmp/review_output.md),Bash(gh pr diff:*),Bash(gh pr view:*)"
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+          REVIEW_FILE="/tmp/review_output.md"
+
+          if [ ! -s "$REVIEW_FILE" ]; then
+            echo "❌ /tmp/review_output.md is empty or missing — skipping comment post"
+            exit 1
+          fi
+
+          echo "📝 Posting review comment ($(wc -c < "$REVIEW_FILE") bytes)..."
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$REVIEW_FILE"
+          echo "✅ Review comment posted"
 
       - name: Emit review event to metrics dashboard
         if: always()
@@ -312,17 +327,16 @@ jobs:
           PR_NUMBER="${{ github.event.pull_request.number }}"
           REPO="${{ github.repository }}"
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          REVIEW_SIZE=$(wc -c < /tmp/review.txt 2>/dev/null || echo "0")
 
           # Build the event payload with jq so all values are safely escaped
+          # pr_number uses --argjson so it is emitted as a JSON integer, not a string
           EVENT_PAYLOAD=$(jq -n \
             --arg agent "claude_review" \
             --arg event_type "$EVENT_TYPE" \
             --arg timestamp "$TIMESTAMP" \
-            --arg pr_number "$PR_NUMBER" \
+            --argjson pr_number "$PR_NUMBER" \
             --arg repo "$REPO" \
             --arg commit_sha "$CURRENT_SHA" \
-            --argjson review_size_bytes "$REVIEW_SIZE" \
             --arg model "$CLAUDE_MODEL" \
             '{
               agent: $agent,
@@ -332,7 +346,6 @@ jobs:
               repo: $repo,
               payload: {
                 commit_sha: $commit_sha,
-                review_size_bytes: $review_size_bytes,
                 model: $model
               }
             }')
@@ -347,7 +360,6 @@ jobs:
           echo "| **repo** | \`$REPO\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **commit_sha** | \`$CURRENT_SHA\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **model** | \`$CLAUDE_MODEL\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **review_size_bytes** | $REVIEW_SIZE |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **timestamp** | $TIMESTAMP |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "<details><summary>Raw JSON payload</summary>" >> "$GITHUB_STEP_SUMMARY"
