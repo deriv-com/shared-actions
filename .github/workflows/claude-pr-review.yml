@@ -6,17 +6,7 @@ on:
       claude_model:
         description: "Claude model to use for review"
         required: false
-        default: "claude-sonnet-4-20250514"
-        type: string
-      claude_temperature:
-        description: "Temperature for Claude responses (0-1)"
-        required: false
-        default: "0"
-        type: string
-      claude_max_tokens:
-        description: "Maximum tokens for Claude response"
-        required: false
-        default: "8192"
+        default: "claude-sonnet-4-6"
         type: string
       prompt_gist_url:
         description: "URL to fetch prompt template from"
@@ -27,6 +17,12 @@ on:
       ANTHROPIC_API_KEY:
         description: "Anthropic API key for Claude"
         required: true
+      AGENT_METRICS_API_URL:
+        description: "Base URL for the OneAboveAll metrics dashboard API (e.g. https://dashboard.example.com). Leave unset to skip POSTing events."
+        required: false
+      AGENT_METRICS_API_KEY:
+        description: "API key for authenticating POST requests to the metrics dashboard. Must match AGENT_METRICS_API_KEY on the backend. Required when AGENT_METRICS_API_URL is set."
+        required: false
 
 jobs:
   claude-review-api:
@@ -45,9 +41,7 @@ jobs:
       cancel-in-progress: true
 
     env:
-      CLAUDE_MODEL: ${{ inputs.claude_model }}
-      CLAUDE_TEMPERATURE: ${{ inputs.claude_temperature }}
-      CLAUDE_MAX_TOKENS: ${{ inputs.claude_max_tokens }}
+      CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-sonnet-4-6' }}
 
     steps:
       - name: Security Check - Validate User Access
@@ -68,7 +62,7 @@ jobs:
           echo "❌ Access denied for user: $ACTOR" && exit 1
 
       - name: Checkout PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.ref }}
@@ -78,18 +72,15 @@ jobs:
       - name: Fetch prompt template from Gist
         id: fetch-prompt
         env:
-          PROMPT_GIST_URL: ${{ inputs.prompt_gist_url }}
+          PROMPT_GIST_URL: ${{ inputs.prompt_gist_url || 'https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/claude-review-format.md' }}
         run: |
           PROMPT_TEMPLATE=$(curl -sL "$PROMPT_GIST_URL")
           [[ -z "$PROMPT_TEMPLATE" ]] && echo "❌ Failed to fetch prompt" && exit 1
 
           PROMPT_TEMPLATE=$(echo "$PROMPT_TEMPLATE" | sed '1s/^prompt:[[:space:]]*|[[:space:]]*//' | sed 's/^____$//g' | sed 's/____$//g')
 
-          PR_URL="https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
-          PR_HASH=$(echo -n "$PR_URL" | base64 -w0 | tr '+/' '-_' | tr -d '=')
-          PROMPT_TEMPLATE=$(echo "$PROMPT_TEMPLATE" | sed "s|{{AUTO_FIX_URL}}|https://click2fix.internal-gcp-ai-agents.deriv.dev/?hash=${PR_HASH}|g")
-
-          { echo 'prompt<<EOF'; echo "$PROMPT_TEMPLATE"; echo 'EOF'; } >> $GITHUB_OUTPUT
+          printf '%s' "$PROMPT_TEMPLATE" > /tmp/prompt_template.txt
+          echo "✅ Prompt template saved ($(wc -c < /tmp/prompt_template.txt) bytes)"
 
       - name: Capture and cleanup previous review
         id: previous-review
@@ -106,9 +97,14 @@ jobs:
           if [ -n "$PREVIOUS" ]; then
             echo "$PREVIOUS" > /tmp/previous_review.txt
             echo "has_previous=true" >> $GITHUB_OUTPUT
+
+            # Extract the last reviewed commit SHA from the previous review metadata
+            LAST_REVIEWED_SHA=$(echo "$PREVIOUS" | grep -oP '(?<=<!-- reviewed-commit: )[a-f0-9]+(?= -->)' || echo "")
+            echo "last_reviewed_sha=$LAST_REVIEWED_SHA" >> $GITHUB_OUTPUT
           else
             echo "" > /tmp/previous_review.txt
             echo "has_previous=false" >> $GITHUB_OUTPUT
+            echo "last_reviewed_sha=" >> $GITHUB_OUTPUT
           fi
 
           # Delete old comments
@@ -152,124 +148,236 @@ jobs:
             echo "ℹ️ No Click2Fix - Acknowledge comment found"
           fi
 
-      - name: Get PR context
+      - name: Build review context
+        id: build-context
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
+          HAS_ACKNOWLEDGED: ${{ steps.acknowledged.outputs.has_acknowledged }}
+          LAST_REVIEWED_SHA: ${{ steps.previous-review.outputs.last_reviewed_sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
         run: |
-          gh pr diff "$PR_NUMBER" --repo "$REPO" > /tmp/pr_diff.txt 2>/dev/null || echo "Unable to fetch diff" > /tmp/pr_diff.txt
-          gh pr view "$PR_NUMBER" --repo "$REPO" --json files --jq '.files[].path' 2>/dev/null | head -50 > /tmp/changed_files.txt || true
-          echo "$PR_TITLE" > /tmp/pr_title.txt
-          echo "$PR_AUTHOR" > /tmp/pr_author.txt
-          echo "$PR_BRANCH" > /tmp/pr_branch.txt
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
 
-      - name: Call Claude API
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          PROMPT_TEMPLATE: ${{ steps.fetch-prompt.outputs.prompt }}
-          HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
-          HAS_ACKNOWLEDGED: ${{ steps.acknowledged.outputs.has_acknowledged }}
-        run: |
-          echo "🤖 Calling Claude API..."
+          # Compute click2fix URL
+          PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
+          PR_HASH=$(echo -n "$PR_URL" | base64 -w0 | tr '+/' '-_' | tr -d '=')
+          CLICK2FIX_URL="https://click2fix.internal-gcp-ai-agents.deriv.dev/?hash=${PR_HASH}"
 
-          PR_DIFF=$(cat /tmp/pr_diff.txt)
-          CHANGED_FILES=$(cat /tmp/changed_files.txt)
-          PR_TITLE=$(cat /tmp/pr_title.txt)
-          PR_AUTHOR=$(cat /tmp/pr_author.txt)
-          PR_BRANCH=$(cat /tmp/pr_branch.txt)
-          PREVIOUS_REVIEW=$(cat /tmp/previous_review.txt)
-          ACKNOWLEDGED_ITEMS=$(cat /tmp/acknowledged_items.txt)
+          # Store current HEAD SHA (used in review comment metadata + metrics)
+          CURRENT_SHA=$(git rev-parse HEAD)
+          echo "$CURRENT_SHA" > /tmp/current_sha.txt
+          echo "current_sha=$CURRENT_SHA" >> $GITHUB_OUTPUT
+          echo "📌 Current HEAD: $CURRENT_SHA"
 
-          SYSTEM_PROMPT="You are an expert code reviewer. Follow the review mode instructions in the prompt template."
-
-          # Build prompt - include previous review section only if exists
-          if [[ "$HAS_PREVIOUS" == "true" ]]; then
-            echo "📋 Follow-up review mode"
-            PREV_SECTION="---PREVIOUS_REVIEW---
-          ${PREVIOUS_REVIEW}
-          ---END_PREVIOUS_REVIEW---"
-          else
-            echo "📋 Initial review mode"
-            PREV_SECTION=""
-          fi
-
-          # Build acknowledged section if exists
-          if [[ "$HAS_ACKNOWLEDGED" == "true" ]]; then
-            echo "✅ Including acknowledged items to skip"
-            ACKNOWLEDGED_SECTION="---ACKNOWLEDGED_SUGGESTIONS---
-          The following suggestions have been acknowledged by the developer and should NOT be included in your review. Do not mention or suggest these items again:
-          ${ACKNOWLEDGED_ITEMS}
-          ---END_ACKNOWLEDGED_SUGGESTIONS---"
-          else
-            ACKNOWLEDGED_SECTION=""
-          fi
-
-          USER_PROMPT="${PROMPT_TEMPLATE}
-
-          ${PREV_SECTION}
-
-          ${ACKNOWLEDGED_SECTION}
-
-          ## Pull Request Information
-          - **Title:** ${PR_TITLE}
-          - **Author:** ${PR_AUTHOR}
-          - **Branch:** ${PR_BRANCH}
-
-          ## Changed Files
-          ${CHANGED_FILES}
-
-          ## Diff
-          \`\`\`diff
-          ${PR_DIFF}
-          \`\`\`"
-
-          PAYLOAD=$(jq -n \
-            --arg model "$CLAUDE_MODEL" \
-            --argjson max_tokens "$CLAUDE_MAX_TOKENS" \
-            --argjson temperature "$CLAUDE_TEMPERATURE" \
-            --arg system "$SYSTEM_PROMPT" \
-            --arg user "$USER_PROMPT" \
-            '{model: $model, max_tokens: ($max_tokens | tonumber), temperature: ($temperature | tonumber), system: $system, messages: [{role: "user", content: $user}]}')
-
-          RESPONSE=$(curl -s -w "\n%{http_code}" "https://api.anthropic.com/v1/messages" \
-            -H "Content-Type: application/json" \
-            -H "x-api-key: $ANTHROPIC_API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
-            -d "$PAYLOAD")
-
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
-
-          [[ "$HTTP_CODE" != "200" ]] && echo "❌ API failed: $HTTP_CODE" && echo "$BODY" && exit 1
-
-          REVIEW=$(echo "$BODY" | jq -r '.content[0].text // empty')
-          [[ -z "$REVIEW" ]] && echo "❌ Empty response" && exit 1
-
-          echo "$REVIEW" > /tmp/review.txt
-          echo "✅ Review generated"
-
-      - name: Post Review Comment
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
-        run: |
-          REVIEW=$(cat /tmp/review.txt)
           [[ "$HAS_PREVIOUS" == "true" ]] && REVIEW_TYPE="🔄 Follow-up Review" || REVIEW_TYPE="📋 Initial Review"
+          [[ "$HAS_PREVIOUS" == "true" ]] && EVENT_TYPE="followup_review" || EVENT_TYPE="initial_review"
+          echo "event_type=$EVENT_TYPE" >> $GITHUB_OUTPUT
 
-          COMMENT="## 🤖 Claude PR Review Complete
+          # Noise pattern for incremental diff filtering — same set as before
+          NOISE_PATTERN='package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.snap|\.min\.js|\.min\.css|dist/|build/|\.generated\.|__generated__|/vendor/|\.pb\.go|_test\.snap|\.spec\.(tsx?|jsx?)|/__tests__/|\.scss$|\.md$'
 
-          **Model:** \`$CLAUDE_MODEL\` | **Review Type:** ${REVIEW_TYPE}
+          # Pre-compute incremental diff (changes since last review) for follow-up mode
+          echo "" > /tmp/incremental_diff.txt
+          if [[ "$HAS_PREVIOUS" == "true" && -n "$LAST_REVIEWED_SHA" ]]; then
+            echo "📋 Generating incremental diff since last reviewed commit: $LAST_REVIEWED_SHA"
+            if git cat-file -e "$LAST_REVIEWED_SHA" 2>/dev/null; then
+              git diff "$LAST_REVIEWED_SHA"..HEAD | awk -v noise="$NOISE_PATTERN" '
+                /^diff --git / { in_noise = ($0 ~ noise); if (!in_noise) print; next }
+                !in_noise { print }
+              ' > /tmp/incremental_diff.txt
+              [ -s /tmp/incremental_diff.txt ] && echo "✅ Incremental diff generated" || echo "ℹ️ No changes since last reviewed commit"
+            else
+              echo "⚠️ Last reviewed commit $LAST_REVIEWED_SHA not found in history (fetch-depth may be too shallow)"
+            fi
+          fi
 
-          ---
+          # Build the full context file that Claude Code Action will read
+          {
+            # System instructions from gist with click2fix URL injected
+            sed "s|{{AUTO_FIX_URL}}|${CLICK2FIX_URL}|g" /tmp/prompt_template.txt
+            echo ""
 
-          $REVIEW
+            # Previous review section (follow-up mode only)
+            if [[ "$HAS_PREVIOUS" == "true" ]]; then
+              echo "---PREVIOUS_REVIEW---"
+              sed \
+                -e '/^## 🤖 Claude PR Review Complete$/d' \
+                -e '/^\*\*Model:\*\*/d' \
+                -e '/^\*Review generated via Claude Code Action\*$/d' \
+                -e '/^\*Review generated via Claude API\*$/d' \
+                -e '/^<!-- reviewed-commit:.*-->$/d' \
+                /tmp/previous_review.txt
+              echo "---END_PREVIOUS_REVIEW---"
+              echo ""
 
-          ---
-          *Review generated via Claude API*"
+              # Incremental diff section — helps Claude identify what was explicitly fixed
+              if [ -s /tmp/incremental_diff.txt ]; then
+                echo "---INCREMENTAL_DIFF---"
+                echo "The following diff shows ONLY the changes made since the last review. Use this to confirm what was explicitly fixed."
+                echo "If a pattern appears on a \`-\` line here it was removed. If it does not appear here at all, it was not touched."
+                echo '```diff'
+                cat /tmp/incremental_diff.txt
+                echo '```'
+                echo "---END_INCREMENTAL_DIFF---"
+                echo ""
+              fi
+            fi
 
-          gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body "$COMMENT"
-          echo "✅ Posted"
+            # Acknowledged suggestions — skip these entirely in the review
+            if [[ "$HAS_ACKNOWLEDGED" == "true" ]]; then
+              echo "---ACKNOWLEDGED_SUGGESTIONS---"
+              echo "The following suggestions have been acknowledged by the developer and must NOT be included in your review. Do not mention or suggest these items again:"
+              cat /tmp/acknowledged_items.txt
+              echo "---END_ACKNOWLEDGED_SUGGESTIONS---"
+              echo ""
+            fi
+
+            # PR metadata
+            printf '## Pull Request Information\n'
+            printf -- '- **Title:** %s\n' "$PR_TITLE"
+            printf -- '- **Author:** %s\n' "$PR_AUTHOR"
+            printf -- '- **Branch:** %s\n' "$PR_BRANCH"
+            printf -- '- **PR Number:** %s\n' "$PR_NUMBER"
+            printf -- '- **Repository:** %s\n' "$REPO"
+            echo ""
+
+            # Output format requirements — the header and metadata tag are required for
+            # follow-up review detection on subsequent runs (same mechanism as before)
+            echo "## Review Output Format Requirements"
+            echo "Begin your PR review comment with exactly this header (no extra text before it):"
+            echo ""
+            echo "## 🤖 Claude PR Review Complete"
+            echo ""
+            printf '**Model:** \`%s\` | **Review Type:** %s\n' "$CLAUDE_MODEL" "$REVIEW_TYPE"
+            echo ""
+            echo "End your comment with this hidden metadata tag on its own line — it is required for follow-up review detection on the next push:"
+            printf '<!-- reviewed-commit: %s -->\n' "$CURRENT_SHA"
+
+          } > /tmp/review_context.md
+
+          echo "📋 Review context built ($(wc -c < /tmp/review_context.md) bytes)"
+
+      - name: Remove CLAUDE.md to prevent project config leaking into review
+        run: rm -f CLAUDE.md
+
+      - name: Claude Code PR Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          model: ${{ env.CLAUDE_MODEL }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            CRITICAL RULES — read before doing anything else:
+            - You may call `gh pr comment` EXACTLY ONE TIME. No test comments, no intermediate comments, no partial comments. One call, at the very end, with the complete review.
+            - Do NOT use `gh pr comment` to test connectivity, dump file contents, or post anything other than the final review.
+            - The single comment MUST begin with exactly this line: ## 🤖 Claude PR Review Complete
+
+            Now follow these steps:
+
+            1. Read /tmp/review_context.md — it contains full review instructions, PR context, previous review (if any), acknowledged suggestions to skip, and the required output format.
+
+            2. Run `gh pr diff ${{ github.event.pull_request.number }}` to get the changed files and diffs.
+
+            3. For each changed file, use Read to open the full file — not just the diff hunk.
+               Full file context is required to understand the complete impact of each change.
+
+            4. For each changed file, identify and Read its dependencies:
+               - Imported modules, utilities, or shared helpers referenced in the changed code
+               - Type definitions, interfaces, or enums used by the changed code
+               - Parent components or callers if the changed file exports something modified
+               - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps
+
+            5. After reading ALL files and dependencies, compile your complete review in memory.
+               Then post it in a SINGLE `gh pr comment` call.
+               The comment MUST start with: ## 🤖 Claude PR Review Complete
+               Do NOT call `gh pr comment` more than once under any circumstances.
+          # Read-only tools: no Edit/Write/NotebookEdit to prevent accidental modifications
+          claude_args: |
+            --allowedTools "Read,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+
+      - name: Emit review event to metrics dashboard
+        if: always()
+        env:
+          AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+          AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
+          CURRENT_SHA: ${{ steps.build-context.outputs.current_sha }}
+          EVENT_TYPE: ${{ steps.build-context.outputs.event_type }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          REVIEW_SIZE=$(wc -c < /tmp/review.txt 2>/dev/null || echo "0")
+
+          # Build the event payload with jq so all values are safely escaped
+          EVENT_PAYLOAD=$(jq -n \
+            --arg agent "claude_review" \
+            --arg event_type "$EVENT_TYPE" \
+            --arg timestamp "$TIMESTAMP" \
+            --arg pr_number "$PR_NUMBER" \
+            --arg repo "$REPO" \
+            --arg commit_sha "$CURRENT_SHA" \
+            --argjson review_size_bytes "$REVIEW_SIZE" \
+            --arg model "$CLAUDE_MODEL" \
+            '{
+              agent: $agent,
+              event_type: $event_type,
+              timestamp: $timestamp,
+              pr_number: $pr_number,
+              repo: $repo,
+              payload: {
+                commit_sha: $commit_sha,
+                review_size_bytes: $review_size_bytes,
+                model: $model
+              }
+            }')
+
+          # Always write to job summary so every run is "logged" regardless of dashboard state
+          echo "### Claude Review Event" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **agent** | \`claude_review\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **event_type** | \`$EVENT_TYPE\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **pr_number** | \`$PR_NUMBER\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **repo** | \`$REPO\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **commit_sha** | \`$CURRENT_SHA\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **model** | \`$CLAUDE_MODEL\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **review_size_bytes** | $REVIEW_SIZE |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **timestamp** | $TIMESTAMP |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<details><summary>Raw JSON payload</summary>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          echo "$EVENT_PAYLOAD" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+          # POST to the metrics dashboard only when AGENT_METRICS_API_URL is set
+          if [[ -n "$AGENT_METRICS_API_URL" ]]; then
+            echo "📡 Sending event to metrics dashboard..."
+            echo "$EVENT_PAYLOAD" > /tmp/event_payload.json
+
+            CURL_HEADERS=(-H "Content-Type: application/json")
+            [[ -n "$AGENT_METRICS_API_KEY" ]] && CURL_HEADERS+=(-H "X-API-Key: $AGENT_METRICS_API_KEY")
+
+            HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/event_response.json \
+              "${CURL_HEADERS[@]}" \
+              "${AGENT_METRICS_API_URL}/api/v1/events" \
+              -X POST \
+              -d @/tmp/event_payload.json)
+
+            if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "201" ]]; then
+              echo "✅ Event sent to dashboard (HTTP $HTTP_CODE)"
+            else
+              echo "⚠️ Dashboard POST returned HTTP $HTTP_CODE — event is still logged in job summary"
+              cat /tmp/event_response.json || true
+            fi
+          else
+            echo "ℹ️ AGENT_METRICS_API_URL not set — event logged to job summary only"
+          fi
