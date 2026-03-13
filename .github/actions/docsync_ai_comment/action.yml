@@ -1508,7 +1508,9 @@ runs:
 
           # Track per-file doc changes for GAP 2 metrics
           DOC_BEFORE_LINES=$(echo "$DOC_CONTENT" | wc -l | tr -d ' ')
+          DOC_BEFORE_LINES=${DOC_BEFORE_LINES:-0}
           DOC_AFTER_LINES=$(echo "$CLAUDE_OUTPUT" | wc -l | tr -d ' ')
+          DOC_AFTER_LINES=${DOC_AFTER_LINES:-0}
           DOC_BEFORE_CHARS=$INPUT_LENGTH
           DOC_AFTER_CHARS=$OUTPUT_LENGTH
           DOC_NET_CHARS=$((DOC_AFTER_CHARS - DOC_BEFORE_CHARS))
