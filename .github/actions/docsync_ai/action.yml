@@ -218,7 +218,7 @@ runs:
             PR_NUMS_JSON=$(cat "$TEMP_DIR/pr_numbers.txt" 2>/dev/null | jq -R '"PR-" + .' | jq -s '.' 2>/dev/null || echo '[]')
             jq -cn \
               --arg run_id "$GITHUB_RUN_ID" \
-              --argjson count "$PR_COUNT" \
+              --argjson count "${PR_COUNT:-0}" \
               --argjson nums "$PR_NUMS_JSON" \
               '{
                 agent: "DocSync AI",
@@ -266,10 +266,11 @@ runs:
         EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
         PR_NUMS_JSON=$(cat "$TEMP_DIR/pr_numbers.txt" 2>/dev/null | jq -R '"PR-" + .' | jq -s '.' 2>/dev/null || echo '[]')
         CHANGED_FILES_COUNT=$(echo "$ALL_CHANGED_FILES" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
+        CHANGED_FILES_COUNT=${CHANGED_FILES_COUNT:-0}
         CHANGED_FILES_JSON=$(echo "$ALL_CHANGED_FILES" | head -n 50 | grep -v '^$' | jq -R '.' | jq -s '.' 2>/dev/null || echo '[]')
         jq -cn \
           --arg run_id "$GITHUB_RUN_ID" \
-          --argjson count "$PR_COUNT" \
+          --argjson count "${PR_COUNT:-0}" \
           --argjson nums "$PR_NUMS_JSON" \
           --argjson fc "$CHANGED_FILES_COUNT" \
           --argjson files "$CHANGED_FILES_JSON" \
