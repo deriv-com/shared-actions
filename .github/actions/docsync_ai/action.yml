@@ -545,6 +545,7 @@ runs:
             SRESPONSE=$(echo "$SRESPONSE" | sed '$d')
 
             PROMPT_CHARS_SENT=$(wc -c < "$SPROMPT_FILE" | tr -d ' ')
+            PROMPT_CHARS_SENT=${PROMPT_CHARS_SENT:-0}
             rm -f "$SREQUEST_FILE" "$SPROMPT_FILE"
 
             # Validate response
@@ -934,6 +935,7 @@ runs:
 
           # Call API
           DOC_PROMPT_CHARS=$(wc -c < "$PROMPT_FILE" | tr -d ' ')
+          DOC_PROMPT_CHARS=${DOC_PROMPT_CHARS:-0}
           DOC_CALL_START=$(($(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000))
           RESPONSE=$(curl -s -w "\n%{http_code}" https://api.anthropic.com/v1/messages \
             -H "content-type: application/json" \
