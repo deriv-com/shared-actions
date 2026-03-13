@@ -524,7 +524,8 @@ runs:
 
         # Log pr_analyzed event
         EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
-        FILES_COUNT=$(echo "$CHANGED_FILES_FILTERED" | grep -v '^$' | wc -l | tr -d ' ')
+        FILES_COUNT=$(echo "$CHANGED_FILES_FILTERED" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
+        FILES_COUNT=${FILES_COUNT:-0}
         FILES_JSON=$(echo "$CHANGED_FILES_FILTERED" | head -n 50 | grep -v '^$' | jq -R '.' | jq -s '.' 2>/dev/null || echo '[]')
         jq -cn \
           --arg run_id "$GITHUB_RUN_ID" \
