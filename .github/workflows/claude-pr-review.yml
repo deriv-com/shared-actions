@@ -34,7 +34,7 @@ jobs:
       pull-requests: write
       issues: write
       id-token: write
-      actions: read
+      actions: write
 
     concurrency:
       group: claude-pr-review-${{ github.event.pull_request.number }}
@@ -381,3 +381,14 @@ jobs:
           else
             echo "ℹ️ AGENT_METRICS_API_URL not set — event logged to job summary only"
           fi
+
+          # Write payload for artifact upload
+          echo "$EVENT_PAYLOAD" > click2fix-payload.json
+
+      - name: Upload review summary as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-review-summary-${{ github.run_id }}
+          path: click2fix-payload.json
+          retention-days: 7
