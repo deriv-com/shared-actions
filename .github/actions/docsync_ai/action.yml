@@ -1541,3 +1541,30 @@ runs:
         echo "pr_created=false" >> $GITHUB_OUTPUT
         echo "Documentation is up to date - no changes needed" >> $GITHUB_STEP_SUMMARY
         rm -rf "$TEMP_DIR" 2>/dev/null || true
+
+    - name: Upload Event Logs Artifact
+      if: always()
+      shell: bash
+      run: |
+        EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+        ARTIFACT_DIR="/tmp/docsync_artifact_${GITHUB_RUN_ID}"
+        mkdir -p "$ARTIFACT_DIR"
+
+        if [ -f "$EVENTS_FILE" ] && [ -s "$EVENTS_FILE" ]; then
+          # Convert JSONL to a JSON array for the artifact
+          jq -s '.' "$EVENTS_FILE" > "$ARTIFACT_DIR/docsync-payload.json"
+        else
+          # Emit an empty array if no events were written (e.g. very early failure)
+          echo '[]' > "$ARTIFACT_DIR/docsync-payload.json"
+        fi
+
+        echo "Event log saved: $(wc -l < "${EVENTS_FILE:-/dev/null}" 2>/dev/null || echo 0) event(s)" >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload DocSync Event Log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: docsync-event-log-${{ github.run_id }}
+        path: /tmp/docsync_artifact_${{ github.run_id }}/docsync-payload.json
+        retention-days: 90
+        if-no-files-found: warn
