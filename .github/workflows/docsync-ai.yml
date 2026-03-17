@@ -269,6 +269,8 @@ jobs:
           else
             ERROR_JSON="\"Job failed with status: $JOB_STATUS\""
           fi
+          # Ensure numeric values are valid for jq --argjson
+          [[ ! "$DURATION_SECONDS" =~ ^[0-9]+$ ]] && DURATION_SECONDS=0
           jq -cn \
             --arg run_id "$GITHUB_RUN_ID" \
             --arg status "$STATUS_VAL" \
@@ -579,6 +581,8 @@ jobs:
           else
             ERROR_JSON="\"Job failed with status: $JOB_STATUS\""
           fi
+          # Ensure numeric values are valid for jq --argjson
+          [[ ! "$DURATION_SECONDS" =~ ^[0-9]+$ ]] && DURATION_SECONDS=0
           jq -cn \
             --arg run_id "$GITHUB_RUN_ID" \
             --arg status "$STATUS_VAL" \
