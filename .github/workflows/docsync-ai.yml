@@ -13,23 +13,6 @@ on:
         required: false
         default: "documentation,automated"
         type: string
-<<<<<<< Updated upstream
-=======
-      slack_channel_id:
-        description: "Slack channel ID to post notifications (e.g., C01234ABCDE)"
-        required: false
-        default: ""
-        type: string
-      slack_mention_user_id:
-<<<<<<< Updated upstream
-        description: 'Slack user ID(s) to mention in notifications (e.g., U01234ABCDE or U01234ABCDE,U56789FGHIJ for multiple users)'
-=======
-        description: "Slack user ID to mention in notifications (e.g., U01234ABCDE)"
->>>>>>> Stashed changes
-        required: false
-        default: ""
-        type: string
->>>>>>> Stashed changes
       trigger_type:
         description: 'Trigger type: "scheduled" for weekly cron, "comment" for PR comment'
         required: false

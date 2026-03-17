@@ -66,6 +66,7 @@ jobs:
 You need to configure the following secrets in your repository:
 
 1. **`ANTHROPIC_API_KEY`**: Your Anthropic API key for Claude
+
    - Get it from: https://console.anthropic.com/
 
 2. **`GITHUB_TOKEN`**: Automatically provided by GitHub Actions

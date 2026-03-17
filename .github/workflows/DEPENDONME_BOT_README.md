@@ -29,15 +29,15 @@ name: 🔒 Security Auto-Fix
 
 on:
   schedule:
-    - cron: "0 8 * * 1" # Every Monday at 8am
+    - cron: '0 8 * * 1'  # Every Monday at 8am
   workflow_dispatch:
 
 jobs:
   fix-vulnerabilities:
     uses: deriv-com/shared-action/.github/workflows/dependonme-bot.yml@<commit-hash> # pin to specific version
     with:
-      slack_users_to_tag: "U12345678,U87654321"
-      base_branch: "master"
+      slack_users_to_tag: 'U12345678,U87654321'
+      base_branch: 'master'
       auto_merge: true
     secrets:
       DEPENDONME_BOT_TOKEN: ${{ secrets.DEPENDONME_BOT_TOKEN }}
@@ -46,30 +46,29 @@ jobs:
 
 ## Inputs
 
-| Input                  | Description                           | Required | Default                 |
-| ---------------------- | ------------------------------------- | -------- | ----------------------- |
-| `slack_users_to_tag`   | Comma-separated Slack user IDs to tag | ✅       | -                       |
-| `base_branch`          | Base branch for PR                    | ❌       | `master`                |
-| `auto_merge`           | Enable auto-merge for safe PRs        | ❌       | `true`                  |
-| `dry_run`              | Preview changes without creating PR   | ❌       | `false`                 |
-| `pr_labels`            | Comma-separated labels for PR         | ❌       | `security,dependencies` |
-| `node_version`         | Node.js version to use                | ❌       | `20`                    |
-| `npm_legacy_peer_deps` | Use `--legacy-peer-deps` flag         | ❌       | `true`                  |
-| `exclude_packages`     | Comma-separated packages to exclude   | ❌       | -                       |
+| Input | Description | Required | Default |
+|-------|-------------|----------|---------|
+| `slack_users_to_tag` | Comma-separated Slack user IDs to tag | ✅ | - |
+| `base_branch` | Base branch for PR | ❌ | `master` |
+| `auto_merge` | Enable auto-merge for safe PRs | ❌ | `true` |
+| `dry_run` | Preview changes without creating PR | ❌ | `false` |
+| `pr_labels` | Comma-separated labels for PR | ❌ | `security,dependencies` |
+| `node_version` | Node.js version to use | ❌ | `20` |
+| `npm_legacy_peer_deps` | Use `--legacy-peer-deps` flag | ❌ | `true` |
+| `exclude_packages` | Comma-separated packages to exclude | ❌ | - |
 
 ## Secrets
 
-| Secret                 | Description                             | Required |
-| ---------------------- | --------------------------------------- | -------- |
-| `DEPENDONME_BOT_TOKEN` | GitHub PAT for PR creation & auto-merge | ✅       |
-| `DEPENDONME_BOT_SLACK` | Slack webhook URL for notifications     | ✅       |
+| Secret | Description | Required |
+|--------|-------------|----------|
+| `DEPENDONME_BOT_TOKEN` | GitHub PAT for PR creation & auto-merge | ✅ |
+| `DEPENDONME_BOT_SLACK` | Slack webhook URL for notifications | ✅ |
 
 > ⚠️ **Note:** Reusable workflows run in the caller's context. Secrets must be passed from the calling workflow.
 
 ## Slack Notifications
 
 ### PR Created
-
 ```
 @user1 @user2
 PR #42 in `org/repo`
@@ -80,7 +79,6 @@ PR #42 in `org/repo`
 ```
 
 ### All Updates Failed
-
 ```
 @user1 @user2 :alert_1:
 1 alert in `org/repo` could not be auto-fixed
@@ -97,3 +95,4 @@ PR #42 in `org/repo`
 5. Verifies only `package.json` and `package-lock.json` changed
 6. Creates PR with auto-merge enabled (if safe)
 7. Sends Slack notification with results
+
