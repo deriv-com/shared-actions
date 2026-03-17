@@ -216,6 +216,9 @@ runs:
             # Log prs_fetched event (workflow-only changes)
             EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
             PR_NUMS_JSON=$(cat "$TEMP_DIR/pr_numbers.txt" 2>/dev/null | jq -R '"PR-" + .' | jq -s '.' 2>/dev/null || echo '[]')
+            # Ensure numeric and JSON values are valid for jq --argjson
+            [[ ! "$PR_COUNT" =~ ^[0-9]+$ ]] && PR_COUNT=0
+            echo "$PR_NUMS_JSON" | jq empty 2>/dev/null || PR_NUMS_JSON='[]'
             jq -cn \
               --arg run_id "$GITHUB_RUN_ID" \
               --argjson count "${PR_COUNT:-0}" \
@@ -267,7 +270,13 @@ runs:
         PR_NUMS_JSON=$(cat "$TEMP_DIR/pr_numbers.txt" 2>/dev/null | jq -R '"PR-" + .' | jq -s '.' 2>/dev/null || echo '[]')
         CHANGED_FILES_COUNT=$(echo "$ALL_CHANGED_FILES" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
         CHANGED_FILES_COUNT=${CHANGED_FILES_COUNT:-0}
+        # Ensure numeric values are valid integers for jq --argjson
+        [[ ! "$CHANGED_FILES_COUNT" =~ ^[0-9]+$ ]] && CHANGED_FILES_COUNT=0
+        [[ ! "$PR_COUNT" =~ ^[0-9]+$ ]] && PR_COUNT=0
         CHANGED_FILES_JSON=$(echo "$ALL_CHANGED_FILES" | head -n 50 | grep -v '^$' | jq -R '.' | jq -s '.' 2>/dev/null || echo '[]')
+        # Ensure JSON arrays are valid
+        echo "$PR_NUMS_JSON" | jq empty 2>/dev/null || PR_NUMS_JSON='[]'
+        echo "$CHANGED_FILES_JSON" | jq empty 2>/dev/null || CHANGED_FILES_JSON='[]'
         jq -cn \
           --arg run_id "$GITHUB_RUN_ID" \
           --argjson count "${PR_COUNT:-0}" \
@@ -315,6 +324,8 @@ runs:
         EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
 
         # Log claude_analysis_started event
+        # Ensure PR_COUNT is valid for jq --argjson
+        [[ ! "$PR_COUNT" =~ ^[0-9]+$ ]] && PR_COUNT=0
         jq -cn \
           --arg run_id "$GITHUB_RUN_ID" \
           --argjson pr_count "${PR_COUNT:-0}" \
@@ -401,6 +412,9 @@ runs:
           echo "skip_analysis=true" >> $GITHUB_OUTPUT
 
           # Log claude_analysis_completed (skipped — no doc files)
+          # Ensure token counts are valid integers for jq --argjson
+          [[ ! "$TOTAL_INPUT_TOKENS" =~ ^[0-9]+$ ]] && TOTAL_INPUT_TOKENS=0
+          [[ ! "$TOTAL_OUTPUT_TOKENS" =~ ^[0-9]+$ ]] && TOTAL_OUTPUT_TOKENS=0
           jq -cn \
             --arg run_id "$GITHUB_RUN_ID" \
             --argjson input_tok "$TOTAL_INPUT_TOKENS" \
@@ -1212,11 +1226,21 @@ runs:
         fi
 
         # Log claude_analysis_completed event (with GAP 2 doc_changes metrics)
+        # Ensure all numeric values are valid integers for jq --argjson
+        [[ ! "$TOTAL_INPUT_TOKENS" =~ ^[0-9]+$ ]] && TOTAL_INPUT_TOKENS=0
+        [[ ! "$TOTAL_OUTPUT_TOKENS" =~ ^[0-9]+$ ]] && TOTAL_OUTPUT_TOKENS=0
         TOTAL_TOKENS=$((TOTAL_INPUT_TOKENS + TOTAL_OUTPUT_TOKENS))
         SKIP_BOOL=$([ "$ANY_UPDATES" = true ] && echo "false" || echo "true")
         REASON=$([ "$ANY_UPDATES" = true ] && echo "Updates generated" || echo "No documentation changes required")
         FILES_JSON="[$(echo "$UPDATED_FILES_LIST" | sed 's/,$//')]"
         DOC_CHANGES_JSON=$(echo "$DOC_CHANGES_LIST" | grep -v '^$' | jq -s '.' 2>/dev/null || echo '[]')
+        # Ensure DIFF_SIZE and related values are valid
+        [[ ! "$DIFF_SIZE" =~ ^[0-9]+$ ]] && DIFF_SIZE=0
+        [[ ! "$DIFF_TOTAL_CHUNKS" =~ ^[0-9]+$ ]] && DIFF_TOTAL_CHUNKS=0
+        [[ "$DIFF_CHUNKED" != "true" ]] && DIFF_CHUNKED=false
+        # Ensure JSON arrays are valid
+        echo "$FILES_JSON" | jq empty 2>/dev/null || FILES_JSON='[]'
+        echo "$DOC_CHANGES_JSON" | jq empty 2>/dev/null || DOC_CHANGES_JSON='[]'
         jq -cn \
           --arg run_id "$GITHUB_RUN_ID" \
           --argjson input_tok "$TOTAL_INPUT_TOKENS" \
