@@ -90,7 +90,7 @@ runs:
         MERGED_PRS=$(gh api \
           -H "Accept: application/vnd.github+json" \
           "/repos/$REPO_NAME/pulls?state=closed&base=$BASE_BRANCH&sort=updated&direction=desc&per_page=100" \
-          --jq "[.[] | select(.merged_at != null and .merged_at >= \"$SINCE_DATE\")]" 2>&1 || echo "[]")
+          --jq "[.[] | select(.merged_at != null and .merged_at >= \"$SINCE_DATE\")]" 2>/dev/null || echo "[]")
 
         # Validate response is valid JSON
         if ! echo "$MERGED_PRS" | jq empty 2>/dev/null; then
@@ -128,7 +128,7 @@ runs:
                 changed_files_count: 0,
                 changed_files: []
               }
-            }' >> "$EVENTS_FILE"
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
 
           rm -rf "$TEMP_DIR"
           exit 0
@@ -164,7 +164,7 @@ runs:
           # Get full PR diff (no size limit)
           PR_DIFF=$(gh api \
             -H "Accept: application/vnd.github.v3.diff" \
-            "/repos/$REPO_NAME/pulls/$PR_NUM" 2>&1 || echo "")
+            "/repos/$REPO_NAME/pulls/$PR_NUM" 2>/dev/null || echo "")
 
           # Sanitize and validate diff content
           PR_DIFF=$(echo "$PR_DIFF" | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
@@ -187,7 +187,7 @@ runs:
           CHANGED_FILES=$(gh api \
             -H "Accept: application/vnd.github+json" \
             "/repos/$REPO_NAME/pulls/$PR_NUM/files" \
-            --jq '.[].filename' 2>&1 || echo "")
+            --jq '.[].filename' 2>/dev/null || echo "")
 
           # Filter out workflow files and lock files
           CHANGED_FILES_FILTERED=$(echo "$CHANGED_FILES" | grep -v '^\.github/workflows/' | grep -vE '(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Gemfile\.lock|composer\.lock|Cargo\.lock|poetry\.lock|go\.sum)$' || echo "")
@@ -236,7 +236,7 @@ runs:
                   changed_files_count: 0,
                   changed_files: []
                 }
-              }' >> "$EVENTS_FILE"
+              }' >> "$EVENTS_FILE" 2>/dev/null || true
 
             exit 0
           fi
@@ -296,7 +296,7 @@ runs:
               changed_files_count: $fc,
               changed_files: $files
             }
-          }' >> "$EVENTS_FILE"
+          }' >> "$EVENTS_FILE" 2>/dev/null || true
 
     - name: Run Claude Sonnet 4.5 Documentation Analysis
       id: claude-analysis
@@ -341,7 +341,7 @@ runs:
               pr_count: $pr_count,
               mode: "pr_analysis"
             }
-          }' >> "$EVENTS_FILE"
+          }' >> "$EVENTS_FILE" 2>/dev/null || true
 
         # Read PR summary from secure temp file
         PR_SUMMARY=""
@@ -435,7 +435,7 @@ runs:
                 total_tokens: $total_tok,
                 files_to_update: []
               }
-            }' >> "$EVENTS_FILE"
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
 
           rm -rf "$TEMP_DIR"
           exit 0
@@ -566,6 +566,10 @@ runs:
             if ! echo "$SRESPONSE" | jq empty 2>/dev/null; then
               echo "  Warning: Invalid response for chunk $i" >> $GITHUB_STEP_SUMMARY
 
+              # Normalize integer vars before --argjson to prevent invalid JSON errors
+              [[ "$TOTAL_CHUNKS" =~ ^[0-9]+$ ]] || TOTAL_CHUNKS=1
+              [[ "$CALL_LATENCY_MS" =~ ^-?[0-9]+$ ]] || CALL_LATENCY_MS=0
+              [[ "$PROMPT_CHARS_SENT" =~ ^[0-9]+$ ]] || PROMPT_CHARS_SENT=0
               jq -cn \
                 --arg run_id "$GITHUB_RUN_ID" \
                 --argjson chunk_idx "$i" \
@@ -594,7 +598,7 @@ runs:
                     api_error_type: "invalid_json",
                     result: "error"
                   }
-                }' >> "$EVENTS_FILE"
+                }' >> "$EVENTS_FILE" 2>/dev/null || true
 
               jq -cn \
                 --arg run_id "$GITHUB_RUN_ID" \
@@ -614,7 +618,7 @@ runs:
                     recoverable: true,
                     continued: true
                   }
-                }' >> "$EVENTS_FILE"
+                }' >> "$EVENTS_FILE" 2>/dev/null || true
 
               continue
             fi
@@ -623,6 +627,9 @@ runs:
               SERR_TYPE=$(echo "$SRESPONSE" | jq -r '.error.type // "unknown"')
               echo "  Warning: API error for chunk $i: $SERR_TYPE" >> $GITHUB_STEP_SUMMARY
 
+              [[ "$TOTAL_CHUNKS" =~ ^[0-9]+$ ]] || TOTAL_CHUNKS=1
+              [[ "$CALL_LATENCY_MS" =~ ^-?[0-9]+$ ]] || CALL_LATENCY_MS=0
+              [[ "$PROMPT_CHARS_SENT" =~ ^[0-9]+$ ]] || PROMPT_CHARS_SENT=0
               jq -cn \
                 --arg run_id "$GITHUB_RUN_ID" \
                 --argjson chunk_idx "$i" \
@@ -652,7 +659,7 @@ runs:
                     api_error_type: $err_type,
                     result: "error"
                   }
-                }' >> "$EVENTS_FILE"
+                }' >> "$EVENTS_FILE" 2>/dev/null || true
 
               jq -cn \
                 --arg run_id "$GITHUB_RUN_ID" \
@@ -673,7 +680,7 @@ runs:
                     recoverable: true,
                     continued: true
                   }
-                }' >> "$EVENTS_FILE"
+                }' >> "$EVENTS_FILE" 2>/dev/null || true
 
               continue
             fi
@@ -692,6 +699,12 @@ runs:
               CHUNK_RESULT="updated"
             fi
 
+            [[ "$TOTAL_CHUNKS" =~ ^[0-9]+$ ]] || TOTAL_CHUNKS=1
+            [[ "$CHUNK_IN" =~ ^[0-9]+$ ]] || CHUNK_IN=0
+            [[ "$CHUNK_OUT" =~ ^[0-9]+$ ]] || CHUNK_OUT=0
+            [[ "$PROMPT_CHARS_SENT" =~ ^[0-9]+$ ]] || PROMPT_CHARS_SENT=0
+            [[ "$RESPONSE_CHARS" =~ ^[0-9]+$ ]] || RESPONSE_CHARS=0
+            [[ "$CALL_LATENCY_MS" =~ ^-?[0-9]+$ ]] || CALL_LATENCY_MS=0
             jq -cn \
               --arg run_id "$GITHUB_RUN_ID" \
               --argjson chunk_idx "$i" \
@@ -724,7 +737,7 @@ runs:
                   api_error_type: null,
                   result: $result
                 }
-              }' >> "$EVENTS_FILE"
+              }' >> "$EVENTS_FILE" 2>/dev/null || true
 
             if [ -n "$CHUNK_SUMMARY" ] && ! echo "$CHUNK_SUMMARY" | grep -q "NO_DOC_RELEVANT_CHANGES"; then
               ALL_SUMMARIES="${ALL_SUMMARIES}
@@ -968,6 +981,8 @@ runs:
           if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
             echo "  Invalid JSON response from API" >> $GITHUB_STEP_SUMMARY
 
+            [[ "$DOC_CALL_LATENCY" =~ ^-?[0-9]+$ ]] || DOC_CALL_LATENCY=0
+            [[ "$DOC_PROMPT_CHARS" =~ ^[0-9]+$ ]] || DOC_PROMPT_CHARS=0
             jq -cn \
               --arg run_id "$GITHUB_RUN_ID" \
               --arg doc_file "$DOC_FILE" \
@@ -995,7 +1010,7 @@ runs:
                   api_error_type: "invalid_json",
                   result: "error"
                 }
-              }' >> "$EVENTS_FILE"
+              }' >> "$EVENTS_FILE" 2>/dev/null || true
 
             jq -cn \
               --arg run_id "$GITHUB_RUN_ID" \
@@ -1016,7 +1031,7 @@ runs:
                   recoverable: false,
                   continued: false
                 }
-              }' >> "$EVENTS_FILE"
+              }' >> "$EVENTS_FILE" 2>/dev/null || true
 
             return 1
           fi
@@ -1027,6 +1042,8 @@ runs:
             ERROR_CODE=$(echo "$RESPONSE" | jq -r '.error.code // "unknown"')
             echo "  Claude API Error for $DOC_FILE: type=$ERROR_TYPE, code=$ERROR_CODE" >> $GITHUB_STEP_SUMMARY
 
+            [[ "$DOC_CALL_LATENCY" =~ ^-?[0-9]+$ ]] || DOC_CALL_LATENCY=0
+            [[ "$DOC_PROMPT_CHARS" =~ ^[0-9]+$ ]] || DOC_PROMPT_CHARS=0
             jq -cn \
               --arg run_id "$GITHUB_RUN_ID" \
               --arg doc_file "$DOC_FILE" \
@@ -1055,7 +1072,7 @@ runs:
                   api_error_type: $err_type,
                   result: "error"
                 }
-              }' >> "$EVENTS_FILE"
+              }' >> "$EVENTS_FILE" 2>/dev/null || true
 
             jq -cn \
               --arg run_id "$GITHUB_RUN_ID" \
@@ -1077,7 +1094,7 @@ runs:
                   recoverable: false,
                   continued: false
                 }
-              }' >> "$EVENTS_FILE"
+              }' >> "$EVENTS_FILE" 2>/dev/null || true
 
             return 1
           fi
@@ -1105,7 +1122,7 @@ runs:
                   recoverable: false,
                   continued: false
                 }
-              }' >> "$EVENTS_FILE"
+              }' >> "$EVENTS_FILE" 2>/dev/null || true
 
             return 1
           fi
@@ -1129,6 +1146,11 @@ runs:
           fi
 
           DOC_RESPONSE_CHARS=${#CLAUDE_OUTPUT}
+          [[ "$DOC_IN" =~ ^[0-9]+$ ]] || DOC_IN=0
+          [[ "$DOC_OUT" =~ ^[0-9]+$ ]] || DOC_OUT=0
+          [[ "$DOC_PROMPT_CHARS" =~ ^[0-9]+$ ]] || DOC_PROMPT_CHARS=0
+          [[ "$DOC_RESPONSE_CHARS" =~ ^[0-9]+$ ]] || DOC_RESPONSE_CHARS=0
+          [[ "$DOC_CALL_LATENCY" =~ ^-?[0-9]+$ ]] || DOC_CALL_LATENCY=0
           jq -cn \
             --arg run_id "$GITHUB_RUN_ID" \
             --arg doc_file "$DOC_FILE" \
@@ -1160,7 +1182,7 @@ runs:
                 api_error_type: null,
                 result: $result
               }
-            }' >> "$EVENTS_FILE"
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
 
           if [ "$DOC_CALL_RESULT" = "no_updates_needed" ]; then
             echo "  No updates needed for $DOC_FILE" >> $GITHUB_STEP_SUMMARY
@@ -1181,6 +1203,11 @@ runs:
           DOC_AFTER_CHARS=$OUTPUT_LENGTH
           DOC_NET_CHARS=$((DOC_AFTER_CHARS - DOC_BEFORE_CHARS))
 
+          [[ "$DOC_BEFORE_CHARS" =~ ^[0-9]+$ ]] || DOC_BEFORE_CHARS=0
+          [[ "$DOC_AFTER_CHARS" =~ ^[0-9]+$ ]] || DOC_AFTER_CHARS=0
+          [[ "$DOC_BEFORE_LINES" =~ ^[0-9]+$ ]] || DOC_BEFORE_LINES=0
+          [[ "$DOC_AFTER_LINES" =~ ^[0-9]+$ ]] || DOC_AFTER_LINES=0
+          [[ "$DOC_NET_CHARS" =~ ^-?[0-9]+$ ]] || DOC_NET_CHARS=0
           DOC_CHANGES_LIST="${DOC_CHANGES_LIST}$(jq -cn \
             --arg file "$DOC_FILE" \
             --argjson bc "$DOC_BEFORE_CHARS" \
@@ -1188,7 +1215,7 @@ runs:
             --argjson bl "$DOC_BEFORE_LINES" \
             --argjson al "$DOC_AFTER_LINES" \
             --argjson nc "$DOC_NET_CHARS" \
-            '{file:$file,before_chars:$bc,after_chars:$ac,before_lines:$bl,after_lines:$al,net_change_chars:$nc}')
+            '{file:$file,before_chars:$bc,after_chars:$ac,before_lines:$bl,after_lines:$al,net_change_chars:$nc}' 2>/dev/null || echo '')
           "
 
           # Write the updated documentation
@@ -1272,7 +1299,7 @@ runs:
               total_chunks: $total_chunks,
               doc_changes: $doc_changes
             }
-          }' >> "$EVENTS_FILE"
+          }' >> "$EVENTS_FILE" 2>/dev/null || true
 
         # Note: TEMP_DIR cleanup deferred — PR creation step still needs pr_numbers.txt
 
@@ -1483,7 +1510,7 @@ runs:
               branch: $branch,
               files_updated: $files
             }
-          }' >> "$EVENTS_FILE"
+          }' >> "$EVENTS_FILE" 2>/dev/null || true
 
         # Clean up temporary directory now that pr_numbers.txt has been read
         rm -rf "$TEMP_DIR" 2>/dev/null || true
