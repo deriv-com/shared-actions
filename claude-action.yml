@@ -34,7 +34,7 @@ jobs:
       pull-requests: write
       issues: write
       id-token: write
-      actions: write
+      actions: read
 
     concurrency:
       group: claude-pr-review-${{ github.event.pull_request.number }}
@@ -283,22 +283,23 @@ jobs:
             CRITICAL RULE: You may call `gh pr comment` EXACTLY ONE TIME — at the very end,
             with the complete review. Do NOT post partial or intermediate comments.
 
-            Follow these steps:
+            Read /tmp/review_context.md — it contains your complete review instructions, PR context,
+            previous review (if any), acknowledged suggestions to skip, and the required output format.
 
-            1. Read /tmp/review_context.md — it contains full review instructions, PR context, previous review (if any), acknowledged suggestions to skip, and the required output format.
+            Then review the PR using this process:
 
-            2. Run `gh pr diff ${{ github.event.pull_request.number }}` to get the changed files and diffs.
+            1. Run `gh pr diff ${{ github.event.pull_request.number }}` to get the changed files and diffs.
 
-            3. For each changed file, use Read to open the full file — not just the diff hunk.
+            2. For each changed file, use Read to open the full file — not just the diff hunk.
                Full file context is required to understand the complete impact of each change.
 
-            4. For each changed file, identify and Read its dependencies:
+            3. For each changed file, identify and Read its dependencies:
                - Imported modules, utilities, or shared helpers referenced in the changed code
                - Type definitions, interfaces, or enums used by the changed code
                - Parent components or callers if the changed file exports something modified
                - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps
 
-            5. After reading ALL files and dependencies, compile your complete review in memory.
+            4. Compile ALL your findings from every changed file into a single complete review.
                Then call `gh pr comment ${{ github.event.pull_request.number }} --body "..."` ONCE with the full review.
                The comment MUST start with: ## 🤖 Claude PR Review Complete
           claude_args: |
@@ -384,14 +385,3 @@ jobs:
           else
             echo "ℹ️ AGENT_METRICS_API_URL not set — event logged to job summary only"
           fi
-
-          # Write payload for artifact upload
-          echo "$EVENT_PAYLOAD" > click2fix-payload.json
-
-      - name: Upload review summary as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: claude-review-summary-${{ github.run_id }}
-          path: click2fix-payload.json
-          retention-days: 7

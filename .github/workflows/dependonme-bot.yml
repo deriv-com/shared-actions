@@ -4,50 +4,50 @@ on:
   workflow_call:
     inputs:
       slack_users_to_tag:
-        description: 'Comma-separated Slack user IDs to tag when manual fix is needed'
+        description: "Comma-separated Slack user IDs to tag when manual fix is needed"
         required: true
         type: string
       base_branch:
-        description: 'Base branch for PR (e.g., master or main)'
+        description: "Base branch for PR (e.g., master or main)"
         required: false
-        default: 'master'
+        default: "master"
         type: string
       auto_merge:
-        description: 'Enable auto-merge for safe PRs (requires repo settings)'
+        description: "Enable auto-merge for safe PRs (requires repo settings)"
         required: false
         default: true
         type: boolean
       dry_run:
-        description: 'Preview changes without creating PR'
+        description: "Preview changes without creating PR"
         required: false
         default: false
         type: boolean
       pr_labels:
-        description: 'Comma-separated labels for PR'
+        description: "Comma-separated labels for PR"
         required: false
-        default: 'security,dependencies'
+        default: "security,dependencies"
         type: string
       node_version:
-        description: 'Node.js version to use'
+        description: "Node.js version to use"
         required: false
-        default: '20'
+        default: "20"
         type: string
       npm_legacy_peer_deps:
-        description: 'Use --legacy-peer-deps flag for npm install'
+        description: "Use --legacy-peer-deps flag for npm install"
         required: false
         default: true
         type: boolean
       exclude_packages:
-        description: 'Comma-separated packages to exclude from updates'
+        description: "Comma-separated packages to exclude from updates"
         required: false
-        default: ''
+        default: ""
         type: string
     secrets:
       DEPENDONME_BOT_TOKEN:
-        description: 'GitHub PAT for PR creation & auto-merge (repo-specific)'
+        description: "GitHub PAT for PR creation & auto-merge (repo-specific)"
         required: true
       DEPENDONME_BOT_SLACK:
-        description: 'Slack webhook URL for notifications (caller must provide)'
+        description: "Slack webhook URL for notifications (caller must provide)"
         required: true
 
 concurrency:
@@ -104,7 +104,7 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "/repos/${{ github.repository }}/dependabot/alerts?state=open&per_page=100" \
             2>&1) || true
-          
+
           # Debug: Check if response is valid JSON array
           if ! echo "$ALERTS" | jq -e 'type == "array"' > /dev/null 2>&1; then
             echo "⚠️ API returned unexpected response:" >> $GITHUB_STEP_SUMMARY
@@ -222,7 +222,7 @@ jobs:
           SKIPPED_COUNT=0
           SKIPPED_PACKAGES=""
           UPDATED_PACKAGES=""
-          
+
           for pkg in $(echo "$PACKAGES" | jq -r '.[] | .name'); do
             LATEST=$(npm view "$pkg" version 2>/dev/null || echo "")
             if [ -z "$LATEST" ]; then
@@ -252,10 +252,10 @@ jobs:
               mv package-lock.json.bak package-lock.json
             fi
           done
-          
+
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Summary:** $UPDATED_COUNT updated, $SKIPPED_COUNT skipped" >> $GITHUB_STEP_SUMMARY
-          
+
           # Output skipped packages for Slack notification
           echo "skipped_packages=${SKIPPED_PACKAGES%,}" >> $GITHUB_OUTPUT
           echo "skipped_count=$SKIPPED_COUNT" >> $GITHUB_OUTPUT
@@ -283,14 +283,14 @@ jobs:
         run: |
           # Get list of changed files
           CHANGED_FILES=$(git diff --name-only HEAD)
-          
+
           echo "Changed files:"
           echo "$CHANGED_FILES"
-          
+
           # Check if ONLY package.json and package-lock.json are changed
           ALLOWED_FILES="package.json
           package-lock.json"
-          
+
           INVALID_FILES=""
           while IFS= read -r file; do
             if [ -n "$file" ]; then
@@ -299,7 +299,7 @@ jobs:
               fi
             fi
           done <<< "$CHANGED_FILES"
-          
+
           if [ -n "$INVALID_FILES" ]; then
             echo "❌ ERROR: Unexpected files changed:$INVALID_FILES" >> $GITHUB_STEP_SUMMARY
             echo "Auto-merge BLOCKED for safety." >> $GITHUB_STEP_SUMMARY
@@ -316,10 +316,10 @@ jobs:
           GH_TOKEN: ${{ secrets.DEPENDONME_BOT_TOKEN }}
         run: |
           echo "Checking for existing security fix PRs..."
-          
+
           # Find and close any existing auto-fix PRs
           EXISTING_PRS=$(gh pr list --search "Auto-fix: Dependabot Security" --state open --json number --jq '.[].number' 2>/dev/null || echo "")
-          
+
           if [ -n "$EXISTING_PRS" ]; then
             echo "Found existing PRs to close:"
             for pr in $EXISTING_PRS; do
@@ -390,7 +390,7 @@ jobs:
           " \
             --base "$BASE_BRANCH" \
             --head "$BRANCH")
-          
+
           # Try to add labels (ignore errors if labels don't exist)
           PR_NUMBER_TEMP=$(echo "$PR_URL" | grep -oE '[0-9]+$')
           for label in $(echo "$LABELS" | tr ',' ' '); do
@@ -428,23 +428,23 @@ jobs:
         run: |
           # Format Slack user mentions
           FORMATTED_USERS=$(echo "$SLACK_USERS" | tr ',' '\n' | sed 's/^/<@/' | sed 's/$/>/' | tr '\n' ' ')
-          
+
           # Build updated packages list
           UPDATED_LIST=$(echo "$PACKAGES" | jq -r '.[] | "- \(.name) → latest (fixes >= \(.version))"')
-          
+
           # Build skipped packages list (if any) - format: "pkg (reason)" → "- pkg → (reason)"
           SKIPPED_LIST=""
           if [ -n "$SKIPPED_PACKAGES" ] && [ "$SKIPPED_COUNT" != "0" ]; then
             SKIPPED_LIST=$(echo "$SKIPPED_PACKAGES" | tr ',' '\n' | sed '/^$/d' | sed 's/^/- /' | sed 's/ (/ → (/')
           fi
-          
+
           # Combine both lists
           if [ -n "$SKIPPED_LIST" ]; then
             FULL_LIST="$UPDATED_LIST"$'\n'"$SKIPPED_LIST"
           else
             FULL_LIST="$UPDATED_LIST"
           fi
-          
+
           # Send Slack notification
           curl -X POST "$SLACK_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
@@ -482,7 +482,7 @@ jobs:
                 ]
               }'
             )"
-          
+
           echo "📢 Slack notification sent" >> $GITHUB_STEP_SUMMARY
 
       - name: ⚠️ Manual Review Required
@@ -502,17 +502,17 @@ jobs:
         run: |
           # Format Slack user mentions
           FORMATTED_USERS=$(echo "$SLACK_USERS" | tr ',' '\n' | sed 's/^/<@/' | sed 's/$/>/' | tr '\n' ' ')
-          
+
           # Build skipped packages list - format: "pkg (reason)" → "- pkg → (reason)"
           SKIPPED_LIST=$(echo "$SKIPPED_PACKAGES" | tr ',' '\n' | sed '/^$/d' | sed 's/^/- /' | sed 's/ (/ → (/')
-          
+
           # Handle singular/plural
           if [ "$ALERT_COUNT" = "1" ]; then
             ALERT_WORD="alert"
           else
             ALERT_WORD="alerts"
           fi
-          
+
           # Send Slack notification
           curl -X POST "$SLACK_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
@@ -550,7 +550,7 @@ jobs:
                 ]
               }'
             )"
-          
+
           echo "🚨 Slack alert sent - all updates failed, manual intervention required" >> $GITHUB_STEP_SUMMARY
 
       - name: 📋 Summary
@@ -571,4 +571,3 @@ jobs:
           echo "| Base Branch | $BASE_BRANCH |" >> $GITHUB_STEP_SUMMARY
           echo "| Auto-Merge | $AUTO_MERGE |" >> $GITHUB_STEP_SUMMARY
           echo "| Dry Run | $DRY_RUN |" >> $GITHUB_STEP_SUMMARY
-
