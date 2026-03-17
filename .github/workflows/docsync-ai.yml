@@ -112,7 +112,7 @@ jobs:
                 base_branch: $base_branch,
                 workflow_name: "docsync-ai"
               }
-            }' >> "$EVENTS_FILE"
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
 
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -234,7 +234,7 @@ jobs:
                 message_type: "documentation_update",
                 pr_link: $pr_link
               }
-            }' >> "$EVENTS_FILE"
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
 
       - name: Summary
         if: always()
@@ -291,7 +291,7 @@ jobs:
                 changes_made: $changes_made,
                 error: $error
               }
-            }' >> "$EVENTS_FILE"
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
 
           # POST accumulated events to the metrics dashboard
           if [[ -n "$AGENT_METRICS_API_URL" ]] && [ -f "$EVENTS_FILE" ]; then
@@ -416,7 +416,7 @@ jobs:
                 base_branch: $base_branch,
                 workflow_name: "docsync-ai"
               }
-            }' >> "$EVENTS_FILE"
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
 
       - name: Run DocSync AI Comment Action
         id: docsync-comment
@@ -542,7 +542,7 @@ jobs:
                 message_type: "documentation_update",
                 pr_link: $pr_link
               }
-            }' >> "$EVENTS_FILE"
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
 
       - name: Summary
         if: always()
@@ -603,7 +603,7 @@ jobs:
                 changes_made: $changes_made,
                 error: $error
               }
-            }' >> "$EVENTS_FILE"
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
 
           # POST accumulated events to the metrics dashboard
           if [[ -n "$AGENT_METRICS_API_URL" ]] && [ -f "$EVENTS_FILE" ]; then
