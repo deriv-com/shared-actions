@@ -264,21 +264,26 @@ jobs:
         run: rm -f CLAUDE.md
 
       - name: Claude Code PR Review
+        # github_token is intentionally omitted from `with:` here.
+        # Providing github_token causes the action to spin up its GitHub MCP server, which
+        # gives Claude inline review-comment tools (add_pull_request_review_comment, etc.)
+        # that it uses to post many small comments instead of one consolidated review.
+        # GH_TOKEN in env: below keeps the `gh` CLI authenticated for the single allowed
+        # `gh pr comment` bash call without enabling the MCP server.
         uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           model: ${{ env.CLAUDE_MODEL }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
-            CRITICAL RULES — read before doing anything else:
-            - You may call `gh pr comment` EXACTLY ONE TIME. No test comments, no intermediate comments, no partial comments. One call, at the very end, with the complete review.
-            - Do NOT use `gh pr comment` to test connectivity, dump file contents, or post anything other than the final review.
-            - The single comment MUST begin with exactly this line: ## 🤖 Claude PR Review Complete
+            CRITICAL RULE: You may call `gh pr comment` EXACTLY ONE TIME — at the very end,
+            with the complete review. Do NOT post partial or intermediate comments.
 
-            Now follow these steps:
+            Follow these steps:
 
             1. Read /tmp/review_context.md — it contains full review instructions, PR context, previous review (if any), acknowledged suggestions to skip, and the required output format.
 
@@ -294,10 +299,8 @@ jobs:
                - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps
 
             5. After reading ALL files and dependencies, compile your complete review in memory.
-               Then post it in a SINGLE `gh pr comment` call.
+               Then call `gh pr comment ${{ github.event.pull_request.number }} --body "..."` ONCE with the full review.
                The comment MUST start with: ## 🤖 Claude PR Review Complete
-               Do NOT call `gh pr comment` more than once under any circumstances.
-          # Read-only tools: no Edit/Write/NotebookEdit to prevent accidental modifications
           claude_args: |
             --allowedTools "Read,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
