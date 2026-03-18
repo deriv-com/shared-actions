@@ -264,24 +264,14 @@ jobs:
         run: rm -f CLAUDE.md
 
       - name: Claude Code PR Review
-        # github_token is intentionally omitted from `with:` here.
-        # Providing github_token causes the action to spin up its GitHub MCP server, which
-        # gives Claude inline review-comment tools (add_pull_request_review_comment, etc.)
-        # that it uses to post many small comments instead of one consolidated review.
-        # GH_TOKEN in env: below keeps the `gh` CLI authenticated for the single allowed
-        # `gh pr comment` bash call without enabling the MCP server.
         uses: anthropics/claude-code-action@v1
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           model: ${{ env.CLAUDE_MODEL }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
-
-            CRITICAL RULE: You may call `gh pr comment` EXACTLY ONE TIME — at the very end,
-            with the complete review. Do NOT post partial or intermediate comments.
 
             Follow these steps:
 
@@ -298,11 +288,28 @@ jobs:
                - Parent components or callers if the changed file exports something modified
                - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps
 
-            5. After reading ALL files and dependencies, compile your complete review in memory.
-               Then call `gh pr comment ${{ github.event.pull_request.number }} --body "..."` ONCE with the full review.
-               The comment MUST start with: ## 🤖 Claude PR Review Complete
+            5. After reading ALL files and dependencies, compile your complete review.
+               Write the ENTIRE review to /tmp/claude_review_output.txt using the Write tool.
+               Do NOT call gh pr comment — the next step posts the file as a single comment.
+          # Write is unrestricted (plain "Write", not "Write(/path)") so the tool is actually available.
+          # Bash(gh pr comment) is intentionally excluded — the post step below guarantees exactly one comment.
           claude_args: |
-            --allowedTools "Read,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --allowedTools "Read,Write,Bash(gh pr diff:*),Bash(gh pr view:*)"
+
+      - name: Post review as single PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          if [ ! -f /tmp/claude_review_output.txt ] || [ ! -s /tmp/claude_review_output.txt ]; then
+            echo "❌ Review file missing or empty — Claude did not write output"
+            exit 1
+          fi
+
+          echo "📬 Posting review ($(wc -c < /tmp/claude_review_output.txt) bytes)..."
+          gh pr comment "$PR_NUMBER" --body-file /tmp/claude_review_output.txt
+          echo "✅ Review posted"
 
       - name: Emit review event to metrics dashboard
         if: always()
