@@ -348,8 +348,26 @@ jobs:
                 echo ""
               } >> "$GITHUB_STEP_SUMMARY"
             done < "$EVENTS_FILE"
+
+            # Prepare artifact with complete event log (including workflow_completed)
+            ARTIFACT_DIR="/tmp/docsync_artifact_${GITHUB_RUN_ID}"
+            mkdir -p "$ARTIFACT_DIR"
+            if [ -s "$EVENTS_FILE" ]; then
+              jq -s '.' "$EVENTS_FILE" > "$ARTIFACT_DIR/docsync-payload.json"
+            else
+              echo '[]' > "$ARTIFACT_DIR/docsync-payload.json"
+            fi
             rm -f "$EVENTS_FILE"
           fi
+
+      - name: Upload DocSync Event Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docsync-event-log-${{ github.run_id }}
+          path: /tmp/docsync_artifact_${{ github.run_id }}/docsync-payload.json
+          retention-days: 90
+          if-no-files-found: warn
 
   update-from-comment:
     name: Update Documentation from Comment
@@ -660,5 +678,23 @@ jobs:
                 echo ""
               } >> "$GITHUB_STEP_SUMMARY"
             done < "$EVENTS_FILE"
+
+            # Prepare artifact with complete event log (including workflow_completed)
+            ARTIFACT_DIR="/tmp/docsync_artifact_${GITHUB_RUN_ID}"
+            mkdir -p "$ARTIFACT_DIR"
+            if [ -s "$EVENTS_FILE" ]; then
+              jq -s '.' "$EVENTS_FILE" > "$ARTIFACT_DIR/docsync-payload.json"
+            else
+              echo '[]' > "$ARTIFACT_DIR/docsync-payload.json"
+            fi
             rm -f "$EVENTS_FILE"
           fi
+
+      - name: Upload DocSync Event Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docsync-event-log-${{ github.run_id }}
+          path: /tmp/docsync_artifact_${{ github.run_id }}/docsync-payload.json
+          retention-days: 90
+          if-no-files-found: warn
