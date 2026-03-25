@@ -348,17 +348,20 @@ jobs:
                 echo ""
               } >> "$GITHUB_STEP_SUMMARY"
             done < "$EVENTS_FILE"
-
-            # Prepare artifact with complete event log (including workflow_completed)
-            ARTIFACT_DIR="/tmp/docsync_artifact_${GITHUB_RUN_ID}"
-            mkdir -p "$ARTIFACT_DIR"
-            if [ -s "$EVENTS_FILE" ]; then
-              jq -s '.' "$EVENTS_FILE" > "$ARTIFACT_DIR/docsync-payload.json"
-            else
-              echo '[]' > "$ARTIFACT_DIR/docsync-payload.json"
-            fi
-            rm -f "$EVENTS_FILE"
           fi
+
+      - name: Prepare Event Log Artifact
+        if: always()
+        run: |
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          ARTIFACT_DIR="/tmp/docsync_artifact_${GITHUB_RUN_ID}"
+          mkdir -p "$ARTIFACT_DIR"
+          if [ -s "$EVENTS_FILE" ]; then
+            jq -s '.' "$EVENTS_FILE" > "$ARTIFACT_DIR/docsync-payload.json"
+          else
+            echo '[]' > "$ARTIFACT_DIR/docsync-payload.json"
+          fi
+          rm -f "$EVENTS_FILE"
 
       - name: Upload DocSync Event Log
         if: always()
@@ -678,17 +681,20 @@ jobs:
                 echo ""
               } >> "$GITHUB_STEP_SUMMARY"
             done < "$EVENTS_FILE"
-
-            # Prepare artifact with complete event log (including workflow_completed)
-            ARTIFACT_DIR="/tmp/docsync_artifact_${GITHUB_RUN_ID}"
-            mkdir -p "$ARTIFACT_DIR"
-            if [ -s "$EVENTS_FILE" ]; then
-              jq -s '.' "$EVENTS_FILE" > "$ARTIFACT_DIR/docsync-payload.json"
-            else
-              echo '[]' > "$ARTIFACT_DIR/docsync-payload.json"
-            fi
-            rm -f "$EVENTS_FILE"
           fi
+
+      - name: Prepare Event Log Artifact
+        if: always()
+        run: |
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          ARTIFACT_DIR="/tmp/docsync_artifact_${GITHUB_RUN_ID}"
+          mkdir -p "$ARTIFACT_DIR"
+          if [ -s "$EVENTS_FILE" ]; then
+            jq -s '.' "$EVENTS_FILE" > "$ARTIFACT_DIR/docsync-payload.json"
+          else
+            echo '[]' > "$ARTIFACT_DIR/docsync-payload.json"
+          fi
+          rm -f "$EVENTS_FILE"
 
       - name: Upload DocSync Event Log
         if: always()
