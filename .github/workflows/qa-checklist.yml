@@ -59,6 +59,42 @@ jobs:
           echo "Only organization members and repository collaborators can trigger Claude actions."
           exit 1
 
+      - name: Log Workflow Triggered
+        id: trigger-info
+        run: |
+          WORKFLOW_START_TIME=$(date +%s)
+          echo "start_time=$WORKFLOW_START_TIME" >> $GITHUB_OUTPUT
+          echo "## QA Checklist Generator — Workflow Info" >> $GITHUB_STEP_SUMMARY
+          echo "Event: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "Actor: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "Triggered by: @${{ github.event.comment.user.login }}" >> $GITHUB_STEP_SUMMARY
+          echo "PR Number: #${{ github.event.issue.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "Repository: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+
+          # Log workflow_triggered event
+          EVENTS_FILE="/tmp/qa_events_${GITHUB_RUN_ID}.jsonl"
+          PR_LINK="https://github.com/${{ github.repository }}/pull/${{ github.event.issue.number }}"
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg repo "${{ github.repository }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg triggered_by "${{ github.event.comment.user.login }}" \
+            --arg pr_link "$PR_LINK" \
+            '{
+              agent: "QA Checklist Generator",
+              event_type: "workflow_triggered",
+              run_id: $run_id,
+              trigger_type: "comment",
+              timestamp: (now | todate),
+              payload: {
+                repository: $repo,
+                actor: $actor,
+                triggered_by: $triggered_by,
+                pr_link: $pr_link,
+                workflow_name: "qa-checklist"
+              }
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
+
       - name: Get PR Details
         id: pr
         timeout-minutes: 2
@@ -226,3 +262,105 @@ jobs:
             - Configuration → Test the configured feature only
 
             Now analyze the PR and generate a concise, relevant checklist.
+
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          WORKFLOW_START_TIME: ${{ steps.trigger-info.outputs.start_time }}
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger | PR Comment |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Number | #${{ github.event.issue.number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Actor | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | @${{ github.event.comment.user.login }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | $JOB_STATUS |" >> $GITHUB_STEP_SUMMARY
+
+          # Compute duration
+          END_TIME=$(date +%s)
+          START_TIME="${WORKFLOW_START_TIME:-$END_TIME}"
+          DURATION_SECONDS=$((END_TIME - START_TIME))
+
+          # Log workflow_completed event
+          EVENTS_FILE="/tmp/qa_events_${GITHUB_RUN_ID}.jsonl"
+          STATUS_VAL=$([ "$JOB_STATUS" = "success" ] && echo "success" || echo "failed")
+          CHECKLIST_BOOL=$([ "$JOB_STATUS" = "success" ] && echo "true" || echo "false")
+          if [ "$JOB_STATUS" = "success" ]; then
+            ERROR_JSON="null"
+          else
+            ERROR_JSON="\"Job failed with status: $JOB_STATUS\""
+          fi
+          # Ensure numeric values are valid for jq --argjson
+          [[ ! "$DURATION_SECONDS" =~ ^[0-9]+$ ]] && DURATION_SECONDS=0
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg repo "${{ github.repository }}" \
+            --arg status "$STATUS_VAL" \
+            --argjson duration "$DURATION_SECONDS" \
+            --argjson checklist_generated "$CHECKLIST_BOOL" \
+            --argjson changes_made "$CHECKLIST_BOOL" \
+            --argjson error "$ERROR_JSON" \
+            '{
+              agent: "QA Checklist Generator",
+              event_type: "workflow_completed",
+              run_id: $run_id,
+              trigger_type: "comment",
+              timestamp: (now | todate),
+              payload: {
+                repository: $repo,
+                status: $status,
+                duration_seconds: $duration,
+                checklist_generated: $checklist_generated,
+                changes_made: $changes_made,
+                error: $error
+              }
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
+
+          # Display accumulated event log
+          if [ -f "$EVENTS_FILE" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "## 📊 QA Checklist Generator — Event Log" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            EVENT_NUM=0
+            while IFS= read -r EVENT_LINE; do
+              EVENT_NUM=$((EVENT_NUM + 1))
+              EVENT_TYPE=$(echo "$EVENT_LINE" | jq -r '.event_type // "unknown"')
+              {
+                echo "<details>"
+                printf "<summary>📋 Event %d: <code>%s</code></summary>\n" "$EVENT_NUM" "$EVENT_TYPE"
+                echo ""
+                echo '```json'
+                echo "$EVENT_LINE" | jq '.'
+                echo '```'
+                echo ""
+                echo "</details>"
+                echo ""
+              } >> "$GITHUB_STEP_SUMMARY"
+            done < "$EVENTS_FILE"
+          fi
+
+      - name: Prepare Event Log Artifact
+        if: always()
+        run: |
+          EVENTS_FILE="/tmp/qa_events_${GITHUB_RUN_ID}.jsonl"
+          ARTIFACT_DIR="/tmp/qa_artifact_${GITHUB_RUN_ID}"
+          mkdir -p "$ARTIFACT_DIR"
+          if [ -s "$EVENTS_FILE" ]; then
+            jq -s '.' "$EVENTS_FILE" > "$ARTIFACT_DIR/qa-checklist-payload.json"
+          else
+            echo '[]' > "$ARTIFACT_DIR/qa-checklist-payload.json"
+          fi
+          rm -f "$EVENTS_FILE"
+
+      - name: Upload QA Checklist Event Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-checklist-event-log-${{ github.run_id }}
+          path: /tmp/qa_artifact_${{ github.run_id }}/qa-checklist-payload.json
+          retention-days: 90
+          if-no-files-found: warn
