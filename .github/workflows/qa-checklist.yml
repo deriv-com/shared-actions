@@ -1,0 +1,228 @@
+name: QA Checklist Generator
+
+on:
+  workflow_call:
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: "Anthropic API key for Claude"
+        required: true
+
+jobs:
+  generate-checklist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+
+    # Prevent duplicate runs
+    concurrency:
+      group: qa-checklist-pr-${{ github.event.issue.number }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Security Check - Validate User Access
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ACTOR="${{ github.actor }}"
+          echo "Validating access for user: $ACTOR"
+
+          # Explicitly mask the token to prevent exposure in debug logs
+          echo "::add-mask::${GH_TOKEN}"
+
+          # Check if user is organization member
+          MEMBERSHIP_STATUS=$(curl -s -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/orgs/deriv-com/members/$ACTOR" \
+            -w "%{http_code}" -o /dev/null)
+
+          if [[ "$MEMBERSHIP_STATUS" == "204" ]]; then
+            echo "✅ User $ACTOR is a verified organization member"
+            exit 0
+          fi
+
+          # Check if user is repository collaborator
+          COLLABORATOR_STATUS=$(curl -s -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/repos/${{ github.repository }}/collaborators/$ACTOR" \
+            -w "%{http_code}" -o /dev/null)
+
+          if [[ "$COLLABORATOR_STATUS" == "204" ]]; then
+            echo "✅ User $ACTOR is a verified repository collaborator"
+            exit 0
+          fi
+
+          echo "❌ Access denied for user: $ACTOR"
+          echo "Only organization members and repository collaborators can trigger Claude actions."
+          exit 1
+
+      - name: Get PR Details
+        id: pr
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Explicitly mask the token to prevent exposure in debug logs
+          echo "::add-mask::${GH_TOKEN}"
+
+          PR_DATA=$(curl -s --max-time 30 \
+            -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")
+
+          # Validate JSON response structure
+          if ! echo "$PR_DATA" | jq -e '.head.ref' > /dev/null 2>&1; then
+            echo "❌ Failed to fetch PR details. Response:"
+            echo "$PR_DATA" | jq '.' || echo "$PR_DATA"
+            exit 1
+          fi
+
+          # Extract values
+          PR_REF=$(echo "$PR_DATA" | jq -r '.head.ref')
+          PR_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
+          PR_REPO=$(echo "$PR_DATA" | jq -r '.head.repo.full_name')
+
+          # Check for null values (deleted fork case)
+          if [[ "$PR_REPO" == "null" || -z "$PR_REPO" ]]; then
+            echo "❌ Cannot determine PR source repository (possibly deleted fork)"
+            exit 1
+          fi
+
+          echo "ref=${PR_REF}" >> $GITHUB_OUTPUT
+          echo "sha=${PR_SHA}" >> $GITHUB_OUTPUT
+          echo "repo=${PR_REPO}" >> $GITHUB_OUTPUT
+
+      - name: Validate PR Source
+        run: |
+          if [[ "${{ steps.pr.outputs.repo }}" != "${{ github.repository }}" ]]; then
+            echo "❌ PRs from forks are not supported for security reasons"
+            exit 1
+          fi
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.pr.outputs.repo }}
+          ref: ${{ steps.pr.outputs.sha }}
+          fetch-depth: 20
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify git workspace
+        run: |
+          pwd
+          git rev-parse --is-inside-work-tree
+          git log -1 --oneline
+
+      - name: Generate QA Checklist
+        uses: anthropics/claude-code-action@8a1c4371755898f67cd97006ba7c97702d5fc4bf
+        timeout-minutes: 60
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.issue.number }}
+            TRIGGERED BY: @${{ github.event.comment.user.login }}
+
+            You are a QA specialist. Generate a focused, actionable end-user testing checklist based on the actual changes in this PR.
+
+            ## Critical Rules
+
+            1. **ONLY test what changed** - Do not include generic tests unrelated to the PR
+            2. **Be proportional** - Scale test count to match the scope of changes (1 test per distinct functionality change)
+            3. **Avoid redundancy** - Combine related tests, don't repeat similar scenarios
+            4. **Focus on impact** - Prioritize user-facing behavior and critical workflows
+            5. **Skip irrelevant edge cases** - Only include edge cases directly related to modified code
+
+            ## Step 1: Analyze PR Changes
+
+            Read the git diff and identify:
+            - Which files were modified (components, stores, utilities, etc.)
+            - What functionality was added, changed, or fixed
+            - Which features/pages use the modified code
+            - Any configuration or dependency changes
+
+            ## Step 2: Map Changes to User Impact
+
+            For EACH modified file, determine:
+            - Is this visible to end users?
+            - What specific user actions are affected?
+            - What workflows might break?
+
+            **Skip testing:**
+            - Code refactoring with no behavior change
+            - Type definition updates
+            - Internal utilities not affecting UI
+            - Test file changes
+            - Documentation updates
+
+            ## Step 3: Generate Focused Checklist
+
+            Create test items (proportional to changes) that:
+            - Directly test the modified functionality (1 test per distinct change)
+            - Include only relevant edge cases based on changes
+            - Cover critical user workflows affected by the PR
+            - Are specific and actionable (not vague)
+            - Avoid redundant or overlapping tests
+
+            **Format:**
+
+            ```markdown
+            ## 🧪 QA Checklist for PR #${{ github.event.issue.number }}
+
+            **For:** @${{ github.event.comment.user.login }}
+            **Changes:** [One sentence describing what changed]
+
+            ### ✅ Core Functionality
+            - [ ] [Specific test based on actual change]
+            - [ ] [Another test directly related to modified code]
+
+            ### 🔍 Edge Cases (if applicable)
+            - [ ] [Edge case relevant to the changes]
+
+            ---
+            *Regenerate: comment `@checkmaite`*
+            ```
+
+            ## Scaling Guidelines
+
+            - **Small PR (1-3 files, single feature):** 3-6 test items
+            - **Medium PR (4-8 files, multiple related changes):** 8-15 test items
+            - **Large PR (9+ files, multiple features):** 15-25 test items
+            - **Always:** Group related tests, avoid redundancy, focus on changes only
+
+            ## Examples
+
+            **✅ GOOD - Focused on changes:**
+            ```
+            PR changes: Updated product price calculation to include tax
+
+            Tests (3 items):
+            - [ ] Add product to cart and verify price includes tax amount
+            - [ ] Change quantity and verify tax recalculates correctly
+            - [ ] Test with tax-exempt items (if applicable to changes)
+            ```
+
+            **❌ BAD - Generic, unrelated to changes:**
+            ```
+            Tests (5 items):
+            - [ ] Test all cart functionality
+            - [ ] Verify navigation works
+            - [ ] Check responsive design
+            - [ ] Test login/logout
+            - [ ] Verify error messages display
+            ```
+
+            ## Quick Reference
+
+            **If PR changes:**
+            - Form validation → Test the specific validation rules modified
+            - UI component → Test the visual/interaction changes
+            - API integration → Test the affected data flow
+            - Store/state → Test features using that state
+            - Configuration → Test the configured feature only
+
+            Now analyze the PR and generate a concise, relevant checklist.
