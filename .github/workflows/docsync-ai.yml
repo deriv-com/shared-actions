@@ -734,25 +734,6 @@ jobs:
           echo "Repository: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
           echo "Triggered by: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
 
-          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
-          jq -cn \
-            --arg run_id "$GITHUB_RUN_ID" \
-            --arg repo "${{ github.repository }}" \
-            --arg base_branch "${{ inputs.base_branch }}" \
-            --arg actor "${{ github.actor }}" \
-            '{
-              agent: "DocSync AI",
-              event_type: "workflow_triggered",
-              run_id: $run_id,
-              trigger_type: "claude_md_refresh",
-              timestamp: (now | todate),
-              payload: {
-                repository: $repo,
-                base_branch: $base_branch,
-                workflow_name: "docsync-ai",
-                triggered_by: $actor
-              }
-            }' >> "$EVENTS_FILE" 2>/dev/null || true
 
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -801,7 +782,6 @@ jobs:
         run: |
           set -e
 
-          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
           echo "## Claude API — CLAUDE.md Reformat" >> $GITHUB_STEP_SUMMARY
 
           CURRENT_CONTENT=$(cat "$CLAUDE_FILE" | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
@@ -912,41 +892,6 @@ jobs:
           echo "Input tokens: $IN_TOKENS | Output tokens: $OUT_TOKENS | Latency: ${CALL_LATENCY}ms" >> $GITHUB_STEP_SUMMARY
           echo "New size: $NEW_CHARS chars" >> $GITHUB_STEP_SUMMARY
 
-          [[ ! "$IN_TOKENS" =~ ^[0-9]+$ ]] && IN_TOKENS=0
-          [[ ! "$OUT_TOKENS" =~ ^[0-9]+$ ]] && OUT_TOKENS=0
-          [[ ! "$CALL_LATENCY" =~ ^-?[0-9]+$ ]] && CALL_LATENCY=0
-          [[ ! "$PROMPT_CHARS" =~ ^[0-9]+$ ]] && PROMPT_CHARS=0
-          [[ ! "$NEW_CHARS" =~ ^[0-9]+$ ]] && NEW_CHARS=0
-          jq -cn \
-            --arg run_id "$GITHUB_RUN_ID" \
-            --arg doc_file "$CLAUDE_FILE" \
-            --argjson in_tok "$IN_TOKENS" \
-            --argjson out_tok "$OUT_TOKENS" \
-            --argjson prompt_chars "$PROMPT_CHARS" \
-            --argjson resp_chars "$NEW_CHARS" \
-            --argjson latency "$CALL_LATENCY" \
-            --arg http_status "$HTTP_CODE" \
-            '{
-              agent: "DocSync AI",
-              event_type: "claude_api_call",
-              run_id: $run_id,
-              trigger_type: "claude_md_refresh",
-              timestamp: (now | todate),
-              payload: {
-                call_type: "claude_md_refresh",
-                target_file: $doc_file,
-                model: "claude-sonnet-4-5",
-                input_tokens: $in_tok,
-                output_tokens: $out_tok,
-                prompt_chars: $prompt_chars,
-                response_chars: $resp_chars,
-                latency_ms: $latency,
-                http_status: $http_status,
-                api_error_type: null,
-                result: "updated"
-              }
-            }' >> "$EVENTS_FILE" 2>/dev/null || true
-
           printf '%s' "$NEW_CONTENT" > "$CLAUDE_FILE"
 
           git add "$CLAUDE_FILE"
@@ -1039,29 +984,6 @@ jobs:
           echo "### Refresh PR Created: #$PR_NUMBER" >> $GITHUB_STEP_SUMMARY
           echo "$PR_URL" >> $GITHUB_STEP_SUMMARY
 
-          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
-          jq -cn \
-            --arg run_id "$GITHUB_RUN_ID" \
-            --arg pr_num "PR-$PR_NUMBER" \
-            --arg pr_title "DocSync AI: Refresh CLAUDE.md to best practices" \
-            --arg pr_url "$PR_URL" \
-            --arg branch "$BRANCH" \
-            --arg file "$CLAUDE_FILE" \
-            '{
-              agent: "DocSync AI",
-              event_type: "doc_pr_created",
-              run_id: $run_id,
-              trigger_type: "claude_md_refresh",
-              timestamp: (now | todate),
-              payload: {
-                pr_number: $pr_num,
-                pr_title: $pr_title,
-                pr_url: $pr_url,
-                branch: $branch,
-                files_updated: [$file]
-              }
-            }' >> "$EVENTS_FILE" 2>/dev/null || true
-
       - name: Send Slack Notification
         if: steps.create-refresh-pr.outputs.pr_created == 'true' && env.SLACK_TOKEN != '' && env.SLACK_CHANNEL != ''
         env:
@@ -1130,28 +1052,6 @@ jobs:
             echo "Warning: Slack API error: $SLACK_ERROR" >> $GITHUB_STEP_SUMMARY
           fi
 
-          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
-          SLACK_STATUS=$([ "$SLACK_OK" = "true" ] && echo "success" || echo "failed")
-          PR_LINK="https://github.com/${{ github.repository }}/pull/$PR_NUMBER"
-          jq -cn \
-            --arg run_id "$GITHUB_RUN_ID" \
-            --arg status "$SLACK_STATUS" \
-            --arg channel "$SLACK_CHANNEL" \
-            --arg pr_link "$PR_LINK" \
-            '{
-              agent: "DocSync AI",
-              event_type: "slack_notification_sent",
-              run_id: $run_id,
-              trigger_type: "claude_md_refresh",
-              timestamp: (now | todate),
-              payload: {
-                status: $status,
-                channel: $channel,
-                message_type: "claude_md_refresh",
-                pr_link: $pr_link
-              }
-            }' >> "$EVENTS_FILE" 2>/dev/null || true
-
       - name: Summary
         if: always()
         env:
@@ -1159,8 +1059,6 @@ jobs:
           PR_CREATED: ${{ steps.create-refresh-pr.outputs.pr_created }}
           PR_URL: ${{ steps.create-refresh-pr.outputs.pr_url }}
           WORKFLOW_START_TIME: ${{ steps.trigger-info.outputs.start_time }}
-          AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
-          AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
         run: |
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
@@ -1175,103 +1073,5 @@ jobs:
           END_TIME=$(date +%s)
           START_TIME="${WORKFLOW_START_TIME:-$END_TIME}"
           DURATION_SECONDS=$((END_TIME - START_TIME))
-
-          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
-          STATUS_VAL=$([ "$JOB_STATUS" = "success" ] && echo "success" || echo "failed")
-          PR_BOOL=$([ "${PR_CREATED:-false}" = "true" ] && echo "true" || echo "false")
-          if [ "$JOB_STATUS" = "success" ]; then
-            ERROR_JSON="null"
-          else
-            ERROR_JSON="\"Job failed with status: $JOB_STATUS\""
-          fi
           [[ ! "$DURATION_SECONDS" =~ ^[0-9]+$ ]] && DURATION_SECONDS=0
-          jq -cn \
-            --arg run_id "$GITHUB_RUN_ID" \
-            --arg status "$STATUS_VAL" \
-            --argjson duration "$DURATION_SECONDS" \
-            --argjson pr_created "$PR_BOOL" \
-            --argjson error "$ERROR_JSON" \
-            '{
-              agent: "DocSync AI",
-              event_type: "workflow_completed",
-              run_id: $run_id,
-              trigger_type: "claude_md_refresh",
-              timestamp: (now | todate),
-              payload: {
-                status: $status,
-                duration_seconds: $duration,
-                doc_pr_created: $pr_created,
-                changes_made: $pr_created,
-                error: $error
-              }
-            }' >> "$EVENTS_FILE" 2>/dev/null || true
-
-          if [[ -n "$AGENT_METRICS_API_URL" ]] && [ -f "$EVENTS_FILE" ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Metrics Dashboard" >> $GITHUB_STEP_SUMMARY
-            CURL_HEADERS=(-H "Content-Type: application/json")
-            [[ -n "$AGENT_METRICS_API_KEY" ]] && CURL_HEADERS+=(-H "X-API-Key: $AGENT_METRICS_API_KEY")
-            POST_SUCCESS=0
-            POST_FAIL=0
-            while IFS= read -r EVENT_LINE; do
-              HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/api_response.json \
-                "${CURL_HEADERS[@]}" \
-                "${AGENT_METRICS_API_URL}/api/v1/events" \
-                -X POST \
-                -d "$EVENT_LINE")
-              if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "201" ]]; then
-                POST_SUCCESS=$((POST_SUCCESS + 1))
-              else
-                POST_FAIL=$((POST_FAIL + 1))
-                echo "Event POST returned HTTP $HTTP_CODE" >> $GITHUB_STEP_SUMMARY
-              fi
-            done < "$EVENTS_FILE"
-            echo "Events sent to dashboard: $POST_SUCCESS success, $POST_FAIL failed" >> $GITHUB_STEP_SUMMARY
-          else
-            [[ -z "$AGENT_METRICS_API_URL" ]] && echo "AGENT_METRICS_API_URL not set — events logged to job summary only" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          if [ -f "$EVENTS_FILE" ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "---" >> $GITHUB_STEP_SUMMARY
-            echo "## DocSync AI — Event Log" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            EVENT_NUM=0
-            while IFS= read -r EVENT_LINE; do
-              EVENT_NUM=$((EVENT_NUM + 1))
-              EVENT_TYPE=$(echo "$EVENT_LINE" | jq -r '.event_type // "unknown"')
-              {
-                echo "<details>"
-                printf "<summary>Event %d: <code>%s</code></summary>\n" "$EVENT_NUM" "$EVENT_TYPE"
-                echo ""
-                echo '```json'
-                echo "$EVENT_LINE" | jq '.'
-                echo '```'
-                echo ""
-                echo "</details>"
-                echo ""
-              } >> "$GITHUB_STEP_SUMMARY"
-            done < "$EVENTS_FILE"
-          fi
-
-      - name: Prepare Event Log Artifact
-        if: always()
-        run: |
-          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
-          ARTIFACT_DIR="/tmp/docsync_artifact_${GITHUB_RUN_ID}"
-          mkdir -p "$ARTIFACT_DIR"
-          if [ -s "$EVENTS_FILE" ]; then
-            jq -s '.' "$EVENTS_FILE" > "$ARTIFACT_DIR/docsync-payload.json"
-          else
-            echo '[]' > "$ARTIFACT_DIR/docsync-payload.json"
-          fi
-          rm -f "$EVENTS_FILE"
-
-      - name: Upload DocSync Event Log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: docsync-event-log-${{ github.run_id }}
-          path: /tmp/docsync_artifact_${{ github.run_id }}/docsync-payload.json
-          retention-days: 90
-          if-no-files-found: warn
+          echo "| Duration | ${DURATION_SECONDS}s |" >> $GITHUB_STEP_SUMMARY
