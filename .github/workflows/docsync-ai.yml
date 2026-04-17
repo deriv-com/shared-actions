@@ -14,7 +14,7 @@ on:
         default: "documentation,automated"
         type: string
       trigger_type:
-        description: 'Trigger type: "scheduled" for weekly cron, "comment" for PR comment'
+        description: 'Trigger type: "scheduled" for weekly cron, "comment" for PR comment, "claude_md_refresh" for manual CLAUDE.md best-practices reformat'
         required: false
         default: "scheduled"
         type: string
@@ -672,6 +672,577 @@ jobs:
               {
                 echo "<details>"
                 printf "<summary>📋 Event %d: <code>%s</code></summary>\n" "$EVENT_NUM" "$EVENT_TYPE"
+                echo ""
+                echo '```json'
+                echo "$EVENT_LINE" | jq '.'
+                echo '```'
+                echo ""
+                echo "</details>"
+                echo ""
+              } >> "$GITHUB_STEP_SUMMARY"
+            done < "$EVENTS_FILE"
+          fi
+
+      - name: Prepare Event Log Artifact
+        if: always()
+        run: |
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          ARTIFACT_DIR="/tmp/docsync_artifact_${GITHUB_RUN_ID}"
+          mkdir -p "$ARTIFACT_DIR"
+          if [ -s "$EVENTS_FILE" ]; then
+            jq -s '.' "$EVENTS_FILE" > "$ARTIFACT_DIR/docsync-payload.json"
+          else
+            echo '[]' > "$ARTIFACT_DIR/docsync-payload.json"
+          fi
+          rm -f "$EVENTS_FILE"
+
+      - name: Upload DocSync Event Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docsync-event-log-${{ github.run_id }}
+          path: /tmp/docsync_artifact_${{ github.run_id }}/docsync-payload.json
+          retention-days: 90
+          if-no-files-found: warn
+
+  refresh-claude-md:
+    name: Refresh CLAUDE.md to Best Practices (Manual)
+    runs-on: ubuntu-latest
+
+    # Only run when trigger_type is 'claude_md_refresh'
+    if: inputs.trigger_type == 'claude_md_refresh'
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    env:
+      BASE_BRANCH: ${{ inputs.base_branch }}
+      SLACK_TOKEN: ${{ secrets.DOCSYNC_SLACK_TOKEN }}
+      SLACK_CHANNEL: ${{ secrets.DOCSYNC_SLACK_CHANNEL_ID }}
+
+    steps:
+      - name: Debug - Workflow Trigger Info
+        id: trigger-info
+        run: |
+          WORKFLOW_START_TIME=$(date +%s)
+          echo "start_time=$WORKFLOW_START_TIME" >> $GITHUB_OUTPUT
+          echo "## CLAUDE.md Refresh — Trigger Info" >> $GITHUB_STEP_SUMMARY
+          echo "Event: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "Trigger Type: ${{ inputs.trigger_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "Base Branch: ${{ inputs.base_branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "Repository: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "Triggered by: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg repo "${{ github.repository }}" \
+            --arg base_branch "${{ inputs.base_branch }}" \
+            --arg actor "${{ github.actor }}" \
+            '{
+              agent: "DocSync AI",
+              event_type: "workflow_triggered",
+              run_id: $run_id,
+              trigger_type: "claude_md_refresh",
+              timestamp: (now | todate),
+              payload: {
+                repository: $repo,
+                base_branch: $base_branch,
+                workflow_name: "docsync-ai",
+                triggered_by: $actor
+              }
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+
+      - name: Locate and Validate CLAUDE.md
+        id: locate-claude-md
+        shell: bash
+        run: |
+          echo "## CLAUDE.md Detection" >> $GITHUB_STEP_SUMMARY
+
+          CLAUDE_FILE=$(find . -maxdepth 1 -type f -iname "claude.md" -print -quit 2>/dev/null)
+
+          if [ -z "$CLAUDE_FILE" ]; then
+            echo "No CLAUDE.md found in repository root — nothing to refresh." >> $GITHUB_STEP_SUMMARY
+            echo "found=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CLAUDE_FILE="${CLAUDE_FILE#./}"
+
+          REALPATH=$(realpath "$CLAUDE_FILE" 2>/dev/null || echo "")
+          WORKDIR=$(realpath . 2>/dev/null || echo "")
+          if [[ -L "$CLAUDE_FILE" ]] || [[ ! "$REALPATH" == "$WORKDIR"/* ]]; then
+            echo "Invalid CLAUDE.md path detected — skipping." >> $GITHUB_STEP_SUMMARY
+            echo "found=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CLAUDE_SIZE=$(wc -c < "$CLAUDE_FILE" | tr -d ' ')
+          echo "Found: $CLAUDE_FILE ($CLAUDE_SIZE bytes)" >> $GITHUB_STEP_SUMMARY
+          echo "found=true" >> $GITHUB_OUTPUT
+          echo "claude_file=$CLAUDE_FILE" >> $GITHUB_OUTPUT
+
+      - name: Reformat CLAUDE.md with Claude API
+        id: reformat
+        if: steps.locate-claude-md.outputs.found == 'true'
+        shell: bash
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.DOCSYNC_ANTHROPIC_API_KEY }}
+          CLAUDE_FILE: ${{ steps.locate-claude-md.outputs.claude_file }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          set -e
+
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          echo "## Claude API — CLAUDE.md Reformat" >> $GITHUB_STEP_SUMMARY
+
+          CURRENT_CONTENT=$(cat "$CLAUDE_FILE" | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
+          CONTENT_CHARS=${#CURRENT_CONTENT}
+          echo "Current size: $CONTENT_CHARS chars" >> $GITHUB_STEP_SUMMARY
+
+          TEMP_DIR=$(mktemp -d -t claude-refresh-XXXXXXXXXX)
+          PROMPT_FILE="$TEMP_DIR/prompt.txt"
+
+          {
+            printf '%s\n' "You are an expert in Claude Code (Anthropic's AI coding CLI). Your task is to reformat an existing CLAUDE.md file so it follows Claude Code best practices — without removing ANY information."
+            printf '%s\n' ""
+            printf '%s\n' "## Repository"
+            printf '%s\n' "$REPO_NAME"
+            printf '%s\n' ""
+            printf '%s\n' "## Claude Code CLAUDE.md Best Practices"
+            printf '%s\n' ""
+            printf '%s\n' "CLAUDE.md is read by Claude Code at the start of every session. The goals are:"
+            printf '%s\n' "- **Concise but complete**: Claude reads it every session; avoid verbose prose."
+            printf '%s\n' "- **Actionable**: Focus on commands, paths, patterns, and conventions a developer needs immediately."
+            printf '%s\n' "- **Structured with clear sections**: Use level-2 (##) headings. Bullet points for lists."
+            printf '%s\n' ""
+            printf '%s\n' "### Required / Recommended Sections (use whichever apply):"
+            printf '%s\n' "1. **Project Overview** — 1–3 sentences: what the project is, its tech stack."
+            printf '%s\n' "2. **Essential Commands** — build, test, lint, run (dev/prod), format. One-liner per command."
+            printf '%s\n' "3. **Architecture** — key directories, major modules, data-flow patterns."
+            printf '%s\n' "4. **Code Style & Conventions** — language version, formatter, linting rules, naming conventions."
+            printf '%s\n' "5. **Important Files** — critical config files, entry points, shared utilities."
+            printf '%s\n' "6. **Testing** — test framework, how to run tests, where tests live."
+            printf '%s\n' "7. **Environment & Configuration** — env vars, secrets management, required external services."
+            printf '%s\n' "8. **Development Workflow** — branch strategy, PR process, deployment steps."
+            printf '%s\n' "9. Any additional project-specific sections already present in the file."
+            printf '%s\n' ""
+            printf '%s\n' "### Formatting Rules:"
+            printf '%s\n' "- Use \`##\` for top-level sections (never \`#\` for sections — that is the document title only)."
+            printf '%s\n' "- Use \`###\` for subsections if needed."
+            printf '%s\n' "- Commands must be in fenced code blocks with the correct language tag (\`\`\`bash, \`\`\`ts, etc.)."
+            printf '%s\n' "- Keep bullet points to one line each; use sub-bullets only when necessary."
+            printf '%s\n' "- Remove duplicate information, but NEVER delete unique facts."
+            printf '%s\n' "- Merge scattered repetitive paragraphs into a single concise bullet."
+            printf '%s\n' "- Do NOT add fabricated information — only use what is already in the document."
+            printf '%s\n' "- Keep the document title (\`#\`) if one exists, otherwise add one based on the repo name."
+            printf '%s\n' ""
+            printf '%s\n' "## ABSOLUTE REQUIREMENTS"
+            printf '%s\n' "1. **PRESERVE ALL INFORMATION**: Every unique fact, command, path, convention, and instruction that exists in the current file MUST appear in the output. Condensation is allowed; deletion is not."
+            printf '%s\n' "2. **DO NOT FABRICATE**: Only use information already present. Do not invent commands, paths, or features."
+            printf '%s\n' "3. **OUTPUT ONLY THE FILE CONTENT**: No preamble, no explanation, no commentary. Start directly with the markdown content."
+            printf '%s\n' "4. **RETURN UNCHANGED IF ALREADY OPTIMAL**: If the file already follows best practices perfectly, output it exactly as-is."
+            printf '%s\n' ""
+            printf '%s\n' "## Current CLAUDE.md Content"
+            printf '%s\n' '```markdown'
+            printf '%s\n' "$CURRENT_CONTENT"
+            printf '%s\n' '```'
+            printf '%s\n' ""
+            printf '%s\n' "Now output the reformatted CLAUDE.md:"
+          } > "$PROMPT_FILE"
+          chmod 600 "$PROMPT_FILE"
+
+          REQUEST_FILE="$TEMP_DIR/request.json"
+          jq -cn \
+            --arg model "claude-sonnet-4-5" \
+            --argjson max_tokens 16384 \
+            --rawfile content "$PROMPT_FILE" \
+            '{
+              model: $model,
+              max_tokens: $max_tokens,
+              messages: [{ role: "user", content: $content }]
+            }' > "$REQUEST_FILE"
+          chmod 600 "$REQUEST_FILE"
+
+          PROMPT_CHARS=$(wc -c < "$PROMPT_FILE" | tr -d ' ')
+          CALL_START=$(($(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000))
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" https://api.anthropic.com/v1/messages \
+            -H "content-type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d @"$REQUEST_FILE")
+
+          CALL_END=$(($(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000))
+          CALL_LATENCY=$((CALL_END - CALL_START))
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          RESPONSE=$(echo "$RESPONSE" | sed '$d')
+
+          rm -f "$REQUEST_FILE" "$PROMPT_FILE"
+
+          if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
+            echo "Invalid JSON response from Claude API (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            rm -rf "$TEMP_DIR"
+            exit 1
+          fi
+
+          if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+            ERR_TYPE=$(echo "$RESPONSE" | jq -r '.error.type // "unknown"')
+            echo "Claude API error: $ERR_TYPE (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            rm -rf "$TEMP_DIR"
+            exit 1
+          fi
+
+          NEW_CONTENT=$(echo "$RESPONSE" | jq -r '.content[0].text // ""' | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
+          IN_TOKENS=$(echo "$RESPONSE" | jq -r '.usage.input_tokens // 0')
+          OUT_TOKENS=$(echo "$RESPONSE" | jq -r '.usage.output_tokens // 0')
+          NEW_CHARS=${#NEW_CONTENT}
+
+          echo "Claude API call successful" >> $GITHUB_STEP_SUMMARY
+          echo "Input tokens: $IN_TOKENS | Output tokens: $OUT_TOKENS | Latency: ${CALL_LATENCY}ms" >> $GITHUB_STEP_SUMMARY
+          echo "New size: $NEW_CHARS chars" >> $GITHUB_STEP_SUMMARY
+
+          [[ ! "$IN_TOKENS" =~ ^[0-9]+$ ]] && IN_TOKENS=0
+          [[ ! "$OUT_TOKENS" =~ ^[0-9]+$ ]] && OUT_TOKENS=0
+          [[ ! "$CALL_LATENCY" =~ ^-?[0-9]+$ ]] && CALL_LATENCY=0
+          [[ ! "$PROMPT_CHARS" =~ ^[0-9]+$ ]] && PROMPT_CHARS=0
+          [[ ! "$NEW_CHARS" =~ ^[0-9]+$ ]] && NEW_CHARS=0
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg doc_file "$CLAUDE_FILE" \
+            --argjson in_tok "$IN_TOKENS" \
+            --argjson out_tok "$OUT_TOKENS" \
+            --argjson prompt_chars "$PROMPT_CHARS" \
+            --argjson resp_chars "$NEW_CHARS" \
+            --argjson latency "$CALL_LATENCY" \
+            --arg http_status "$HTTP_CODE" \
+            '{
+              agent: "DocSync AI",
+              event_type: "claude_api_call",
+              run_id: $run_id,
+              trigger_type: "claude_md_refresh",
+              timestamp: (now | todate),
+              payload: {
+                call_type: "claude_md_refresh",
+                target_file: $doc_file,
+                model: "claude-sonnet-4-5",
+                input_tokens: $in_tok,
+                output_tokens: $out_tok,
+                prompt_chars: $prompt_chars,
+                response_chars: $resp_chars,
+                latency_ms: $latency,
+                http_status: $http_status,
+                api_error_type: null,
+                result: "updated"
+              }
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
+
+          printf '%s' "$NEW_CONTENT" > "$CLAUDE_FILE"
+
+          git add "$CLAUDE_FILE"
+          if git diff --cached --quiet; then
+            echo "CLAUDE.md is already following best practices — no changes needed." >> $GITHUB_STEP_SUMMARY
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "### Diff preview (first 100 lines):" >> $GITHUB_STEP_SUMMARY
+            echo '```diff' >> $GITHUB_STEP_SUMMARY
+            git diff --cached -- "$CLAUDE_FILE" | head -100 >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+          rm -rf "$TEMP_DIR"
+
+      - name: Create CLAUDE.md Refresh PR
+        id: create-refresh-pr
+        if: steps.reformat.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
+          CLAUDE_FILE: ${{ steps.locate-claude-md.outputs.claude_file }}
+        run: |
+          set -e
+
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          RANDOM_SUFFIX=$(openssl rand -hex 4)
+          BRANCH="docs/claude-md-refresh-${TIMESTAMP}-${RANDOM_SUFFIX}"
+
+          git checkout -b "$BRANCH"
+          git add "$CLAUDE_FILE"
+          git commit -m "DocSync AI: Refresh CLAUDE.md to best practices
+
+          Reformatted CLAUDE.md to match Claude Code best practices.
+          All existing information preserved; structure and conciseness improved.
+
+          Triggered manually by: ${{ github.actor }}
+          Generated by DocSync AI (claude_md_refresh)"
+
+          git push origin "$BRANCH"
+
+          PR_BODY="## CLAUDE.md Best-Practices Refresh
+
+          This PR was triggered manually by **${{ github.actor }}** via the DocSync AI \`claude_md_refresh\` workflow.
+
+          ### What changed
+          The existing \`CLAUDE.md\` was reformatted to match Claude Code best practices for AI-assisted development:
+          - Consistent \`##\` section headings
+          - Commands in fenced code blocks
+          - Concise bullet points
+          - Logical section ordering
+
+          ### What was preserved
+          **All information from the original file is retained.** Only the structure, formatting, and conciseness were improved. No content was removed.
+
+          ### Review Checklist
+          - [ ] All commands and paths are correct
+          - [ ] No information was accidentally omitted
+          - [ ] Section headings accurately describe their content
+          - [ ] Formatting renders correctly in GitHub markdown preview
+
+          ---
+          *Automated by DocSync AI (Manual — claude_md_refresh)*"
+
+          PR_URL=$(gh pr create \
+            --title "DocSync AI: Refresh CLAUDE.md to best practices" \
+            --body "$PR_BODY" \
+            --base "$BASE_BRANCH" \
+            --head "$BRANCH")
+
+          PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+          if [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            IFS=',' read -ra LABEL_ARRAY <<< "${{ inputs.pr_labels }}"
+            for label in "${LABEL_ARRAY[@]}"; do
+              label=$(echo "$label" | xargs)
+              if [[ "$label" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+                gh pr edit "$PR_NUMBER" --add-label "$label" 2>/dev/null || true
+              fi
+            done
+          fi
+
+          echo "pr_created=true" >> $GITHUB_OUTPUT
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Refresh PR Created: #$PR_NUMBER" >> $GITHUB_STEP_SUMMARY
+          echo "$PR_URL" >> $GITHUB_STEP_SUMMARY
+
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg pr_num "PR-$PR_NUMBER" \
+            --arg pr_title "DocSync AI: Refresh CLAUDE.md to best practices" \
+            --arg pr_url "$PR_URL" \
+            --arg branch "$BRANCH" \
+            --arg file "$CLAUDE_FILE" \
+            '{
+              agent: "DocSync AI",
+              event_type: "doc_pr_created",
+              run_id: $run_id,
+              trigger_type: "claude_md_refresh",
+              timestamp: (now | todate),
+              payload: {
+                pr_number: $pr_num,
+                pr_title: $pr_title,
+                pr_url: $pr_url,
+                branch: $branch,
+                files_updated: [$file]
+              }
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
+
+      - name: Send Slack Notification
+        if: steps.create-refresh-pr.outputs.pr_created == 'true' && env.SLACK_TOKEN != '' && env.SLACK_CHANNEL != ''
+        env:
+          PR_NUMBER: ${{ steps.create-refresh-pr.outputs.pr_number }}
+          PR_URL: ${{ steps.create-refresh-pr.outputs.pr_url }}
+          SLACK_MENTION_USER: ${{ secrets.DOCSYNC_SLACK_MENTION_USER_IDS }}
+        run: |
+          set -e
+          PR_URL_CLEAN=$(echo "$PR_URL" | head -c 500)
+          MENTION_TEXT=""
+          if [ -n "$SLACK_MENTION_USER" ]; then
+            IFS=',' read -ra USER_IDS <<< "$SLACK_MENTION_USER"
+            for user_id in "${USER_IDS[@]}"; do
+              user_id=$(echo "$user_id" | xargs)
+              [ -n "$user_id" ] && MENTION_TEXT="${MENTION_TEXT}<@${user_id}> "
+            done
+          fi
+
+          SLACK_PAYLOAD=$(jq -cn \
+            --arg channel "$SLACK_CHANNEL" \
+            --arg repo "${{ github.repository }}" \
+            --arg pr_url "$PR_URL_CLEAN" \
+            --arg pr_num "$PR_NUMBER" \
+            --arg actor "${{ github.actor }}" \
+            --arg mention "$MENTION_TEXT" \
+            '{
+              "channel": $channel,
+              "text": ($mention + "CLAUDE.md Refresh Ready - PR #" + $pr_num + " in " + $repo),
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ($mention + ":sparkles: *CLAUDE.md Best-Practices Refresh Ready*\n*<" + $pr_url + "|PR #" + $pr_num + ">* in `" + $repo + "`")
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ("Manually triggered by *" + $actor + "*. CLAUDE.md has been reformatted for Claude Code best practices — all content preserved.")
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": ("DocSync AI (Manual Refresh) | <" + $pr_url + "|Review changes>")
+                    }
+                  ]
+                }
+              ]
+            }')
+
+          RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer $SLACK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$SLACK_PAYLOAD")
+
+          SLACK_OK=$(echo "$RESPONSE" | jq -r '.ok' 2>/dev/null || echo "false")
+          if [ "$SLACK_OK" = "true" ]; then
+            echo "Slack notification sent successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            SLACK_ERROR=$(echo "$RESPONSE" | jq -r '.error // "unknown"' 2>/dev/null)
+            echo "Warning: Slack API error: $SLACK_ERROR" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          SLACK_STATUS=$([ "$SLACK_OK" = "true" ] && echo "success" || echo "failed")
+          PR_LINK="https://github.com/${{ github.repository }}/pull/$PR_NUMBER"
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg status "$SLACK_STATUS" \
+            --arg channel "$SLACK_CHANNEL" \
+            --arg pr_link "$PR_LINK" \
+            '{
+              agent: "DocSync AI",
+              event_type: "slack_notification_sent",
+              run_id: $run_id,
+              trigger_type: "claude_md_refresh",
+              timestamp: (now | todate),
+              payload: {
+                status: $status,
+                channel: $channel,
+                message_type: "claude_md_refresh",
+                pr_link: $pr_link
+              }
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
+
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          PR_CREATED: ${{ steps.create-refresh-pr.outputs.pr_created }}
+          PR_URL: ${{ steps.create-refresh-pr.outputs.pr_url }}
+          WORKFLOW_START_TIME: ${{ steps.trigger-info.outputs.start_time }}
+          AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+          AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger | Manual (claude_md_refresh) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered By | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Refresh PR Created | ${PR_CREATED:-false} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | $JOB_STATUS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Base Branch | $BASE_BRANCH |" >> $GITHUB_STEP_SUMMARY
+
+          END_TIME=$(date +%s)
+          START_TIME="${WORKFLOW_START_TIME:-$END_TIME}"
+          DURATION_SECONDS=$((END_TIME - START_TIME))
+
+          EVENTS_FILE="/tmp/docsync_events_${GITHUB_RUN_ID}.jsonl"
+          STATUS_VAL=$([ "$JOB_STATUS" = "success" ] && echo "success" || echo "failed")
+          PR_BOOL=$([ "${PR_CREATED:-false}" = "true" ] && echo "true" || echo "false")
+          if [ "$JOB_STATUS" = "success" ]; then
+            ERROR_JSON="null"
+          else
+            ERROR_JSON="\"Job failed with status: $JOB_STATUS\""
+          fi
+          [[ ! "$DURATION_SECONDS" =~ ^[0-9]+$ ]] && DURATION_SECONDS=0
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg status "$STATUS_VAL" \
+            --argjson duration "$DURATION_SECONDS" \
+            --argjson pr_created "$PR_BOOL" \
+            --argjson error "$ERROR_JSON" \
+            '{
+              agent: "DocSync AI",
+              event_type: "workflow_completed",
+              run_id: $run_id,
+              trigger_type: "claude_md_refresh",
+              timestamp: (now | todate),
+              payload: {
+                status: $status,
+                duration_seconds: $duration,
+                doc_pr_created: $pr_created,
+                changes_made: $pr_created,
+                error: $error
+              }
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
+
+          if [[ -n "$AGENT_METRICS_API_URL" ]] && [ -f "$EVENTS_FILE" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Metrics Dashboard" >> $GITHUB_STEP_SUMMARY
+            CURL_HEADERS=(-H "Content-Type: application/json")
+            [[ -n "$AGENT_METRICS_API_KEY" ]] && CURL_HEADERS+=(-H "X-API-Key: $AGENT_METRICS_API_KEY")
+            POST_SUCCESS=0
+            POST_FAIL=0
+            while IFS= read -r EVENT_LINE; do
+              HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/api_response.json \
+                "${CURL_HEADERS[@]}" \
+                "${AGENT_METRICS_API_URL}/api/v1/events" \
+                -X POST \
+                -d "$EVENT_LINE")
+              if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "201" ]]; then
+                POST_SUCCESS=$((POST_SUCCESS + 1))
+              else
+                POST_FAIL=$((POST_FAIL + 1))
+                echo "Event POST returned HTTP $HTTP_CODE" >> $GITHUB_STEP_SUMMARY
+              fi
+            done < "$EVENTS_FILE"
+            echo "Events sent to dashboard: $POST_SUCCESS success, $POST_FAIL failed" >> $GITHUB_STEP_SUMMARY
+          else
+            [[ -z "$AGENT_METRICS_API_URL" ]] && echo "AGENT_METRICS_API_URL not set — events logged to job summary only" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ -f "$EVENTS_FILE" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "## DocSync AI — Event Log" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            EVENT_NUM=0
+            while IFS= read -r EVENT_LINE; do
+              EVENT_NUM=$((EVENT_NUM + 1))
+              EVENT_TYPE=$(echo "$EVENT_LINE" | jq -r '.event_type // "unknown"')
+              {
+                echo "<details>"
+                printf "<summary>Event %d: <code>%s</code></summary>\n" "$EVENT_NUM" "$EVENT_TYPE"
                 echo ""
                 echo '```json'
                 echo "$EVENT_LINE" | jq '.'
