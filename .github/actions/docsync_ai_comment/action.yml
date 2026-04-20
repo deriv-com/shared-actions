@@ -1083,7 +1083,46 @@ runs:
           if [ "$DOC_FORMAT" = "README" ]; then
             FORMAT_INSTRUCTION="This is a README.md file. Maintain standard README format with clear sections, proper markdown formatting, badges, installation instructions, usage examples, and project overview. Keep the professional, user-facing documentation style."
           else
-            FORMAT_INSTRUCTION="This is a CLAUDE.md file for AI assistance. Maintain the technical, detailed format suitable for AI context with implementation details, architecture notes, and development guidelines. Keep the detailed, technical documentation style."
+            FORMAT_INSTRUCTION=$(printf '%s\n' \
+              'This is a CLAUDE.md file — the project-level context file that Claude Code reads at the START of EVERY coding session in this repository. Your updates MUST conform to the official Claude Code CLAUDE.md best practices (https://code.claude.com/docs/en/best-practices).' \
+              '' \
+              '## Core principles (from the official Claude Code documentation)' \
+              '- CONCISE IS CORRECT. CLAUDE.md is loaded every session. For EVERY line you add, ask: "Would removing this cause Claude to make mistakes?" If not, do NOT add it. Bloated CLAUDE.md files cause Claude to IGNORE instructions.' \
+              '- Operational, not descriptive. Include only things Claude cannot infer by reading the code.' \
+              '- Stable, not frequently-changing. Do NOT document things that change often (version numbers, dependency versions, changelogs).' \
+              '- No required format. Keep it short and human-readable. Use whatever heading structure the file already uses — there is no official rule on `#` vs `##`.' \
+              '- Use emphasis (IMPORTANT, YOU MUST) sparingly and only where adherence matters.' \
+              '' \
+              '## What to INCLUDE (the PR is significant enough for CLAUDE.md ONLY if it introduces at least one of these)' \
+              '- Bash commands Claude cannot guess (non-standard scripts, custom CLIs, monorepo-specific make targets).' \
+              '- Code-style rules that differ from language defaults (linter configs, formatter quirks, import style).' \
+              '- Testing instructions and preferred test runners (how to run a single test, coverage command).' \
+              '- Repository etiquette (branch naming, PR conventions, commit style).' \
+              '- Architectural decisions specific to THIS project (patterns contributors must follow, structural choices).' \
+              '- Developer-environment quirks (required env vars, local setup gotchas, required external services).' \
+              '- Common gotchas and non-obvious behaviors that have caused bugs before.' \
+              '' \
+              '## What to EXCLUDE (do NOT add these, even when the PR touches related code)' \
+              '- Anything Claude can figure out by reading the code itself (file-by-file descriptions, obvious function summaries).' \
+              '- Standard language or framework conventions Claude already knows.' \
+              '- Detailed API documentation — link to the authoritative docs instead.' \
+              '- Information that changes frequently (version numbers, dependency versions, changelogs).' \
+              '- Long explanations, tutorials, or narrative prose.' \
+              '- Self-evident practices (examples: write clean code, add tests).' \
+              '' \
+              '## Significance test for THIS PR' \
+              'Before adding ANY content to CLAUDE.md, apply this test: does the change introduce something a new contributor (or Claude Code itself) would get WRONG without being told? If not, output NO_UPDATES_NEEDED for CLAUDE.md.' \
+              '- PASSES the test: a new required env var; a new test command; a new lint rule affecting every file; a new architectural pattern contributors must follow; a new gotcha.' \
+              '- FAILS the test: a feature with no operational impact on contributors; an internal refactor; a bug fix; a dependency bump; a rename.' \
+              '' \
+              '## Formatting rules' \
+              '- Preserve the existing heading style of the file (whether it uses `#` or `##` for sections). Match what is already there.' \
+              '- Commands go in fenced code blocks with a language tag (bash, ts, sh, etc.).' \
+              '- Keep bullets to ONE line each. No sub-bullets unless strictly necessary.' \
+              '- Match the voice and density of the surrounding content EXACTLY. Do NOT introduce a more verbose style than the file already has.' \
+              '- Merge repetitive information; do not duplicate facts across sections.' \
+              '- When a new entry does not fit any existing section, add a new section using the SAME heading level as the other sections already in the file.' \
+              '- NEVER remove existing content while adding new content.')
           fi
 
           PROMPT_FILE="$TEMP_DIR/claude_prompt_$(openssl rand -hex 8).txt"
