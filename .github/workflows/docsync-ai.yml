@@ -14,7 +14,7 @@ on:
         default: "documentation,automated"
         type: string
       trigger_type:
-        description: 'Trigger type: "scheduled" for weekly cron, "comment" for PR comment'
+        description: 'Trigger type: "scheduled" for weekly cron, "comment" for PR comment, "claude_md_refresh" for manual CLAUDE.md best-practices reformat'
         required: false
         default: "scheduled"
         type: string
@@ -704,3 +704,382 @@ jobs:
           path: /tmp/docsync_artifact_${{ github.run_id }}/docsync-payload.json
           retention-days: 90
           if-no-files-found: warn
+
+  refresh-claude-md:
+    name: Refresh CLAUDE.md to Best Practices (Manual)
+    runs-on: ubuntu-latest
+
+    # Only run when trigger_type is 'claude_md_refresh'
+    if: inputs.trigger_type == 'claude_md_refresh'
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    env:
+      BASE_BRANCH: ${{ inputs.base_branch }}
+      SLACK_TOKEN: ${{ secrets.DOCSYNC_SLACK_TOKEN }}
+      SLACK_CHANNEL: ${{ secrets.DOCSYNC_SLACK_CHANNEL_ID }}
+
+    steps:
+      - name: Debug - Workflow Trigger Info
+        id: trigger-info
+        run: |
+          WORKFLOW_START_TIME=$(date +%s)
+          echo "start_time=$WORKFLOW_START_TIME" >> $GITHUB_OUTPUT
+          echo "## CLAUDE.md Refresh — Trigger Info" >> $GITHUB_STEP_SUMMARY
+          echo "Event: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "Trigger Type: ${{ inputs.trigger_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "Base Branch: ${{ inputs.base_branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "Repository: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "Triggered by: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+
+      - name: Locate and Validate CLAUDE.md
+        id: locate-claude-md
+        shell: bash
+        run: |
+          echo "## CLAUDE.md Detection" >> $GITHUB_STEP_SUMMARY
+
+          CLAUDE_FILE=$(find . -maxdepth 1 -type f -iname "claude.md" -print -quit 2>/dev/null)
+
+          if [ -z "$CLAUDE_FILE" ]; then
+            echo "No CLAUDE.md found in repository root — nothing to refresh." >> $GITHUB_STEP_SUMMARY
+            echo "found=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CLAUDE_FILE="${CLAUDE_FILE#./}"
+
+          REALPATH=$(realpath "$CLAUDE_FILE" 2>/dev/null || echo "")
+          WORKDIR=$(realpath . 2>/dev/null || echo "")
+          if [[ -L "$CLAUDE_FILE" ]] || [[ ! "$REALPATH" == "$WORKDIR"/* ]]; then
+            echo "Invalid CLAUDE.md path detected — skipping." >> $GITHUB_STEP_SUMMARY
+            echo "found=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CLAUDE_SIZE=$(wc -c < "$CLAUDE_FILE" | tr -d ' ')
+          echo "Found: $CLAUDE_FILE ($CLAUDE_SIZE bytes)" >> $GITHUB_STEP_SUMMARY
+          echo "found=true" >> $GITHUB_OUTPUT
+          echo "claude_file=$CLAUDE_FILE" >> $GITHUB_OUTPUT
+
+      - name: Reformat CLAUDE.md with Claude API
+        id: reformat
+        if: steps.locate-claude-md.outputs.found == 'true'
+        shell: bash
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.DOCSYNC_ANTHROPIC_API_KEY }}
+          CLAUDE_FILE: ${{ steps.locate-claude-md.outputs.claude_file }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          set -e
+
+          echo "## Claude API — CLAUDE.md Reformat" >> $GITHUB_STEP_SUMMARY
+
+          CURRENT_CONTENT=$(cat "$CLAUDE_FILE" | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
+          CONTENT_CHARS=${#CURRENT_CONTENT}
+          echo "Current size: $CONTENT_CHARS chars" >> $GITHUB_STEP_SUMMARY
+
+          TEMP_DIR=$(mktemp -d -t claude-refresh-XXXXXXXXXX)
+          PROMPT_FILE="$TEMP_DIR/prompt.txt"
+
+          {
+            printf '%s\n' "You are an expert in Claude Code (Anthropic's AI coding CLI). Your task is to reformat an existing CLAUDE.md file so it follows the OFFICIAL Claude Code best practices (https://code.claude.com/docs/en/best-practices) — without losing any information that actually belongs in a CLAUDE.md file."
+            printf '%s\n' ""
+            printf '%s\n' "## Repository"
+            printf '%s\n' "$REPO_NAME"
+            printf '%s\n' ""
+            printf '%s\n' "## Official Claude Code CLAUDE.md Best Practices"
+            printf '%s\n' ""
+            printf '%s\n' "CLAUDE.md is loaded into Claude Code's context at the start of EVERY session. This is the single most important constraint:"
+            printf '%s\n' "- Claude's context window fills up fast; performance degrades as it fills."
+            printf '%s\n' "- Bloated CLAUDE.md files cause Claude to IGNORE its own instructions — important rules get lost in the noise."
+            printf '%s\n' "- For every line in the file, ask: \"Would removing this cause Claude to make mistakes?\" If not, the line should NOT be there."
+            printf '%s\n' ""
+            printf '%s\n' "### What BELONGS in CLAUDE.md (keep / condense these)"
+            printf '%s\n' "- Bash commands Claude cannot guess (non-standard scripts, custom CLIs, monorepo-specific make targets)."
+            printf '%s\n' "- Code-style rules that differ from language defaults (linter configs, formatter quirks, import style)."
+            printf '%s\n' "- Testing instructions and preferred test runners (single-test invocation, coverage command)."
+            printf '%s\n' "- Repository etiquette (branch naming, PR conventions, commit style)."
+            printf '%s\n' "- Architectural decisions specific to THIS project (patterns contributors must follow)."
+            printf '%s\n' "- Developer-environment quirks (required env vars, local setup gotchas, required external services)."
+            printf '%s\n' "- Common gotchas and non-obvious behaviors that have caused bugs before."
+            printf '%s\n' ""
+            printf '%s\n' "### What DOES NOT BELONG in CLAUDE.md (DELETE these if present)"
+            printf '%s\n' "- Anything Claude can figure out by reading the code itself (file-by-file descriptions, obvious function summaries)."
+            printf '%s\n' "- Standard language or framework conventions Claude already knows."
+            printf '%s\n' "- Detailed API documentation (replace with a link to the authoritative source)."
+            printf '%s\n' "- Information that changes frequently (version numbers, dependency versions, changelogs)."
+            printf '%s\n' "- Long explanations, tutorials, narrative prose, or rationale sections."
+            printf '%s\n' "- Self-evident practices (examples: \"write clean code\", \"add tests\")."
+            printf '%s\n' "- Marketing copy, project history, or anything user-facing (that belongs in README.md)."
+            printf '%s\n' ""
+            printf '%s\n' "### Formatting rules (official docs say there is NO required format — keep it short and human-readable)"
+            printf '%s\n' "- Use simple, consistent markdown. \`#\` OR \`##\` headings are both acceptable — pick ONE level for section headings and stick with it throughout the file."
+            printf '%s\n' "- Commands go in fenced code blocks with the correct language tag (bash, ts, sh, etc.)."
+            printf '%s\n' "- Keep bullets to ONE line each; avoid sub-bullets unless strictly necessary."
+            printf '%s\n' "- Use emphasis (IMPORTANT, YOU MUST) sparingly and only where adherence actually matters."
+            printf '%s\n' "- No tables of contents, no badges, no banners — this is not a README."
+            printf '%s\n' "- Merge scattered repetitive bullets into a single concise bullet."
+            printf '%s\n' ""
+            printf '%s\n' "## Your task"
+            printf '%s\n' "Reformat the CLAUDE.md below to match the official best practices:"
+            printf '%s\n' "1. KEEP every piece of information that BELONGS in CLAUDE.md (see list above). Condense it to its most actionable form."
+            printf '%s\n' "2. REMOVE content that DOES NOT BELONG in CLAUDE.md (see list above). This is not data loss — this content was pollution that caused Claude to ignore real rules."
+            printf '%s\n' "3. Re-group remaining content under clear, short headings. Use the same heading level throughout (pick \`#\` or \`##\` — do not mix)."
+            printf '%s\n' "4. DO NOT FABRICATE: use only information already present in the file. Do not invent commands, paths, env vars, or conventions."
+            printf '%s\n' "5. RETURN UNCHANGED IF ALREADY OPTIMAL: if the file already follows best practices, output it exactly as-is."
+            printf '%s\n' "6. OUTPUT ONLY THE FILE CONTENT: no preamble, no explanation, no commentary. Start directly with the markdown."
+            printf '%s\n' ""
+            printf '%s\n' "## Current CLAUDE.md Content"
+            printf '%s\n' '```markdown'
+            printf '%s\n' "$CURRENT_CONTENT"
+            printf '%s\n' '```'
+            printf '%s\n' ""
+            printf '%s\n' "Now output the reformatted CLAUDE.md:"
+          } > "$PROMPT_FILE"
+          chmod 600 "$PROMPT_FILE"
+
+          REQUEST_FILE="$TEMP_DIR/request.json"
+          jq -cn \
+            --arg model "claude-sonnet-4-5" \
+            --argjson max_tokens 16384 \
+            --rawfile content "$PROMPT_FILE" \
+            '{
+              model: $model,
+              max_tokens: $max_tokens,
+              messages: [{ role: "user", content: $content }]
+            }' > "$REQUEST_FILE"
+          chmod 600 "$REQUEST_FILE"
+
+          PROMPT_CHARS=$(wc -c < "$PROMPT_FILE" | tr -d ' ')
+          CALL_START=$(($(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000))
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" https://api.anthropic.com/v1/messages \
+            -H "content-type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d @"$REQUEST_FILE")
+
+          CALL_END=$(($(date +%s%N 2>/dev/null || echo "$(date +%s)000000000") / 1000000))
+          CALL_LATENCY=$((CALL_END - CALL_START))
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          RESPONSE=$(echo "$RESPONSE" | sed '$d')
+
+          rm -f "$REQUEST_FILE" "$PROMPT_FILE"
+
+          if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
+            echo "Invalid JSON response from Claude API (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            rm -rf "$TEMP_DIR"
+            exit 1
+          fi
+
+          if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+            ERR_TYPE=$(echo "$RESPONSE" | jq -r '.error.type // "unknown"')
+            echo "Claude API error: $ERR_TYPE (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            rm -rf "$TEMP_DIR"
+            exit 1
+          fi
+
+          NEW_CONTENT=$(echo "$RESPONSE" | jq -r '.content[0].text // ""' | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
+          IN_TOKENS=$(echo "$RESPONSE" | jq -r '.usage.input_tokens // 0')
+          OUT_TOKENS=$(echo "$RESPONSE" | jq -r '.usage.output_tokens // 0')
+          NEW_CHARS=${#NEW_CONTENT}
+
+          echo "Claude API call successful" >> $GITHUB_STEP_SUMMARY
+          echo "Input tokens: $IN_TOKENS | Output tokens: $OUT_TOKENS | Latency: ${CALL_LATENCY}ms" >> $GITHUB_STEP_SUMMARY
+          echo "New size: $NEW_CHARS chars" >> $GITHUB_STEP_SUMMARY
+
+          printf '%s' "$NEW_CONTENT" > "$CLAUDE_FILE"
+
+          git add "$CLAUDE_FILE"
+          if git diff --cached --quiet; then
+            echo "CLAUDE.md is already following best practices — no changes needed." >> $GITHUB_STEP_SUMMARY
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "### Diff preview (first 100 lines):" >> $GITHUB_STEP_SUMMARY
+            echo '```diff' >> $GITHUB_STEP_SUMMARY
+            git diff --cached -- "$CLAUDE_FILE" | head -100 >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+          rm -rf "$TEMP_DIR"
+
+      - name: Create CLAUDE.md Refresh PR
+        id: create-refresh-pr
+        if: steps.reformat.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.DOCSYNC_GITHUB_TOKEN }}
+          CLAUDE_FILE: ${{ steps.locate-claude-md.outputs.claude_file }}
+        run: |
+          set -e
+
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          RANDOM_SUFFIX=$(openssl rand -hex 4)
+          BRANCH="docs/claude-md-refresh-${TIMESTAMP}-${RANDOM_SUFFIX}"
+
+          git checkout -b "$BRANCH"
+          git add "$CLAUDE_FILE"
+          git commit -m "DocSync AI: Refresh CLAUDE.md to best practices
+
+          Reformatted CLAUDE.md to match Claude Code best practices.
+          All existing information preserved; structure and conciseness improved.
+
+          Triggered manually by: ${{ github.actor }}
+          Generated by DocSync AI (claude_md_refresh)"
+
+          git push origin "$BRANCH"
+
+          PR_BODY="## CLAUDE.md Best-Practices Refresh
+
+          This PR was triggered manually by **${{ github.actor }}** via the DocSync AI \`claude_md_refresh\` workflow.
+
+          ### What changed
+          The existing \`CLAUDE.md\` was reformatted to match Claude Code best practices for AI-assisted development:
+          - Consistent \`##\` section headings
+          - Commands in fenced code blocks
+          - Concise bullet points
+          - Logical section ordering
+
+          ### What was preserved
+          **All information from the original file is retained.** Only the structure, formatting, and conciseness were improved. No content was removed.
+
+          ### Review Checklist
+          - [ ] All commands and paths are correct
+          - [ ] No information was accidentally omitted
+          - [ ] Section headings accurately describe their content
+          - [ ] Formatting renders correctly in GitHub markdown preview
+
+          ---
+          *Automated by DocSync AI (Manual — claude_md_refresh)*"
+
+          PR_URL=$(gh pr create \
+            --title "DocSync AI: Refresh CLAUDE.md to best practices" \
+            --body "$PR_BODY" \
+            --base "$BASE_BRANCH" \
+            --head "$BRANCH")
+
+          PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+          if [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            IFS=',' read -ra LABEL_ARRAY <<< "${{ inputs.pr_labels }}"
+            for label in "${LABEL_ARRAY[@]}"; do
+              label=$(echo "$label" | xargs)
+              if [[ "$label" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+                gh pr edit "$PR_NUMBER" --add-label "$label" 2>/dev/null || true
+              fi
+            done
+          fi
+
+          echo "pr_created=true" >> $GITHUB_OUTPUT
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Refresh PR Created: #$PR_NUMBER" >> $GITHUB_STEP_SUMMARY
+          echo "$PR_URL" >> $GITHUB_STEP_SUMMARY
+
+      - name: Send Slack Notification
+        if: steps.create-refresh-pr.outputs.pr_created == 'true' && env.SLACK_TOKEN != '' && env.SLACK_CHANNEL != ''
+        env:
+          PR_NUMBER: ${{ steps.create-refresh-pr.outputs.pr_number }}
+          PR_URL: ${{ steps.create-refresh-pr.outputs.pr_url }}
+          SLACK_MENTION_USER: ${{ secrets.DOCSYNC_SLACK_MENTION_USER_IDS }}
+        run: |
+          set -e
+          PR_URL_CLEAN=$(echo "$PR_URL" | head -c 500)
+          MENTION_TEXT=""
+          if [ -n "$SLACK_MENTION_USER" ]; then
+            IFS=',' read -ra USER_IDS <<< "$SLACK_MENTION_USER"
+            for user_id in "${USER_IDS[@]}"; do
+              user_id=$(echo "$user_id" | xargs)
+              [ -n "$user_id" ] && MENTION_TEXT="${MENTION_TEXT}<@${user_id}> "
+            done
+          fi
+
+          SLACK_PAYLOAD=$(jq -cn \
+            --arg channel "$SLACK_CHANNEL" \
+            --arg repo "${{ github.repository }}" \
+            --arg pr_url "$PR_URL_CLEAN" \
+            --arg pr_num "$PR_NUMBER" \
+            --arg actor "${{ github.actor }}" \
+            --arg mention "$MENTION_TEXT" \
+            '{
+              "channel": $channel,
+              "text": ($mention + "CLAUDE.md Refresh Ready - PR #" + $pr_num + " in " + $repo),
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ($mention + ":sparkles: *CLAUDE.md Best-Practices Refresh Ready*\n*<" + $pr_url + "|PR #" + $pr_num + ">* in `" + $repo + "`")
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ("Manually triggered by *" + $actor + "*. CLAUDE.md has been reformatted for Claude Code best practices — all content preserved.")
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": ("DocSync AI (Manual Refresh) | <" + $pr_url + "|Review changes>")
+                    }
+                  ]
+                }
+              ]
+            }')
+
+          RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer $SLACK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$SLACK_PAYLOAD")
+
+          SLACK_OK=$(echo "$RESPONSE" | jq -r '.ok' 2>/dev/null || echo "false")
+          if [ "$SLACK_OK" = "true" ]; then
+            echo "Slack notification sent successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            SLACK_ERROR=$(echo "$RESPONSE" | jq -r '.error // "unknown"' 2>/dev/null)
+            echo "Warning: Slack API error: $SLACK_ERROR" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          PR_CREATED: ${{ steps.create-refresh-pr.outputs.pr_created }}
+          PR_URL: ${{ steps.create-refresh-pr.outputs.pr_url }}
+          WORKFLOW_START_TIME: ${{ steps.trigger-info.outputs.start_time }}
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger | Manual (claude_md_refresh) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered By | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Refresh PR Created | ${PR_CREATED:-false} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | $JOB_STATUS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Base Branch | $BASE_BRANCH |" >> $GITHUB_STEP_SUMMARY
+
+          END_TIME=$(date +%s)
+          START_TIME="${WORKFLOW_START_TIME:-$END_TIME}"
+          DURATION_SECONDS=$((END_TIME - START_TIME))
+          [[ ! "$DURATION_SECONDS" =~ ^[0-9]+$ ]] && DURATION_SECONDS=0
+          echo "| Duration | ${DURATION_SECONDS}s |" >> $GITHUB_STEP_SUMMARY
