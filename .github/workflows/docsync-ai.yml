@@ -872,7 +872,7 @@ jobs:
 
           REQUEST_FILE="$TEMP_DIR/request.json"
           jq -cn \
-            --arg model "claude-sonnet-4-5" \
+            --arg model "claude-sonnet-4-6" \
             --argjson max_tokens 16384 \
             --rawfile content "$PROMPT_FILE" \
             '{
