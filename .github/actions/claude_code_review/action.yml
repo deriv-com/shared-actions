@@ -20,6 +20,10 @@ inputs:
   repository:
     description: "Repository name (owner/repo)"
     required: true
+  claude_model:
+    description: "Claude model to use for the review"
+    required: false
+    default: "claude-sonnet-4-6"
   review_prompt:
     description: "Custom review prompt (optional)"
     required: false
@@ -61,6 +65,7 @@ runs:
       with:
         github_token: ${{ inputs.github_token }}
         anthropic_api_key: ${{ inputs.anthropic_api_key }}
+        claude_args: "--model ${{ inputs.claude_model }}"
         track_progress: true
         prompt: |
           REPO: ${{ inputs.repository }}

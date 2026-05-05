@@ -552,7 +552,7 @@ runs:
     # ──────────────────────────────────────────────
     # STEP 7: Run Claude analysis (update)
     # ──────────────────────────────────────────────
-    - name: Run Claude Sonnet 4.5 Documentation Analysis
+    - name: Run Claude Sonnet 4.6 Documentation Analysis
       id: claude-analysis
       if: >
         steps.parse-command.outputs.valid == 'true' &&
@@ -571,8 +571,8 @@ runs:
       run: |
         set -e
 
-        echo "## Claude Sonnet 4.5 Analysis" >> $GITHUB_STEP_SUMMARY
-        echo "Model: claude-sonnet-4-5" >> $GITHUB_STEP_SUMMARY
+        echo "## Claude Sonnet 4.6 Analysis" >> $GITHUB_STEP_SUMMARY
+        echo "Model: claude-sonnet-4-6" >> $GITHUB_STEP_SUMMARY
         echo "Target: $TARGET_FILE" >> $GITHUB_STEP_SUMMARY
 
         # Token accumulation across all Claude API calls in this step
@@ -591,7 +591,7 @@ runs:
             trigger_type: "comment",
             timestamp: (now | todate),
             payload: {
-              model: "claude-sonnet-4-5",
+              model: "claude-sonnet-4-6",
               max_tokens: 16384,
               mode: "pr_analysis"
             }
@@ -703,7 +703,7 @@ runs:
             # Build API request
             SREQUEST_FILE="$TEMP_DIR/srequest_${i}.json"
             jq -cn \
-              --arg model "claude-sonnet-4-5" \
+              --arg model "claude-sonnet-4-6" \
               --argjson max_tokens 4096 \
               --rawfile content "$SPROMPT_FILE" \
               '{
@@ -758,7 +758,7 @@ runs:
                     target_file: null,
                     chunk_index: $chunk_idx,
                     total_chunks: $total_chunks,
-                    model: "claude-sonnet-4-5",
+                    model: "claude-sonnet-4-6",
                     input_tokens: 0,
                     output_tokens: 0,
                     prompt_chars: $prompt_chars,
@@ -819,7 +819,7 @@ runs:
                     target_file: null,
                     chunk_index: $chunk_idx,
                     total_chunks: $total_chunks,
-                    model: "claude-sonnet-4-5",
+                    model: "claude-sonnet-4-6",
                     input_tokens: 0,
                     output_tokens: 0,
                     prompt_chars: $prompt_chars,
@@ -897,7 +897,7 @@ runs:
                   target_file: null,
                   chunk_index: $chunk_idx,
                   total_chunks: $total_chunks,
-                  model: "claude-sonnet-4-5",
+                  model: "claude-sonnet-4-6",
                   input_tokens: $in_tok,
                   output_tokens: $out_tok,
                   prompt_chars: $prompt_chars,
@@ -924,7 +924,7 @@ runs:
 
           # Replace PR_DIFF with summaries for the update prompt
           if [ -n "$ALL_SUMMARIES" ]; then
-            PR_DIFF="[SUMMARIZED — Original diff was ${DIFF_SIZE} chars. Each chunk was analyzed by Claude Sonnet 4.5 for documentation-relevant changes.]
+            PR_DIFF="[SUMMARIZED — Original diff was ${DIFF_SIZE} chars. Each chunk was analyzed by Claude Sonnet 4.6 for documentation-relevant changes.]
         ${ALL_SUMMARIES}"
             echo "Diff chunking complete — summaries ready for update prompt" >> $GITHUB_STEP_SUMMARY
           else
@@ -1336,7 +1336,7 @@ runs:
 
           REQUEST_FILE="$TEMP_DIR/request_$(openssl rand -hex 8).json"
           jq -cn \
-            --arg model "claude-sonnet-4-5" \
+            --arg model "claude-sonnet-4-6" \
             --argjson max_tokens 16384 \
             --rawfile content "$PROMPT_FILE" \
             '{
@@ -1387,7 +1387,7 @@ runs:
                   target_file: $doc_file,
                   chunk_index: null,
                   total_chunks: null,
-                  model: "claude-sonnet-4-5",
+                  model: "claude-sonnet-4-6",
                   input_tokens: 0,
                   output_tokens: 0,
                   prompt_chars: $prompt_chars,
@@ -1448,7 +1448,7 @@ runs:
                   target_file: $doc_file,
                   chunk_index: null,
                   total_chunks: null,
-                  model: "claude-sonnet-4-5",
+                  model: "claude-sonnet-4-6",
                   input_tokens: 0,
                   output_tokens: 0,
                   prompt_chars: $prompt_chars,
@@ -1555,7 +1555,7 @@ runs:
                 target_file: $doc_file,
                 chunk_index: null,
                 total_chunks: null,
-                model: "claude-sonnet-4-5",
+                model: "claude-sonnet-4-6",
                 input_tokens: $in_tok,
                 output_tokens: $out_tok,
                 prompt_chars: $prompt_chars,
