@@ -6,7 +6,7 @@ on:
       claude_model:
         description: "Claude model to use for review (must be a model your LiteLLM service account exposes)"
         required: false
-        default: "claude-opus-4-8"
+        default: "claude-sonnet-4-6"
         type: string
       prompt_gist_url:
         description: "URL to fetch prompt template from"
@@ -42,7 +42,7 @@ jobs:
       cancel-in-progress: true
 
     env:
-      CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-opus-4-8' }}
+      CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-sonnet-4-6' }}
       ANTHROPIC_BASE_URL: "https://litellmsa.deriv.ai/v1"
 
     steps:
