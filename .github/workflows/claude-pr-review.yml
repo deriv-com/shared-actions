@@ -267,8 +267,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         env:
           # Route Claude Code through the company-wide LiteLLM gateway (Anthropic-compatible).
+          # The action validates that ANTHROPIC_API_KEY is set before it starts Claude Code,
+          # so the LiteLLM key must be passed as ANTHROPIC_API_KEY (sent as the x-api-key header,
+          # which LiteLLM accepts) — not ANTHROPIC_AUTH_TOKEN, which the validator ignores.
           ANTHROPIC_BASE_URL: "https://litellmsa.deriv.ai/v1"
-          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: |
