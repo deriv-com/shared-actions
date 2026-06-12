@@ -4,9 +4,9 @@ on:
   workflow_call:
     inputs:
       claude_model:
-        description: "Claude model to use for review (must be a model your LiteLLM service account exposes)"
+        description: "Model id to use for review. Must be a model the LiteLLM gateway (litellmsa.deriv.ai) actually exposes — currently only 'code-junkie'. Passing a raw Anthropic id (e.g. claude-opus-4-8) returns 404 model_not_found."
         required: false
-        default: "claude-sonnet-4-6"
+        default: "code-junkie"
         type: string
       prompt_gist_url:
         description: "URL to fetch prompt template from"
@@ -42,7 +42,7 @@ jobs:
       cancel-in-progress: true
 
     env:
-      CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-sonnet-4-6' }}
+      CLAUDE_MODEL: ${{ inputs.claude_model || 'code-junkie' }}
       ANTHROPIC_BASE_URL: "https://litellmsa.deriv.ai/v1"
 
     steps:
