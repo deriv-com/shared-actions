@@ -267,10 +267,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         env:
           # Route Claude Code through the company-wide LiteLLM gateway (Anthropic-compatible).
-          # TODO: confirm the base URL path with #need_help_infra_prod — LiteLLM serves the
-          # Anthropic wire format on /anthropic, while /v1 is the OpenAI-compatible route.
           ANTHROPIC_BASE_URL: "https://litellmsa.deriv.ai/v1"
-          # LiteLLM authenticates with a bearer token, not an Anthropic x-api-key.
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_API_KEY }}
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
