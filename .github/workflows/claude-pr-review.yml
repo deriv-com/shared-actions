@@ -26,11 +26,8 @@ on:
 
 jobs:
   claude-review-api:
-    # Self-hosted runner group inside Deriv's network — required so requests reach
-    # the LiteLLM gateway (litellmsa.deriv.ai), which Cloudflare blocks from
-    # GitHub-hosted runner IPs.
     runs-on:
-      group: github-hosted-code-reviewer
+      group: github_claude_code_reviewer
     if: github.event.pull_request.draft == false
 
     permissions:
