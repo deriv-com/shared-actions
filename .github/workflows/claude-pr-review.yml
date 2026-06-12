@@ -42,9 +42,6 @@ jobs:
 
     env:
       CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-opus-4-8' }}
-      # Route Claude Code through the company-wide LiteLLM gateway. Must be job-level:
-      # the action forwards ANTHROPIC_BASE_URL to the Claude CLI via ${{ env.ANTHROPIC_BASE_URL }},
-      # and its inner step env: shadows the calling step's env:, so a step-level value is dropped.
       ANTHROPIC_BASE_URL: "https://litellmsa.deriv.ai/v1"
 
     steps:
@@ -270,11 +267,6 @@ jobs:
       - name: Claude Code PR Review
         uses: anthropics/claude-code-action@v1
         with:
-          # LiteLLM service-account key (sk-...). Must go through the action's
-          # anthropic_api_key INPUT — its inner steps set ANTHROPIC_API_KEY from
-          # inputs.anthropic_api_key and shadow the calling step's env:, so a
-          # step-level ANTHROPIC_API_KEY arrives empty and fails validation.
-          # ANTHROPIC_BASE_URL is set at job level (read via env.) above.
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: |
