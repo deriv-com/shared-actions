@@ -4,9 +4,9 @@ on:
   workflow_call:
     inputs:
       claude_model:
-        description: "Model id to use for review. Must be a model the LiteLLM gateway (litellmsa.deriv.ai) actually exposes — currently only 'code-junkie'. Passing a raw Anthropic id (e.g. claude-opus-4-8) returns 404 model_not_found."
+        description: "Claude model to use for review"
         required: false
-        default: "code-junkie"
+        default: "claude-opus-4-8"
         type: string
       prompt_gist_url:
         description: "URL to fetch prompt template from"
@@ -15,7 +15,7 @@ on:
         type: string
     secrets:
       ANTHROPIC_API_KEY:
-        description: "LiteLLM service-account key (sk-...) for the company-wide gateway"
+        description: "Anthropic API key for Claude"
         required: true
       AGENT_METRICS_API_URL:
         description: "Base URL for the OneAboveAll metrics dashboard API (e.g. https://dashboard.example.com). Leave unset to skip POSTing events."
@@ -26,8 +26,7 @@ on:
 
 jobs:
   claude-review-api:
-    runs-on:
-      group: github_claude_code_reviewer
+    runs-on: ubuntu-latest
     if: github.event.pull_request.draft == false
 
     permissions:
@@ -42,8 +41,7 @@ jobs:
       cancel-in-progress: true
 
     env:
-      CLAUDE_MODEL: ${{ inputs.claude_model || 'code-junkie' }}
-      ANTHROPIC_BASE_URL: "https://litellmsa.deriv.ai/v1"
+      CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-opus-4-8' }}
 
     steps:
       - name: Security Check - Validate User Access
@@ -270,9 +268,6 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          # Temporary: surface the full SDK output so a failed gateway request
-          # shows its actual error (status code / body) instead of just is_error.
-          show_full_output: true
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
