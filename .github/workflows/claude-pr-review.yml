@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       claude_model:
-        description: "Claude model to use for review"
+        description: "Claude model to use for review (must be a model your LiteLLM service account exposes)"
         required: false
         default: "claude-opus-4-8"
         type: string
@@ -15,7 +15,7 @@ on:
         type: string
     secrets:
       ANTHROPIC_API_KEY:
-        description: "Anthropic API key for Claude"
+        description: "LiteLLM service-account key (sk-...) for the company-wide gateway"
         required: true
       AGENT_METRICS_API_URL:
         description: "Base URL for the OneAboveAll metrics dashboard API (e.g. https://dashboard.example.com). Leave unset to skip POSTing events."
@@ -265,8 +265,11 @@ jobs:
 
       - name: Claude Code PR Review
         uses: anthropics/claude-code-action@v1
+        env:
+          # Route Claude Code through the company-wide LiteLLM gateway (Anthropic-compatible).
+          ANTHROPIC_BASE_URL: "https://litellmsa.deriv.ai/v1"
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_API_KEY }}
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: |
             REPO: ${{ github.repository }}
