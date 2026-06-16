@@ -268,9 +268,6 @@ jobs:
         timeout-minutes: 60
         env:
           ANTHROPIC_BASE_URL: https://litellmsa.deriv.ai
-          # ANTHROPIC_AUTH_TOKEN is the bearer the Claude CLI sends to the gateway.
-          # The api key for the action's env validation is passed via the
-          # anthropic_api_key `with:` input below (maps to ANTHROPIC_API_KEY).
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
           CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
