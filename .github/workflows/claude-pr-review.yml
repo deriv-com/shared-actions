@@ -6,7 +6,7 @@ on:
       claude_model:
         description: "Claude model to use for review"
         required: false
-        default: "claude-opus-4-8"
+        default: "claude-sonnet-4-6"
         type: string
       prompt_gist_url:
         description: "URL to fetch prompt template from"
@@ -41,7 +41,7 @@ jobs:
       cancel-in-progress: true
 
     env:
-      CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-opus-4-8' }}
+      CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-sonnet-4-6' }}
 
     steps:
       - name: Security Check - Validate User Access
@@ -264,10 +264,18 @@ jobs:
         run: rm -f CLAUDE.md
 
       - name: Claude Code PR Review
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
+        timeout-minutes: 60
+        env:
+          ANTHROPIC_BASE_URL: https://litellmsa.deriv.ai
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          DISABLE_NON_ESSENTIAL_MODEL_CALLS: "1"
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          track_progress: true
+          show_full_output: true
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
@@ -323,7 +331,7 @@ jobs:
           PR_NUMBER="${{ github.event.pull_request.number }}"
           REPO="${{ github.repository }}"
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          REVIEW_SIZE=$(wc -c < /tmp/review.txt 2>/dev/null || echo "0")
+          REVIEW_SIZE=$(wc -c < /tmp/claude_review_output.txt 2>/dev/null || echo "0")
 
           # Build the event payload with jq so all values are safely escaped
           EVENT_PAYLOAD=$(jq -n \
