@@ -274,6 +274,9 @@ jobs:
           DISABLE_NON_ESSENTIAL_MODEL_CALLS: "1"
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --model ${{ env.CLAUDE_MODEL }}
+            --allowedTools "Read,Write,Bash(gh pr diff:*),Bash(gh pr view:*)"
           github_token: ${{ secrets.GITHUB_TOKEN }}
           track_progress: true
           show_full_output: true
@@ -299,12 +302,6 @@ jobs:
             5. After reading ALL files and dependencies, compile your complete review.
                Write the ENTIRE review to /tmp/claude_review_output.txt using the Write tool.
                Do NOT call gh pr comment — the next step posts the file as a single comment.
-          # Write is unrestricted (plain "Write", not "Write(/path)") so the tool is actually available.
-          # Bash(gh pr comment) is intentionally excluded — the post step below guarantees exactly one comment.
-          # model moved to claude_args — `model` is no longer a valid action input.
-          claude_args: |
-            --model ${{ env.CLAUDE_MODEL }}
-            --allowedTools "Read,Write,Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       - name: Post review as single PR comment
         env:
