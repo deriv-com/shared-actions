@@ -26,7 +26,8 @@ on:
 
 jobs:
   claude-review-api:
-    runs-on: ubuntu-latest
+    runs-on:
+      group: github_claude_code_reviewer
     if: github.event.pull_request.draft == false
 
     permissions:
