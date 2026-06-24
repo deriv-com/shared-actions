@@ -23,6 +23,9 @@ on:
       AGENT_METRICS_API_KEY:
         description: "API key for authenticating POST requests to the metrics dashboard. Must match AGENT_METRICS_API_KEY on the backend. Required when AGENT_METRICS_API_URL is set."
         required: false
+      CLICK2FIX_BASE_URL:
+        description: "Click2Fix origin without trailing slash (e.g. https://click2fix.example.com). The workflow appends /?hash=<derived> for {{AUTO_FIX_URL}}."
+        required: true
 
 jobs:
   claude-review-api:
@@ -158,6 +161,7 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          CLICK2FIX_BASE_URL: ${{ secrets.CLICK2FIX_BASE_URL }}
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
           REPO="${{ github.repository }}"
@@ -165,7 +169,12 @@ jobs:
           # Compute click2fix URL
           PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
           PR_HASH=$(echo -n "$PR_URL" | base64 -w0 | tr '+/' '-_' | tr -d '=')
-          CLICK2FIX_URL="https://click2fix.internal-gcp-ai-agents.deriv.dev/?hash=${PR_HASH}"
+          if [ -z "$CLICK2FIX_BASE_URL" ]; then
+            echo "❌ CLICK2FIX_BASE_URL secret is not set"
+            exit 1
+          fi
+          BASE_URL="${CLICK2FIX_BASE_URL%/}"
+          CLICK2FIX_URL="${BASE_URL}/?hash=${PR_HASH}"
 
           # Store current HEAD SHA (used in review comment metadata + metrics)
           CURRENT_SHA=$(git rev-parse HEAD)
