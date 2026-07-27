@@ -53,7 +53,7 @@ jobs:
           echo "🔒 Validating access for user: $ACTOR"
 
           MEMBERSHIP=$(curl -s -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/orgs/regentmarkets/members/$ACTOR" -w "%{http_code}" -o /dev/null)
+            "https://api.github.com/orgs/deriv-com/members/$ACTOR" -w "%{http_code}" -o /dev/null)
           [[ "$MEMBERSHIP" == "204" ]] && echo "✅ Verified org member" && exit 0
 
           COLLAB=$(curl -s -H "Authorization: token $GH_TOKEN" \
