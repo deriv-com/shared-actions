@@ -13,7 +13,9 @@ const path = require("path");
 
 // Prefer GITHUB_WORKSPACE so this script works when shipped as a composite
 // action (action files live under github.action_path, not the consumer repo).
-const ROOT = process.env.GITHUB_WORKSPACE || path.join(__dirname, "..");
+// Fallback: three levels up from .github/actions/archive_on_merge → repo root.
+const ROOT =
+  process.env.GITHUB_WORKSPACE || path.join(__dirname, "..", "..", "..");
 
 /**
  * Given a list of changed file paths (e.g. from `git diff --name-only`),
@@ -64,6 +66,7 @@ function isTasksComplete(tasksMdContent) {
 function gitDiffNames(base, head) {
   const raw = execFileSync("git", ["diff", "--name-only", `${base}..${head}`], {
     encoding: "utf8",
+    cwd: ROOT,
   });
   return raw.split("\n").filter(Boolean);
 }
@@ -90,6 +93,28 @@ function runOpenspecArchive(changeName) {
   }
 }
 
+/**
+ * Write composite/workflow step outputs. Always emits `archived` (true/false)
+ * so callers can branch on either value, including the no-candidates path.
+ */
+function writeOutputs(archived) {
+  if (!process.env.GITHUB_OUTPUT) {
+    return;
+  }
+  // `a.change` comes from openspec's own JSON response, not from our
+  // validated `name` input — re-validate against the same kebab-case
+  // allowlist before writing it to the GITHUB_OUTPUT file, so a malformed
+  // value (e.g. containing a newline) can't inject extra output keys.
+  const safeChanges = archived
+    .map((a) => a.change)
+    .filter((c) => CHANGE_NAME_RE.test(c))
+    .join(",");
+  fs.appendFileSync(
+    process.env.GITHUB_OUTPUT,
+    `archived=${archived.length > 0}\nchanges=${safeChanges}\n`
+  );
+}
+
 function main() {
   const base = process.env.BASE_SHA;
   const head = process.env.HEAD_SHA;
@@ -111,10 +136,12 @@ function main() {
     console.log(
       "No openspec change directories touched by this merge. Nothing to archive."
     );
+    writeOutputs([]);
     return;
   }
 
   const archived = [];
+  let archiveFailures = 0;
   for (const name of candidates) {
     // Fault-isolated per candidate: an unexpected failure archiving one
     // change (e.g. a merge that touches two changes at once) must not lose
@@ -148,6 +175,7 @@ function main() {
         console.log(
           `openspec archive failed for '${name}': ${messages || "unknown error"}`
         );
+        archiveFailures += 1;
         continue;
       }
       console.log(`Archived '${name}' -> ${result.archive.archivedAs}`);
@@ -156,22 +184,20 @@ function main() {
       console.log(
         `Unexpected error archiving '${name}': ${err.message}. Skipping.`
       );
+      archiveFailures += 1;
     }
   }
 
-  if (process.env.GITHUB_OUTPUT) {
-    // `a.change` comes from openspec's own JSON response, not from our
-    // validated `name` input — re-validate against the same kebab-case
-    // allowlist before writing it to the GITHUB_OUTPUT file, so a malformed
-    // value (e.g. containing a newline) can't inject extra output keys.
-    const safeChanges = archived
-      .map((a) => a.change)
-      .filter((c) => CHANGE_NAME_RE.test(c))
-      .join(",");
-    fs.appendFileSync(
-      process.env.GITHUB_OUTPUT,
-      `archived=${archived.length > 0}\nchanges=${safeChanges}\n`
+  writeOutputs(archived);
+
+  // Soft-skip (incomplete / no tasks.md) is success. But if every attempt to
+  // archive a completed change failed, exit non-zero so CI does not go green
+  // while leaving finished changes unarchived.
+  if (archived.length === 0 && archiveFailures > 0) {
+    console.error(
+      `Failed to archive ${archiveFailures} completed change(s); see logs above.`
     );
+    process.exit(1);
   }
 }
 
@@ -181,6 +207,7 @@ module.exports = {
   isValidSha,
   gitDiffNames,
   runOpenspecArchive,
+  writeOutputs,
   main,
 };
 

@@ -32,5 +32,5 @@ and a checkout of the consumer repo at the base branch with full history
 
 | Name | Description |
 | --- | --- |
-| `archived` | `'true'` when at least one change was archived |
-| `changes` | Comma-separated kebab-case names that were archived |
+| `archived` | `'true'` when at least one change was archived, otherwise `'false'` |
+| `changes` | Comma-separated kebab-case names that were archived (empty when none) |

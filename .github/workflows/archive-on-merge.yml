@@ -19,6 +19,9 @@ name: Archive on Merge
 #     archive:
 #       if: github.event.pull_request.merged == true
 #       uses: deriv-com/shared-actions/.github/workflows/archive-on-merge.yml@master
+#       with:
+#         # Must match the workflow ref above (master / tag / sha).
+#         action_ref: master
 #       permissions:
 #         contents: write
 #         pull-requests: write
@@ -43,10 +46,10 @@ on:
         type: string
       action_ref:
         description: >
-          Git ref of shared-actions used to fetch the archive_on_merge script
-          (keep in sync with the workflow ref you call, e.g. master)
-        required: false
-        default: "master"
+          Git ref of shared-actions used to fetch the archive_on_merge script.
+          Required — must match the workflow ref in your `uses:` pin (e.g.
+          master, a tag, or a commit SHA) so the script cannot drift.
+        required: true
         type: string
 
 jobs:
@@ -69,11 +72,12 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.base_branch }}
 
-      # Fetch the archive script from shared-actions at the same ref the caller
-      # pinned (default master). A second checkout is required because a
-      # reusable workflow cannot resolve a same-repo composite action via a
-      # relative `uses: ./` path when invoked cross-repo (that path is relative
-      # to the *caller*), and `uses:` does not accept `${{ }}` expressions.
+      # Fetch the archive script from shared-actions at the caller-supplied
+      # action_ref (must match the workflow `uses:` pin). A second checkout is
+      # required because a reusable workflow cannot resolve a same-repo
+      # composite action via a relative `uses: ./` path when invoked cross-repo
+      # (that path is relative to the *caller*), and `uses:` does not accept
+      # `${{ }}` expressions.
       - name: Fetch archive-on-merge script
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -129,6 +133,11 @@ jobs:
             echo "PR #$EXISTING already open for $BRANCH — skipping."
             exit 0
           fi
+
+          # No open PR uses this branch — drop any stale remote left from a
+          # closed-without-merge archive PR so re-runs are not blocked by a
+          # non-fast-forward push.
+          git push origin --delete "$BRANCH" 2>/dev/null || true
 
           git checkout -b "$BRANCH"
           git add openspec/

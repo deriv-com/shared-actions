@@ -16,7 +16,7 @@ outputs:
     description: "'true' when at least one change was archived, otherwise 'false'"
     value: ${{ steps.archive.outputs.archived }}
   changes:
-    description: Comma-separated kebab-case change names that were archived
+    description: Comma-separated kebab-case change names that were archived (empty when none)
     value: ${{ steps.archive.outputs.changes }}
 runs:
   using: composite

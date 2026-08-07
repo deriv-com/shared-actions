@@ -33,14 +33,17 @@ jobs:
   archive:
     if: github.event.pull_request.merged == true
     uses: deriv-com/shared-actions/.github/workflows/archive-on-merge.yml@master
+    with:
+      # Required — must match the workflow ref in `uses:` above.
+      action_ref: master
     permissions:
       contents: write
       pull-requests: write
 ```
 
-Optional inputs: `base_branch` (default `master`), `node_version` (default
-`22`), `openspec_version` (default `1.6.0`), `action_ref` (default `master` —
-keep in sync with the workflow ref you call).
+Required input: `action_ref` (same ref as the workflow `uses:` pin). Optional:
+`base_branch` (default `master`), `node_version` (default `22`),
+`openspec_version` (default `1.6.0`).
 
 The detect/archive script is also available as a composite action:
 [`archive_on_merge`](.github/actions/archive_on_merge/).
