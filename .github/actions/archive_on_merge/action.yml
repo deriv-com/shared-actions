@@ -1,0 +1,33 @@
+name: archive_on_merge
+description: >
+  Detect openspec change(s) completed by a merge, verify every tasks.md item
+  is checked, and run `openspec archive --yes --json`. Emits outputs used by
+  a follow-up step/workflow that opens the archive PR (never pushes to a
+  protected branch).
+inputs:
+  base_sha:
+    description: Base SHA of the merged PR (40-char hex)
+    required: true
+  head_sha:
+    description: Merge commit SHA of the merged PR (40-char hex)
+    required: true
+outputs:
+  archived:
+    description: "'true' when at least one change was archived, otherwise 'false'"
+    value: ${{ steps.archive.outputs.archived }}
+  changes:
+    description: Comma-separated kebab-case change names that were archived
+    value: ${{ steps.archive.outputs.changes }}
+runs:
+  using: composite
+  steps:
+    - name: Detect + archive completed changes
+      id: archive
+      shell: bash
+      env:
+        BASE_SHA: ${{ inputs.base_sha }}
+        HEAD_SHA: ${{ inputs.head_sha }}
+        # openspec telemetry auto-disables when CI=true; set DO_NOT_TRACK too
+        # as defense-in-depth and for local runs outside CI.
+        DO_NOT_TRACK: "1"
+      run: node "${{ github.action_path }}/archive-on-merge.js"
