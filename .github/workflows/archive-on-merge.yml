@@ -1,0 +1,160 @@
+name: Archive on Merge
+
+# Reusable workflow: when a merged PR completes an openspec change (every task
+# checked), run `openspec archive --yes --json` and open a follow-up PR moving
+# it to openspec/changes/archive/. Never pushes directly to a protected branch;
+# a human still merges the archive PR.
+#
+# Caller example (thin wrapper in the consumer repo):
+#
+#   name: Archive on Merge
+#   on:
+#     pull_request:
+#       types: [closed]
+#       branches: [master]
+#   permissions:
+#     contents: write
+#     pull-requests: write
+#   jobs:
+#     archive:
+#       if: github.event.pull_request.merged == true
+#       uses: deriv-com/shared-actions/.github/workflows/archive-on-merge.yml@master
+#       with:
+#         # Must match the workflow ref above (master / tag / sha).
+#         action_ref: master
+#       permissions:
+#         contents: write
+#         pull-requests: write
+
+on:
+  workflow_call:
+    inputs:
+      base_branch:
+        description: Base branch to check out and target for the archive PR
+        required: false
+        default: "master"
+        type: string
+      node_version:
+        description: Node.js version for the openspec CLI
+        required: false
+        default: "22"
+        type: string
+      openspec_version:
+        description: Pinned @fission-ai/openspec version installed for the archive CLI
+        required: false
+        default: "1.6.0"
+        type: string
+      action_ref:
+        description: >
+          Git ref of shared-actions used to fetch the archive_on_merge script.
+          Required — must match the workflow ref in your `uses:` pin (e.g.
+          master, a tag, or a commit SHA) so the script cannot drift.
+        required: true
+        type: string
+
+jobs:
+  archive:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    concurrency:
+      group: archive-on-merge-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.base_branch }}
+
+      # Fetch the archive script from shared-actions at the caller-supplied
+      # action_ref (must match the workflow `uses:` pin). A second checkout is
+      # required because a reusable workflow cannot resolve a same-repo
+      # composite action via a relative `uses: ./` path when invoked cross-repo
+      # (that path is relative to the *caller*), and `uses:` does not accept
+      # `${{ }}` expressions.
+      - name: Fetch archive-on-merge script
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: deriv-com/shared-actions
+          ref: ${{ inputs.action_ref }}
+          path: .shared-actions
+          sparse-checkout: |
+            .github/actions/archive_on_merge
+          sparse-checkout-cone-mode: true
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Install openspec CLI
+        env:
+          OPENSPEC_VERSION: ${{ inputs.openspec_version }}
+        run: npm install -g "@fission-ai/openspec@${OPENSPEC_VERSION}"
+
+      - name: Detect + archive completed changes
+        id: archive
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          # openspec telemetry auto-disables when CI=true; set DO_NOT_TRACK too
+          # as defense-in-depth and for local runs outside CI.
+          DO_NOT_TRACK: "1"
+        run: node .shared-actions/.github/actions/archive_on_merge/archive-on-merge.js
+
+      - name: Remove shared-actions checkout
+        if: always()
+        run: rm -rf .shared-actions
+
+      - name: Open archive PR
+        if: steps.archive.outputs.archived == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANGES: ${{ steps.archive.outputs.changes }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+        run: |
+          BRANCH="archive-on-merge/$PR_NUMBER"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Idempotency: skip if a PR for this branch is already open.
+          # `// empty` (rather than bare `.[0].number`) matters here: on no
+          # match, `.[0]` is `null` and `.number` on `null` is still `null`,
+          # which `jq` prints as the *string* "null" — truthy to `[ -n ]`.
+          EXISTING=$(gh pr list --state open --head "$BRANCH" --json number --jq '.[0].number // empty' || true)
+          if [ -n "$EXISTING" ]; then
+            echo "PR #$EXISTING already open for $BRANCH — skipping."
+            exit 0
+          fi
+
+          # No open PR uses this branch — drop any stale remote left from a
+          # closed-without-merge archive PR so re-runs are not blocked by a
+          # non-fast-forward push.
+          git push origin --delete "$BRANCH" 2>/dev/null || true
+
+          git checkout -b "$BRANCH"
+          git add openspec/
+
+          # Guard against the edge case where `openspec archive` reported
+          # success but staged no filesystem changes — `git commit` would
+          # otherwise fail with a cryptic "nothing to commit" error.
+          if git diff --cached --quiet; then
+            echo "openspec archive reported success but staged no changes — nothing to push."
+            exit 0
+          fi
+
+          git commit -m "docs(openspec): archive completed change(s) - $CHANGES"
+          git push -u origin "$BRANCH"
+
+          gh pr create \
+            --title "docs(openspec): archive completed change(s) - $CHANGES" \
+            --body "Automated archive triggered by the merge of #${PR_NUMBER}. Moves ${CHANGES} to \`openspec/changes/archive/\` and syncs specs, per \`openspec archive --yes\`." \
+            --base "$BASE_BRANCH" \
+            --head "$BRANCH"
