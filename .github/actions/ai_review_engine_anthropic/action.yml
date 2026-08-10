@@ -75,8 +75,28 @@ runs:
       shell: bash
       working-directory: ${{ github.workspace }}
       run: |
-        rm -f CLAUDE.md CLAUDE.local.md AGENTS.md .mcp.json
-        rm -rf .claude .claude-plugin
+        # Recursive, not root-only. Per Claude Code's memory docs: "Claude also
+        # discovers CLAUDE.md and CLAUDE.local.md files in subdirectories under
+        # your current working directory... they are included when Claude reads
+        # files in those subdirectories." Nested .claude/rules/*.md load the same
+        # way (path-scoped rules trigger when a matching file is read). This
+        # review's prompt tells the model to traverse into dependencies, so a
+        # nested packages/foo/CLAUDE.md would reach it as trusted instructions
+        # even with the root file deleted.
+        #
+        # AGENTS.md is stripped defensively — Claude Code does not read it
+        # natively ("Claude Code reads CLAUDE.md, not AGENTS.md") but a CLAUDE.md
+        # can @import it, and other engines do read it.
+        #
+        # .git is pruned so the sweep cannot corrupt the checkout.
+        find . -name .git -prune -o -type f \
+          \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' -o -name '.mcp.json' \) \
+          -print0 | xargs -0 -r rm -f
+        find . -name .git -prune -o -type d \
+          \( -name '.claude' -o -name '.claude-plugin' \) \
+          -print0 | xargs -0 -r rm -rf
+        echo "✅ Stripped PR-supplied agent config (recursive)"
+
         # Persistent self-hosted runner: clear cross-run agent state too.
         rm -rf "$HOME/.claude"
         rm -f "$HOME/.claude.json"

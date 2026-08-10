@@ -209,10 +209,11 @@ for telling engines apart — prefer grouping on it over reading `agent`.
 
 ## Migrating from `claude-pr-review.yml`
 
-`claude-pr-review.yml` is **deprecated** and now delegates here. It will be
-deleted; see the deprecation ledger in the repo README. To migrate a consumer,
-edit its caller (three changes — `uses:`, `with:`, and the secret *parameter*
-name):
+`claude-pr-review.yml` is **deprecated**. It is still its own standalone
+implementation for now — converting it into a thin shim that delegates here is a
+tracked follow-up, after which it will be deleted. See the deprecation ledger in
+the repo README. To migrate a consumer, edit its caller (three changes —
+`uses:`, `with:`, and the secret *parameter* name):
 
 ```diff
 -    uses: deriv-com/shared-actions/.github/workflows/claude-pr-review.yml@master

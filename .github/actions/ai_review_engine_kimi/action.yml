@@ -85,8 +85,17 @@ runs:
       shell: bash
       working-directory: ${{ github.workspace }}
       run: |
-        rm -f CLAUDE.md AGENTS.md KIMI.md
-        rm -rf .kimi-code
+        # Recursive, not root-only. Instruction files are discovered per-directory
+        # as an agent reads files there, and this review's prompt explicitly tells
+        # it to traverse into dependencies — so a nested packages/foo/CLAUDE.md
+        # would reach the model as trusted instructions even with the root file
+        # deleted. .git is pruned so the sweep cannot corrupt the checkout.
+        find . -name .git -prune -o -type f \
+          \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' -o -name 'KIMI.md' \) \
+          -print0 | xargs -0 -r rm -f
+        find . -name .git -prune -o -type d -name '.kimi-code' \
+          -print0 | xargs -0 -r rm -rf
+        echo "✅ Stripped PR-supplied agent config (recursive)"
 
     - name: Set up Node.js
       # Pinned to a commit SHA, not a tag: tags are mutable, so `@v4` would let a

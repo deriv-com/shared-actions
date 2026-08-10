@@ -23,7 +23,7 @@ Everything here is consumed at `@master`, so **changes are live for every consum
 
 | Workflow | Replacement | Notes |
 |---|---|---|
-| `claude-pr-review.yml` | `ai-pr-review.yml` with `engine: anthropic` | Delegates to the replacement; see the [migration guide](.github/workflows/AI_PR_REVIEW_README.md#migrating-from-claude-pr-reviewyml). Do not delete until consumers are migrated and deprecation telemetry has been silent for 30 days. |
+| `claude-pr-review.yml` | `ai-pr-review.yml` with `engine: anthropic` | **Still a standalone duplicate** — converting it into a delegating shim is a tracked follow-up. See the [migration guide](.github/workflows/AI_PR_REVIEW_README.md#migrating-from-claude-pr-reviewyml). Do not delete until consumers are migrated and deprecation telemetry has been silent for 30 days. |
 
 Add a row here when deprecating anything. With no CHANGELOG and no release process, this table is the only coordination mechanism the repo has.
 

@@ -90,10 +90,15 @@ jobs:
       # API, and claude-code-action's docs at the pinned SHA ask for
       # `actions: read` only, for the opt-in CI-log feature we do not enable.
       # If the Anthropic engine ever needs it, add `actions: read` — not write.
+      #
+      # `id-token:` is absent for the same reason. It only enables OIDC token
+      # minting for cloud federation, which nothing here does — both engines
+      # authenticate to the proxy with a bearer key. Self-hosted runner
+      # registration does not use the job token, so the runner group is
+      # unaffected.
       contents: read
       pull-requests: write
       issues: write
-      id-token: write
 
     concurrency:
       group: ai-pr-review-${{ github.event.pull_request.number }}
@@ -198,8 +203,13 @@ jobs:
         env:
           PROMPT_GIST_URL: ${{ inputs.prompt_gist_url || 'https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/claude-review-format.md' }}
         run: |
-          PROMPT_TEMPLATE=$(curl -sL "$PROMPT_GIST_URL")
-          [[ -z "$PROMPT_TEMPLATE" ]] && echo "❌ Failed to fetch prompt" && exit 1
+          # -f matters: without it curl exits 0 on 4xx/5xx and returns the error
+          # page body, which is non-empty — so the emptiness check below would
+          # pass and GitHub's 404 page would silently become the review's
+          # instruction template.
+          PROMPT_TEMPLATE=$(curl -sfL "$PROMPT_GIST_URL") \
+            || { echo "❌ Failed to fetch prompt (HTTP error from $PROMPT_GIST_URL)"; exit 1; }
+          [[ -z "$PROMPT_TEMPLATE" ]] && echo "❌ Failed to fetch prompt (empty body)" && exit 1
 
           PROMPT_TEMPLATE=$(echo "$PROMPT_TEMPLATE" | sed '1s/^prompt:[[:space:]]*|[[:space:]]*//' | sed 's/^____$//g' | sed 's/____$//g')
 
