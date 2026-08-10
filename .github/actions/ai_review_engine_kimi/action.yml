@@ -89,7 +89,10 @@ runs:
         rm -rf .kimi-code
 
     - name: Set up Node.js
-      uses: actions/setup-node@v4
+      # Pinned to a commit SHA, not a tag: tags are mutable, so `@v4` would let a
+      # retagged release execute in a job holding the LLM API key and a
+      # write-scoped GITHUB_TOKEN. Bump deliberately via PR.
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
       with:
         node-version: ${{ inputs.node_version }}
 

@@ -100,6 +100,9 @@ runs:
         echo "🔧 Anthropic engine | model=${{ inputs.model }} | base_url=$BASE_URL"
 
     - name: Claude Code PR review
+      # Not a release tag — this is the SHA claude-pr-review.yml was pinned to
+      # (2026-05-01, "bump Claude Code to 2.1.126"). Carried over unchanged so the
+      # engine behaves identically to the workflow it replaces.
       uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
       env:
         ANTHROPIC_BASE_URL: ${{ steps.resolve.outputs.base_url }}
