@@ -63,8 +63,9 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 | Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) |
 | Default model | `k3` | `claude-sonnet-5` |
 | `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** |
-| Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` |
+| Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` **+ the action's base GitHub tools** |
 | Shell | none (absent from `enabled` **and** denied by rule) | none (`--allowedTools` omits Bash) |
+| `Write` scope | output directory only (allow + catch-all deny) | **unscoped** — see below |
 | Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` |
 | Applicable inputs | all, incl. `max_context_size`, `cli_version` | all except `max_context_size`, `cli_version` |
 | `agent` reported | `ai_review` | `claude_review` |
@@ -76,6 +77,30 @@ receive one. Each engine normalises the value it is given, so the same
 `base_url` works across engines and flipping `engine` never silently 404s. Do
 not "fix" this by giving the dispatch per-engine defaults — that would make one
 input value mean two different things.
+
+**The two engines are not equally sandboxed.** Be precise about this rather than
+assuming parity:
+
+- **Kimi** — the tool surface *is* the guarantee. Bash is absent from `enabled`
+  and denied by rule; `Write` is confined to the output directory by an allow rule
+  plus a catch-all deny; no GitHub token reaches the step at all. The agent
+  cannot comment because it has no means to.
+- **Anthropic** — weaker, in two ways. `--allowedTools` **adds to** a base set
+  rather than replacing it (the action's docs: *"The base GitHub tools are always
+  included"*), so some GitHub tool surface is not removable and the action does
+  hold a token for its own actor checks. And `Write` is unscoped, because
+  path-scoped patterns are only documented for `Bash`, and the workflow this
+  replaced recorded that a scoped `Write(/path)` made the tool unavailable
+  entirely. Shell access *is* definitively gone — the docs confirm Bash is off
+  unless explicitly allowed.
+
+  So on this engine "exactly one review comment" rests on three things: no
+  tracking comment (`track_progress` is off), an explicit prompt instruction not
+  to comment, and the caller deleting marker-matching comments before posting.
+
+Tightening the Anthropic `Write` grant needs a verification run, since an
+unavailable `Write` means the engine reviews and writes nothing. Do not
+"fix" it blind.
 
 **A model swap is config; an engine swap is a rewrite.** Any model the LiteLLM
 proxy fronts can be reached by setting `model` (and `max_context_size` on Kimi).
@@ -117,15 +142,34 @@ is already a LiteLLM virtual key.
 
 ## Permissions
 
-`actions: write` is currently declared but believed unnecessary — `git blame`
-shows it was escalated from `read` alongside an `upload-artifact` change, and
-`upload-artifact` authenticates with `ACTIONS_RUNTIME_TOKEN` rather than this
-token. It is retained only so no existing consumer breaks mid-migration. When
-removing it: **drop it from this workflow first, then from the callers.** The
-reverse order fails every run, because a caller granting less than the called
-workflow declares is rejected outright.
+This workflow does **not** request `actions:` at all. `claude-pr-review.yml`
+granted `actions: write`, but `git blame` shows it was escalated from `read`
+alongside an `upload-artifact` change, and `upload-artifact` authenticates with
+`ACTIONS_RUNTIME_TOKEN` rather than this token. Neither engine calls the Actions
+API.
 
-`id-token: write` also appears unused and is a candidate for the same treatment.
+Callers may keep granting it harmlessly: **permissions can only be reduced, never
+elevated, down a reusable-workflow chain**, so declaring less than a caller grants
+always works. The reverse does not — a called workflow requesting *more* than its
+caller granted fails the run outright. That asymmetry is why the caller stubs in
+the migration guide keep their existing `permissions` block unchanged.
+
+`id-token: write` also appears unused by both engines and is a candidate for the
+same trim, pending a check that the self-hosted runner group does not rely on it.
+
+## Known limitations
+
+**Engine actions are referenced at `@master`, not a pinned SHA.** Every other
+third-party ref in this workflow is SHA-pinned, so this is a deliberate
+exception, for two reasons: a SHA cannot be referenced before the commit that
+introduces it exists, and pinning would make every engine change a two-commit
+dance (change, then re-pin). It also matches house style — `docsync-ai.yml` does
+the same for its composite actions.
+
+The consequence worth knowing: a consumer pinning `ai-pr-review.yml` to a tag or
+SHA does **not** pin the engine code that actually executes. Given how privileged
+this job is, pinning the engine refs — across this repo's self-referencing
+composite actions consistently, not just here — is a reasonable follow-up.
 
 ## Comment markers and cleanup
 

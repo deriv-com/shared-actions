@@ -78,21 +78,22 @@ jobs:
     if: github.event.pull_request.draft == false
 
     permissions:
+      # `actions:` is deliberately absent. Permissions can only be reduced, never
+      # elevated, down a reusable-workflow chain, so declaring less than a caller
+      # grants is always safe — a caller may keep granting `actions: write` and
+      # this job simply will not receive it. Nothing to migrate.
+      #
+      # It is also unused: `git log -S "actions: write"` shows one commit,
+      # af32344 "chore: add artifact", which escalated actions:read -> write
+      # alongside upload-artifact — and upload-artifact authenticates with
+      # ACTIONS_RUNTIME_TOKEN, not this token. Neither engine calls the Actions
+      # API, and claude-code-action's docs at the pinned SHA ask for
+      # `actions: read` only, for the opt-in CI-log feature we do not enable.
+      # If the Anthropic engine ever needs it, add `actions: read` — not write.
       contents: read
       pull-requests: write
       issues: write
       id-token: write
-      # PROVISIONAL — carried over from claude-pr-review.yml so no consumer breaks
-      # mid-migration. A reusable workflow may not request more than its caller
-      # grants, and all 14 current callers already grant this, so it is free
-      # today. Evidence says it is unnecessary: `git log -S "actions: write"`
-      # shows one commit, af32344 "chore: add artifact", which escalated
-      # actions:read -> write alongside upload-artifact — and upload-artifact
-      # authenticates with ACTIONS_RUNTIME_TOKEN, not this token. Neither engine
-      # calls the Actions API, and claude-code-action's docs at the pinned SHA
-      # ask for `actions: read` only, for an opt-in feature we do not enable.
-      # Confirm on the first dogfood run, then drop it HERE FIRST, callers after.
-      actions: write
 
     concurrency:
       group: ai-pr-review-${{ github.event.pull_request.number }}

