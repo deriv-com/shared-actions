@@ -100,7 +100,11 @@ jobs:
           echo "❌ Access denied for user: $ACTOR" && exit 1
 
       - name: Checkout PR head
-        uses: actions/checkout@v6
+        # Third-party actions are pinned to a commit SHA, not a tag: tags are
+        # mutable, so `@v6` would let a retagged release execute in a job holding
+        # LLM_API_KEY and a write-scoped GITHUB_TOKEN. Same reasoning as the
+        # pinned cli_version. Bump deliberately via PR.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.ref }}
@@ -340,7 +344,7 @@ jobs:
           rm -rf .kimi-code
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
 
@@ -530,7 +534,7 @@ jobs:
 
       - name: Upload review summary as artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ai-review-summary-${{ github.run_id }}
           path: click2fix-payload.json
