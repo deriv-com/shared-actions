@@ -282,7 +282,12 @@ jobs:
           echo "📋 Review context built ($(wc -c < /tmp/review_context.md) bytes)"
 
       - name: Remove agent config files to prevent project config leaking into review
-        run: rm -f CLAUDE.md AGENTS.md
+        # .kimi-code/ is removed because project-level .kimi-code/mcp.json can declare
+        # MCP servers (arbitrary local commands) and .kimi-code/local.toml can widen
+        # workspace access — a PR must not be able to alter the review agent's runtime.
+        run: |
+          rm -f CLAUDE.md AGENTS.md KIMI.md
+          rm -rf .kimi-code
 
       # ======================= ENGINE: Kimi Code CLI =======================
       # Everything below (install, configure, run) is the swappable engine.
@@ -312,13 +317,25 @@ jobs:
           # Model + provider are defined entirely through the KIMI_MODEL_* env channel
           # on the run step (no credentials written to disk); this config file only
           # restricts the tool surface:
-          #   Read, Write, Bash(gh pr diff:*), Bash(gh pr view:*)
+          #   Read, Write(/tmp only), Bash(gh pr diff:*), Bash(gh pr view:*)
           # Grep/Glob stay available as read-only exploration helpers.
           cat > "$HOME/.kimi-code/config.toml" <<'EOF'
           default_permission_mode = "auto"
 
           [tools]
           enabled = ["Read", "Write", "Bash", "Grep", "Glob"]
+
+          # Rules are matched first-match-wins, before the mode default applies.
+          # Write is allowed only under /tmp (review output); everything else is
+          # denied so the agent cannot modify the checkout. Bash is pinned to the
+          # two read-only gh commands the review needs.
+          [[permission.rules]]
+          decision = "allow"
+          pattern = "Write(/tmp/*)"
+
+          [[permission.rules]]
+          decision = "deny"
+          pattern = "Write"
 
           [[permission.rules]]
           decision = "allow"
