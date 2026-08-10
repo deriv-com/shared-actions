@@ -1,31 +1,45 @@
 name: AI PR Review
 
-# LLM-agnostic PR review workflow.
-# The public interface (inputs, secrets, review marker, metrics event) is engine-neutral
-# so the underlying LLM engine can be swapped later. The current engine is Kimi Code CLI
-# (Kimi K3) — see the clearly-marked "engine" steps below. To substitute a different
-# engine, replace those steps and keep everything else unchanged.
+# AI PR review workflow. Current engine: Kimi Code CLI (Kimi K3), reached through
+# the Deriv LiteLLM proxy.
+#
+# Two kinds of "swap" are possible here, and they are NOT equally cheap:
+#
+#   Model swap — cheap, supported. Any model the LiteLLM proxy fronts can be used
+#   via the `model` / `base_url` inputs; the proxy normalises the API.
+#
+#   Engine swap — a rewrite, not a config change. Replacing the Kimi CLI with a
+#   different agentic CLI (Codex, Claude Code, ...) means rewriting every step in
+#   the marked ENGINE section below: each CLI has its own config format,
+#   sandbox/permission model, tool names and non-interactive entrypoint, and its
+#   own set of PR-supplied config files that must be stripped first.
+#
+# The scaffolding outside the ENGINE section (access gate, prompt fetch, previous
+# review handling, context build, comment posting, metrics) is genuinely reusable
+# across engines. The ENGINE section is not portable — do not assume otherwise.
+#
+# Inputs tagged [engine-specific] apply only to the current engine.
 
 on:
   workflow_call:
     inputs:
       model:
-        description: "Model ID to use for review (engine-specific; for the Kimi engine: k3, k3-256k, kimi-for-coding, kimi-for-coding-highspeed)"
+        description: "[engine-specific] Model ID to use for review. Kimi engine: k3, k3-256k, kimi-for-coding, kimi-for-coding-highspeed. Any model fronted by the LiteLLM proxy also works."
         required: false
         default: "k3"
         type: string
       base_url:
-        description: "Base URL of the LLM API endpoint (default is the Deriv LiteLLM proxy; use https://api.kimi.com/coding/v1 for direct Kimi Code platform access)"
+        description: "[engine-specific] Base URL of the LLM API endpoint. Default is the Deriv LiteLLM proxy; use https://api.kimi.com/coding/v1 for direct Kimi Code platform access."
         required: false
         default: "https://litellmsa.deriv.ai/v1"
         type: string
       max_context_size:
-        description: "Maximum context window in tokens for the selected model (k3 = 1048576, k3-256k / kimi-for-coding = 262144)"
+        description: "[engine-specific] Maximum context window in tokens (k3 = 1048576, k3-256k / kimi-for-coding = 262144). Maps to KIMI_MODEL_MAX_CONTEXT_SIZE and has no equivalent on other engines — ignored if the engine is swapped."
         required: false
         default: "1048576"
         type: string
       cli_version:
-        description: "Version of the review CLI to install (npm dist-tag or version; engine-specific)"
+        description: "[engine-specific] Version of the review CLI to install (npm dist-tag or version)."
         required: false
         default: "latest"
         type: string
@@ -281,22 +295,30 @@ jobs:
 
           echo "📋 Review context built ($(wc -c < /tmp/review_context.md) bytes)"
 
-      - name: Remove agent config files to prevent project config leaking into review
-        # .kimi-code/ is removed because project-level .kimi-code/mcp.json can declare
-        # MCP servers (arbitrary local commands) and .kimi-code/local.toml can widen
-        # workspace access — a PR must not be able to alter the review agent's runtime.
+      # ======================= ENGINE: Kimi Code CLI =======================
+      # Everything below (strip config, install, configure, run) is the engine.
+      # Replacing it is a rewrite of all four steps, not a config change.
+      #
+      # Contract any replacement engine MUST satisfy:
+      #   - strips every file in the checkout that the PR could use to alter the
+      #     engine's runtime BEFORE the engine starts: context/instruction files,
+      #     permission or sandbox config, and MCP server declarations. This is a
+      #     security boundary, and the file names are engine-specific — e.g.
+      #     Kimi reads .kimi-code/{mcp.json,local.toml}, Codex reads .codex/rules/.
+      #     Do not carry this step over unchanged.
+      #   - reads /tmp/review_context.md and the checked-out PR code
+      #   - writes the final review markdown to /tmp/ai_review_output.txt
+      #   - restricts the agent so it cannot post PR comments itself (the post
+      #     step below guarantees exactly one comment)
+      # ===================================================================
+
+      - name: Strip PR-supplied agent config (Kimi Code)
+        # Instruction files (prompt injection) plus .kimi-code/ — project-level
+        # mcp.json there can declare MCP servers (arbitrary local commands, not
+        # gated by the Bash deny rule) and local.toml can widen workspace access.
         run: |
           rm -f CLAUDE.md AGENTS.md KIMI.md
           rm -rf .kimi-code
-
-      # ======================= ENGINE: Kimi Code CLI =======================
-      # Everything below (install, configure, run) is the swappable engine.
-      # To substitute a different LLM engine, replace these three steps with
-      # the equivalent install/configure/run for that engine. Contract:
-      #   - reads /tmp/review_context.md and the checked-out PR code
-      #   - writes the final review markdown to /tmp/ai_review_output.txt
-      #   - does NOT post PR comments itself
-      # ===================================================================
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
