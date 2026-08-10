@@ -34,7 +34,7 @@ on:
 
 jobs:
   fix-vulnerabilities:
-    uses: deriv-com/shared-action/.github/workflows/dependonme-bot.yml@<commit-hash> # pin to specific version
+    uses: deriv-com/shared-actions/.github/workflows/dependonme-bot.yml@<commit-hash> # pin to specific version
     with:
       slack_users_to_tag: 'U12345678,U87654321'
       base_branch: 'master'
