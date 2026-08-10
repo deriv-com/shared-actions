@@ -1,47 +1,59 @@
 name: AI PR Review
 
-# AI PR review workflow. Current engine: Kimi Code CLI (Kimi K3), reached through
-# the Deriv LiteLLM proxy.
+# AI PR review workflow. The LLM engine is pluggable via the `engine` input.
+# Full docs: .github/workflows/AI_PR_REVIEW_README.md
 #
-# Two kinds of "swap" are possible here, and they are NOT equally cheap:
+#   Model swap — set `model` (and `max_context_size` on the Kimi engine). Any
+#   model the LiteLLM proxy fronts works; the proxy normalises the API.
 #
-#   Model swap — cheap, supported. Any model the LiteLLM proxy fronts can be used
-#   via the `model` / `base_url` inputs; the proxy normalises the API.
+#   Engine swap — set `engine`. Each engine is a composite action under
+#   .github/actions/ai_review_engine_<engine>/ owning its own CLI, sandbox model,
+#   tool restrictions and PR-supplied-config stripping.
 #
-#   Engine swap — a rewrite, not a config change. Replacing the Kimi CLI with a
-#   different agentic CLI (Codex, Claude Code, ...) means rewriting every step in
-#   the marked ENGINE section below: each CLI has its own config format,
-#   sandbox/permission model, tool names and non-interactive entrypoint, and its
-#   own set of PR-supplied config files that must be stripped first.
+# Adding an engine is exactly 3 edits:
+#   1. .github/actions/ai_review_engine_<name>/action.yml   (the engine contract)
+#   2. a `case` arm in "Resolve and validate engine" below  (enum + defaults)
+#   3. an `if:`-gated step in the ENGINE DISPATCH block      (`uses:` takes no
+#      expressions, so dispatch cannot be a single dynamic step)
 #
-# The scaffolding outside the ENGINE section (access gate, prompt fetch, previous
-# review handling, context build, comment posting, metrics) is genuinely reusable
-# across engines. The ENGINE section is not portable — do not assume otherwise.
+# Everything outside ENGINE DISPATCH is engine-neutral scaffolding: access gate,
+# prompt fetch, previous-review capture/cleanup, context build, diff pre-fetch,
+# comment posting, metrics. Engines never touch those concerns.
 #
-# Inputs tagged [engine-specific] apply only to the current engine.
+# Inputs tagged [engine-specific] apply to some engines only.
 
 on:
   workflow_call:
     inputs:
-      model:
-        description: "[engine-specific] Model ID to use for review. Kimi engine: k3, k3-256k, kimi-for-coding, kimi-for-coding-highspeed. Any model fronted by the LiteLLM proxy also works."
+      engine:
+        description: "Review engine: `kimi` (Kimi Code CLI) or `anthropic` (Claude Code Action). Each is a composite action under .github/actions/ai_review_engine_<engine>/. Set this explicitly — the default is `kimi`, so an omitted value on a repo migrating from claude-pr-review.yml would switch LLM vendor."
         required: false
-        default: "k3"
+        default: "kimi"
+        type: string
+      model:
+        description: "Model ID to use for review. Defaults per engine (kimi -> k3, anthropic -> claude-sonnet-5). Any model the LiteLLM proxy fronts works."
+        required: false
+        default: ""
         type: string
       base_url:
-        description: "[engine-specific] Base URL of the LLM API endpoint. Default is the Deriv LiteLLM proxy; use https://api.kimi.com/coding/v1 for direct Kimi Code platform access."
+        description: "Base URL of the LLM API endpoint. Engine-neutral: a trailing /v1 is added or removed as each engine requires, so the same value works across engines. Use https://api.kimi.com/coding/v1 for direct Kimi Code platform access."
         required: false
         default: "https://litellmsa.deriv.ai/v1"
         type: string
       max_context_size:
-        description: "[engine-specific] Maximum context window in tokens (k3 = 1048576, k3-256k / kimi-for-coding = 262144). Maps to KIMI_MODEL_MAX_CONTEXT_SIZE and has no equivalent on other engines — ignored if the engine is swapped."
+        description: "[engine-specific: kimi] Maximum context window in tokens (k3 = 1048576, k3-256k / kimi-for-coding = 262144). Must match the model or the CLI over-packs context and the API rejects the request. Ignored when engine is not `kimi`."
         required: false
         default: "1048576"
         type: string
       cli_version:
-        description: "[engine-specific] Exact version of the review CLI to install. Pinned deliberately — @moonshot-ai/kimi-code is pre-1.0 and ships minor releases weekly, so `latest` risks both breaking changes and unreviewed code in a privileged job. Bump via PR."
+        description: "[engine-specific: kimi] Exact @moonshot-ai/kimi-code version to install. Pinned deliberately — the package is pre-1.0 and ships minor releases weekly, so `latest` risks both breaking changes and unreviewed code in a privileged job. Bump via PR. Ignored when engine is not `kimi`."
         required: false
         default: "0.34.0"
+        type: string
+      legacy_markers:
+        description: "Newline-separated comment markers from superseded review workflows that this run should ALSO delete, so a PR does not accumulate one stale review comment per workflow it has been through. Empty this only once no open PR org-wide can still carry a pre-migration comment — see AI_PR_REVIEW_README.md."
+        required: false
+        default: "Claude PR Review Complete"
         type: string
       prompt_gist_url:
         description: "URL to fetch prompt template from"
@@ -50,7 +62,7 @@ on:
         type: string
     secrets:
       LLM_API_KEY:
-        description: "API key for the LLM engine (with the default LiteLLM base_url: a LiteLLM virtual key; with the direct Kimi endpoint: a Kimi Code Console key)"
+        description: "API key for the LLM engine (with the default LiteLLM base_url: a LiteLLM virtual key; with the direct Kimi endpoint: a Kimi Code Console key). The same value serves every engine."
         required: true
       AGENT_METRICS_API_URL:
         description: "Base URL for the OneAboveAll metrics dashboard API (e.g. https://dashboard.example.com). Leave unset to skip POSTing events."
@@ -66,20 +78,31 @@ jobs:
     if: github.event.pull_request.draft == false
 
     permissions:
-      # No step calls the Actions API, so `actions: write` is deliberately absent
-      # (the sibling claude-pr-review.yml grants it for claude-code-action's
-      # internals). upload-artifact uses ACTIONS_RUNTIME_TOKEN, not this token.
       contents: read
       pull-requests: write
       issues: write
       id-token: write
+      # PROVISIONAL — carried over from claude-pr-review.yml so no consumer breaks
+      # mid-migration. A reusable workflow may not request more than its caller
+      # grants, and all 14 current callers already grant this, so it is free
+      # today. Evidence says it is unnecessary: `git log -S "actions: write"`
+      # shows one commit, af32344 "chore: add artifact", which escalated
+      # actions:read -> write alongside upload-artifact — and upload-artifact
+      # authenticates with ACTIONS_RUNTIME_TOKEN, not this token. Neither engine
+      # calls the Actions API, and claude-code-action's docs at the pinned SHA
+      # ask for `actions: read` only, for an opt-in feature we do not enable.
+      # Confirm on the first dogfood run, then drop it HERE FIRST, callers after.
+      actions: write
 
     concurrency:
       group: ai-pr-review-${{ github.event.pull_request.number }}
       cancel-in-progress: true
 
     env:
-      REVIEW_MODEL: ${{ inputs.model || 'k3' }}
+      # Single source of truth for the review file both the engine and the post
+      # step touch. REVIEW_MODEL is NOT here — it depends on `engine`, so the
+      # "Resolve and validate engine" step writes it to $GITHUB_ENV.
+      REVIEW_OUTPUT_FILE: /tmp/ai_review_output.txt
 
     steps:
       - name: Security Check - Validate User Access
@@ -98,6 +121,64 @@ jobs:
           [[ "$COLLAB" == "204" ]] && echo "✅ Verified collaborator" && exit 0
 
           echo "❌ Access denied for user: $ACTOR" && exit 1
+
+      - name: Resolve and validate engine
+        id: engine
+        env:
+          ENGINE_INPUT: ${{ inputs.engine }}
+          MODEL_INPUT: ${{ inputs.model }}
+        run: |
+          ENGINE="${ENGINE_INPUT:-kimi}"
+
+          # Single source of truth for the engine enum and its per-engine
+          # defaults. Every value accepted here MUST have a matching if-gated
+          # step in ENGINE DISPATCH below, and vice versa.
+          #
+          # Validating up front is what makes the dispatch block provably
+          # exhaustive: without it an unknown engine silently matches no gate and
+          # the run fails minutes later at "Post review" with "review file
+          # missing", which reads like an engine crash rather than a caller typo.
+          #
+          # metrics_agent is pinned per engine so migrating a repo onto this
+          # workflow is invisible to the dashboard, and a later engine switch
+          # shows up as a deliberate new series rather than a silent shift.
+          # ARTIFACT_PREFIX is pinned per engine for the same reason: the artifact
+          # name is a public interface that something outside this repo may poll,
+          # so routing a repo onto this workflow must not rename it.
+          case "$ENGINE" in
+            kimi)
+              DEFAULT_MODEL="k3"
+              METRICS_AGENT="ai_review"
+              ARTIFACT_PREFIX="ai-review"
+              ;;
+            anthropic)
+              DEFAULT_MODEL="claude-sonnet-5"
+              METRICS_AGENT="claude_review"
+              ARTIFACT_PREFIX="claude-review"
+              ;;
+            *)
+              echo "❌ Unknown engine: '$ENGINE'"
+              echo "   Supported values for the \`engine\` input: kimi, anthropic"
+              exit 1
+              ;;
+          esac
+
+          MODEL="${MODEL_INPUT:-$DEFAULT_MODEL}"
+
+          echo "engine=$ENGINE" >> "$GITHUB_OUTPUT"
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "artifact_prefix=$ARTIFACT_PREFIX" >> "$GITHUB_OUTPUT"
+
+          # Consumed by later `run:` scripts (review header, metrics payload,
+          # step summary) rather than by `if:`, so $GITHUB_ENV is fine here.
+          # Dispatch gates read steps.engine.outputs.engine instead.
+          {
+            echo "REVIEW_MODEL=$MODEL"
+            echo "REVIEW_ENGINE=$ENGINE"
+            echo "METRICS_AGENT=$METRICS_AGENT"
+          } >> "$GITHUB_ENV"
+
+          echo "✅ Engine: $ENGINE | Model: $MODEL | Metrics agent: $METRICS_AGENT"
 
       - name: Checkout PR head
         # Third-party actions are pinned to a commit SHA, not a tag: tags are
@@ -128,31 +209,59 @@ jobs:
         id: previous-review
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Canonical marker first — appended deterministically by the post step,
+          # so detection no longer depends on the model reproducing a visible
+          # header. Legacy markers let this run also reap comments left by
+          # workflows it supersedes; without them a PR open across a migration
+          # keeps one orphaned review comment per workflow, forever.
+          REVIEW_MARKERS: |
+            <!-- deriv-pr-review -->
+            AI PR Review Complete
+            ${{ inputs.legacy_markers }}
         run: |
           REPO="${{ github.repository }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
-          # Capture previous review before deleting
-          PREVIOUS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
-            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("AI PR Review Complete"))) | .body' 2>/dev/null || echo "")
+          # --paginate: the default page size is 30, so the previous single-call
+          # version silently missed review comments on busy PRs and left
+          # duplicates behind. Fetch once, filter locally, reuse for the delete.
+          # `jq -s add` merges the per-page arrays --paginate concatenates (do not
+          # use `--jq` with a whole-array filter — it applies per page).
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            | jq -s 'add' > /tmp/all_comments.json
 
-          if [ -n "$PREVIOUS" ]; then
-            echo "$PREVIOUS" > /tmp/previous_review.txt
-            echo "has_previous=true" >> $GITHUB_OUTPUT
+          # Substring matching, not regex, so marker content needs no escaping.
+          FILTER='
+            ($ENV.REVIEW_MARKERS | split("\n") | map(select(length > 0))) as $markers
+            | map(select(
+                .user.login == "github-actions[bot]"
+                and (.body as $b | any($markers[]; $b | contains(.)))
+              ))
+            | sort_by(.created_at)
+          '
 
-            # Extract the last reviewed commit SHA from the previous review metadata
-            LAST_REVIEWED_SHA=$(echo "$PREVIOUS" | grep -oP '(?<=<!-- reviewed-commit: )[a-f0-9]+(?= -->)' || echo "")
-            echo "last_reviewed_sha=$LAST_REVIEWED_SHA" >> $GITHUB_OUTPUT
+          # `last` — newest match only. A PR that crossed a migration legitimately
+          # holds two matching comments; concatenating them produced a MULTI-LINE
+          # last_reviewed_sha, which corrupts $GITHUB_OUTPUT.
+          jq -r "$FILTER | last | .body // empty" /tmp/all_comments.json \
+            > /tmp/previous_review.txt
+
+          if [ -s /tmp/previous_review.txt ]; then
+            echo "has_previous=true" >> "$GITHUB_OUTPUT"
+            LAST_REVIEWED_SHA=$(grep -oP '(?<=<!-- reviewed-commit: )[a-f0-9]+(?= -->)' \
+              /tmp/previous_review.txt | head -1 || true)
+            echo "last_reviewed_sha=$LAST_REVIEWED_SHA" >> "$GITHUB_OUTPUT"
+            echo "📋 Found previous review (last reviewed: ${LAST_REVIEWED_SHA:-unknown})"
           else
-            echo "" > /tmp/previous_review.txt
-            echo "has_previous=false" >> $GITHUB_OUTPUT
-            echo "last_reviewed_sha=" >> $GITHUB_OUTPUT
+            : > /tmp/previous_review.txt
+            echo "has_previous=false" >> "$GITHUB_OUTPUT"
+            echo "last_reviewed_sha=" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ No previous review found"
           fi
 
-          # Delete old comments
-          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
-            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("AI PR Review Complete"))) | .id' 2>/dev/null | \
-            xargs -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE 2>/dev/null || true
+          # Delete ALL matches, legacy included — not just the newest one.
+          jq -r "$FILTER | .[].id" /tmp/all_comments.json \
+            | xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE
 
       - name: Fetch acknowledged suggestions
         id: acknowledged
@@ -245,11 +354,16 @@ jobs:
             # Previous review section (follow-up mode only)
             if [[ "$HAS_PREVIOUS" == "true" ]]; then
               echo "---PREVIOUS_REVIEW---"
-              sed \
-                -e '/^## 🤖 AI PR Review Complete$/d' \
+              # Strips this workflow's own header AND any superseded workflow's,
+              # so a follow-up review does not re-feed a stale header back to the
+              # agent (which may echo it and break the next run's parsing).
+              # `Review generated via .*` collapses the historical variants.
+              sed -E \
+                -e '/^## 🤖 (AI|Claude) PR Review Complete$/d' \
                 -e '/^\*\*Model:\*\*/d' \
-                -e '/^\*Review generated via AI Code Review Action\*$/d' \
+                -e '/^\*Review generated via .*\*$/d' \
                 -e '/^<!-- reviewed-commit:.*-->$/d' \
+                -e '/^<!-- deriv-pr-review *-->$/d' \
                 /tmp/previous_review.txt
               echo "---END_PREVIOUS_REVIEW---"
               echo ""
@@ -285,17 +399,18 @@ jobs:
             printf -- '- **Repository:** %s\n' "$REPO"
             echo ""
 
-            # Output format requirements — the header and metadata tag are required for
-            # follow-up review detection on subsequent runs (same mechanism as before)
+            # Output format — the header is for human readers only. Follow-up
+            # detection no longer depends on the model reproducing it: the post
+            # step appends the canonical <!-- deriv-pr-review --> marker and the
+            # reviewed-commit tag itself. Do NOT ask the model to emit those tags,
+            # or a compliant model plus the append yields two and the SHA grep
+            # returns two values.
             echo "## Review Output Format Requirements"
             echo "Begin your PR review comment with exactly this header (no extra text before it):"
             echo ""
             echo "## 🤖 AI PR Review Complete"
             echo ""
             printf '**Model:** \`%s\` | **Review Type:** %s\n' "$REVIEW_MODEL" "$REVIEW_TYPE"
-            echo ""
-            echo "End your comment with this hidden metadata tag on its own line — it is required for follow-up review detection on the next push:"
-            printf '<!-- reviewed-commit: %s -->\n' "$CURRENT_SHA"
 
           } > /tmp/review_context.md
 
@@ -316,136 +431,86 @@ jobs:
           [[ -s /tmp/pr_diff.txt ]] || { echo "❌ PR diff is empty"; exit 1; }
           echo "✅ PR diff fetched ($(wc -c < /tmp/pr_diff.txt) bytes)"
 
-      # ======================= ENGINE: Kimi Code CLI =======================
-      # Everything below (strip config, install, configure, run) is the engine.
-      # Replacing it is a rewrite of all four steps, not a config change.
+      # ======================== ENGINE DISPATCH ============================
+      # Exactly one step below runs. `uses:` accepts no expressions, so engine
+      # selection cannot be a single dynamic step — it is N if-gated steps with
+      # static refs. These gates and the `case` in "Resolve and validate engine"
+      # are two halves of one thing: adding an engine means editing both.
       #
-      # Contract any replacement engine MUST satisfy:
-      #   - strips every file in the checkout that the PR could use to alter the
-      #     engine's runtime BEFORE the engine starts: context/instruction files,
-      #     permission or sandbox config, and MCP server declarations. This is a
-      #     security boundary, and the file names are engine-specific — e.g.
-      #     Kimi reads .kimi-code/{mcp.json,local.toml}, Codex reads .codex/rules/.
-      #     Do not carry this step over unchanged.
-      #   - reads /tmp/review_context.md, /tmp/pr_diff.txt and the checked-out code
-      #   - writes the final review markdown to /tmp/ai_review_output.txt
-      #   - grants NO shell/command tool. Everything the review needs is already on
-      #     disk, so the agent cannot post a comment, reach the network, or depend on
-      #     the engine's command-pattern matching being argv-aware. The post step
-      #     below is what guarantees exactly one comment.
-      # ===================================================================
+      # Engines are referenced by absolute deriv-com/shared-actions path, NOT
+      # `./.github/actions/...`: inside a reusable workflow a local path resolves
+      # against the CALLER's repo, which would break every external consumer.
+      # Same house style as docsync-ai.yml. Note this also means a PR branch
+      # still pulls engines from @master — to test an engine change pre-merge,
+      # temporarily point these refs at @<branch> and revert before merging.
+      #
+      # `timeout-minutes` lives on these calling steps because it is not
+      # supported on steps inside a composite action. Keep the values in sync.
+      #
+      # Each engine owns: stripping PR-supplied agent config, its own CLI and
+      # sandbox config, and granting the model NO shell tool. Each reads
+      # review_context_path + pr_diff_path and writes output_path. None of them
+      # post comments — the post step below is the only thing that can.
+      # =====================================================================
 
-      - name: Strip PR-supplied agent config (Kimi Code)
-        # Instruction files (prompt injection) plus .kimi-code/ — project-level
-        # mcp.json there can declare MCP servers (arbitrary local commands, not
-        # gated by the Bash deny rule) and local.toml can widen workspace access.
-        run: |
-          rm -f CLAUDE.md AGENTS.md KIMI.md
-          rm -rf .kimi-code
-
-      - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 22
-
-      - name: Install review CLI (Kimi Code)
-        env:
-          CLI_VERSION: ${{ inputs.cli_version || '0.34.0' }}
-        run: |
-          npm install -g "@moonshot-ai/kimi-code@${CLI_VERSION}"
-          kimi --version
-
-      - name: Configure review CLI (Kimi Code)
-        run: |
-          mkdir -p "$HOME/.kimi-code"
-
-          # Model + provider are defined entirely through the KIMI_MODEL_* env channel
-          # on the run step (no credentials written to disk); this config file only
-          # restricts the tool surface:
-          #   Read, Write(/tmp only), Grep, Glob — no Bash.
-          # The diff is pre-fetched to /tmp/pr_diff.txt, so the agent has no reason to
-          # run commands. Bash is left out of `enabled` AND denied by rule, so neither
-          # control has to be correct on its own.
-          cat > "$HOME/.kimi-code/config.toml" <<'EOF'
-          default_permission_mode = "auto"
-
-          [tools]
-          enabled = ["Read", "Write", "Grep", "Glob"]
-
-          # Rules are matched first-match-wins, before the mode default applies.
-          # Write is allowed only under /tmp (review output); everything else is
-          # denied so the agent cannot modify the checkout.
-          [[permission.rules]]
-          decision = "allow"
-          pattern = "Write(/tmp/*)"
-
-          [[permission.rules]]
-          decision = "deny"
-          pattern = "Write"
-
-          [[permission.rules]]
-          decision = "deny"
-          pattern = "Bash"
-          EOF
-
-          kimi doctor config
-
-      - name: Run AI PR review (Kimi Code)
+      - name: AI review (Kimi Code engine)
+        id: engine-kimi
+        if: steps.engine.outputs.engine == 'kimi'
         timeout-minutes: 60
-        env:
-          KIMI_MODEL_NAME: ${{ env.REVIEW_MODEL }}
-          KIMI_MODEL_API_KEY: ${{ secrets.LLM_API_KEY }}
-          KIMI_MODEL_BASE_URL: ${{ inputs.base_url || 'https://litellmsa.deriv.ai/v1' }}
-          KIMI_MODEL_MAX_CONTEXT_SIZE: ${{ inputs.max_context_size || '1048576' }}
-          KIMI_MODEL_PROVIDER_TYPE: kimi
-          KIMI_DISABLE_TELEMETRY: "1"
-          KIMI_CODE_NO_AUTO_UPDATE: "1"
-          CI: "1"
-        run: |
-          cat > /tmp/review_prompt.txt <<'EOF'
-          REPO: ${{ github.repository }}
-          PR NUMBER: ${{ github.event.pull_request.number }}
+        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_kimi@master
+        with:
+          repository: ${{ github.repository }}
+          pr_number: ${{ github.event.pull_request.number }}
+          review_context_path: /tmp/review_context.md
+          pr_diff_path: /tmp/pr_diff.txt
+          output_path: ${{ env.REVIEW_OUTPUT_FILE }}
+          model: ${{ steps.engine.outputs.model }}
+          base_url: ${{ inputs.base_url || 'https://litellmsa.deriv.ai/v1' }}
+          api_key: ${{ secrets.LLM_API_KEY }}
+          max_context_size: ${{ inputs.max_context_size || '1048576' }}
+          cli_version: ${{ inputs.cli_version || '0.34.0' }}
 
-          Follow these steps:
+      - name: AI review (Anthropic / Claude Code engine)
+        id: engine-anthropic
+        if: steps.engine.outputs.engine == 'anthropic'
+        timeout-minutes: 60
+        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_anthropic@master
+        with:
+          repository: ${{ github.repository }}
+          pr_number: ${{ github.event.pull_request.number }}
+          review_context_path: /tmp/review_context.md
+          pr_diff_path: /tmp/pr_diff.txt
+          output_path: ${{ env.REVIEW_OUTPUT_FILE }}
+          model: ${{ steps.engine.outputs.model }}
+          base_url: ${{ inputs.base_url || 'https://litellmsa.deriv.ai/v1' }}
+          api_key: ${{ secrets.LLM_API_KEY }}
 
-          1. Read /tmp/review_context.md — it contains full review instructions, PR context, previous review (if any), acknowledged suggestions to skip, and the required output format.
-
-          2. Read /tmp/pr_diff.txt — it contains the full diff for this PR (changed files and hunks), already fetched for you. You have no shell tool; everything you need is on disk.
-
-          3. For each changed file, use Read to open the full file — not just the diff hunk.
-             Full file context is required to understand the complete impact of each change.
-
-          4. For each changed file, identify and Read its dependencies:
-             - Imported modules, utilities, or shared helpers referenced in the changed code
-             - Type definitions, interfaces, or enums used by the changed code
-             - Parent components or callers if the changed file exports something modified
-             - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps
-
-          5. After reading ALL files and dependencies, compile your complete review.
-             Write the ENTIRE review to /tmp/ai_review_output.txt using the Write tool.
-             The next step posts that file as a single PR comment.
-          EOF
-
-          # No GH_TOKEN in this step's env and no Bash tool in the config: the agent
-          # cannot reach the GitHub API at all, so the post step below is the only
-          # thing that can comment on the PR.
-          kimi -p "$(cat /tmp/review_prompt.txt)"
-
-      # ==================== END ENGINE: Kimi Code CLI ======================
+      # ====================== END ENGINE DISPATCH ==========================
 
       - name: Post review as single PR comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_SHA: ${{ steps.build-context.outputs.current_sha }}
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
-          if [ ! -f /tmp/ai_review_output.txt ] || [ ! -s /tmp/ai_review_output.txt ]; then
-            echo "❌ Review file missing or empty — the review agent did not write output"
+          if [ ! -s "$REVIEW_OUTPUT_FILE" ]; then
+            echo "❌ Review file $REVIEW_OUTPUT_FILE missing or empty — the '$REVIEW_ENGINE' engine ran but produced no output"
             exit 1
           fi
 
-          echo "📬 Posting review ($(wc -c < /tmp/ai_review_output.txt) bytes)..."
-          gh pr comment "$PR_NUMBER" --body-file /tmp/ai_review_output.txt
+          # Append the detection metadata here rather than asking the model to
+          # emit it. Dedup on the next push then depends on this step, not on LLM
+          # instruction-following: one reworded header used to mean the next run
+          # could not find its own previous comment, leaving a duplicate forever.
+          {
+            printf '\n'
+            printf '<!-- reviewed-commit: %s -->\n' "$CURRENT_SHA"
+            printf '<!-- deriv-pr-review -->\n'
+          } >> "$REVIEW_OUTPUT_FILE"
+
+          echo "📬 Posting review ($(wc -c < "$REVIEW_OUTPUT_FILE") bytes)..."
+          gh pr comment "$PR_NUMBER" --body-file "$REVIEW_OUTPUT_FILE"
           echo "✅ Review posted"
 
       - name: Emit review event to metrics dashboard
@@ -459,18 +524,26 @@ jobs:
           PR_NUMBER="${{ github.event.pull_request.number }}"
           REPO="${{ github.repository }}"
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          REVIEW_SIZE=$(wc -c < /tmp/ai_review_output.txt 2>/dev/null || echo "0")
+          REVIEW_SIZE=$(wc -c < "$REVIEW_OUTPUT_FILE" 2>/dev/null || echo "0")
 
+          # $METRICS_AGENT comes from "Resolve and validate engine" and is pinned
+          # per engine so migrating a repo onto this workflow keeps feeding the
+          # dashboard series it already had. payload.engine is the durable
+          # dimension: whatever the dashboard groups on today, the data needed to
+          # tell the engines apart is present.
           # Build the event payload with jq so all values are safely escaped
+          # Fallbacks because this step is `if: always()` and therefore also runs
+          # when "Resolve and validate engine" failed, leaving these env unset.
           EVENT_PAYLOAD=$(jq -n \
-            --arg agent "ai_review" \
+            --arg agent "${METRICS_AGENT:-ai_review}" \
             --arg event_type "$EVENT_TYPE" \
             --arg timestamp "$TIMESTAMP" \
             --arg pr_number "$PR_NUMBER" \
             --arg repo "$REPO" \
             --arg commit_sha "$CURRENT_SHA" \
             --argjson review_size_bytes "$REVIEW_SIZE" \
-            --arg model "$REVIEW_MODEL" \
+            --arg model "${REVIEW_MODEL:-unknown}" \
+            --arg engine "${REVIEW_ENGINE:-unknown}" \
             '{
               agent: $agent,
               event_type: $event_type,
@@ -480,7 +553,8 @@ jobs:
               payload: {
                 commit_sha: $commit_sha,
                 review_size_bytes: $review_size_bytes,
-                model: $model
+                model: $model,
+                engine: $engine
               }
             }')
 
@@ -488,12 +562,13 @@ jobs:
           echo "### AI Review Event" >> "$GITHUB_STEP_SUMMARY"
           echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **agent** | \`ai_review\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **agent** | \`${METRICS_AGENT:-ai_review}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **event_type** | \`$EVENT_TYPE\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **pr_number** | \`$PR_NUMBER\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **repo** | \`$REPO\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **commit_sha** | \`$CURRENT_SHA\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **model** | \`$REVIEW_MODEL\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **engine** | \`${REVIEW_ENGINE:-unknown}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **model** | \`${REVIEW_MODEL:-unknown}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **review_size_bytes** | $REVIEW_SIZE |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **timestamp** | $TIMESTAMP |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -536,6 +611,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ai-review-summary-${{ github.run_id }}
+          # Engine-derived so migrating a repo onto this workflow does not rename
+          # an artifact something outside this repo may be polling: the anthropic
+          # engine keeps emitting claude-review-summary-*. The `||` fallback
+          # matters because this step is `if: always()` and so also runs when the
+          # resolve step failed, and an empty artifact name is a hard error.
+          name: ${{ steps.engine.outputs.artifact_prefix || 'ai-review' }}-summary-${{ github.run_id }}
           path: click2fix-payload.json
           retention-days: 7
