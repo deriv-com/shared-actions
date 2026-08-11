@@ -2,6 +2,31 @@
 
 This repository is dedicated to hosting reusable GitHub Actions YAML files that can be shared across different repositories. Centralizing common actions, to promote consistency and efficiency in workflows.
 
+It holds two kinds of thing:
+
+- **Reusable workflows** (`.github/workflows/*.yml`) — called from another repo with `jobs.<id>.uses:`
+- **Composite actions** (`.github/actions/<name>/action.yml`) — called from a step with `uses:`
+
+Everything here is consumed at `@master`, so **changes are live for every consumer as soon as they merge.** There is no release gate; the `v1`–`v4` tags are stale and referenced by nothing. Treat every change as immediately org-wide, and prefer changes that are revertable in one commit.
+
+### Reusable workflows
+
+| Workflow | Purpose | Docs | Status |
+|---|---|---|---|
+| [`ai-pr-review.yml`](.github/workflows/ai-pr-review.yml) | LLM PR review; engine selectable (`kimi` \| `anthropic`) | [AI_PR_REVIEW_README.md](.github/workflows/AI_PR_REVIEW_README.md) | ✅ active |
+| [`claude-pr-review.yml`](.github/workflows/claude-pr-review.yml) | Claude PR review | — | ⚠️ **deprecated** → use `ai-pr-review.yml` with `engine: anthropic` |
+| [`docsync-ai.yml`](.github/workflows/docsync-ai.yml) | Keeps docs in sync with code; scheduled + comment-triggered | — | ✅ active |
+| [`dependonme-bot.yml`](.github/workflows/dependonme-bot.yml) | Auto-fixes Dependabot security alerts | [DEPENDONME_BOT_README.md](.github/workflows/DEPENDONME_BOT_README.md) | ✅ active |
+| [`qa-checklist.yml`](.github/workflows/qa-checklist.yml) | Generates a QA checklist for a PR | — | ✅ active |
+
+### Deprecations
+
+| Workflow | Replacement | Notes |
+|---|---|---|
+| `claude-pr-review.yml` | `ai-pr-review.yml` with `engine: anthropic` | **Still a standalone duplicate** — converting it into a delegating shim is a tracked follow-up. See the [migration guide](.github/workflows/AI_PR_REVIEW_README.md#migrating-from-claude-pr-reviewyml). Do not delete until consumers are migrated and deprecation telemetry has been silent for 30 days. |
+
+Add a row here when deprecating anything. With no CHANGELOG and no release process, this table is the only coordination mechanism the repo has.
+
 #### Example Usage
 
 ```

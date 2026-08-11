@@ -1,0 +1,227 @@
+name: ai_review_engine_kimi
+description: >
+  AI PR review engine — Kimi Code CLI. Reads a pre-built review context and a
+  pre-fetched PR diff, reviews the checked-out code, and writes the review
+  markdown to a file. It posts nothing: it is given no GitHub token and no shell
+  tool. The calling workflow owns comment posting.
+
+# ENGINE CONTRACT (see .github/workflows/AI_PR_REVIEW_README.md)
+#
+# The caller guarantees: PR head is checked out; review_context_path and
+# pr_diff_path exist and are non-empty; the access gate has passed.
+#
+# This engine must: strip PR-supplied agent config FIRST, grant the model no
+# shell tool, write the review to output_path, and fail with an engine-named
+# message if it wrote nothing. It must not post PR comments or reach the GitHub
+# API on the model's behalf.
+#
+# Composite-action gotchas that constrain this file:
+#   - `secrets` is not readable here, so api_key arrives as an input.
+#   - `timeout-minutes` is invalid on the steps below; the caller's dispatch
+#     step carries it.
+#   - All steps share one log group, so failures must name this engine.
+
+inputs:
+  review_context_path:
+    description: "Path to the pre-built review context markdown (instructions, PR metadata, previous review, acknowledged suggestions, required output format). Built by the caller."
+    required: false
+    default: "/tmp/review_context.md"
+  pr_diff_path:
+    description: "Path to the pre-fetched PR diff. Fetched by the caller with the trusted token so this engine needs neither a shell tool nor network access."
+    required: false
+    default: "/tmp/pr_diff.txt"
+  output_path:
+    description: "Path this engine MUST write the final review markdown to. Its parent directory is the only location the CLI is permitted to write."
+    required: false
+    default: "/tmp/ai_review_output.txt"
+  repository:
+    description: "owner/repo of the PR under review (prompt preamble only)."
+    required: true
+  pr_number:
+    description: "Number of the PR under review (prompt preamble only)."
+    required: true
+  model:
+    description: "Model ID — k3, k3-256k, kimi-for-coding, kimi-for-coding-highspeed, or any model the LiteLLM proxy fronts. Maps to KIMI_MODEL_NAME."
+    required: false
+    default: "k3"
+  base_url:
+    description: "LLM API base URL. A trailing /v1 is appended when absent, so the identical value also works for the anthropic engine (which needs it removed). Maps to KIMI_MODEL_BASE_URL."
+    required: false
+    default: "https://litellmsa.deriv.ai/v1"
+  api_key:
+    description: "API key for base_url. Composite actions cannot read the `secrets` context, so the caller must pass this explicitly. Maps to KIMI_MODEL_API_KEY and is never written to disk."
+    required: true
+  max_context_size:
+    description: "Maximum context window in tokens (k3 = 1048576, k3-256k / kimi-for-coding = 262144). Must match the selected model, or the CLI over-packs context and the API rejects the request. Maps to KIMI_MODEL_MAX_CONTEXT_SIZE."
+    required: false
+    default: "1048576"
+  provider_type:
+    description: "Provider dialect for the Kimi CLI. Maps to KIMI_MODEL_PROVIDER_TYPE."
+    required: false
+    default: "kimi"
+  cli_version:
+    description: "Exact @moonshot-ai/kimi-code version to install. Pinned deliberately — the package is pre-1.0 and ships minor releases weekly, so `latest` risks both breaking changes and unreviewed code in a privileged job. Bump via PR."
+    required: false
+    default: "0.34.0"
+  node_version:
+    description: "Node.js version used to install and run the CLI."
+    required: false
+    default: "22"
+
+outputs:
+  output_path:
+    description: "Path the review markdown was written to."
+    value: ${{ steps.run.outputs.output_path }}
+
+runs:
+  using: composite
+  steps:
+    # Security boundary, not hygiene. Instruction files are a prompt-injection
+    # vector, and project-level .kimi-code/mcp.json can declare MCP servers —
+    # arbitrary local commands, NOT gated by the Bash deny rule below — while
+    # local.toml can widen workspace access. These paths are engine-specific:
+    # another engine must revisit this list, never inherit it.
+    - name: Strip PR-supplied agent config (Kimi Code)
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        # Recursive, not root-only. Instruction files are discovered per-directory
+        # as an agent reads files there, and this review's prompt explicitly tells
+        # it to traverse into dependencies — so a nested packages/foo/CLAUDE.md
+        # would reach the model as trusted instructions even with the root file
+        # deleted. .git is pruned so the sweep cannot corrupt the checkout.
+        find . -name .git -prune -o -type f \
+          \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' -o -name 'KIMI.md' \) \
+          -print0 | xargs -0 -r rm -f
+        find . -name .git -prune -o -type d -name '.kimi-code' \
+          -print0 | xargs -0 -r rm -rf
+        echo "✅ Stripped PR-supplied agent config (recursive)"
+
+    - name: Set up Node.js
+      # Pinned to a commit SHA, not a tag: tags are mutable, so `@v4` would let a
+      # retagged release execute in a job holding the LLM API key and a
+      # write-scoped GITHUB_TOKEN. Bump deliberately via PR.
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: ${{ inputs.node_version }}
+
+    - name: Install review CLI (Kimi Code)
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli_version }}
+      run: |
+        npm install -g "@moonshot-ai/kimi-code@${CLI_VERSION}"
+        kimi --version
+
+    - name: Configure review CLI (Kimi Code)
+      shell: bash
+      env:
+        OUTPUT_PATH: ${{ inputs.output_path }}
+      run: |
+        # Model and credentials are supplied entirely through the KIMI_MODEL_*
+        # env channel on the run step — nothing sensitive is written to disk.
+        # This file only restricts the tool surface: Read, Write (output dir
+        # only), Grep, Glob. No Bash. The diff is pre-fetched, so the agent has
+        # no reason to run commands.
+        #
+        # Rules are first-match-wins and evaluated before the mode default, so
+        # each `allow` must precede its `deny` catch-all. Bash is absent from
+        # `enabled` AND denied by rule, so neither control has to be correct on
+        # its own.
+        #
+        # $HOME/.kimi-code is recreated rather than merged: on a persistent
+        # self-hosted runner a previous run's config could otherwise survive
+        # (e.g. a leftover mcp.json, which `cat > config.toml` would not remove).
+        OUT_DIR="$(dirname "$OUTPUT_PATH")"
+        rm -rf "$HOME/.kimi-code"
+        mkdir -p "$HOME/.kimi-code"
+
+        cat > "$HOME/.kimi-code/config.toml" <<EOF
+        default_permission_mode = "auto"
+
+        [tools]
+        enabled = ["Read", "Write", "Grep", "Glob"]
+
+        [[permission.rules]]
+        decision = "allow"
+        pattern = "Write(${OUT_DIR}/*)"
+
+        [[permission.rules]]
+        decision = "deny"
+        pattern = "Write"
+
+        [[permission.rules]]
+        decision = "deny"
+        pattern = "Bash"
+        EOF
+
+        kimi doctor config
+
+    - name: Run AI PR review (Kimi Code)
+      id: run
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        KIMI_MODEL_NAME: ${{ inputs.model }}
+        KIMI_MODEL_API_KEY: ${{ inputs.api_key }}
+        KIMI_MODEL_MAX_CONTEXT_SIZE: ${{ inputs.max_context_size }}
+        KIMI_MODEL_PROVIDER_TYPE: ${{ inputs.provider_type }}
+        KIMI_DISABLE_TELEMETRY: "1"
+        KIMI_CODE_NO_AUTO_UPDATE: "1"
+        CI: "1"
+        INPUT_BASE_URL: ${{ inputs.base_url }}
+        CONTEXT_PATH: ${{ inputs.review_context_path }}
+        DIFF_PATH: ${{ inputs.pr_diff_path }}
+        OUTPUT_PATH: ${{ inputs.output_path }}
+      run: |
+        [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Kimi engine: missing or empty review context at $CONTEXT_PATH"; exit 1; }
+        [[ -s "$DIFF_PATH"    ]] || { echo "❌ Kimi engine: missing or empty PR diff at $DIFF_PATH"; exit 1; }
+
+        # base_url is accepted with or without a trailing /v1 so one caller-facing
+        # value works for every engine. The anthropic engine strips it instead.
+        BASE_URL="${INPUT_BASE_URL%/}"
+        [[ "$BASE_URL" == */v1 ]] || BASE_URL="${BASE_URL}/v1"
+        export KIMI_MODEL_BASE_URL="$BASE_URL"
+        echo "🔧 Kimi engine | model=$KIMI_MODEL_NAME | base_url=$BASE_URL"
+
+        # Quoted heredoc: the ${{ }} expressions below are substituted by Actions
+        # before bash sees this script, so no shell expansion happens in the
+        # prompt body.
+        cat > /tmp/review_prompt.txt <<'EOF'
+        REPO: ${{ inputs.repository }}
+        PR NUMBER: ${{ inputs.pr_number }}
+
+        Follow these steps:
+
+        1. Read ${{ inputs.review_context_path }} — it contains full review instructions, PR context, previous review (if any), acknowledged suggestions to skip, and the required output format.
+
+        2. Read ${{ inputs.pr_diff_path }} — it contains the full diff for this PR (changed files and hunks), already fetched for you. You have no shell tool; everything you need is on disk.
+
+        3. For each changed file, use Read to open the full file — not just the diff hunk.
+           Full file context is required to understand the complete impact of each change.
+
+        4. For each changed file, identify and Read its dependencies:
+           - Imported modules, utilities, or shared helpers referenced in the changed code
+           - Type definitions, interfaces, or enums used by the changed code
+           - Parent components or callers if the changed file exports something modified
+           - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps
+
+        5. After reading ALL files and dependencies, compile your complete review.
+           Write the ENTIRE review to ${{ inputs.output_path }} using the Write tool.
+           The caller posts that file as a single PR comment.
+        EOF
+
+        # No GitHub token in this step's env and no Bash tool in the config: the
+        # agent cannot reach the GitHub API at all. The caller's post step is the
+        # only thing that can comment on the PR.
+        kimi -p "$(cat /tmp/review_prompt.txt)"
+
+        # Fail here, named, rather than letting the caller report a generic
+        # "review file missing" — all steps in a composite action share one log
+        # group, so an engine-attributed error is what makes this locatable.
+        if [[ ! -s "$OUTPUT_PATH" ]]; then
+          echo "❌ Kimi engine: the CLI finished but wrote no review to $OUTPUT_PATH"
+          exit 1
+        fi
+        echo "✅ Kimi engine: review written ($(wc -c < "$OUTPUT_PATH") bytes)"
+        echo "output_path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"
