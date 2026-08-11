@@ -242,11 +242,18 @@ jobs:
             | jq -s 'add' > /tmp/all_comments.json
 
           # Substring matching, not regex, so marker content needs no escaping.
+          #
+          # The marker MUST be captured with `. as $marker` before piping into
+          # `$body`. Writing the condition as `$body | contains(.)` looks right but
+          # rebinds `.` to $body inside the pipe, making it `$body contains $body`
+          # — always true. That silently matched EVERY github-actions[bot] comment
+          # on the PR, so the delete loop below would reap unrelated bot comments
+          # (DocSync, QA checklist, ...) instead of just prior reviews.
           FILTER='
             ($ENV.REVIEW_MARKERS | split("\n") | map(select(length > 0))) as $markers
             | map(select(
                 .user.login == "github-actions[bot]"
-                and (.body as $b | any($markers[]; $b | contains(.)))
+                and (.body as $body | any($markers[]; . as $marker | $body | contains($marker)))
               ))
             | sort_by(.created_at)
           '
