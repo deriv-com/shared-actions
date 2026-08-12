@@ -50,6 +50,11 @@ on:
         required: false
         default: "0.34.0"
         type: string
+      provider_type:
+        description: "[engine-specific: kimi] Wire dialect the Kimi CLI speaks: kimi, anthropic, openai, openai_responses, google-genai, vertexai. Must match what `base_url` serves — `kimi` targets api.kimi.com/coding/v1 and a LiteLLM proxy rejects it with a bare 400, while `openai` speaks the plain /v1/chat/completions the proxy serves. Change this only alongside `base_url`. Ignored when engine is not `kimi`."
+        required: false
+        default: "openai"
+        type: string
       legacy_markers:
         description: "Newline-separated comment markers from superseded review workflows that this run should ALSO delete, so a PR does not accumulate one stale review comment per workflow it has been through. Empty this only once no open PR org-wide can still carry a pre-migration comment — see AI_PR_REVIEW_README.md."
         required: false
@@ -514,6 +519,7 @@ jobs:
           api_key: ${{ secrets.LLM_API_KEY }}
           max_context_size: ${{ inputs.max_context_size || '1048576' }}
           cli_version: ${{ inputs.cli_version || '0.34.0' }}
+          provider_type: ${{ inputs.provider_type || 'openai' }}
 
       - name: AI review (Anthropic / Claude Code engine)
         id: engine-anthropic

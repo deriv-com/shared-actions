@@ -57,9 +57,12 @@ inputs:
     required: false
     default: "1048576"
   provider_type:
-    description: "Provider dialect for the Kimi CLI. Maps to KIMI_MODEL_PROVIDER_TYPE."
+    description: "Wire dialect the CLI speaks. One of kimi, anthropic, openai, openai_responses, google-genai, vertexai. MUST match what base_url actually serves: `kimi` targets the Kimi Code platform at api.kimi.com/coding/v1 and a LiteLLM proxy rejects it with a bare 400; `openai` speaks plain /v1/chat/completions, which is what the proxy serves. Defaults to `openai` to pair with the default base_url. Maps to KIMI_MODEL_PROVIDER_TYPE."
     required: false
-    default: "kimi"
+    # Paired with the default base_url (the LiteLLM proxy). Verified: a plain
+    # OpenAI-style chat/completions request for kimi-k3 succeeds against that
+    # proxy, while provider_type=kimi returns 400 for the same model and key.
+    default: "openai"
   cli_version:
     description: "Exact @moonshot-ai/kimi-code version to install. Pinned deliberately — the package is pre-1.0 and ships minor releases weekly, so `latest` risks both breaking changes and unreviewed code in a privileged job. Bump via PR."
     required: false

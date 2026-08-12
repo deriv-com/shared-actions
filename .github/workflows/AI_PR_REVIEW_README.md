@@ -67,9 +67,24 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 | Shell | none (absent from `enabled` **and** denied by rule) | none (`--allowedTools` omits Bash) |
 | `Write` scope | output directory only (allow + catch-all deny) | **unscoped** — see below |
 | Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` |
-| Applicable inputs | all, incl. `max_context_size`, `cli_version` | all except `max_context_size`, `cli_version` |
+| Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type` | all except `max_context_size`, `cli_version`, `provider_type` |
 | `agent` reported | `ai_review` | `claude_review` |
 | Artifact | `ai-review-summary-*` | `claude-review-summary-*` |
+
+**`provider_type` must match what `base_url` serves.** This is the Kimi engine's
+sharpest trap, because a mismatch produces a bare `400 The request was invalid`
+that names nothing:
+
+| `base_url` | correct `provider_type` |
+|---|---|
+| `https://litellmsa.deriv.ai/v1` (LiteLLM proxy — the default) | `openai` |
+| `https://api.kimi.com/coding/v1` (direct Kimi Code platform) | `kimi` |
+
+The `kimi` dialect is built for the Kimi Code platform and a LiteLLM proxy
+rejects it, even when the model name and key are correct — verified by sending
+the same model and key as a plain `/v1/chat/completions` request, which
+succeeds. **Change these two inputs together, never one alone.** Valid types:
+`kimi`, `anthropic`, `openai`, `openai_responses`, `google-genai`, `vertexai`.
 
 **Model names belong to the endpoint, not the model.** `model` is passed through
 verbatim, so it must be whatever the thing in `base_url` calls it. On the Deriv
