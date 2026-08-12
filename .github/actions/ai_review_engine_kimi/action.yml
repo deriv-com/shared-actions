@@ -216,16 +216,41 @@ runs:
            The caller posts that file as a single PR comment.
         EOF
 
+        # Dumps the CLI's own log on failure. Without this the step reports only
+        # the CLI's one-line summary (e.g. "provider.api_error: 400 The request
+        # was invalid") and points at a log file on a runner that is already gone,
+        # so the actual provider request and response body are unrecoverable.
+        # Secrets registered with the job are masked in these logs by Actions.
+        dump_kimi_log() {
+          echo "::group::kimi-code.log (last 200 lines)"
+          tail -n 200 "$HOME/.kimi-code/logs/kimi-code.log" 2>/dev/null \
+            || echo "(no log at $HOME/.kimi-code/logs/kimi-code.log)"
+          echo "::endgroup::"
+          echo "ℹ️  Resolved provider config: model=$KIMI_MODEL_NAME base_url=$KIMI_MODEL_BASE_URL provider_type=$KIMI_MODEL_PROVIDER_TYPE"
+          echo "ℹ️  A 400 from the proxy most often means \`model\` is not a name it fronts."
+          echo "    The Kimi-platform ids (k3, k3-256k, kimi-for-coding) are valid at"
+          echo "    api.kimi.com/coding/v1, NOT necessarily on a LiteLLM proxy, which uses"
+          echo "    whatever aliases it was configured with. List them with:"
+          echo "      curl -H \"Authorization: Bearer \$LLM_API_KEY\" $KIMI_MODEL_BASE_URL/models"
+        }
+
         # No GitHub token in this step's env and no Bash tool in the config: the
         # agent cannot reach the GitHub API at all. The caller's post step is the
         # only thing that can comment on the PR.
-        kimi -p "$(cat /tmp/review_prompt.txt)"
+        kimi -p "$(cat /tmp/review_prompt.txt)" && KIMI_STATUS=0 || KIMI_STATUS=$?
+
+        if [[ "$KIMI_STATUS" -ne 0 ]]; then
+          echo "❌ Kimi engine: CLI exited $KIMI_STATUS"
+          dump_kimi_log
+          exit "$KIMI_STATUS"
+        fi
 
         # Fail here, named, rather than letting the caller report a generic
         # "review file missing" — all steps in a composite action share one log
         # group, so an engine-attributed error is what makes this locatable.
         if [[ ! -s "$OUTPUT_PATH" ]]; then
           echo "❌ Kimi engine: the CLI finished but wrote no review to $OUTPUT_PATH"
+          dump_kimi_log
           exit 1
         fi
         echo "✅ Kimi engine: review written ($(wc -c < "$OUTPUT_PATH") bytes)"
