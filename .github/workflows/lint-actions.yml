@@ -21,7 +21,6 @@ on:
     paths:
       - '.github/workflows/**'
       - '.github/actions/**'
-      - '.github/workflows/lint-actions.yml'
   workflow_dispatch:
 
 permissions:
@@ -30,6 +29,7 @@ permissions:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -39,7 +39,11 @@ jobs:
           # (mostly unquoted $GITHUB_OUTPUT redirects) that would drown the real
           # errors. This catches Actions-level mistakes — bad expressions, unknown
           # contexts, invalid keys — which is what actually breaks a run.
-          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          #
+          # Both the download script and the actionlint version are pinned, so a
+          # new actionlint release with new rules cannot turn this gate red
+          # without a change in this repo. Bump both deliberately.
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/3795ba2f6cb243eeca54c9d22e5c531cb9dcfb4a/scripts/download-actionlint.bash) 1.7.12
           ./actionlint -shellcheck= -color
 
       - name: Lint composite actions
@@ -48,6 +52,13 @@ jobs:
           # so this file cannot trip check 1 on itself.
           OPEN=$(printf '\x24\x7b\x7b')
           fail=0
+
+          # PyYAML ships preinstalled on ubuntu-latest. Fail loudly if that ever
+          # changes, rather than reporting every action as "invalid YAML".
+          if ! python3 -c 'import yaml' 2>/dev/null; then
+            echo "::error::PyYAML is not available on the runner — the YAML validity check cannot run"
+            exit 1
+          fi
 
           shopt -s nullglob
           actions=(.github/actions/*/action.yml .github/actions/*/action.yaml)
@@ -59,10 +70,11 @@ jobs:
           for f in "${actions[@]}"; do
             echo "── $f"
 
-            # 0. Valid YAML at all.
-            if ! npx --yes yaml-lint "$f" >/dev/null 2>&1; then
+            # 0. Valid YAML at all. PyYAML is preinstalled on the runner, so this
+            #    needs no network and no third-party code fetched at run time.
+            if ! err=$(python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$f" 2>&1); then
               echo "::error file=$f::invalid YAML"
-              npx --yes yaml-lint "$f" 2>&1 | tail -5
+              echo "$err" | tail -5
               fail=1
             fi
 
@@ -86,7 +98,7 @@ jobs:
             # 3. secrets context: unavailable inside composite actions. It does not
             #    error, it resolves to empty, so a credential silently goes missing.
             if grep -nE '\bsecrets\.[A-Za-z_]' "$f"; then
-              echo "::error file=$f::composite actions cannot read the secrets context — pass the value in as an input"
+              echo "::error file=$f::composite actions cannot read the secrets context — pass the value in as an input. This check also matches comments — reword them rather than referencing secrets.NAME."
               fail=1
             fi
           done
