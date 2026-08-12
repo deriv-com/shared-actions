@@ -36,24 +36,24 @@ on:
         default: ""
         type: string
       base_url:
-        description: "Base URL of the LLM API endpoint. Engine-neutral: a trailing /v1 is added or removed as each engine requires, so the same value works across engines. Use https://api.kimi.com/coding/v1 for direct Kimi Code platform access."
+        description: "Base URL of the LLM API endpoint. Engine-neutral: a trailing /v1 is added or removed as each engine requires, so the same value works across engines. Use https://api.kimi.com/coding/v1 for direct Kimi Code platform access. Empty resolves to https://litellmsa.deriv.ai/v1 (the LiteLLM proxy) — the real default lives in the 'Resolve and validate engine' step so it exists in exactly one place."
         required: false
-        default: "https://litellmsa.deriv.ai/v1"
+        default: ""
         type: string
       max_context_size:
-        description: "[engine-specific: kimi] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; the 256k variants are 262144. If a request fails with a 400 after the model name is confirmed correct, try lowering this. Ignored when engine is not `kimi`."
+        description: "[engine-specific: kimi] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; the 256k variants are 262144. If a request fails with a 400 after the model name is confirmed correct, try lowering this. Empty resolves to 1048576. Ignored when engine is not `kimi`."
         required: false
-        default: "1048576"
+        default: ""
         type: string
       cli_version:
-        description: "[engine-specific: kimi] Exact @moonshot-ai/kimi-code version to install. Pinned deliberately — the package is pre-1.0 and ships minor releases weekly, so `latest` risks both breaking changes and unreviewed code in a privileged job. Bump via PR. Ignored when engine is not `kimi`."
+        description: "[engine-specific: kimi] Exact @moonshot-ai/kimi-code version to install. Pinned deliberately — the package is pre-1.0 and ships minor releases weekly, so `latest` risks both breaking changes and unreviewed code in a privileged job. Empty resolves to the pinned version in the 'Resolve and validate engine' step; bump it there via PR. Ignored when engine is not `kimi`."
         required: false
-        default: "0.34.0"
+        default: ""
         type: string
       provider_type:
-        description: "[engine-specific: kimi] Wire dialect the Kimi CLI speaks: kimi, anthropic, openai, openai_responses, google-genai, vertexai. Must match what `base_url` serves — `kimi` targets api.kimi.com/coding/v1 and a LiteLLM proxy rejects it with a bare 400, while `openai` speaks the plain /v1/chat/completions the proxy serves. Change this only alongside `base_url`. Ignored when engine is not `kimi`."
+        description: "[engine-specific: kimi] Wire dialect the Kimi CLI speaks: kimi, anthropic, openai, openai_responses, google-genai, vertexai. Must match what `base_url` serves — `kimi` targets api.kimi.com/coding/v1 and a LiteLLM proxy rejects it with a bare 400, while `openai` speaks the plain /v1/chat/completions the proxy serves. Change this only alongside `base_url`. Empty resolves to `openai`. Ignored when engine is not `kimi`."
         required: false
-        default: "openai"
+        default: ""
         type: string
       legacy_markers:
         description: "Newline-separated comment markers from superseded review workflows that this run should ALSO delete, so a PR does not accumulate one stale review comment per workflow it has been through. Empty this only once no open PR org-wide can still carry a pre-migration comment — see AI_PR_REVIEW_README.md."
@@ -61,9 +61,9 @@ on:
         default: "Claude PR Review Complete"
         type: string
       prompt_gist_url:
-        description: "URL to fetch prompt template from"
+        description: "URL to fetch the prompt template from. Empty resolves to the DerivFE gist PINNED TO A REVISION — the unpinned raw/ URL would let a gist edit silently rewrite the review agent's instructions for every consumer, live, with no PR. To roll out a new prompt, update the revision hash in the 'Resolve and validate engine' step via PR."
         required: false
-        default: "https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/claude-review-format.md"
+        default: ""
         type: string
     secrets:
       LLM_API_KEY:
@@ -80,7 +80,12 @@ jobs:
   ai-review:
     runs-on:
       group: github_claude_code_reviewer
-    if: github.event.pull_request.draft == false
+    # Bot actors are skipped, not failed: dependabot and friends are not org
+    # members, so they cannot pass the access gate below — without this guard
+    # every bot PR produces a red run that reads like a workflow regression.
+    # Skipping also avoids spending LLM tokens on lockfile-bump PRs. A human
+    # actor failing the gate still fails red, which is the correct signal.
+    if: github.event.pull_request.draft == false && !endsWith(github.actor, '[bot]')
 
     permissions:
       # `actions:` is deliberately absent. Permissions can only be reduced, never
@@ -110,10 +115,33 @@ jobs:
       cancel-in-progress: true
 
     env:
-      # Single source of truth for the review file both the engine and the post
-      # step touch. REVIEW_MODEL is NOT here — it depends on `engine`, so the
-      # "Resolve and validate engine" step writes it to $GITHUB_ENV.
+      # Single source of truth for the three files the steps and the engine
+      # hand to each other. REVIEW_MODEL is NOT here — it depends on `engine`,
+      # so the "Resolve and validate engine" step writes it to $GITHUB_ENV.
       REVIEW_OUTPUT_FILE: /tmp/ai_review_output.txt
+      REVIEW_CONTEXT_FILE: /tmp/review_context.md
+      PR_DIFF_FILE: /tmp/pr_diff.txt
+
+      # Files whose diffs carry no review signal ANYWHERE — lockfiles and
+      # generated/minified/vendored output — filtered from BOTH the main
+      # pre-fetched diff and the incremental diff. Deliberately NARROW: test
+      # files, styles and docs are NOT here, because the main diff is what the
+      # initial review sees and test coverage is a stated review criterion —
+      # filtering *.spec.* from it silently defeated that. The incremental
+      # diff appends those extras where it is built, since there the filter
+      # only scopes "what changed since last review", not what gets reviewed
+      # at all.
+      NOISE_PATTERN: 'package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.snap|\.min\.js|\.min\.css|dist/|build/|\.generated\.|__generated__|/vendor/|\.pb\.go|_test\.snap'
+
+      # Comment markers identifying a review comment as ours. Canonical marker
+      # first — appended deterministically by the post step, so detection never
+      # depends on the model reproducing a visible header. Legacy markers let a
+      # run also reap comments left by workflows this one supersedes. Job-level
+      # because both the capture step and the post step (which deletes) need it.
+      REVIEW_MARKERS: |
+        <!-- deriv-pr-review -->
+        AI PR Review Complete
+        ${{ inputs.legacy_markers }}
 
     steps:
       - name: Security Check - Validate User Access
@@ -138,6 +166,11 @@ jobs:
         env:
           ENGINE_INPUT: ${{ inputs.engine }}
           MODEL_INPUT: ${{ inputs.model }}
+          BASE_URL_INPUT: ${{ inputs.base_url }}
+          MAX_CONTEXT_INPUT: ${{ inputs.max_context_size }}
+          CLI_VERSION_INPUT: ${{ inputs.cli_version }}
+          PROVIDER_TYPE_INPUT: ${{ inputs.provider_type }}
+          PROMPT_GIST_URL_INPUT: ${{ inputs.prompt_gist_url }}
         run: |
           ENGINE="${ENGINE_INPUT:-kimi}"
 
@@ -179,9 +212,32 @@ jobs:
 
           MODEL="${MODEL_INPUT:-$DEFAULT_MODEL}"
 
-          echo "engine=$ENGINE" >> "$GITHUB_OUTPUT"
-          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
-          echo "artifact_prefix=$ARTIFACT_PREFIX" >> "$GITHUB_OUTPUT"
+          # Engine-neutral defaults, resolved HERE and nowhere else. The input
+          # declarations default to "" and every consumer of these values reads
+          # the step outputs, so each default value exists in exactly one place
+          # — previously they were duplicated between the input declaration and
+          # `||` fallbacks at each use site, which is how defaults drift apart.
+          #
+          # The gist URL is pinned to a revision: the bare raw/ URL is mutable,
+          # and whoever edits the gist would rewrite the review agent's
+          # instructions for every consumer with no PR and no audit trail. To
+          # ship a new prompt, edit the gist, then bump this hash via PR.
+          BASE_URL="${BASE_URL_INPUT:-https://litellmsa.deriv.ai/v1}"
+          MAX_CONTEXT="${MAX_CONTEXT_INPUT:-1048576}"
+          CLI_VERSION="${CLI_VERSION_INPUT:-0.34.0}"
+          PROVIDER_TYPE="${PROVIDER_TYPE_INPUT:-openai}"
+          PROMPT_GIST_URL="${PROMPT_GIST_URL_INPUT:-https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/2d5131aa058801e99fe77f69db124bf583f7d3ea/claude-review-format.md}"
+
+          {
+            echo "engine=$ENGINE"
+            echo "model=$MODEL"
+            echo "artifact_prefix=$ARTIFACT_PREFIX"
+            echo "base_url=$BASE_URL"
+            echo "max_context_size=$MAX_CONTEXT"
+            echo "cli_version=$CLI_VERSION"
+            echo "provider_type=$PROVIDER_TYPE"
+            echo "prompt_gist_url=$PROMPT_GIST_URL"
+          } >> "$GITHUB_OUTPUT"
 
           # Consumed by later `run:` scripts (review header, metrics payload,
           # step summary) rather than by `if:`, so $GITHUB_ENV is fine here.
@@ -202,14 +258,20 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
+          # head.sha, NOT head.ref. This is pull_request_target: the access gate
+          # above validated the actor of THIS event, and checking out the branch
+          # name instead would fetch whatever the branch points at by now —
+          # including commits pushed after the gate ran, which nothing validated.
+          # Pinning to the event's SHA also makes the reviewed-commit marker mean
+          # what it says. Concurrency narrows that race; this closes it.
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 20
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Fetch prompt template from Gist
         id: fetch-prompt
         env:
-          PROMPT_GIST_URL: ${{ inputs.prompt_gist_url || 'https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/claude-review-format.md' }}
+          PROMPT_GIST_URL: ${{ steps.engine.outputs.prompt_gist_url }}
         run: |
           # -f matters: without it curl exits 0 on 4xx/5xx and returns the error
           # page body, which is non-empty — so the emptiness check below would
@@ -224,53 +286,58 @@ jobs:
           printf '%s' "$PROMPT_TEMPLATE" > /tmp/prompt_template.txt
           echo "✅ Prompt template saved ($(wc -c < /tmp/prompt_template.txt) bytes)"
 
-      - name: Capture and cleanup previous review
+      - name: Capture previous review
+        # Capture ONLY. Deletion used to happen here too, which meant any failure
+        # or cancellation in the ~60 minutes between this step and the post step
+        # (an engine 400, a timeout, a cancel-in-progress from a new push) left
+        # the PR with NO review comment and destroyed the reviewed-commit SHA —
+        # so the next run silently degraded to an initial review. The post step
+        # now deletes only AFTER the replacement is live, closing that window
+        # entirely.
         id: previous-review
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Canonical marker first — appended deterministically by the post step,
-          # so detection no longer depends on the model reproducing a visible
-          # header. Legacy markers let this run also reap comments left by
-          # workflows it supersedes; without them a PR open across a migration
-          # keeps one orphaned review comment per workflow, forever.
-          REVIEW_MARKERS: |
-            <!-- deriv-pr-review -->
-            AI PR Review Complete
-            ${{ inputs.legacy_markers }}
         run: |
           REPO="${{ github.repository }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
-          # --paginate: the default page size is 30, so the previous single-call
-          # version silently missed review comments on busy PRs and left
-          # duplicates behind. Fetch once, filter locally, reuse for the delete.
-          # `jq -s add` merges the per-page arrays --paginate concatenates (do not
-          # use `--jq` with a whole-array filter — it applies per page).
-          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            | jq -s 'add' > /tmp/all_comments.json
-
+          # Shared with the post step's delete, so capture and delete can never
+          # match different comment sets. REVIEW_MARKERS is job-level env for the
+          # same reason ($ENV.REVIEW_MARKERS reads it at jq run time).
+          #
           # Substring matching, not regex, so marker content needs no escaping.
           #
           # The marker MUST be captured with `. as $marker` before piping into
           # `$body`. Writing the condition as `$body | contains(.)` looks right but
           # rebinds `.` to $body inside the pipe, making it `$body contains $body`
           # — always true. That silently matched EVERY github-actions[bot] comment
-          # on the PR, so the delete loop below would reap unrelated bot comments
+          # on the PR, so the delete would reap unrelated bot comments
           # (DocSync, QA checklist, ...) instead of just prior reviews.
-          FILTER='
-            ($ENV.REVIEW_MARKERS | split("\n") | map(select(length > 0))) as $markers
-            | map(select(
-                .user.login == "github-actions[bot]"
-                and (.body as $body | any($markers[]; . as $marker | $body | contains($marker)))
-              ))
-            | sort_by(.created_at)
-          '
+          cat > /tmp/review_marker_filter.jq <<'JQ'
+          ($ENV.REVIEW_MARKERS | split("\n") | map(select(length > 0))) as $markers
+          | map(select(
+              .user.login == "github-actions[bot]"
+              and (.body as $body | any($markers[]; . as $marker | $body | contains($marker)))
+            ))
+          | sort_by(.created_at)
+          JQ
+
+          # --paginate: the default page size is 30, so the previous single-call
+          # version silently missed review comments on busy PRs and left
+          # duplicates behind. Fetch once, filter locally; the acknowledged-
+          # suggestions step reuses this file rather than re-fetching.
+          # `jq -s 'add // []'` merges the per-page arrays --paginate concatenates
+          # (do not use `--jq` with a whole-array filter — it applies per page);
+          # `// []` guards the zero-output case, where `add` yields null and the
+          # filter's map() would error.
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            | jq -s 'add // []' > /tmp/all_comments.json
 
           # `last` — newest match only. A PR that crossed a migration legitimately
           # holds two matching comments; concatenating them produced a MULTI-LINE
           # last_reviewed_sha, which corrupts $GITHUB_OUTPUT.
-          jq -r "$FILTER | last | .body // empty" /tmp/all_comments.json \
-            > /tmp/previous_review.txt
+          jq -f /tmp/review_marker_filter.jq /tmp/all_comments.json \
+            | jq -r 'last | .body // empty' > /tmp/previous_review.txt
 
           if [ -s /tmp/previous_review.txt ]; then
             echo "has_previous=true" >> "$GITHUB_OUTPUT"
@@ -285,44 +352,54 @@ jobs:
             echo "ℹ️ No previous review found"
           fi
 
-          # Delete ALL matches, legacy included — not just the newest one.
-          jq -r "$FILTER | .[].id" /tmp/all_comments.json \
-            | xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE
-
       - name: Fetch acknowledged suggestions
         id: acknowledged
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          REPO="${{ github.repository }}"
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-
           echo "🔍 Scanning for Click2Fix - Acknowledge comments..."
 
-          # Find comments containing "Click2Fix - Acknowledge" and extract bullet points
-          ACKNOWLEDGE_COMMENT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
-            --jq '.[] | select(.body | contains("Click2Fix - Acknowledge")) | .body' 2>/dev/null || echo "")
+          # Reads /tmp/all_comments.json from the capture step instead of calling
+          # the API again — which also fixes two bugs the old separate call had:
+          # it was unpaginated (an acknowledge comment past the first 30 comments
+          # was silently ignored), and it swallowed API errors as "no comment".
+          #
+          # The author filter is the important part. Acknowledged items are fed
+          # to the model as "must NOT appear in your review", so an unrestricted
+          # match is a finding-suppression channel: ANY account could comment
+          # "Click2Fix - Acknowledge" + "- concerns about the auth change" and
+          # the reviewer would be instructed to stay silent about it. Restricted
+          # to the posting bot and to accounts GitHub attests have repo standing
+          # (author_association is computed server-side and cannot be spoofed).
+          jq -r '
+            map(select(
+              (.body | contains("Click2Fix - Acknowledge"))
+              and (
+                .user.login == "github-actions[bot]"
+                or (.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
+              )
+            ))
+            | .[].body
+          ' /tmp/all_comments.json > /tmp/acknowledge_comments.txt
 
-          if [ -n "$ACKNOWLEDGE_COMMENT" ]; then
-            echo "✅ Found acknowledge comment"
+          if [ -s /tmp/acknowledge_comments.txt ]; then
+            echo "✅ Found acknowledge comment(s)"
 
-            # Extract bullet points (lines starting with - or *) using printf for safer handling
-            ACKNOWLEDGED_ITEMS=$(printf '%s\n' "$ACKNOWLEDGE_COMMENT" | grep -E '^\s*[-*]\s+' | sed 's/^\s*[-*]\s*//' || echo "")
+            # Extract bullet points (lines starting with - or *)
+            ACKNOWLEDGED_ITEMS=$(grep -E '^\s*[-*]\s+' /tmp/acknowledge_comments.txt | sed 's/^\s*[-*]\s*//' || true)
 
             if [ -n "$ACKNOWLEDGED_ITEMS" ]; then
               printf '%s\n' "$ACKNOWLEDGED_ITEMS" > /tmp/acknowledged_items.txt
-              echo "has_acknowledged=true" >> $GITHUB_OUTPUT
+              echo "has_acknowledged=true" >> "$GITHUB_OUTPUT"
               echo "📋 Acknowledged items:"
               printf '%s\n' "$ACKNOWLEDGED_ITEMS"
             else
-              echo "" > /tmp/acknowledged_items.txt
-              echo "has_acknowledged=false" >> $GITHUB_OUTPUT
+              : > /tmp/acknowledged_items.txt
+              echo "has_acknowledged=false" >> "$GITHUB_OUTPUT"
               echo "ℹ️ No bullet items found in acknowledge comment"
             fi
           else
-            echo "" > /tmp/acknowledged_items.txt
-            echo "has_acknowledged=false" >> $GITHUB_OUTPUT
-            echo "ℹ️ No Click2Fix - Acknowledge comment found"
+            : > /tmp/acknowledged_items.txt
+            echo "has_acknowledged=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ No Click2Fix - Acknowledge comment found (from an authorized author)"
           fi
 
       - name: Build review context
@@ -359,15 +436,18 @@ jobs:
           [[ "$HAS_PREVIOUS" == "true" ]] && EVENT_TYPE="followup_review" || EVENT_TYPE="initial_review"
           echo "event_type=$EVENT_TYPE" >> $GITHUB_OUTPUT
 
-          # Noise pattern for incremental diff filtering — same set as before
-          NOISE_PATTERN='package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.snap|\.min\.js|\.min\.css|dist/|build/|\.generated\.|__generated__|/vendor/|\.pb\.go|_test\.snap|\.spec\.(tsx?|jsx?)|/__tests__/|\.scss$|\.md$'
-
-          # Pre-compute incremental diff (changes since last review) for follow-up mode
+          # Pre-compute incremental diff (changes since last review) for follow-up
+          # mode. The shared NOISE_PATTERN (job env) is extended with test, style
+          # and doc files HERE ONLY: in this diff the filter merely scopes "what
+          # changed since the last review", while in the main diff (which uses
+          # NOISE_PATTERN alone) it would remove those files from review
+          # entirely.
+          INCREMENTAL_NOISE_PATTERN="${NOISE_PATTERN}"'|\.spec\.(tsx?|jsx?)|/__tests__/|\.scss$|\.md$'
           echo "" > /tmp/incremental_diff.txt
           if [[ "$HAS_PREVIOUS" == "true" && -n "$LAST_REVIEWED_SHA" ]]; then
             echo "📋 Generating incremental diff since last reviewed commit: $LAST_REVIEWED_SHA"
             if git cat-file -e "$LAST_REVIEWED_SHA" 2>/dev/null; then
-              git diff "$LAST_REVIEWED_SHA"..HEAD | awk -v noise="$NOISE_PATTERN" '
+              git diff "$LAST_REVIEWED_SHA"..HEAD | awk -v noise="$INCREMENTAL_NOISE_PATTERN" '
                 /^diff --git / { in_noise = ($0 ~ noise); if (!in_noise) print; next }
                 !in_noise { print }
               ' > /tmp/incremental_diff.txt
@@ -449,6 +529,23 @@ jobs:
               echo ""
             fi
 
+            # Review procedure — engine-neutral, so it lives here rather than
+            # being duplicated (and drifting) in every engine's prompt. Engines
+            # point the model at this file; this section takes over from there.
+            echo "## Review Procedure"
+            echo ""
+            echo "Work through these steps in order:"
+            echo ""
+            echo "1. Read $PR_DIFF_FILE — the full diff for this PR (changed files and hunks), already fetched for you. You have no shell tool; everything you need is on disk."
+            echo "2. For each changed file, use Read to open the full file — not just the diff hunk. Full file context is required to understand the complete impact of each change."
+            echo "3. For each changed file, identify and Read its dependencies:"
+            echo "   - Imported modules, utilities, or shared helpers referenced in the changed code"
+            echo "   - Type definitions, interfaces, or enums used by the changed code"
+            echo "   - Parent components or callers if the changed file exports something modified"
+            echo "   - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps"
+            echo "4. After reading ALL files and dependencies, compile your complete review and write the ENTIRE review to $REVIEW_OUTPUT_FILE using the Write tool. Do not post, create, or update any PR or issue comment — writing that file is the whole job; the caller posts it as a single comment."
+            echo ""
+
             # Output format — the header is for human readers only. Follow-up
             # detection no longer depends on the model reproducing it: the post
             # step appends the canonical <!-- deriv-pr-review --> marker and the
@@ -462,9 +559,9 @@ jobs:
             echo ""
             printf '**Model:** \`%s\` | **Review Type:** %s\n' "$REVIEW_MODEL" "$REVIEW_TYPE"
 
-          } > /tmp/review_context.md
+          } > "$REVIEW_CONTEXT_FILE"
 
-          echo "📋 Review context built ($(wc -c < /tmp/review_context.md) bytes)"
+          echo "📋 Review context built ($(wc -c < "$REVIEW_CONTEXT_FILE") bytes)"
 
       - name: Fetch PR diff for review
         # Fetched here with the trusted token rather than by the review agent, so the
@@ -477,9 +574,28 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
-          gh pr diff "$PR_NUMBER" > /tmp/pr_diff.txt
-          [[ -s /tmp/pr_diff.txt ]] || { echo "❌ PR diff is empty"; exit 1; }
-          echo "✅ PR diff fetched ($(wc -c < /tmp/pr_diff.txt) bytes)"
+          gh pr diff "$PR_NUMBER" > /tmp/pr_diff_raw.txt
+          [[ -s /tmp/pr_diff_raw.txt ]] || { echo "❌ PR diff is empty"; exit 1; }
+
+          # Same noise filter the incremental diff gets (NOISE_PATTERN is job
+          # env): lockfile and generated-file churn carries no review signal but
+          # eats context window — and the PRs with the most lockfile churn are
+          # exactly the ones most likely to blow the model's context budget.
+          awk -v noise="$NOISE_PATTERN" '
+            /^diff --git / { in_noise = ($0 ~ noise); if (!in_noise) print; next }
+            !in_noise { print }
+          ' /tmp/pr_diff_raw.txt > "$PR_DIFF_FILE"
+
+          # A PR whose every file matches the noise pattern (a lockfile-only
+          # bump, a docs-only change) still deserves a review of what it does
+          # contain — fall back to the unfiltered diff rather than handing the
+          # engine an empty file, which it treats as a hard error.
+          if [[ ! -s "$PR_DIFF_FILE" ]]; then
+            echo "ℹ️ Every changed file matched the noise filter — using the unfiltered diff"
+            cp /tmp/pr_diff_raw.txt "$PR_DIFF_FILE"
+          fi
+
+          echo "✅ PR diff fetched ($(wc -c < /tmp/pr_diff_raw.txt) bytes raw, $(wc -c < "$PR_DIFF_FILE") after noise filter)"
 
       # ======================== ENGINE DISPATCH ============================
       # Exactly one step below runs. `uses:` accepts no expressions, so engine
@@ -511,15 +627,15 @@ jobs:
         with:
           repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
-          review_context_path: /tmp/review_context.md
-          pr_diff_path: /tmp/pr_diff.txt
+          review_context_path: ${{ env.REVIEW_CONTEXT_FILE }}
+          pr_diff_path: ${{ env.PR_DIFF_FILE }}
           output_path: ${{ env.REVIEW_OUTPUT_FILE }}
           model: ${{ steps.engine.outputs.model }}
-          base_url: ${{ inputs.base_url || 'https://litellmsa.deriv.ai/v1' }}
+          base_url: ${{ steps.engine.outputs.base_url }}
           api_key: ${{ secrets.LLM_API_KEY }}
-          max_context_size: ${{ inputs.max_context_size || '1048576' }}
-          cli_version: ${{ inputs.cli_version || '0.34.0' }}
-          provider_type: ${{ inputs.provider_type || 'openai' }}
+          max_context_size: ${{ steps.engine.outputs.max_context_size }}
+          cli_version: ${{ steps.engine.outputs.cli_version }}
+          provider_type: ${{ steps.engine.outputs.provider_type }}
 
       - name: AI review (Anthropic / Claude Code engine)
         id: engine-anthropic
@@ -529,11 +645,11 @@ jobs:
         with:
           repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
-          review_context_path: /tmp/review_context.md
-          pr_diff_path: /tmp/pr_diff.txt
+          review_context_path: ${{ env.REVIEW_CONTEXT_FILE }}
+          pr_diff_path: ${{ env.PR_DIFF_FILE }}
           output_path: ${{ env.REVIEW_OUTPUT_FILE }}
           model: ${{ steps.engine.outputs.model }}
-          base_url: ${{ inputs.base_url || 'https://litellmsa.deriv.ai/v1' }}
+          base_url: ${{ steps.engine.outputs.base_url }}
           api_key: ${{ secrets.LLM_API_KEY }}
 
       # ====================== END ENGINE DISPATCH ==========================
@@ -542,27 +658,85 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CURRENT_SHA: ${{ steps.build-context.outputs.current_sha }}
+          # For the exfiltration guard below only — never interpolated into a
+          # command line, and grep reads it from the environment.
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
 
           if [ ! -s "$REVIEW_OUTPUT_FILE" ]; then
             echo "❌ Review file $REVIEW_OUTPUT_FILE missing or empty — the '$REVIEW_ENGINE' engine ran but produced no output"
             exit 1
           fi
 
+          # Exfiltration guard. Actions masks secrets in LOGS, not in comment
+          # bodies — and the model's output is derived from attacker-influenced
+          # input (the diff, the PR description). If an injection ever talks the
+          # model into echoing its credentials (e.g. read from /proc/*/environ),
+          # this is the last point where posting them publicly can be stopped.
+          # Everything up to the post below is deliberately fail-CLOSED: on any
+          # failure in this step's checks, the previous review is untouched.
+          if [[ -n "$LLM_API_KEY" ]] && grep -qF -- "$LLM_API_KEY" "$REVIEW_OUTPUT_FILE"; then
+            echo "❌ Review output contains the LLM API key — refusing to post. Rotate the key and inspect the run."
+            exit 1
+          fi
+
+          # GitHub caps issue comments at 65536 characters; a 422 here used to
+          # fail the run. Truncate with headroom for the markers appended below,
+          # preserving the full text in the step log first. head -c can split a
+          # multibyte character at the cut; iconv -c drops the partial sequence
+          # so the body stays valid UTF-8 (GitHub rejects invalid encodings).
+          MAX_BODY=64000
+          SIZE=$(wc -c < "$REVIEW_OUTPUT_FILE")
+          if [ "$SIZE" -gt "$MAX_BODY" ]; then
+            echo "::group::Full review before truncation ($SIZE bytes)"
+            cat "$REVIEW_OUTPUT_FILE"
+            echo "::endgroup::"
+            # `|| true` is load-bearing: when the cut lands mid-character, iconv
+            # writes the valid prefix but still exits non-zero ("incomplete
+            # character"), and under this step's pipefail that would fail the
+            # run on exactly the input truncation exists to handle.
+            head -c "$MAX_BODY" "$REVIEW_OUTPUT_FILE" | iconv -f UTF-8 -t UTF-8 -c > /tmp/review_truncated.txt || true
+            printf '\n\n> ⚠️ Review truncated from %s to %s bytes to fit GitHub'"'"'s comment size limit. The full text is in this run'"'"'s job log.\n' \
+              "$SIZE" "$MAX_BODY" >> /tmp/review_truncated.txt
+            mv /tmp/review_truncated.txt "$REVIEW_OUTPUT_FILE"
+          fi
+
           # Append the detection metadata here rather than asking the model to
           # emit it. Dedup on the next push then depends on this step, not on LLM
           # instruction-following: one reworded header used to mean the next run
           # could not find its own previous comment, leaving a duplicate forever.
+          # (After truncation, so the markers can never be cut off.)
           {
             printf '\n'
             printf '<!-- reviewed-commit: %s -->\n' "$CURRENT_SHA"
             printf '<!-- deriv-pr-review -->\n'
           } >> "$REVIEW_OUTPUT_FILE"
 
+          # Reap-list for prior reviews, captured BEFORE posting — the new
+          # comment carries the markers too, so a fetch-after-post would match
+          # (and delete) the comment it just created. Fresh fetch, since
+          # comments may have changed during the engine run; same filter file
+          # the capture step used, ALL matches including legacy.
+          #
+          # Post FIRST, delete after. Deletion used to happen in the capture
+          # step, an hour earlier — any failure in between left the PR with no
+          # review at all and destroyed the reviewed-commit SHA. Deleting even
+          # a second before posting kept a sliver of that: a failed post after
+          # a successful delete is the same loss in miniature. This ordering
+          # trades it for the harmless inverse — a transient duplicate that the
+          # next run reaps, since its reap-list is built the same way.
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            | jq -s 'add // []' > /tmp/comments_at_post.json
+          jq -f /tmp/review_marker_filter.jq /tmp/comments_at_post.json \
+            | jq -r '.[].id' > /tmp/reap_ids.txt
+
           echo "📬 Posting review ($(wc -c < "$REVIEW_OUTPUT_FILE") bytes)..."
           gh pr comment "$PR_NUMBER" --body-file "$REVIEW_OUTPUT_FILE"
-          echo "✅ Review posted"
+
+          xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE < /tmp/reap_ids.txt
+          echo "✅ Review posted, previous review(s) reaped"
 
       - name: Emit review event to metrics dashboard
         if: always()
@@ -587,7 +761,7 @@ jobs:
           # when "Resolve and validate engine" failed, leaving these env unset.
           EVENT_PAYLOAD=$(jq -n \
             --arg agent "${METRICS_AGENT:-ai_review}" \
-            --arg event_type "$EVENT_TYPE" \
+            --arg event_type "${EVENT_TYPE:-unknown}" \
             --arg timestamp "$TIMESTAMP" \
             --arg pr_number "$PR_NUMBER" \
             --arg repo "$REPO" \

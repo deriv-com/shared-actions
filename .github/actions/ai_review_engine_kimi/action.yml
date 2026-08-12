@@ -196,28 +196,21 @@ runs:
         # whole run: string for expressions, including text bash treats as a
         # comment, and an empty one fails manifest validation before any step
         # runs — which is exactly how this file got broken once already.
+        # The step-by-step review procedure lives in the caller-built context
+        # file (its "Review Procedure" section), NOT here — it is engine-neutral,
+        # and duplicating it per engine let the copies drift. This prompt only
+        # bootstraps the model into that file.
         cat > /tmp/review_prompt.txt <<'EOF'
         REPO: ${{ inputs.repository }}
         PR NUMBER: ${{ inputs.pr_number }}
 
-        Follow these steps:
-
-        1. Read ${{ inputs.review_context_path }} — it contains full review instructions, PR context, previous review (if any), acknowledged suggestions to skip, and the required output format.
-
-        2. Read ${{ inputs.pr_diff_path }} — it contains the full diff for this PR (changed files and hunks), already fetched for you. You have no shell tool; everything you need is on disk.
-
-        3. For each changed file, use Read to open the full file — not just the diff hunk.
-           Full file context is required to understand the complete impact of each change.
-
-        4. For each changed file, identify and Read its dependencies:
-           - Imported modules, utilities, or shared helpers referenced in the changed code
-           - Type definitions, interfaces, or enums used by the changed code
-           - Parent components or callers if the changed file exports something modified
-           - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps
-
-        5. After reading ALL files and dependencies, compile your complete review.
-           Write the ENTIRE review to ${{ inputs.output_path }} using the Write tool.
-           The caller posts that file as a single PR comment.
+        Read ${{ inputs.review_context_path }} and follow it exactly. It contains
+        the full review instructions, PR context, previous review (if any),
+        acknowledged suggestions to skip, and the required output format — plus a
+        "Review Procedure" section telling you what else to read, including the
+        pre-fetched PR diff at ${{ inputs.pr_diff_path }}, and requiring you to
+        write your complete review to ${{ inputs.output_path }} with the Write
+        tool. You have no shell tool; everything you need is on disk.
         EOF
 
         # Dumps the CLI's own log on failure. Without this the step reports only
