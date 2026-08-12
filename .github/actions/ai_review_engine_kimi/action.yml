@@ -41,9 +41,10 @@ inputs:
     description: "Number of the PR under review (prompt preamble only)."
     required: true
   model:
-    description: "Model ID — k3, k3-256k, kimi-for-coding, kimi-for-coding-highspeed, or any model the LiteLLM proxy fronts. Maps to KIMI_MODEL_NAME."
+    description: "Model ID as the endpoint in base_url names it. With the LiteLLM proxy that is a proxy alias, e.g. `kimi-k3`. The Kimi-platform ids (`k3`, `k3-256k`, `kimi-for-coding`, `kimi-for-coding-highspeed`) only resolve against api.kimi.com/coding/v1 and return 400 from the proxy. Maps to KIMI_MODEL_NAME."
     required: false
-    default: "k3"
+    # Matches the default base_url below, which is the LiteLLM proxy.
+    default: "kimi-k3"
   base_url:
     description: "LLM API base URL. A trailing /v1 is appended when absent, so the identical value also works for the anthropic engine (which needs it removed). Maps to KIMI_MODEL_BASE_URL."
     required: false
@@ -52,7 +53,7 @@ inputs:
     description: "API key for base_url. Composite actions cannot read the `secrets` context, so the caller must pass this explicitly. Maps to KIMI_MODEL_API_KEY and is never written to disk."
     required: true
   max_context_size:
-    description: "Maximum context window in tokens (k3 = 1048576, k3-256k / kimi-for-coding = 262144). Must match the selected model, or the CLI over-packs context and the API rejects the request. Maps to KIMI_MODEL_MAX_CONTEXT_SIZE."
+    description: "Maximum context window in tokens. Must not exceed what the endpoint allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; the 256k variants are 262144. If a 400 persists after confirming the model name, try lowering this. Maps to KIMI_MODEL_MAX_CONTEXT_SIZE."
     required: false
     default: "1048576"
   provider_type:
@@ -216,16 +217,61 @@ runs:
            The caller posts that file as a single PR comment.
         EOF
 
+        # Dumps the CLI's own log on failure. Without this the step reports only
+        # the CLI's one-line summary (e.g. "provider.api_error: 400 The request
+        # was invalid") and points at a log file on a runner that is already gone,
+        # so the actual provider request and response body are unrecoverable.
+        # Secrets registered with the job are masked in these logs by Actions.
+        dump_kimi_log() {
+          KIMI_LOG="$HOME/.kimi-code/logs/kimi-code.log"
+          KIMI_LOG_LINES=0
+          # tr strips the leading padding BSD wc emits, so the count reads cleanly
+          # if this is ever run outside the Linux runner.
+          [[ -f "$KIMI_LOG" ]] && KIMI_LOG_LINES=$(wc -l < "$KIMI_LOG" | tr -d '[:space:]')
+
+          echo "::group::kimi-code.log (showing last 200 of $KIMI_LOG_LINES lines)"
+          if [[ -f "$KIMI_LOG" ]]; then
+            tail -n 200 "$KIMI_LOG"
+          else
+            echo "(no log at $KIMI_LOG)"
+          fi
+          echo "::endgroup::"
+
+          # State the truncation explicitly. Silent truncation would defeat the
+          # point of dumping the log at all: if the provider error scrolls past
+          # the window, the reader needs to know the tail is not the whole story.
+          if [[ "$KIMI_LOG_LINES" -gt 200 ]]; then
+            echo "⚠️  Log is $KIMI_LOG_LINES lines and only the last 200 are shown."
+            echo "    If the provider request/response is not visible above, raise the tail window."
+          fi
+
+          echo "ℹ️  Resolved provider config: model=$KIMI_MODEL_NAME base_url=$KIMI_MODEL_BASE_URL provider_type=$KIMI_MODEL_PROVIDER_TYPE"
+          echo "ℹ️  A 400 from the proxy most often means \`model\` is not a name it fronts."
+          echo "    The Kimi-platform ids (k3, k3-256k, kimi-for-coding) are valid at"
+          echo "    api.kimi.com/coding/v1, NOT necessarily on a LiteLLM proxy, which uses"
+          echo "    whatever aliases it was configured with. To list them, run this on your"
+          echo "    own machine with the same key you passed as LLM_API_KEY (that variable is"
+          echo "    deliberately not set in this job, so the line below is a template):"
+          echo "      curl -H \"Authorization: Bearer \$LLM_API_KEY\" $KIMI_MODEL_BASE_URL/models"
+        }
+
         # No GitHub token in this step's env and no Bash tool in the config: the
         # agent cannot reach the GitHub API at all. The caller's post step is the
         # only thing that can comment on the PR.
-        kimi -p "$(cat /tmp/review_prompt.txt)"
+        kimi -p "$(cat /tmp/review_prompt.txt)" && KIMI_STATUS=0 || KIMI_STATUS=$?
+
+        if [[ "$KIMI_STATUS" -ne 0 ]]; then
+          echo "❌ Kimi engine: CLI exited $KIMI_STATUS"
+          dump_kimi_log
+          exit "$KIMI_STATUS"
+        fi
 
         # Fail here, named, rather than letting the caller report a generic
         # "review file missing" — all steps in a composite action share one log
         # group, so an engine-attributed error is what makes this locatable.
         if [[ ! -s "$OUTPUT_PATH" ]]; then
           echo "❌ Kimi engine: the CLI finished but wrote no review to $OUTPUT_PATH"
+          dump_kimi_log
           exit 1
         fi
         echo "✅ Kimi engine: review written ($(wc -c < "$OUTPUT_PATH") bytes)"
