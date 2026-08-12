@@ -223,6 +223,12 @@ runs:
         # so the actual provider request and response body are unrecoverable.
         # Secrets registered with the job are masked in these logs by Actions.
         dump_kimi_log() {
+          # A diagnostic must never be killed by the thing it is diagnosing. The
+          # step runs under `bash -e -o pipefail`, so any non-zero command in here
+          # would abort the dump partway and hide the rest. Both call sites `exit`
+          # explicitly straight after, so relaxing this has no other effect.
+          set +e +o pipefail
+
           # Request shape first. A 400 whose body we cannot see is still narrowable
           # from the sizes: if the packed context approaches the window the proxy
           # allows for this alias, "context too large" is the likely cause rather
@@ -238,7 +244,14 @@ runs:
           # does not always create it, so search for whatever it did write instead
           # of reporting "no log" and giving up — that left the provider response
           # unrecoverable on the runs this function was added to diagnose.
-          KIMI_LOGS=$(find "$HOME" /tmp -maxdepth 5 -type f -name '*.log' 2>/dev/null | grep -i kimi | head -5)
+          #
+          # `|| true` is load-bearing: the step runs under `bash -e -o pipefail`,
+          # and grep exits 1 when it matches nothing. Without it, pipefail
+          # propagates that failure and set -e kills the script mid-diagnostic —
+          # aborting on exactly the no-log case this branch exists to report, and
+          # swallowing the narrowing hints below. That is what happened on the
+          # first run after this function shipped.
+          KIMI_LOGS=$(find "$HOME" /tmp -maxdepth 5 -type f -name '*.log' 2>/dev/null | grep -i kimi | head -5 || true)
 
           if [[ -n "$KIMI_LOGS" ]]; then
             while IFS= read -r log; do
