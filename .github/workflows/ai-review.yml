@@ -1,0 +1,77 @@
+name: AI PR Review (Kimi K3)
+
+# Dogfoods this repo's own review workflow on this repo's own PRs.
+#
+# This is the highest-value place to run it: the engine code lives here, so a
+# regression in ai-pr-review.yml or ai_review_engine_* shows up on our own PRs
+# before it reaches the 14 consumer repos.
+#
+# Runs ALONGSIDE claude.yml on purpose, so Kimi K3 and Claude review the same PRs
+# and can be compared. Every PR gets two review comments, told apart by header:
+#   "## 🤖 AI PR Review Complete"     <- this workflow (Kimi K3)
+#   "## 🤖 Claude PR Review Complete" <- claude.yml (claude-sonnet-5)
+#
+# TWO SELF-REFERENCE CAVEATS, both worth knowing before trusting a green run here:
+#
+#   1. The trigger is pull_request_target, so GitHub runs the workflow file from
+#      the BASE branch. A PR that edits this caller is therefore reviewed by
+#      master's copy, not its own.
+#   2. The reusable workflow and the engine actions are pulled at @master. A PR
+#      that changes ai-pr-review.yml or an engine action is reviewed by the
+#      version already on master, not the version in the PR.
+#
+#   So this dogfoods what is MERGED, not what is proposed. To exercise an engine
+#   change before merge, temporarily point the refs in ai-pr-review.yml at
+#   @<branch> and revert before merging.
+#
+# Docs: .github/workflows/AI_PR_REVIEW_README.md
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  ai-review:
+    # Absolute path at @master rather than a local `./` path, matching claude.yml
+    # and docsync-ai.yml. It also keeps this caller identical in shape to the
+    # consumer repos', so dogfooding exercises the same resolution path they use.
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@master
+
+    # Exactly what the shared workflow declares. `actions: write` and
+    # `id-token: write` were dropped from it (nothing calls the Actions API, no
+    # step mints an OIDC token), so they are not needed here either — unlike
+    # claude.yml, which still grants both for the older workflow.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    with:
+      # All three pinned rather than inherited, so a change to a shared default
+      # cannot silently alter what this repo runs — which matters more here than
+      # anywhere, since this is where those defaults are edited.
+      engine: kimi
+      # LiteLLM proxy alias for K3. The Kimi-platform id `k3` resolves only at
+      # api.kimi.com/coding/v1 and the proxy answers it with a bare 400.
+      model: kimi-k3
+      # Wire dialect. Must match what base_url serves: the proxy serves plain
+      # /v1/chat/completions, which is `openai`. `kimi` targets the Kimi Code
+      # platform and the proxy rejects it, even with a correct model and key.
+      provider_type: openai
+
+      # REQUIRED while claude.yml also runs. The shared workflow defaults this to
+      # "Claude PR Review Complete" so a repo migrating OFF claude-pr-review.yml
+      # cleans up its leftovers; left at that default here, this run would delete
+      # the Claude review it is being compared against on every push. Emptying it
+      # leaves Claude's comments alone — each workflow reaps only its own.
+      # Restore the default when claude.yml is removed.
+      legacy_markers: ""
+
+    secrets:
+      # LiteLLM virtual key, authorised for `kimi-k3` on litellmsa.deriv.ai.
+      # NOTE: this secret does not exist in this repo yet — it must be added
+      # (repo- or org-level) or the run fails at the engine step.
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      # Optional. Unset here, so review events go to the job summary only.
+      AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+      AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
