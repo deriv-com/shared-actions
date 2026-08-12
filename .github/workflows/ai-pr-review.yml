@@ -122,10 +122,16 @@ jobs:
       REVIEW_CONTEXT_FILE: /tmp/review_context.md
       PR_DIFF_FILE: /tmp/pr_diff.txt
 
-      # Files whose diffs carry no review signal, filtered from BOTH the main
-      # pre-fetched diff and the incremental diff. Lives here so the two steps
-      # that filter cannot drift apart.
-      NOISE_PATTERN: 'package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.snap|\.min\.js|\.min\.css|dist/|build/|\.generated\.|__generated__|/vendor/|\.pb\.go|_test\.snap|\.spec\.(tsx?|jsx?)|/__tests__/|\.scss$|\.md$'
+      # Files whose diffs carry no review signal ANYWHERE — lockfiles and
+      # generated/minified/vendored output — filtered from BOTH the main
+      # pre-fetched diff and the incremental diff. Deliberately NARROW: test
+      # files, styles and docs are NOT here, because the main diff is what the
+      # initial review sees and test coverage is a stated review criterion —
+      # filtering *.spec.* from it silently defeated that. The incremental
+      # diff appends those extras where it is built, since there the filter
+      # only scopes "what changed since last review", not what gets reviewed
+      # at all.
+      NOISE_PATTERN: 'package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.snap|\.min\.js|\.min\.css|dist/|build/|\.generated\.|__generated__|/vendor/|\.pb\.go|_test\.snap'
 
       # Comment markers identifying a review comment as ours. Canonical marker
       # first — appended deterministically by the post step, so detection never
@@ -286,8 +292,8 @@ jobs:
         # (an engine 400, a timeout, a cancel-in-progress from a new push) left
         # the PR with NO review comment and destroyed the reviewed-commit SHA —
         # so the next run silently degraded to an initial review. The post step
-        # now deletes immediately before posting, shrinking that window from up
-        # to an hour to about a second.
+        # now deletes only AFTER the replacement is live, closing that window
+        # entirely.
         id: previous-review
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -431,13 +437,17 @@ jobs:
           echo "event_type=$EVENT_TYPE" >> $GITHUB_OUTPUT
 
           # Pre-compute incremental diff (changes since last review) for follow-up
-          # mode. NOISE_PATTERN comes from job env — one definition shared with
-          # the main diff fetch below.
+          # mode. The shared NOISE_PATTERN (job env) is extended with test, style
+          # and doc files HERE ONLY: in this diff the filter merely scopes "what
+          # changed since the last review", while in the main diff (which uses
+          # NOISE_PATTERN alone) it would remove those files from review
+          # entirely.
+          INCREMENTAL_NOISE_PATTERN="${NOISE_PATTERN}"'|\.spec\.(tsx?|jsx?)|/__tests__/|\.scss$|\.md$'
           echo "" > /tmp/incremental_diff.txt
           if [[ "$HAS_PREVIOUS" == "true" && -n "$LAST_REVIEWED_SHA" ]]; then
             echo "📋 Generating incremental diff since last reviewed commit: $LAST_REVIEWED_SHA"
             if git cat-file -e "$LAST_REVIEWED_SHA" 2>/dev/null; then
-              git diff "$LAST_REVIEWED_SHA"..HEAD | awk -v noise="$NOISE_PATTERN" '
+              git diff "$LAST_REVIEWED_SHA"..HEAD | awk -v noise="$INCREMENTAL_NOISE_PATTERN" '
                 /^diff --git / { in_noise = ($0 ~ noise); if (!in_noise) print; next }
                 !in_noise { print }
               ' > /tmp/incremental_diff.txt
@@ -665,8 +675,8 @@ jobs:
           # input (the diff, the PR description). If an injection ever talks the
           # model into echoing its credentials (e.g. read from /proc/*/environ),
           # this is the last point where posting them publicly can be stopped.
-          # Everything before the delete below is deliberately fail-CLOSED: on
-          # any failure in this step's checks, the previous review is untouched.
+          # Everything up to the post below is deliberately fail-CLOSED: on any
+          # failure in this step's checks, the previous review is untouched.
           if [[ -n "$LLM_API_KEY" ]] && grep -qF -- "$LLM_API_KEY" "$REVIEW_OUTPUT_FILE"; then
             echo "❌ Review output contains the LLM API key — refusing to post. Rotate the key and inspect the run."
             exit 1
@@ -704,21 +714,29 @@ jobs:
             printf '<!-- deriv-pr-review -->\n'
           } >> "$REVIEW_OUTPUT_FILE"
 
-          # Delete the previous review only NOW, seconds before its replacement
-          # posts. This used to happen in the capture step, an hour earlier —
-          # any engine failure or a cancel-in-progress in between left the PR
-          # with no review at all and destroyed the reviewed-commit SHA. Fresh
-          # fetch (comments may have changed during the engine run), same filter
-          # file the capture step used, delete ALL matches including legacy.
+          # Reap-list for prior reviews, captured BEFORE posting — the new
+          # comment carries the markers too, so a fetch-after-post would match
+          # (and delete) the comment it just created. Fresh fetch, since
+          # comments may have changed during the engine run; same filter file
+          # the capture step used, ALL matches including legacy.
+          #
+          # Post FIRST, delete after. Deletion used to happen in the capture
+          # step, an hour earlier — any failure in between left the PR with no
+          # review at all and destroyed the reviewed-commit SHA. Deleting even
+          # a second before posting kept a sliver of that: a failed post after
+          # a successful delete is the same loss in miniature. This ordering
+          # trades it for the harmless inverse — a transient duplicate that the
+          # next run reaps, since its reap-list is built the same way.
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
             | jq -s 'add // []' > /tmp/comments_at_post.json
           jq -f /tmp/review_marker_filter.jq /tmp/comments_at_post.json \
-            | jq -r '.[].id' \
-            | xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE
+            | jq -r '.[].id' > /tmp/reap_ids.txt
 
           echo "📬 Posting review ($(wc -c < "$REVIEW_OUTPUT_FILE") bytes)..."
           gh pr comment "$PR_NUMBER" --body-file "$REVIEW_OUTPUT_FILE"
-          echo "✅ Review posted"
+
+          xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE < /tmp/reap_ids.txt
+          echo "✅ Review posted, previous review(s) reaped"
 
       - name: Emit review event to metrics dashboard
         if: always()

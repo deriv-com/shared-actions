@@ -16,7 +16,7 @@ engine is pluggable: pick `kimi` or `anthropic` with one input.
 
 - 🤖 Full-context review — reads changed files whole, plus their imports, types, callers and tests
 - 🔄 Follow-up mode — on re-push, feeds the previous review plus an incremental diff so fixed items are not re-reported
-- 🧹 Exactly one review comment per PR, ever — captured at the start, deleted seconds before the replacement posts, so a failed or cancelled run never leaves the PR without its review
+- 🧹 Exactly one review comment per PR — the old one is captured at the start and deleted only after its replacement is live, so a failed or cancelled run never leaves the PR without its review
 - 🔌 Pluggable engine (`kimi` | `anthropic`), each a composite action with its own CLI and sandbox
 - 🔒 The model gets **no shell tool** and no GitHub token — it cannot comment, and PR-supplied agent config is stripped before it starts
 - 🛡️ The post step refuses to publish a review containing the LLM API key (comment bodies are not covered by Actions secret masking), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
@@ -221,9 +221,11 @@ composite actions consistently, not just here — is a reasonable follow-up.
 
 ## Comment markers and cleanup
 
-Each run deletes prior review comments **immediately before posting** the
-replacement, so a PR carries exactly one — and a run that fails or is cancelled
-mid-review leaves the old comment untouched. (Deletion used to happen at the
+Each run deletes prior review comments **only after the replacement has
+posted** (the reap-list is captured just before posting, so the new comment
+cannot match its own filter), so a PR carries exactly one — and a run that
+fails at any point leaves the old comment untouched. The worst case is a
+transient duplicate, which the next run reaps. (Deletion used to happen at the
 start of the run, which meant every engine failure or cancel-in-progress in the
 up-to-an-hour gap destroyed the previous review and its reviewed-commit SHA.)
 Detection uses a canonical hidden marker, `<!-- deriv-pr-review -->`, which
@@ -362,9 +364,10 @@ CLI reads.
    noise-filtered incremental diff, acknowledged items, PR metadata, review
    procedure, output format.
 8. **Pre-fetch the diff** to `/tmp/pr_diff.txt` with the trusted token (so the
-   engine needs no shell), noise-filtered like the incremental diff.
+   engine needs no shell), filtered for build noise only — lockfiles and
+   generated output, never test or doc files, which the review must see.
 9. **Dispatch to the engine** — it writes `/tmp/ai_review_output.txt`.
 10. **Post**: scan the review for the API key (refuse if found), truncate over
-    GitHub's comment limit, **then** delete prior review comments and post the
-    replacement seconds later, appending the detection markers.
+    GitHub's comment limit, append the detection markers, post the replacement,
+    **then** delete the prior review comments captured just before posting.
 11. **Emit metrics** to the dashboard and the job summary; upload the payload.
