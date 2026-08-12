@@ -55,16 +55,19 @@ jobs:
       # resolve only at api.kimi.com/coding/v1 and the proxy answers them with
       # a bare 400.
       #
-      # NOT kimi-k3: one of the two deployments behind that alias rejects the
-      # assistant tool_call message shape the Kimi CLI sends (it omits the
-      # `content` key), so a review 400s at its first tool call — which is every
-      # review. kimi-k2.7-code routes only to the tolerant deployment and is
-      # coding-tuned. Verified 6/6 against the CLI's exact request bodies where
-      # kimi-k3 managed 3/6. Details in AI_PR_REVIEW_README.md.
-      model: kimi-k2.7-code
-      # Matches kimi-k2.7-code's 256k window. Leaving this at K3's 1048576 would
-      # make the CLI over-pack and the proxy would reject the request.
-      max_context_size: "262144"
+      # K3 with its full 1M window. The shared workflow special-cases this alias:
+      # one of its two deployments (the Cloudflare AI Gateway "compat" endpoint)
+      # rejects the assistant tool_call shape the Kimi CLI sends, so the resolve
+      # step pins the request to the healthy OpenRouter deployment at run time.
+      #
+      # This repo deliberately runs the pinned path rather than the simpler
+      # single-deployment aliases (kimi-k2.7-code, kimi-k2.6), so the workaround
+      # is exercised here before any consumer relies on it — and so a proxy
+      # change that breaks the pin surfaces on our own PRs first.
+      model: kimi-k3
+      # K3's window. Must accompany model: kimi-k3 — the workflow defaults to
+      # 262144 for the 256k aliases, which would leave 3/4 of K3 unused.
+      max_context_size: "1048576"
       # Wire dialect. Must match what base_url serves: the proxy serves plain
       # /v1/chat/completions, which is `openai`. `kimi` targets the Kimi Code
       # platform and the proxy rejects it, even with a correct model and key.

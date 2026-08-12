@@ -90,7 +90,8 @@ succeeds. **Change these two inputs together, never one alone.** Valid types:
 **Model names belong to the endpoint, not the model.** `model` is passed through
 verbatim, so it must be whatever the thing in `base_url` calls it. The Deriv
 LiteLLM proxy fronts three kimi aliases — `kimi-k2.7-code` (the default),
-`kimi-k2.6` and `kimi-k3` (**unusable**, see below); the Kimi-platform ids
+`kimi-k2.6` and `kimi-k3` (usable only via the deployment pin below); the
+Kimi-platform ids
 (`k3`, `k3-256k`, `kimi-for-coding`) resolve only against
 `api.kimi.com/coding/v1` and return a bare `400 The request was invalid` from
 the proxy. List what a proxy accepts:
@@ -104,13 +105,13 @@ If a 400 survives fixing the model name, suspect `max_context_size` exceeding
 the window the endpoint allows for that alias — or the known multi-turn 400
 below, which looks identical but has nothing to do with either.
 
-### DO NOT USE `kimi-k3`: it 400s on every review (multi-turn tool calls)
+### `kimi-k3` and the deployment pin (why half its requests used to 400)
 
-**Status: diagnosed and worked around by not using that alias.** The default
-model is `kimi-k2.7-code`. Setting `model: kimi-k3` brings the failure back:
-every run dies ~20s in with `provider.api_error: 400 The request was invalid`,
-which is not the model name, the context size, `provider_type`, or the API key
-— all of those are correct. Diagnosed 2026-08-12.
+**Status: diagnosed and worked around inside this workflow.** `model: kimi-k3`
+works — the resolve step pins it to a healthy deployment at run time. Without
+that pin every run died ~20s in with `provider.api_error: 400 The request was
+invalid`, which is not the model name, the context size, `provider_type`, or
+the API key; all of those were correct. Diagnosed 2026-08-12.
 
 **Root cause.** The Kimi CLI omits the `content` key *entirely* on assistant
 messages that carry only `tool_calls` (`convertMessage` in the bundle's
@@ -138,10 +139,11 @@ fine, which is what made this look like a config problem for so long.
 the CLI; no env var or `config.toml` key changes it, and the CLI's native
 `kimi` dialect behaves identically, so the direct Kimi endpoint is no escape.
 
-**So the workaround is the alias.** Only three kimi aliases exist on the proxy.
-Per `GET /model/info`, two of them have a single OpenRouter deployment, while
-`kimi-k3` is load-balanced across two — and it is the **Cloudflare AI Gateway
-"compat" endpoint** that rejects the CLI's shape, not Moonshot or OpenRouter:
+**Which leaves the deployment as the lever.** Only three kimi aliases exist on
+the proxy. Per `GET /model/info`, two of them have a single OpenRouter
+deployment, while `kimi-k3` is load-balanced across two — and it is the
+**Cloudflare AI Gateway "compat" endpoint** that rejects the CLI's shape, not
+Moonshot and not OpenRouter:
 
 | Alias | Deployment(s) (`litellm_params.model` → `api_base`) | Result | Window |
 |---|---|---|---|
@@ -161,23 +163,46 @@ set it accordingly. In practice 256k is ample — a real run measured 25 KB of
 context plus a 57 KB diff, so roughly 20k tokens before the model starts
 reading files.
 
-**To get `kimi-k3` back**, in order of preference, the LiteLLM owners can:
+**How the pin makes `kimi-k3` usable now.** LiteLLM lets a request target one
+deployment by passing that deployment's `model_info.id` as `model` (verified:
+6/6 against the healthy id, 0/6 against the Cloudflare one). So when
+`engine: kimi` and `model: kimi-k3`, the resolve step does a
+`GET <base_url>/model/info`, picks the deployment whose `litellm_params.model`
+starts with `openrouter/`, and sends the engine that id instead of the alias.
 
-1. **Add a pre-call hook** normalising the message for every client — a
-   `CustomLogger.async_pre_call_hook` that sets `content = ""` on assistant
-   messages having `tool_calls` and no string content. Verified: the same
+Three properties worth keeping if this code is touched:
+
+- **The id is resolved at run time, never committed.** It is a hash of the
+  deployment config, so a hardcoded copy would go stale the next time the proxy
+  is reconfigured and resurface as the same opaque 400.
+- **Failure is loud.** If no `openrouter/` deployment is found — proxy layout
+  changed, key cannot read model info — the step exits with a message naming
+  `kimi-k2.7-code` as the alternative. It does not fall back to the plain
+  alias, which would silently restore the 50% failure rate.
+- **Only `kimi-k3` is rewritten**, and the review header and metrics still
+  report `kimi-k3` rather than a bare hash (`model` vs `engine_model` outputs).
+
+The pin also costs `kimi-k3` its load balancing: every request goes to one
+deployment, with no failover if that one is down. That is the trade for it
+working at all, and it is why the *default* stays on `kimi-k2.7-code` — a
+single-deployment alias that needs no special case. This repo's own caller runs
+the pinned path deliberately, so the workaround is exercised on our PRs before
+any consumer depends on it.
+
+**The pin is a workaround; the LiteLLM owners still have the real fix.** In
+order of preference:
+
+1. **A pre-call hook** normalising the message for every client — a
+   `CustomLogger.async_pre_call_hook` setting `content = ""` on assistant
+   messages that have `tool_calls` and no string content. Verified: the same
    Cloudflare deployment that always 400s returns 200 with that one field
-   added. This is the real fix — any multi-turn tool-using client on that
-   deployment is broken today, and single-turn probes hide it.
-2. **Pin or split the alias** — remove the Cloudflare compat deployment from
-   the `kimi-k3` pool, or expose an OpenRouter-only alias (`kimi-k3-code`),
-   which would make this a one-line `model:` change here.
+   added. This is the real fix — any multi-turn tool-using client landing on
+   that deployment is broken today, and single-turn probes hide it entirely.
+2. **Pin or split the alias upstream** — remove the Cloudflare compat
+   deployment from the `kimi-k3` pool, or expose an OpenRouter-only alias.
 
-Addressing the healthy deployment directly also works — `model:` set to its
-`model_info.id` was 6/6 — but that id is an opaque hash tied to the deployment
-config, so it is a stopgap, not something to commit. Until any of this lands,
-staying on `kimi-k2.7-code` is a config choice rather than an outage, and
-`engine: anthropic` is unaffected either way.
+Once either lands, delete the pin block from the resolve step and drop
+`engine_model` back to `model`. `engine: anthropic` was unaffected throughout.
 
 Two debugging notes for whoever picks this up. The CLI **names a log file it
 never creates** (`$HOME/.kimi-code/logs/kimi-code.log`), so the provider
