@@ -119,7 +119,7 @@ its native `kimi` dialect has the identical behavior). That is legal
 OpenAI-wire JSON, but of the two deployments behind the `kimi-k3` alias, one
 rejects it with a bare 400 and the other accepts it. Bisected against the
 proxy with the CLI's byte-exact request, captured by running the CLI against a
-local mock:
+local mock that answers turn 1 with a tool call:
 
 | Request | Result |
 |---|---|
@@ -138,29 +138,46 @@ fine, which is what made this look like a config problem for so long.
 the CLI; no env var or `config.toml` key changes it, and the CLI's native
 `kimi` dialect behaves identically, so the direct Kimi endpoint is no escape.
 
-**So the workaround is the alias.** Only three kimi aliases exist on the proxy,
-and the strict deployment sits in exactly one pool:
+**So the workaround is the alias.** Only three kimi aliases exist on the proxy.
+Per `GET /model/info`, two of them have a single OpenRouter deployment, while
+`kimi-k3` is load-balanced across two — and it is the **Cloudflare AI Gateway
+"compat" endpoint** that rejects the CLI's shape, not Moonshot or OpenRouter:
 
-| Alias | Multi-turn tool-call shape | Window |
-|---|---|---|
-| `kimi-k2.7-code` ← **default** | 6/6 × 200 (turn 1 and turn 2, full CLI bodies) | 262144 |
-| `kimi-k2.6` | 6/6 × 200 | 262144 |
-| `kimi-k3` | **3/6 — unusable** | 1048576 |
+| Alias | Deployment(s) (`litellm_params.model` → `api_base`) | Result | Window |
+|---|---|---|---|
+| `kimi-k2.7-code` ← **default** | `openrouter/moonshotai/kimi-k2.7-code` → openrouter.ai | 6/6 × 200 | 262144 |
+| `kimi-k2.6` | `openrouter/moonshotai/kimi-k2.6` → openrouter.ai | 6/6 × 200 | 262144 |
+| `kimi-k3` | `openrouter/moonshotai/kimi-k3` → openrouter.ai | 6/6 × 200 | 1048576 |
+| | `openai/moonshotai/kimi-k3` → **gateway.ai.cloudflare.com/…/compat** | **0/6 — always 400** | |
 
-Every successful response came from the same upstream (`gen-…` ids); the
-rejections carry no id at all. `x-litellm-tags` routing is not configured on
-this proxy, so header-based pinning is not an option.
+So `kimi-k3` fails ~half the time purely because the router keeps landing on
+the Cloudflare compat deployment. `x-litellm-tags` routing is not configured on
+this proxy, so header-based pinning is not available.
 
-Note the window difference: switching away from `kimi-k3` means
-`max_context_size` must drop to `262144`, or the CLI over-packs and the request
-is rejected for an entirely different reason. Both the workflow default and the
-dogfooding caller set it accordingly.
+Note the window difference: moving off `kimi-k3` means `max_context_size` must
+drop to `262144`, or the CLI over-packs and the request is rejected for an
+entirely different reason. Both the workflow default and the dogfooding caller
+set it accordingly. In practice 256k is ample — a real run measured 25 KB of
+context plus a 57 KB diff, so roughly 20k tokens before the model starts
+reading files.
 
-**To get `kimi-k3` (and its 1M window) back**, the LiteLLM owners need to
-either drop the strict deployment from that alias's pool or give it a request
-transformation setting `content: ""` on assistant `tool_calls` messages. Until
-then this is a config choice, not an outage. `engine: anthropic` is unaffected
-either way.
+**To get `kimi-k3` back**, in order of preference, the LiteLLM owners can:
+
+1. **Add a pre-call hook** normalising the message for every client — a
+   `CustomLogger.async_pre_call_hook` that sets `content = ""` on assistant
+   messages having `tool_calls` and no string content. Verified: the same
+   Cloudflare deployment that always 400s returns 200 with that one field
+   added. This is the real fix — any multi-turn tool-using client on that
+   deployment is broken today, and single-turn probes hide it.
+2. **Pin or split the alias** — remove the Cloudflare compat deployment from
+   the `kimi-k3` pool, or expose an OpenRouter-only alias (`kimi-k3-code`),
+   which would make this a one-line `model:` change here.
+
+Addressing the healthy deployment directly also works — `model:` set to its
+`model_info.id` was 6/6 — but that id is an opaque hash tied to the deployment
+config, so it is a stopgap, not something to commit. Until any of this lands,
+staying on `kimi-k2.7-code` is a config choice rather than an outage, and
+`engine: anthropic` is unaffected either way.
 
 Two debugging notes for whoever picks this up. The CLI **names a log file it
 never creates** (`$HOME/.kimi-code/logs/kimi-code.log`), so the provider
