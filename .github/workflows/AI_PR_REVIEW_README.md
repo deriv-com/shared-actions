@@ -99,7 +99,58 @@ curl -s https://litellmsa.deriv.ai/v1/models \
 ```
 
 If a 400 survives fixing the model name, suspect `max_context_size` exceeding
-the window the endpoint allows for that alias.
+the window the endpoint allows for that alias — or the known multi-turn 400
+below, which looks identical but has nothing to do with either.
+
+### KNOWN OPEN BUG: `kimi-k3` 400s on every review (multi-turn tool calls)
+
+**Status: the Kimi engine cannot complete a review against the LiteLLM proxy.**
+Every run dies ~20s in with `provider.api_error: 400 The request was invalid`.
+It is not the model name, the context size, `provider_type`, or the API key —
+all of those are correct. Diagnosed 2026-08-12; the fix is not ours to make.
+
+**Root cause.** The Kimi CLI omits the `content` key *entirely* on assistant
+messages that carry only `tool_calls` (`convertMessage` in the bundle's
+`openai-legacy` provider sets `content` only when a non-thinking part exists —
+its native `kimi` dialect has the identical behavior). That is legal
+OpenAI-wire JSON, but of the two deployments behind the `kimi-k3` alias, one
+rejects it with a bare 400 and the other accepts it. Bisected against the
+proxy with the CLI's byte-exact request, captured by running the CLI against a
+local mock:
+
+| Request | Result |
+|---|---|
+| First turn, exactly as CI sends it | 6/6 × 200 |
+| Second turn (assistant `tool_calls` + `tool` result), as CI sends it | 3/8 × 200 — **rejected whenever it lands on the strict deployment** |
+| Same, with `content: ""` added to the assistant message | **8/8 × 200 on both deployments** |
+| Same, with `content: null` | 3/8 × 200 — the key must be a *string* |
+| Same, minus `tools` and `prompt_cache_key` | still 4/8 — those are innocent |
+
+**Why CI fails 100% of the time when a single request only fails ~55%:** a
+review is dozens of tool-call turns, and every turn after the first re-sends
+the offending message shape. P(whole review) ≈ 0.45^n. A one-off `curl` looks
+fine, which is what made this look like a config problem for so long.
+
+**Why we cannot fix it here.** The message is built inside the CLI; no env var
+or `config.toml` key changes it. `KIMI_CODE_CUSTOM_HEADERS` (newline-separated
+`Name: value`) can inject routing headers, which is the only workflow-side
+lever.
+
+**The actual fixes, in order of preference:**
+
+1. **Proxy (right fix, needs the LiteLLM owners):** drop the strict deployment
+   from the `kimi-k3` pool, or give that deployment a request transformation
+   that sets `content: ""` on assistant `tool_calls` messages.
+2. **A tolerant alias:** if the proxy exposes an alias routing only to the
+   accepting deployment, set `model:` to it — a one-line caller change.
+3. **Interim:** run `engine: anthropic`, which is unaffected.
+
+Two debugging notes for whoever picks this up. The CLI **names a log file it
+never creates** (`$HOME/.kimi-code/logs/kimi-code.log`), so the provider
+response body is genuinely unrecoverable from a runner — reproduce locally
+against a mock instead. And LiteLLM **caches responses**: repeating an
+identical body returns the same response `id` without reaching a backend, so
+any probe must vary the body per attempt or it silently tests nothing.
 
 **On the `/v1` asymmetry:** `base_url` is one engine-neutral input. The Kimi CLI
 wants a `/v1` suffix; the Anthropic SDK appends `/v1/messages` itself and must not

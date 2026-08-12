@@ -254,8 +254,12 @@ runs:
             echo "ℹ️  no kimi log written; provider response body unavailable"
           fi
 
-          echo "ℹ️  Troubleshooting: AI_PR_REVIEW_README.md — a 400 is usually a"
-          echo "    model/provider_type/base_url mismatch, and those must agree."
+          echo "ℹ️  A 400 here is very likely the KNOWN OPEN BUG documented in"
+          echo "    AI_PR_REVIEW_README.md: the CLI omits \`content\` on assistant"
+          echo "    tool_call messages and one deployment behind the kimi-k3 alias"
+          echo "    rejects that, so every multi-turn review fails. Not fixable from"
+          echo "    this action — it needs a proxy-side fix or a tolerant alias."
+          echo "    (Otherwise: a model/provider_type/base_url mismatch.)"
         }
 
         # No GitHub token in this step's env and no Bash tool in the config: the
