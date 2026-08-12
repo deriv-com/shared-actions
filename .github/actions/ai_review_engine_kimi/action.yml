@@ -41,9 +41,10 @@ inputs:
     description: "Number of the PR under review (prompt preamble only)."
     required: true
   model:
-    description: "Model ID — k3, k3-256k, kimi-for-coding, kimi-for-coding-highspeed, or any model the LiteLLM proxy fronts. Maps to KIMI_MODEL_NAME."
+    description: "Model ID as the endpoint in base_url names it. With the LiteLLM proxy that is a proxy alias, e.g. `kimi-k3`. The Kimi-platform ids (`k3`, `k3-256k`, `kimi-for-coding`, `kimi-for-coding-highspeed`) only resolve against api.kimi.com/coding/v1 and return 400 from the proxy. Maps to KIMI_MODEL_NAME."
     required: false
-    default: "k3"
+    # Matches the default base_url below, which is the LiteLLM proxy.
+    default: "kimi-k3"
   base_url:
     description: "LLM API base URL. A trailing /v1 is appended when absent, so the identical value also works for the anthropic engine (which needs it removed). Maps to KIMI_MODEL_BASE_URL."
     required: false
@@ -52,7 +53,7 @@ inputs:
     description: "API key for base_url. Composite actions cannot read the `secrets` context, so the caller must pass this explicitly. Maps to KIMI_MODEL_API_KEY and is never written to disk."
     required: true
   max_context_size:
-    description: "Maximum context window in tokens (k3 = 1048576, k3-256k / kimi-for-coding = 262144). Must match the selected model, or the CLI over-packs context and the API rejects the request. Maps to KIMI_MODEL_MAX_CONTEXT_SIZE."
+    description: "Maximum context window in tokens. Must not exceed what the endpoint allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; the 256k variants are 262144. If a 400 persists after confirming the model name, try lowering this. Maps to KIMI_MODEL_MAX_CONTEXT_SIZE."
     required: false
     default: "1048576"
   provider_type:

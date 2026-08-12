@@ -31,7 +31,7 @@ on:
         default: "kimi"
         type: string
       model:
-        description: "Model ID to use for review. Defaults per engine (kimi -> k3, anthropic -> claude-sonnet-5). Any model the LiteLLM proxy fronts works."
+        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
         required: false
         default: ""
         type: string
@@ -41,7 +41,7 @@ on:
         default: "https://litellmsa.deriv.ai/v1"
         type: string
       max_context_size:
-        description: "[engine-specific: kimi] Maximum context window in tokens (k3 = 1048576, k3-256k / kimi-for-coding = 262144). Must match the model or the CLI over-packs context and the API rejects the request. Ignored when engine is not `kimi`."
+        description: "[engine-specific: kimi] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; the 256k variants are 262144. If a request fails with a 400 after the model name is confirmed correct, try lowering this. Ignored when engine is not `kimi`."
         required: false
         default: "1048576"
         type: string
@@ -153,7 +153,10 @@ jobs:
           # so routing a repo onto this workflow must not rename it.
           case "$ENGINE" in
             kimi)
-              DEFAULT_MODEL="k3"
+              # LiteLLM alias, NOT the Kimi-platform id. The proxy fronts K3 as
+              # `kimi-k3`; `k3` only resolves at api.kimi.com/coding/v1 and gets
+              # a 400 from the proxy.
+              DEFAULT_MODEL="kimi-k3"
               METRICS_AGENT="ai_review"
               ARTIFACT_PREFIX="ai-review"
               ;;
@@ -327,8 +330,10 @@ jobs:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           # Passed through env, never interpolated into the script below: the body
-          # is author-controlled, so `${{ }}` inline in a run block would let
-          # backticks or $(...) execute on the runner.
+          # is author-controlled, so an inline Actions expression in a run block
+          # would let backticks or $(...) execute on the runner.
+          # (Deliberately not spelling out an empty expression pair here — Actions
+          # scans run: blocks for those and fails the manifest, cf. PR #109.)
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"

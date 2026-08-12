@@ -61,7 +61,7 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 | | `kimi` | `anthropic` |
 |---|---|---|
 | Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) |
-| Default model | `k3` | `claude-sonnet-5` |
+| Default model | `kimi-k3` | `claude-sonnet-5` |
 | `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** |
 | Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` **+ the action's base GitHub tools** |
 | Shell | none (absent from `enabled` **and** denied by rule) | none (`--allowedTools` omits Bash) |
@@ -70,6 +70,20 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 | Applicable inputs | all, incl. `max_context_size`, `cli_version` | all except `max_context_size`, `cli_version` |
 | `agent` reported | `ai_review` | `claude_review` |
 | Artifact | `ai-review-summary-*` | `claude-review-summary-*` |
+
+**Model names belong to the endpoint, not the model.** `model` is passed through
+verbatim, so it must be whatever the thing in `base_url` calls it. On the Deriv
+LiteLLM proxy K3 is `kimi-k3`; the Kimi-platform ids (`k3`, `k3-256k`,
+`kimi-for-coding`) resolve only against `api.kimi.com/coding/v1` and return a
+bare `400 The request was invalid` from the proxy. List what a proxy accepts:
+
+```bash
+curl -s https://litellmsa.deriv.ai/v1/models \
+  -H "Authorization: Bearer $LLM_API_KEY" | jq -r '.data[].id' | sort
+```
+
+If a 400 survives fixing the model name, suspect `max_context_size` exceeding
+the window the endpoint allows for that alias.
 
 **On the `/v1` asymmetry:** `base_url` is one engine-neutral input. The Kimi CLI
 wants a `/v1` suffix; the Anthropic SDK appends `/v1/messages` itself and must not
@@ -199,7 +213,7 @@ summary regardless of dashboard state:
   "agent": "ai_review",
   "event_type": "initial_review | followup_review",
   "timestamp": "…", "pr_number": "…", "repo": "…",
-  "payload": { "commit_sha": "…", "review_size_bytes": 0, "model": "k3", "engine": "kimi" }
+  "payload": { "commit_sha": "…", "review_size_bytes": 0, "model": "kimi-k3", "engine": "kimi" }
 }
 ```
 
