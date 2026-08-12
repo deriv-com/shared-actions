@@ -225,6 +225,12 @@ runs:
         # was invalid") and points at a log file on a runner that is already gone,
         # so the actual provider request and response body are unrecoverable.
         # Secrets registered with the job are masked in these logs by Actions.
+        # Runs only on failure. Deliberately short: the long troubleshooting essay
+        # this used to print was scaffolding for diagnosing one specific 400 (a
+        # provider_type/base_url mismatch), which is now fixed and documented in
+        # AI_PR_REVIEW_README.md. What stays is what a failing run cannot be
+        # debugged without: the resolved config, the input sizes, and the CLI's own
+        # log if it wrote one.
         dump_kimi_log() {
           # A diagnostic must never be killed by the thing it is diagnosing. The
           # step runs under `bash -e -o pipefail`, so any non-zero command in here
@@ -232,68 +238,31 @@ runs:
           # explicitly straight after, so relaxing this has no other effect.
           set +e +o pipefail
 
-          # Request shape first. A 400 whose body we cannot see is still narrowable
-          # from the sizes: if the packed context approaches the window the proxy
-          # allows for this alias, "context too large" is the likely cause rather
-          # than a bad model name or an unsupported parameter.
-          echo "ℹ️  Resolved provider config: model=$KIMI_MODEL_NAME base_url=$KIMI_MODEL_BASE_URL provider_type=$KIMI_MODEL_PROVIDER_TYPE"
-          echo "ℹ️  max_context_size declared to the CLI: $KIMI_MODEL_MAX_CONTEXT_SIZE tokens"
-          # tr strips the padding BSD wc emits; harmless on the Linux runner but
-          # keeps the numbers readable if this is ever run elsewhere.
+          # tr strips the padding BSD wc emits, harmless on the Linux runner.
           bytes_of() { wc -c < "$1" 2>/dev/null | tr -d '[:space:]' || echo '?'; }
-          echo "ℹ️  Input sizes in bytes: context=$(bytes_of "$CONTEXT_PATH") diff=$(bytes_of "$DIFF_PATH") prompt=$(bytes_of /tmp/review_prompt.txt)"
 
-          # The CLI's error message names $HOME/.kimi-code/logs/kimi-code.log but
-          # does not always create it, so search for whatever it did write instead
-          # of reporting "no log" and giving up — that left the provider response
-          # unrecoverable on the runs this function was added to diagnose.
-          #
-          # `|| true` is load-bearing: the step runs under `bash -e -o pipefail`,
-          # and grep exits 1 when it matches nothing. Without it, pipefail
-          # propagates that failure and set -e kills the script mid-diagnostic —
-          # aborting on exactly the no-log case this branch exists to report, and
-          # swallowing the narrowing hints below. That is what happened on the
-          # first run after this function shipped.
-          KIMI_LOGS=$(find "$HOME" /tmp -maxdepth 5 -type f -name '*.log' 2>/dev/null | grep -i kimi | head -5 || true)
+          echo "ℹ️  config: model=$KIMI_MODEL_NAME base_url=$KIMI_MODEL_BASE_URL provider_type=$KIMI_MODEL_PROVIDER_TYPE max_context_size=$KIMI_MODEL_MAX_CONTEXT_SIZE"
+          echo "ℹ️  input bytes: context=$(bytes_of "$CONTEXT_PATH") diff=$(bytes_of "$DIFF_PATH") prompt=$(bytes_of /tmp/review_prompt.txt)"
 
+          # The CLI names $HOME/.kimi-code/logs/kimi-code.log in its errors but does
+          # not always create it, so search rather than assume.
+          # `|| true` is load-bearing: grep exits 1 on no match, and under pipefail
+          # + set -e that would abort this function mid-dump.
+          KIMI_LOGS=$(find "$HOME" /tmp -maxdepth 5 -type f -name '*.log' 2>/dev/null | grep -i kimi | head -3 || true)
           if [[ -n "$KIMI_LOGS" ]]; then
             while IFS= read -r log; do
-              # tr strips the padding BSD wc emits, so the count reads cleanly off
-              # the Linux runner too.
               lines=$(wc -l < "$log" | tr -d '[:space:]')
-              echo "::group::$log (showing last 200 of $lines lines)"
+              echo "::group::$log (last 200 of $lines lines)"
               tail -n 200 "$log"
               echo "::endgroup::"
-              # Say so explicitly: silent truncation could hide the very error this
-              # dump exists to surface.
-              if [[ "$lines" -gt 200 ]]; then
-                echo "⚠️  $log is $lines lines and only the last 200 are shown."
-                echo "    If the provider request/response is not visible, raise the tail window."
-              fi
+              [[ "$lines" -gt 200 ]] && echo "⚠️  truncated: $log has $lines lines"
             done <<< "$KIMI_LOGS"
           else
-            echo "⚠️  No kimi log found anywhere under \$HOME or /tmp, despite the CLI"
-            echo "    naming \$HOME/.kimi-code/logs/kimi-code.log. The provider response"
-            echo "    body is therefore unavailable from this job."
-            echo "::group::kimi --help (looking for a verbose/debug flag to enable next time)"
-            kimi --help 2>&1 | head -60 || echo "(kimi --help failed)"
-            echo "::endgroup::"
+            echo "ℹ️  no kimi log written; provider response body unavailable"
           fi
 
-          echo "ℹ️  Narrowing a 400 from here:"
-          echo "    1. Model name — must be an alias the endpoint fronts. Kimi-platform"
-          echo "       ids (k3, k3-256k, kimi-for-coding) only resolve at"
-          echo "       api.kimi.com/coding/v1, not on a LiteLLM proxy."
-          echo "    2. max_context_size above the window configured for that alias."
-          echo "    3. A parameter or wire format the proxy rejects (provider_type)."
-          echo "    Run this locally with the key you passed as LLM_API_KEY (that variable"
-          echo "    is deliberately not set in this job, so the lines below are templates):"
-          echo "      curl -s $KIMI_MODEL_BASE_URL/models -H \"Authorization: Bearer \$LLM_API_KEY\" | jq -r '.data[].id'"
-          echo "      curl -sS $KIMI_MODEL_BASE_URL/chat/completions -H \"Authorization: Bearer \$LLM_API_KEY\" \\"
-          echo "        -H 'Content-Type: application/json' \\"
-          echo "        -d '{\"model\":\"$KIMI_MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}' | jq ."
-          echo "    The second command is decisive: if it succeeds, the model and key are"
-          echo "    fine and the problem is in what the CLI sends, not what it targets."
+          echo "ℹ️  Troubleshooting: AI_PR_REVIEW_README.md — a 400 is usually a"
+          echo "    model/provider_type/base_url mismatch, and those must agree."
         }
 
         # No GitHub token in this step's env and no Bash tool in the config: the
