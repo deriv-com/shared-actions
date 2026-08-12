@@ -62,7 +62,7 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 | | `kimi` | `anthropic` |
 |---|---|---|
 | Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) |
-| Default model | `kimi-k3` | `claude-sonnet-5` |
+| Default model | `kimi-k2.7-code` (**not** `kimi-k3` — see below) | `claude-sonnet-5` |
 | `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** |
 | Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (agent mode mounts **no** GitHub MCP servers — see below) |
 | Shell | none (absent from `enabled` **and** denied by rule) | none (`--allowedTools` omits Bash, `--disallowedTools` re-denies it) |
@@ -88,10 +88,12 @@ succeeds. **Change these two inputs together, never one alone.** Valid types:
 `kimi`, `anthropic`, `openai`, `openai_responses`, `google-genai`, `vertexai`.
 
 **Model names belong to the endpoint, not the model.** `model` is passed through
-verbatim, so it must be whatever the thing in `base_url` calls it. On the Deriv
-LiteLLM proxy K3 is `kimi-k3`; the Kimi-platform ids (`k3`, `k3-256k`,
-`kimi-for-coding`) resolve only against `api.kimi.com/coding/v1` and return a
-bare `400 The request was invalid` from the proxy. List what a proxy accepts:
+verbatim, so it must be whatever the thing in `base_url` calls it. The Deriv
+LiteLLM proxy fronts three kimi aliases — `kimi-k2.7-code` (the default),
+`kimi-k2.6` and `kimi-k3` (**unusable**, see below); the Kimi-platform ids
+(`k3`, `k3-256k`, `kimi-for-coding`) resolve only against
+`api.kimi.com/coding/v1` and return a bare `400 The request was invalid` from
+the proxy. List what a proxy accepts:
 
 ```bash
 curl -s https://litellmsa.deriv.ai/v1/models \
@@ -102,12 +104,13 @@ If a 400 survives fixing the model name, suspect `max_context_size` exceeding
 the window the endpoint allows for that alias — or the known multi-turn 400
 below, which looks identical but has nothing to do with either.
 
-### KNOWN OPEN BUG: `kimi-k3` 400s on every review (multi-turn tool calls)
+### DO NOT USE `kimi-k3`: it 400s on every review (multi-turn tool calls)
 
-**Status: the Kimi engine cannot complete a review against the LiteLLM proxy.**
-Every run dies ~20s in with `provider.api_error: 400 The request was invalid`.
-It is not the model name, the context size, `provider_type`, or the API key —
-all of those are correct. Diagnosed 2026-08-12; the fix is not ours to make.
+**Status: diagnosed and worked around by not using that alias.** The default
+model is `kimi-k2.7-code`. Setting `model: kimi-k3` brings the failure back:
+every run dies ~20s in with `provider.api_error: 400 The request was invalid`,
+which is not the model name, the context size, `provider_type`, or the API key
+— all of those are correct. Diagnosed 2026-08-12.
 
 **Root cause.** The Kimi CLI omits the `content` key *entirely* on assistant
 messages that carry only `tool_calls` (`convertMessage` in the bundle's
@@ -131,19 +134,33 @@ review is dozens of tool-call turns, and every turn after the first re-sends
 the offending message shape. P(whole review) ≈ 0.45^n. A one-off `curl` looks
 fine, which is what made this look like a config problem for so long.
 
-**Why we cannot fix it here.** The message is built inside the CLI; no env var
-or `config.toml` key changes it. `KIMI_CODE_CUSTOM_HEADERS` (newline-separated
-`Name: value`) can inject routing headers, which is the only workflow-side
-lever.
+**The request shape cannot be fixed from here.** The message is built inside
+the CLI; no env var or `config.toml` key changes it, and the CLI's native
+`kimi` dialect behaves identically, so the direct Kimi endpoint is no escape.
 
-**The actual fixes, in order of preference:**
+**So the workaround is the alias.** Only three kimi aliases exist on the proxy,
+and the strict deployment sits in exactly one pool:
 
-1. **Proxy (right fix, needs the LiteLLM owners):** drop the strict deployment
-   from the `kimi-k3` pool, or give that deployment a request transformation
-   that sets `content: ""` on assistant `tool_calls` messages.
-2. **A tolerant alias:** if the proxy exposes an alias routing only to the
-   accepting deployment, set `model:` to it — a one-line caller change.
-3. **Interim:** run `engine: anthropic`, which is unaffected.
+| Alias | Multi-turn tool-call shape | Window |
+|---|---|---|
+| `kimi-k2.7-code` ← **default** | 6/6 × 200 (turn 1 and turn 2, full CLI bodies) | 262144 |
+| `kimi-k2.6` | 6/6 × 200 | 262144 |
+| `kimi-k3` | **3/6 — unusable** | 1048576 |
+
+Every successful response came from the same upstream (`gen-…` ids); the
+rejections carry no id at all. `x-litellm-tags` routing is not configured on
+this proxy, so header-based pinning is not an option.
+
+Note the window difference: switching away from `kimi-k3` means
+`max_context_size` must drop to `262144`, or the CLI over-packs and the request
+is rejected for an entirely different reason. Both the workflow default and the
+dogfooding caller set it accordingly.
+
+**To get `kimi-k3` (and its 1M window) back**, the LiteLLM owners need to
+either drop the strict deployment from that alias's pool or give it a request
+transformation setting `content: ""` on assistant `tool_calls` messages. Until
+then this is a config choice, not an outage. `engine: anthropic` is unaffected
+either way.
 
 Two debugging notes for whoever picks this up. The CLI **names a log file it
 never creates** (`$HOME/.kimi-code/logs/kimi-code.log`), so the provider
@@ -204,7 +221,7 @@ CLI has its own config format, sandbox model, tool names and entrypoint.
 | `engine` | `kimi` or `anthropic` | ❌ | `kimi` |
 | `model` | Model ID; resolved per engine when empty | ❌ | per engine |
 | `base_url` | LLM API endpoint; `/v1` added or stripped per engine | ❌ | `https://litellmsa.deriv.ai/v1` |
-| `max_context_size` | **[kimi]** Context window in tokens. Must match the model, or the CLI over-packs and the API rejects the request | ❌ | `1048576` |
+| `max_context_size` | **[kimi]** Context window in tokens. Must not exceed the model's, or the CLI over-packs and the API rejects the request | ❌ | `262144` |
 | `cli_version` | **[kimi]** Exact `@moonshot-ai/kimi-code` version | ❌ | `0.34.0` |
 | `provider_type` | **[kimi]** Wire dialect; must match what `base_url` serves | ❌ | `openai` |
 | `legacy_markers` | Newline-separated markers from superseded workflows to also delete | ❌ | `Claude PR Review Complete` |
@@ -304,7 +321,7 @@ summary regardless of dashboard state:
   "agent": "ai_review",
   "event_type": "initial_review | followup_review",
   "timestamp": "…", "pr_number": "…", "repo": "…",
-  "payload": { "commit_sha": "…", "review_size_bytes": 0, "model": "kimi-k3", "engine": "kimi" }
+  "payload": { "commit_sha": "…", "review_size_bytes": 0, "model": "kimi-k2.7-code", "engine": "kimi" }
 }
 ```
 

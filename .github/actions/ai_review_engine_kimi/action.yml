@@ -41,10 +41,11 @@ inputs:
     description: "Number of the PR under review (prompt preamble only)."
     required: true
   model:
-    description: "Model ID as the endpoint in base_url names it. With the LiteLLM proxy that is a proxy alias, e.g. `kimi-k3`. The Kimi-platform ids (`k3`, `k3-256k`, `kimi-for-coding`, `kimi-for-coding-highspeed`) only resolve against api.kimi.com/coding/v1 and return 400 from the proxy. Maps to KIMI_MODEL_NAME."
+    description: "Model ID as the endpoint in base_url names it. With the LiteLLM proxy that is a proxy alias, e.g. `kimi-k2.7-code`. The Kimi-platform ids (`k3`, `k3-256k`, `kimi-for-coding`, `kimi-for-coding-highspeed`) only resolve against api.kimi.com/coding/v1 and return 400 from the proxy. Avoid `kimi-k3`: one deployment behind that alias rejects this CLI's tool-call request shape, failing every review. Maps to KIMI_MODEL_NAME."
     required: false
-    # Matches the default base_url below, which is the LiteLLM proxy.
-    default: "kimi-k3"
+    # Matches the default base_url below, which is the LiteLLM proxy. Not
+    # kimi-k3 — see the model description and AI_PR_REVIEW_README.md.
+    default: "kimi-k2.7-code"
   base_url:
     description: "LLM API base URL. A trailing /v1 is appended when absent, so the identical value also works for the anthropic engine (which needs it removed). Maps to KIMI_MODEL_BASE_URL."
     required: false
@@ -53,9 +54,11 @@ inputs:
     description: "API key for base_url. Composite actions cannot read the `secrets` context, so the caller must pass this explicitly. Maps to KIMI_MODEL_API_KEY and is never written to disk."
     required: true
   max_context_size:
-    description: "Maximum context window in tokens. Must not exceed what the endpoint allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; the 256k variants are 262144. If a 400 persists after confirming the model name, try lowering this. Maps to KIMI_MODEL_MAX_CONTEXT_SIZE."
+    description: "Maximum context window in tokens. Must not exceed what the endpoint allows for the selected model, or the CLI over-packs context and the request is rejected. kimi-k2.7-code and kimi-k2.6 are 262144; kimi-k3 is 1048576. If a 400 persists after confirming the model name, try lowering this. Maps to KIMI_MODEL_MAX_CONTEXT_SIZE."
     required: false
-    default: "1048576"
+    # Paired with the default model above. Under-declaring only wastes window;
+    # over-declaring makes the CLI over-pack and the request is rejected.
+    default: "262144"
   provider_type:
     description: "Wire dialect the CLI speaks. One of kimi, anthropic, openai, openai_responses, google-genai, vertexai. MUST match what base_url actually serves: `kimi` targets the Kimi Code platform at api.kimi.com/coding/v1 and a LiteLLM proxy rejects it with a bare 400; `openai` speaks plain /v1/chat/completions, which is what the proxy serves. Defaults to `openai` to pair with the default base_url. Maps to KIMI_MODEL_PROVIDER_TYPE."
     required: false
@@ -254,12 +257,14 @@ runs:
             echo "ℹ️  no kimi log written; provider response body unavailable"
           fi
 
-          echo "ℹ️  A 400 here is very likely the KNOWN OPEN BUG documented in"
-          echo "    AI_PR_REVIEW_README.md: the CLI omits \`content\` on assistant"
-          echo "    tool_call messages and one deployment behind the kimi-k3 alias"
-          echo "    rejects that, so every multi-turn review fails. Not fixable from"
-          echo "    this action — it needs a proxy-side fix or a tolerant alias."
-          echo "    (Otherwise: a model/provider_type/base_url mismatch.)"
+          echo "ℹ️  If model is kimi-k3, that is the known cause: one deployment"
+          echo "    behind that alias rejects this CLI's tool-call requests (it"
+          echo "    omits \`content\` on assistant tool_call messages), so every"
+          echo "    review 400s at its first tool call. Use kimi-k2.7-code."
+          echo "    Otherwise check, in order: max_context_size above the window"
+          echo "    the endpoint allows for this model, then a"
+          echo "    model/provider_type/base_url mismatch. See"
+          echo "    AI_PR_REVIEW_README.md."
         }
 
         # No GitHub token in this step's env and no Bash tool in the config: the

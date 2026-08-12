@@ -31,7 +31,7 @@ on:
         default: "kimi"
         type: string
       model:
-        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
+        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k2.7-code, anthropic -> claude-sonnet-5). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1. Do NOT set this to `kimi-k3`: one deployment behind that alias rejects the Kimi CLI's tool-call requests, so every review fails — see AI_PR_REVIEW_README.md."
         required: false
         default: ""
         type: string
@@ -41,7 +41,7 @@ on:
         default: ""
         type: string
       max_context_size:
-        description: "[engine-specific: kimi] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; the 256k variants are 262144. If a request fails with a 400 after the model name is confirmed correct, try lowering this. Empty resolves to 1048576. Ignored when engine is not `kimi`."
+        description: "[engine-specific: kimi] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. kimi-k2.7-code and kimi-k2.6 are 262144; kimi-k3 is 1048576. If a request fails with a 400 after the model name is confirmed correct, try lowering this. Empty resolves to 262144, matching the default model. Ignored when engine is not `kimi`."
         required: false
         default: ""
         type: string
@@ -191,10 +191,18 @@ jobs:
           # so routing a repo onto this workflow must not rename it.
           case "$ENGINE" in
             kimi)
-              # LiteLLM alias, NOT the Kimi-platform id. The proxy fronts K3 as
-              # `kimi-k3`; `k3` only resolves at api.kimi.com/coding/v1 and gets
-              # a 400 from the proxy.
-              DEFAULT_MODEL="kimi-k3"
+              # LiteLLM alias, NOT the Kimi-platform id (`k3` and friends only
+              # resolve at api.kimi.com/coding/v1 and get a 400 from the proxy).
+              #
+              # NOT kimi-k3, deliberately: one of the two deployments behind
+              # that alias rejects the assistant tool_call message shape the
+              # Kimi CLI emits, so a review 400s as soon as it makes its first
+              # tool call — which is always. kimi-k2.7-code routes only to the
+              # tolerant deployment (verified 6/6 on the CLI's exact turn-1 and
+              # turn-2 bodies, versus 3/6 for kimi-k3) and is coding-tuned.
+              # Revert to kimi-k3 only once the proxy pool is fixed; see the
+              # bug section in AI_PR_REVIEW_README.md.
+              DEFAULT_MODEL="kimi-k2.7-code"
               METRICS_AGENT="ai_review"
               ARTIFACT_PREFIX="ai-review"
               ;;
@@ -223,7 +231,12 @@ jobs:
           # instructions for every consumer with no PR and no audit trail. To
           # ship a new prompt, edit the gist, then bump this hash via PR.
           BASE_URL="${BASE_URL_INPUT:-https://litellmsa.deriv.ai/v1}"
-          MAX_CONTEXT="${MAX_CONTEXT_INPUT:-1048576}"
+          # 262144 is the window of the default model (kimi-k2.7-code) and of
+          # kimi-k2.6. It is also the SAFE default: declaring more than the
+          # endpoint allows makes the CLI over-pack and the request is rejected,
+          # while declaring less merely under-uses the window. Raise it only
+          # alongside a model whose window is genuinely larger.
+          MAX_CONTEXT="${MAX_CONTEXT_INPUT:-262144}"
           CLI_VERSION="${CLI_VERSION_INPUT:-0.34.0}"
           PROVIDER_TYPE="${PROVIDER_TYPE_INPUT:-openai}"
           PROMPT_GIST_URL="${PROMPT_GIST_URL_INPUT:-https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/2d5131aa058801e99fe77f69db124bf583f7d3ea/claude-review-format.md}"
