@@ -261,8 +261,38 @@ jobs:
 
           echo "📋 Review context built ($(wc -c < /tmp/review_context.md) bytes)"
 
-      - name: Remove CLAUDE.md to prevent project config leaking into review
-        run: rm -f CLAUDE.md
+      - name: Strip PR-supplied agent config
+        # Security boundary, not hygiene — and deliberately wider than the
+        # `rm -f CLAUDE.md` this replaces. Everything below is PR-controlled and
+        # reaches the agent as trusted configuration, none of it gated by the
+        # --allowedTools allowlist further down:
+        #   .claude/settings.json  can declare HOOKS, which execute arbitrary
+        #                          commands in this job — the job holds a
+        #                          write-scoped GITHUB_TOKEN and the API key
+        #   .claude/rules/*.md     load on demand when a matching file is read
+        #   .mcp.json              declares MCP servers (arbitrary local commands)
+        #   .claude-plugin/        plugin manifest
+        #   CLAUDE.md, CLAUDE.local.md, AGENTS.md   instruction files
+        #
+        # Recursive, not root-only: Claude Code discovers CLAUDE.md and
+        # CLAUDE.local.md in subdirectories and loads them when it reads files
+        # there, and this review's prompt tells it to traverse into dependencies.
+        # A nested packages/foo/CLAUDE.md therefore reached the model even with the
+        # root file deleted. AGENTS.md is stripped defensively — Claude Code does
+        # not read it natively, but a CLAUDE.md can @import it.
+        #
+        # .git is pruned so the sweep cannot corrupt the checkout.
+        run: |
+          find . -name .git -prune -o -type f \
+            \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' -o -name '.mcp.json' \) \
+            -print0 | xargs -0 -r rm -f
+          find . -name .git -prune -o -type d \
+            \( -name '.claude' -o -name '.claude-plugin' \) \
+            -print0 | xargs -0 -r rm -rf
+          # Persistent runner: clear cross-run agent state too.
+          rm -rf "$HOME/.claude"
+          rm -f "$HOME/.claude.json"
+          echo "✅ Stripped PR-supplied agent config (recursive)"
 
       - name: Claude Code PR Review
         uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
