@@ -223,36 +223,61 @@ runs:
         # so the actual provider request and response body are unrecoverable.
         # Secrets registered with the job are masked in these logs by Actions.
         dump_kimi_log() {
-          KIMI_LOG="$HOME/.kimi-code/logs/kimi-code.log"
-          KIMI_LOG_LINES=0
-          # tr strips the leading padding BSD wc emits, so the count reads cleanly
-          # if this is ever run outside the Linux runner.
-          [[ -f "$KIMI_LOG" ]] && KIMI_LOG_LINES=$(wc -l < "$KIMI_LOG" | tr -d '[:space:]')
-
-          echo "::group::kimi-code.log (showing last 200 of $KIMI_LOG_LINES lines)"
-          if [[ -f "$KIMI_LOG" ]]; then
-            tail -n 200 "$KIMI_LOG"
-          else
-            echo "(no log at $KIMI_LOG)"
-          fi
-          echo "::endgroup::"
-
-          # State the truncation explicitly. Silent truncation would defeat the
-          # point of dumping the log at all: if the provider error scrolls past
-          # the window, the reader needs to know the tail is not the whole story.
-          if [[ "$KIMI_LOG_LINES" -gt 200 ]]; then
-            echo "⚠️  Log is $KIMI_LOG_LINES lines and only the last 200 are shown."
-            echo "    If the provider request/response is not visible above, raise the tail window."
-          fi
-
+          # Request shape first. A 400 whose body we cannot see is still narrowable
+          # from the sizes: if the packed context approaches the window the proxy
+          # allows for this alias, "context too large" is the likely cause rather
+          # than a bad model name or an unsupported parameter.
           echo "ℹ️  Resolved provider config: model=$KIMI_MODEL_NAME base_url=$KIMI_MODEL_BASE_URL provider_type=$KIMI_MODEL_PROVIDER_TYPE"
-          echo "ℹ️  A 400 from the proxy most often means \`model\` is not a name it fronts."
-          echo "    The Kimi-platform ids (k3, k3-256k, kimi-for-coding) are valid at"
-          echo "    api.kimi.com/coding/v1, NOT necessarily on a LiteLLM proxy, which uses"
-          echo "    whatever aliases it was configured with. To list them, run this on your"
-          echo "    own machine with the same key you passed as LLM_API_KEY (that variable is"
-          echo "    deliberately not set in this job, so the line below is a template):"
-          echo "      curl -H \"Authorization: Bearer \$LLM_API_KEY\" $KIMI_MODEL_BASE_URL/models"
+          echo "ℹ️  max_context_size declared to the CLI: $KIMI_MODEL_MAX_CONTEXT_SIZE tokens"
+          # tr strips the padding BSD wc emits; harmless on the Linux runner but
+          # keeps the numbers readable if this is ever run elsewhere.
+          bytes_of() { wc -c < "$1" 2>/dev/null | tr -d '[:space:]' || echo '?'; }
+          echo "ℹ️  Input sizes in bytes: context=$(bytes_of "$CONTEXT_PATH") diff=$(bytes_of "$DIFF_PATH") prompt=$(bytes_of /tmp/review_prompt.txt)"
+
+          # The CLI's error message names $HOME/.kimi-code/logs/kimi-code.log but
+          # does not always create it, so search for whatever it did write instead
+          # of reporting "no log" and giving up — that left the provider response
+          # unrecoverable on the runs this function was added to diagnose.
+          KIMI_LOGS=$(find "$HOME" /tmp -maxdepth 5 -type f -name '*.log' 2>/dev/null | grep -i kimi | head -5)
+
+          if [[ -n "$KIMI_LOGS" ]]; then
+            while IFS= read -r log; do
+              # tr strips the padding BSD wc emits, so the count reads cleanly off
+              # the Linux runner too.
+              lines=$(wc -l < "$log" | tr -d '[:space:]')
+              echo "::group::$log (showing last 200 of $lines lines)"
+              tail -n 200 "$log"
+              echo "::endgroup::"
+              # Say so explicitly: silent truncation could hide the very error this
+              # dump exists to surface.
+              if [[ "$lines" -gt 200 ]]; then
+                echo "⚠️  $log is $lines lines and only the last 200 are shown."
+                echo "    If the provider request/response is not visible, raise the tail window."
+              fi
+            done <<< "$KIMI_LOGS"
+          else
+            echo "⚠️  No kimi log found anywhere under \$HOME or /tmp, despite the CLI"
+            echo "    naming \$HOME/.kimi-code/logs/kimi-code.log. The provider response"
+            echo "    body is therefore unavailable from this job."
+            echo "::group::kimi --help (looking for a verbose/debug flag to enable next time)"
+            kimi --help 2>&1 | head -60 || echo "(kimi --help failed)"
+            echo "::endgroup::"
+          fi
+
+          echo "ℹ️  Narrowing a 400 from here:"
+          echo "    1. Model name — must be an alias the endpoint fronts. Kimi-platform"
+          echo "       ids (k3, k3-256k, kimi-for-coding) only resolve at"
+          echo "       api.kimi.com/coding/v1, not on a LiteLLM proxy."
+          echo "    2. max_context_size above the window configured for that alias."
+          echo "    3. A parameter or wire format the proxy rejects (provider_type)."
+          echo "    Run this locally with the key you passed as LLM_API_KEY (that variable"
+          echo "    is deliberately not set in this job, so the lines below are templates):"
+          echo "      curl -s $KIMI_MODEL_BASE_URL/models -H \"Authorization: Bearer \$LLM_API_KEY\" | jq -r '.data[].id'"
+          echo "      curl -sS $KIMI_MODEL_BASE_URL/chat/completions -H \"Authorization: Bearer \$LLM_API_KEY\" \\"
+          echo "        -H 'Content-Type: application/json' \\"
+          echo "        -d '{\"model\":\"$KIMI_MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}' | jq ."
+          echo "    The second command is decisive: if it succeeds, the model and key are"
+          echo "    fine and the problem is in what the CLI sends, not what it targets."
         }
 
         # No GitHub token in this step's env and no Bash tool in the config: the
