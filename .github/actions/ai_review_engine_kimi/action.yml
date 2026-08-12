@@ -184,9 +184,14 @@ runs:
         export KIMI_MODEL_BASE_URL="$BASE_URL"
         echo "🔧 Kimi engine | model=$KIMI_MODEL_NAME | base_url=$BASE_URL"
 
-        # Quoted heredoc: the ${{ }} expressions below are substituted by Actions
-        # before bash sees this script, so no shell expansion happens in the
-        # prompt body.
+        # Quoted heredoc: the inputs.* expressions below are substituted by
+        # Actions before bash sees this script, so no shell expansion happens in
+        # the prompt body.
+        #
+        # Do NOT write an empty expression pair in this block. Actions scans the
+        # whole run: string for expressions, including text bash treats as a
+        # comment, and an empty one fails manifest validation before any step
+        # runs — which is exactly how this file got broken once already.
         cat > /tmp/review_prompt.txt <<'EOF'
         REPO: ${{ inputs.repository }}
         PR NUMBER: ${{ inputs.pr_number }}
