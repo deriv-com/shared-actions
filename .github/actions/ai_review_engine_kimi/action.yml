@@ -223,15 +223,35 @@ runs:
         # so the actual provider request and response body are unrecoverable.
         # Secrets registered with the job are masked in these logs by Actions.
         dump_kimi_log() {
-          echo "::group::kimi-code.log (last 200 lines)"
-          tail -n 200 "$HOME/.kimi-code/logs/kimi-code.log" 2>/dev/null \
-            || echo "(no log at $HOME/.kimi-code/logs/kimi-code.log)"
+          KIMI_LOG="$HOME/.kimi-code/logs/kimi-code.log"
+          KIMI_LOG_LINES=0
+          # tr strips the leading padding BSD wc emits, so the count reads cleanly
+          # if this is ever run outside the Linux runner.
+          [[ -f "$KIMI_LOG" ]] && KIMI_LOG_LINES=$(wc -l < "$KIMI_LOG" | tr -d '[:space:]')
+
+          echo "::group::kimi-code.log (showing last 200 of $KIMI_LOG_LINES lines)"
+          if [[ -f "$KIMI_LOG" ]]; then
+            tail -n 200 "$KIMI_LOG"
+          else
+            echo "(no log at $KIMI_LOG)"
+          fi
           echo "::endgroup::"
+
+          # State the truncation explicitly. Silent truncation would defeat the
+          # point of dumping the log at all: if the provider error scrolls past
+          # the window, the reader needs to know the tail is not the whole story.
+          if [[ "$KIMI_LOG_LINES" -gt 200 ]]; then
+            echo "⚠️  Log is $KIMI_LOG_LINES lines and only the last 200 are shown."
+            echo "    If the provider request/response is not visible above, raise the tail window."
+          fi
+
           echo "ℹ️  Resolved provider config: model=$KIMI_MODEL_NAME base_url=$KIMI_MODEL_BASE_URL provider_type=$KIMI_MODEL_PROVIDER_TYPE"
           echo "ℹ️  A 400 from the proxy most often means \`model\` is not a name it fronts."
           echo "    The Kimi-platform ids (k3, k3-256k, kimi-for-coding) are valid at"
           echo "    api.kimi.com/coding/v1, NOT necessarily on a LiteLLM proxy, which uses"
-          echo "    whatever aliases it was configured with. List them with:"
+          echo "    whatever aliases it was configured with. To list them, run this on your"
+          echo "    own machine with the same key you passed as LLM_API_KEY (that variable is"
+          echo "    deliberately not set in this job, so the line below is a template):"
           echo "      curl -H \"Authorization: Bearer \$LLM_API_KEY\" $KIMI_MODEL_BASE_URL/models"
         }
 
