@@ -1,0 +1,110 @@
+name: Lint Actions
+
+# Validates this repo's own workflows and composite actions.
+#
+# It exists because composite actions had NO validation at all, and three bugs
+# shipped to master through that gap in a single day:
+#   1. An empty Actions expression pair inside a `run:` block — valid YAML, so
+#      yaml-lint passed, but it fails manifest loading and every consumer job
+#      died at "Set up job" before running a step.
+#   2. `timeout-minutes:` on a step inside a composite action — silently
+#      unsupported, so a 60-minute cap was quietly dropped.
+#   3. A `secrets.` reference inside a composite action — unavailable there, and
+#      it resolves to empty rather than erroring.
+#
+# actionlint does NOT cover any of this: it only parses `.github/workflows/`, and
+# handing it an `action.yml` makes it complain the file has no `jobs:` section.
+# Hence the explicit checks below.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Lint workflows with actionlint
+        run: |
+          # shellcheck is disabled: the repo has ~250 pre-existing style findings
+          # (mostly unquoted $GITHUB_OUTPUT redirects) that would drown the real
+          # errors. This catches Actions-level mistakes — bad expressions, unknown
+          # contexts, invalid keys — which is what actually breaks a run.
+          #
+          # Both the download script and the actionlint version are pinned, so a
+          # new actionlint release with new rules cannot turn this gate red
+          # without a change in this repo. Bump both deliberately.
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/3795ba2f6cb243eeca54c9d22e5c531cb9dcfb4a/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -shellcheck= -color
+
+      - name: Lint composite actions
+        run: |
+          # The opening delimiter is assembled from bytes rather than written out,
+          # so this file cannot trip check 1 on itself.
+          OPEN=$(printf '\x24\x7b\x7b')
+          fail=0
+
+          # PyYAML ships preinstalled on ubuntu-latest. Fail loudly if that ever
+          # changes, rather than reporting every action as "invalid YAML".
+          if ! python3 -c 'import yaml' 2>/dev/null; then
+            echo "::error::PyYAML is not available on the runner — the YAML validity check cannot run"
+            exit 1
+          fi
+
+          shopt -s nullglob
+          actions=(.github/actions/*/action.yml .github/actions/*/action.yaml)
+          if [[ ${#actions[@]} -eq 0 ]]; then
+            echo "::error::no composite actions found — has the layout changed?"
+            exit 1
+          fi
+
+          for f in "${actions[@]}"; do
+            echo "── $f"
+
+            # 0. Valid YAML at all. PyYAML is preinstalled on the runner, so this
+            #    needs no network and no third-party code fetched at run time.
+            if ! err=$(python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$f" 2>&1); then
+              echo "::error file=$f::invalid YAML"
+              echo "$err" | tail -5
+              fail=1
+            fi
+
+            # 1. Empty expression pair. Actions scans the WHOLE run: string for
+            #    expressions, including lines bash treats as comments, and an empty
+            #    one fails manifest validation before any step executes. The error
+            #    it reports points at the start of the block scalar, not the
+            #    offending line, so it reads like an indentation problem.
+            if grep -nE '\$\{\{[[:space:]]*\}\}' "$f"; then
+              echo "::error file=$f::empty Actions expression pair — fails manifest loading. Reword so an empty '$OPEN }}' is not written literally, even inside a comment."
+              fail=1
+            fi
+
+            # 2. timeout-minutes on an inner step: not supported in composite
+            #    actions. Put it on the calling step in the workflow instead.
+            if grep -nE '^[[:space:]]*timeout-minutes:' "$f"; then
+              echo "::error file=$f::timeout-minutes is not supported on steps inside a composite action — move it to the calling step"
+              fail=1
+            fi
+
+            # 3. secrets context: unavailable inside composite actions. It does not
+            #    error, it resolves to empty, so a credential silently goes missing.
+            if grep -nE '\bsecrets\.[A-Za-z_]' "$f"; then
+              echo "::error file=$f::composite actions cannot read the secrets context — pass the value in as an input. This check also matches comments — reword them rather than referencing secrets.NAME."
+              fail=1
+            fi
+          done
+
+          if [[ "$fail" -ne 0 ]]; then
+            echo "::error::composite action lint failed — see annotations above"
+            exit 1
+          fi
+          echo "✅ ${#actions[@]} composite action(s) passed"
