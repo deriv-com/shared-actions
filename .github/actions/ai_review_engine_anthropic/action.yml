@@ -135,20 +135,21 @@ runs:
         anthropic_api_key: ${{ inputs.api_key }}
         # The action needs a token for its own actor/permission checks.
         #
-        # Be precise about what this engine does and does not guarantee, because
-        # it is weaker than the Kimi engine's. Per the action's docs at the pinned
-        # SHA: "The base GitHub tools are always included" — so --allowedTools ADDS
-        # to a base set rather than replacing it, and some GitHub tool surface is
-        # not removable. What IS established: Claude "cannot execute Bash commands
-        # unless explicitly allowed", so omitting Bash genuinely removes shell
-        # access; and it "cannot post multiple comments" / "cannot submit formal
-        # PR reviews" by design.
+        # What the model can actually reach here — verified against the action's
+        # SOURCE at the pinned SHA, not its docs (the docs' "base GitHub tools
+        # are always included" describes tag mode): passing `prompt:` puts the
+        # action in AGENT mode, and in agent mode src/mcp/install-mcp-server.ts
+        # mounts the github_comment MCP server only when --allowedTools requests
+        # mcp__github_comment__* tools, the file-ops server only with commit
+        # signing, and the inline-comment server only when requested. Ours asks
+        # for "Read,Write", so NO GitHub MCP server is mounted at all — the
+        # model holds no comment tool, same guarantee as the Kimi engine.
         #
-        # So "exactly one review comment" rests on three things here, not one:
-        #   1. track_progress is off, so there is no tracking comment to update
-        #   2. the prompt explicitly forbids commenting (step 5 below)
-        #   3. the caller deletes any marker-matching comment before posting
-        # Unlike the Kimi engine, it is NOT enforced by the tool surface alone.
+        # Because that rests on source behavior at one SHA rather than a
+        # documented contract, --disallowedTools below re-denies those servers
+        # (plus Bash/WebFetch/WebSearch) as a belt — so a future SHA bump that
+        # changes agent-mode defaults fails safe instead of silently widening
+        # the surface. The caller's delete-before-post remains the final layer.
         github_token: ${{ github.token }}
         # track_progress is deliberately NOT set. It forces tag mode, which makes
         # the action post and update its own tracking comment on the PR — that
@@ -156,30 +157,25 @@ runs:
         # cleanup step only reaps comments carrying the review marker, so tracking
         # comments would accumulate on every PR forever.
         show_full_output: true
+        # The step-by-step review procedure lives in the caller-built context
+        # file (its "Review Procedure" section), NOT here — it is engine-neutral,
+        # and duplicating it per engine let the copies drift. This prompt only
+        # bootstraps the model into that file.
         prompt: |
           REPO: ${{ inputs.repository }}
           PR NUMBER: ${{ inputs.pr_number }}
 
-          Follow these steps:
+          Read ${{ inputs.review_context_path }} and follow it exactly. It contains
+          the full review instructions, PR context, previous review (if any),
+          acknowledged suggestions to skip, and the required output format — plus a
+          "Review Procedure" section telling you what else to read, including the
+          pre-fetched PR diff at ${{ inputs.pr_diff_path }}, and requiring you to
+          write your complete review to ${{ inputs.output_path }} with the Write
+          tool. You have no shell tool; everything you need is on disk.
 
-          1. Read ${{ inputs.review_context_path }} — it contains full review instructions, PR context, previous review (if any), acknowledged suggestions to skip, and the required output format.
-
-          2. Read ${{ inputs.pr_diff_path }} — it contains the full diff for this PR (changed files and hunks), already fetched for you. You have no shell tool; everything you need is on disk.
-
-          3. For each changed file, use Read to open the full file — not just the diff hunk.
-             Full file context is required to understand the complete impact of each change.
-
-          4. For each changed file, identify and Read its dependencies:
-             - Imported modules, utilities, or shared helpers referenced in the changed code
-             - Type definitions, interfaces, or enums used by the changed code
-             - Parent components or callers if the changed file exports something modified
-             - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps
-
-          5. After reading ALL files and dependencies, compile your complete review.
-             Write the ENTIRE review to ${{ inputs.output_path }} using the Write tool.
-             Do NOT post, create or update any PR or issue comment, and do not use
-             any GitHub tool to publish your review. Writing the file is the whole
-             job — the caller posts it as a single comment.
+          Do NOT post, create or update any PR or issue comment, and do not use
+          any GitHub tool to publish your review. Writing the file is the whole
+          job — the caller posts it as a single comment.
         # Bash is dropped entirely: the diff is pre-fetched, so the previous
         # `Bash(gh pr diff:*)` grant bought nothing and rested on the CLI's
         # command-pattern matching being argv-aware — under a naive prefix match,
@@ -195,9 +191,16 @@ runs:
         # and writes nothing, tightening this needs a real run to verify, not a
         # guess — tracked in the PR test plan. Until then the asymmetry is real
         # and documented rather than papered over.
+        #
+        # --disallowedTools is the belt for the agent-mode analysis on
+        # github_token above: server-level MCP names deny every tool of those
+        # servers, and disallowing a tool that is not mounted is a no-op — this
+        # only matters if a future SHA bump mounts them again. Disallowed takes
+        # precedence over allowed in the CLI, so it cannot mask Read/Write.
         claude_args: |
           --model ${{ inputs.model }}
           --allowedTools "Read,Write"
+          --disallowedTools "Bash,WebFetch,WebSearch,mcp__github_comment,mcp__github_inline_comment,mcp__github_file_ops,mcp__github"
 
     - name: Verify review output
       id: verify
