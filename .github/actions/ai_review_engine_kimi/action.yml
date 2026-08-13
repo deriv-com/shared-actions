@@ -254,12 +254,13 @@ runs:
             echo "ℹ️  no kimi log written; provider response body unavailable"
           fi
 
-          echo "ℹ️  Troubleshooting: AI_PR_REVIEW_README.md. A 400 is usually a"
-          echo "    model/provider_type/base_url mismatch (those must agree), or"
-          echo "    max_context_size above what the endpoint allows for this model."
-          echo "    If the run got as far as reading files before failing, check the"
-          echo "    RESOLVED kimi-k3 section instead — a proxy deployment rejecting"
-          echo "    the CLI's tool-call requests looks exactly like this."
+          echo "ℹ️  Troubleshooting: AI_PR_REVIEW_README.md. When this failed on the"
+          echo "    FIRST request, suspect config: a model/provider_type/base_url"
+          echo "    mismatch (those must agree), or max_context_size above what the"
+          echo "    endpoint allows for this model. When it failed only after the"
+          echo "    agent had started reading files, config is probably fine —"
+          echo "    suspect the endpoint rejecting a mid-conversation request, and"
+          echo "    check whether the model alias fronts more than one deployment."
         }
 
         # No GitHub token in this step's env and no Bash tool in the config: the
