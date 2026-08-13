@@ -1,0 +1,26 @@
+name: generate_app_info
+description: Create or update app-info.json with the production tag in the build output directory
+inputs:
+  version:
+    description: "Production tag to write as the version (e.g., production_V20260813_0)"
+    required: true
+  output_dir:
+    description: "Directory in which your compiled frontend is located"
+    required: false
+    default: "."
+runs:
+  using: composite
+  steps:
+    - name: Create or update app-info.json
+      env:
+        VERSION: ${{ inputs.version }}
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+      run: |
+        if [ ! -d "$OUTPUT_DIR" ]; then
+          echo "::error::Output directory '$OUTPUT_DIR' does not exist"
+          exit 1
+        fi
+        jq -n --arg version "$VERSION" '{version: $version}' > "$OUTPUT_DIR/app-info.json"
+        echo "Wrote $OUTPUT_DIR/app-info.json:"
+        cat "$OUTPUT_DIR/app-info.json"
+      shell: bash
