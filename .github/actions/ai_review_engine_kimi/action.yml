@@ -254,8 +254,13 @@ runs:
             echo "ℹ️  no kimi log written; provider response body unavailable"
           fi
 
-          echo "ℹ️  Troubleshooting: AI_PR_REVIEW_README.md — a 400 is usually a"
-          echo "    model/provider_type/base_url mismatch, and those must agree."
+          echo "ℹ️  Troubleshooting: AI_PR_REVIEW_README.md. When this failed on the"
+          echo "    FIRST request, suspect config: a model/provider_type/base_url"
+          echo "    mismatch (those must agree), or max_context_size above what the"
+          echo "    endpoint allows for this model. When it failed only after the"
+          echo "    agent had started reading files, config is probably fine —"
+          echo "    suspect the endpoint rejecting a mid-conversation request, and"
+          echo "    check whether the model alias fronts more than one deployment."
         }
 
         # No GitHub token in this step's env and no Bash tool in the config: the
