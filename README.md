@@ -38,6 +38,26 @@ Add a row here when deprecating anything. With no CHANGELOG and no release proce
           head_sha: ${{github.event.workflow_run.head_sha}}
 ```
 
+### App info (version stamp)
+
+[`generate_app_info`](.github/actions/generate_app_info/) creates or updates an
+`app-info.json` file in the build output directory containing the production tag.
+Full docs: [generate_app_info README](.github/actions/generate_app_info/README.md).
+
+```yaml
+      - name: Generate app-info.json
+        uses: "deriv-com/shared-actions/.github/actions/generate_app_info@master"
+        with:
+          version: ${{ github.event.inputs.tag }} # the production tag
+          output_dir: dist # optional, defaults to "."
+```
+
+Output file:
+
+```json
+{ "version": "<the tag passed>" }
+```
+
 ### Archive on Merge (openspec)
 
 When a PR that completes an openspec change merges, archive it and open a
