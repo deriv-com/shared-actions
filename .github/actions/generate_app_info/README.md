@@ -31,36 +31,59 @@ Given a tag, it writes this file into the directory you point it at:
 
 ## Usage
 
-Add a step **after your build step** (so the file lands in the final build
-output and gets deployed with it):
+Add a step **after your build step and before your Cloudflare Pages publish
+step**, so the file lands in the final build output and gets deployed with it.
+No checkout of `shared-actions` is needed — referencing the action with `uses:`
+is enough.
+
+Example from a production workflow triggered by pushing a `production_*` tag
+(derivatives-trader style, where the deployed output is `packages/core/dist`):
 
 ```yaml
+on:
+  push:
+    tags:
+      - production_*
+
+# ...
+
 steps:
   - name: Checkout
     uses: actions/checkout@v4
 
   - name: Build
-    run: npm run build
+    uses: "./.github/actions/build"
+    with:
+      NODE_ENV: production
+      # ...
 
   - name: Generate app-info.json
     uses: "deriv-com/shared-actions/.github/actions/generate_app_info@master"
     with:
-      version: ${{ github.event.inputs.tag }}
-      output_dir: dist
+      version: ${{ github.ref_name }} # the production_* tag that triggered the workflow
+      output_dir: packages/core/dist
 
-  # ... your deploy step (Cloudflare Pages, Vercel, etc.)
+  - name: Publish to Cloudflare Pages Production
+    uses: "./.github/actions/publish_to_pages_production"
+    with:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 ```
+
+`output_dir` must be the same directory your publish step deploys (the
+argument to `wrangler pages deploy`), so `app-info.json` ends up at the site
+root.
 
 ### Where does the tag come from?
 
 Pass whatever identifies the release in your pipeline. Common sources:
 
 ```yaml
+# Workflow triggered by pushing a tag (e.g. production_*)
+version: ${{ github.ref_name }}
+
 # Production workflow triggered manually with a tag input
 version: ${{ github.event.inputs.tag }}
-
-# Workflow triggered by pushing a tag
-version: ${{ github.ref_name }}
 
 # Release event
 version: ${{ github.event.release.tag_name }}
