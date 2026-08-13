@@ -31,7 +31,7 @@ on:
         default: "kimi"
         type: string
       model:
-        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k2.7-code, anthropic -> claude-sonnet-5). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1. `kimi-k3` works but is special-cased: half of its deployments reject the Kimi CLI's tool-call requests, so the workflow pins it to the healthy one at run time (and needs `max_context_size: 1048576`) — see AI_PR_REVIEW_README.md."
+        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
         required: false
         default: ""
         type: string
@@ -41,7 +41,7 @@ on:
         default: ""
         type: string
       max_context_size:
-        description: "[engine-specific: kimi] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. kimi-k2.7-code and kimi-k2.6 are 262144; kimi-k3 is 1048576. If a request fails with a 400 after the model name is confirmed correct, try lowering this. Empty resolves to 262144, matching the default model. Ignored when engine is not `kimi`."
+        description: "[engine-specific: kimi] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; the 256k variants are 262144. If a request fails with a 400 after the model name is confirmed correct, try lowering this. Empty resolves to 1048576. Ignored when engine is not `kimi`."
         required: false
         default: ""
         type: string
@@ -166,9 +166,6 @@ jobs:
         env:
           ENGINE_INPUT: ${{ inputs.engine }}
           MODEL_INPUT: ${{ inputs.model }}
-          # Only for the kimi-k3 deployment-pin lookup below (GET /model/info).
-          # Never echoed; the engine step receives it as an input separately.
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           BASE_URL_INPUT: ${{ inputs.base_url }}
           MAX_CONTEXT_INPUT: ${{ inputs.max_context_size }}
           CLI_VERSION_INPUT: ${{ inputs.cli_version }}
@@ -194,16 +191,10 @@ jobs:
           # so routing a repo onto this workflow must not rename it.
           case "$ENGINE" in
             kimi)
-              # LiteLLM alias, NOT the Kimi-platform id (`k3` and friends only
-              # resolve at api.kimi.com/coding/v1 and get a 400 from the proxy).
-              #
-              # Not kimi-k3: half the deployments behind that alias reject the
-              # Kimi CLI's tool-call requests, so a review 400s at its first
-              # tool call — which is always. `model: kimi-k3` IS supported (the
-              # deployment pin below makes it work), but the default stays on a
-              # single-deployment alias so no consumer depends on that
-              # workaround. kimi-k2.7-code is coding-tuned and 6/6 clean.
-              DEFAULT_MODEL="kimi-k2.7-code"
+              # LiteLLM alias, NOT the Kimi-platform id. The proxy fronts K3 as
+              # `kimi-k3`; `k3` only resolves at api.kimi.com/coding/v1 and gets
+              # a 400 from the proxy.
+              DEFAULT_MODEL="kimi-k3"
               METRICS_AGENT="ai_review"
               ARTIFACT_PREFIX="ai-review"
               ;;
@@ -232,76 +223,14 @@ jobs:
           # instructions for every consumer with no PR and no audit trail. To
           # ship a new prompt, edit the gist, then bump this hash via PR.
           BASE_URL="${BASE_URL_INPUT:-https://litellmsa.deriv.ai/v1}"
-          # 262144 is the window of the default model (kimi-k2.7-code) and of
-          # kimi-k2.6. It is also the SAFE default: declaring more than the
-          # endpoint allows makes the CLI over-pack and the request is rejected,
-          # while declaring less merely under-uses the window. Raise it only
-          # alongside a model whose window is genuinely larger.
-          MAX_CONTEXT="${MAX_CONTEXT_INPUT:-262144}"
+          MAX_CONTEXT="${MAX_CONTEXT_INPUT:-1048576}"
           CLI_VERSION="${CLI_VERSION_INPUT:-0.34.0}"
           PROVIDER_TYPE="${PROVIDER_TYPE_INPUT:-openai}"
           PROMPT_GIST_URL="${PROMPT_GIST_URL_INPUT:-https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/2d5131aa058801e99fe77f69db124bf583f7d3ea/claude-review-format.md}"
 
-          # ---- kimi-k3 deployment pin (WORKAROUND — delete once the proxy pool
-          #      is fixed; see the kimi-k3 section of AI_PR_REVIEW_README.md) ----
-          #
-          # `kimi-k3` is load-balanced across two deployments and only one works:
-          # the Cloudflare AI Gateway "compat" endpoint rejects the assistant
-          # tool_call message shape the Kimi CLI sends (it omits `content`), so
-          # ~half of all requests 400 and no multi-turn review ever finishes.
-          #
-          # LiteLLM lets a request target ONE deployment by passing that
-          # deployment's model_info.id as `model`. The id is a hash of the
-          # deployment config, so it is resolved HERE at run time rather than
-          # committed — a hardcoded hash would go stale silently the next time
-          # the proxy config is touched, and resurface as the same opaque 400.
-          #
-          # Only kimi-k3 is rewritten; every other model passes through
-          # untouched and pays nothing for this.
-          ENGINE_MODEL="$MODEL"
-          if [[ "$ENGINE" == "kimi" && "$MODEL" == "kimi-k3" ]]; then
-            # Try the base_url as given, then without /v1 — proxies expose this
-            # endpoint at either place depending on how they are mounted.
-            DEPLOYMENTS=$(curl -sfL "${BASE_URL%/}/model/info" \
-                            -H "Authorization: Bearer $LLM_API_KEY" --max-time 30) \
-              || DEPLOYMENTS=$(curl -sfL "${BASE_URL%/v1}/model/info" \
-                            -H "Authorization: Bearer $LLM_API_KEY" --max-time 30) \
-              || DEPLOYMENTS=""
-            [[ -n "$DEPLOYMENTS" ]] || DEPLOYMENTS='{}'
-
-            # Pick the OpenRouter-backed deployment: it is the one verified to
-            # accept the CLI's requests (6/6, versus 0/6 for the Cloudflare one).
-            PINNED=$(printf '%s' "$DEPLOYMENTS" | jq -r --arg m "$MODEL" '
-              [ .data[]?
-                | select(.model_name == $m)
-                | select((.litellm_params.model // "") | startswith("openrouter/"))
-                | .model_info.id // empty
-              ] | first // empty
-            ' 2>/dev/null || true)
-
-            if [[ -z "$PINNED" ]]; then
-              echo "❌ '$MODEL' requires the OpenRouter deployment pin, which could not be resolved."
-              echo "   GET ${BASE_URL%/}/model/info returned no openrouter/ deployment for it."
-              echo "   Either the proxy layout changed or the key cannot read model info."
-              echo "   Use model: kimi-k2.7-code (or kimi-k2.6) instead — both are"
-              echo "   single-deployment aliases that need no pin. See the kimi-k3"
-              echo "   section of AI_PR_REVIEW_README.md."
-              exit 1
-            fi
-
-            ENGINE_MODEL="$PINNED"
-            echo "📌 $MODEL: pinned to its OpenRouter deployment (${PINNED:0:12}…) — the other"
-            echo "   deployment in that pool 400s on every tool call."
-          fi
-
           {
             echo "engine=$ENGINE"
-            # `model` is the human-facing name, used for the review header and
-            # the metrics payload. `engine_model` is what the engine actually
-            # sends — identical unless the pin above rewrote it, so a pinned run
-            # still reports `kimi-k3` rather than a bare hash.
             echo "model=$MODEL"
-            echo "engine_model=$ENGINE_MODEL"
             echo "artifact_prefix=$ARTIFACT_PREFIX"
             echo "base_url=$BASE_URL"
             echo "max_context_size=$MAX_CONTEXT"
@@ -701,7 +630,7 @@ jobs:
           review_context_path: ${{ env.REVIEW_CONTEXT_FILE }}
           pr_diff_path: ${{ env.PR_DIFF_FILE }}
           output_path: ${{ env.REVIEW_OUTPUT_FILE }}
-          model: ${{ steps.engine.outputs.engine_model }}
+          model: ${{ steps.engine.outputs.model }}
           base_url: ${{ steps.engine.outputs.base_url }}
           api_key: ${{ secrets.LLM_API_KEY }}
           max_context_size: ${{ steps.engine.outputs.max_context_size }}
@@ -719,7 +648,7 @@ jobs:
           review_context_path: ${{ env.REVIEW_CONTEXT_FILE }}
           pr_diff_path: ${{ env.PR_DIFF_FILE }}
           output_path: ${{ env.REVIEW_OUTPUT_FILE }}
-          model: ${{ steps.engine.outputs.engine_model }}
+          model: ${{ steps.engine.outputs.model }}
           base_url: ${{ steps.engine.outputs.base_url }}
           api_key: ${{ secrets.LLM_API_KEY }}
 

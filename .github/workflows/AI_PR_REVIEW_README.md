@@ -62,7 +62,7 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 | | `kimi` | `anthropic` |
 |---|---|---|
 | Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) |
-| Default model | `kimi-k2.7-code` (**not** `kimi-k3` — see below) | `claude-sonnet-5` |
+| Default model | `kimi-k3` | `claude-sonnet-5` |
 | `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** |
 | Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (agent mode mounts **no** GitHub MCP servers — see below) |
 | Shell | none (absent from `enabled` **and** denied by rule) | none (`--allowedTools` omits Bash, `--disallowedTools` re-denies it) |
@@ -88,13 +88,10 @@ succeeds. **Change these two inputs together, never one alone.** Valid types:
 `kimi`, `anthropic`, `openai`, `openai_responses`, `google-genai`, `vertexai`.
 
 **Model names belong to the endpoint, not the model.** `model` is passed through
-verbatim, so it must be whatever the thing in `base_url` calls it. The Deriv
-LiteLLM proxy fronts three kimi aliases — `kimi-k2.7-code` (the default),
-`kimi-k2.6` and `kimi-k3` (usable only via the deployment pin below); the
-Kimi-platform ids
-(`k3`, `k3-256k`, `kimi-for-coding`) resolve only against
-`api.kimi.com/coding/v1` and return a bare `400 The request was invalid` from
-the proxy. List what a proxy accepts:
+verbatim, so it must be whatever the thing in `base_url` calls it. On the Deriv
+LiteLLM proxy K3 is `kimi-k3`; the Kimi-platform ids (`k3`, `k3-256k`,
+`kimi-for-coding`) resolve only against `api.kimi.com/coding/v1` and return a
+bare `400 The request was invalid` from the proxy. List what a proxy accepts:
 
 ```bash
 curl -s https://litellmsa.deriv.ai/v1/models \
@@ -102,139 +99,85 @@ curl -s https://litellmsa.deriv.ai/v1/models \
 ```
 
 If a 400 survives fixing the model name, suspect `max_context_size` exceeding
-the window the endpoint allows for that alias — or the known multi-turn 400
-below, which looks identical but has nothing to do with either.
+the window the endpoint allows for that alias — or, if the 400 only appears once
+the agent starts calling tools, the resolved incident below.
 
-### `kimi-k3` and the deployment pin (why half its requests used to 400)
+### RESOLVED (2026-08-13): `kimi-k3` 400s on every review
 
-**Status: diagnosed and worked around inside this workflow.** `model: kimi-k3`
-works — the resolve step pins it to a healthy deployment at run time. Without
-that pin every run died ~20s in with `provider.api_error: 400 The request was
-invalid`, which is not the model name, the context size, `provider_type`, or
-the API key; all of those were correct. Diagnosed 2026-08-12.
+Kept because the failure is opaque, took a long time to find, and the fix lives
+outside this repo — so a regression would otherwise be re-diagnosed from
+scratch. **Nothing in this workflow works around it any more.**
 
-**Root cause.** The Kimi CLI omits the `content` key *entirely* on assistant
-messages that carry only `tool_calls` (`convertMessage` in the bundle's
-`openai-legacy` provider sets `content` only when a non-thinking part exists —
-its native `kimi` dialect has the identical behavior). That is legal
-OpenAI-wire JSON, but of the two deployments behind the `kimi-k3` alias, one
-rejects it with a bare 400 and the other accepts it. Bisected against the
-proxy with the CLI's byte-exact request, captured by running the CLI against a
-local mock that answers turn 1 with a tool call:
+**Symptom.** Every Kimi review died ~20s in with
+`provider.api_error: 400 The request was invalid`, naming no field. The model
+name, key, `provider_type`, `max_context_size` and tool schemas were all
+correct, and a plain `curl` with the same model and key always returned 200.
 
-| Request | Result |
+**Cause.** The Kimi CLI omits the `content` key *entirely* on assistant messages
+that carry only `tool_calls` — legal OpenAI-wire JSON (`convertMessage` in its
+bundled `openai-legacy` provider sets `content` only when a non-thinking part
+exists; its native `kimi` dialect behaves the same). `kimi-k3` was
+load-balanced across two deployments, and the Cloudflare AI Gateway "compat"
+one rejected that shape while the OpenRouter one accepted it:
+
+| Request (identical body, one field changed) | Result |
 |---|---|
-| First turn, exactly as CI sends it | 6/6 × 200 |
-| Second turn (assistant `tool_calls` + `tool` result), as CI sends it | 3/8 × 200 — **rejected whenever it lands on the strict deployment** |
-| Same, with `content: ""` added to the assistant message | **8/8 × 200 on both deployments** |
-| Same, with `content: null` | 3/8 × 200 — the key must be a *string* |
-| Same, minus `tools` and `prompt_cache_key` | still 4/8 — those are innocent |
+| First turn — no tool calls in it yet | 6/6 × 200 |
+| Later turn: assistant `tool_calls`, no `content` key | 3/8 × 200 |
+| Same, with `content: ""` added | 8/8 × 200 on both deployments |
+| Same, with `content: null` | 3/8 — the key had to be a *string* |
+| Same, minus `tools` and `prompt_cache_key` | 4/8 — both innocent |
 
-**Why CI fails 100% of the time when a single request only fails ~55%:** a
-review is dozens of tool-call turns, and every turn after the first re-sends
-the offending message shape. P(whole review) ≈ 0.45^n. A one-off `curl` looks
-fine, which is what made this look like a config problem for so long.
+**Why it presented as 100% failure from a ~55% per-request failure rate:** a
+review is dozens of tool-call turns and each one replays that message, so
+P(review completes) ≈ 0.45^n. Single-request testing could never see it.
 
-**The request shape cannot be fixed from here.** The message is built inside
-the CLI; no env var or `config.toml` key changes it, and the CLI's native
-`kimi` dialect behaves identically, so the direct Kimi endpoint is no escape.
+**Resolution.** Fixed proxy-side on 2026-08-13 — the Cloudflare deployment now
+accepts the shape (verified 8/8 addressed directly, having been 0/6), and the
+alias is clean with traffic interleaving both deployments. No change was needed
+here; a run-time deployment pin was written and then dropped as unnecessary.
 
-**Which leaves the deployment as the lever.** Only three kimi aliases exist on
-the proxy. Per `GET /model/info`, two of them have a single OpenRouter
-deployment, while `kimi-k3` is load-balanced across two — and it is the
-**Cloudflare AI Gateway "compat" endpoint** that rejects the CLI's shape, not
-Moonshot and not OpenRouter:
+**If it comes back**, this is the check — the shape matters, not the volume:
 
-| Alias | Deployment(s) (`litellm_params.model` → `api_base`) | Result | Window |
-|---|---|---|---|
-| `kimi-k2.7-code` ← **default** | `openrouter/moonshotai/kimi-k2.7-code` → openrouter.ai | 6/6 × 200 | 262144 |
-| `kimi-k2.6` | `openrouter/moonshotai/kimi-k2.6` → openrouter.ai | 6/6 × 200 | 262144 |
-| `kimi-k3` | `openrouter/moonshotai/kimi-k3` → openrouter.ai | 6/6 × 200 | 1048576 |
-| | `openai/moonshotai/kimi-k3` → **gateway.ai.cloudflare.com/…/compat** | **0/6 — always 400** | |
+```bash
+# A two-turn body whose assistant message has tool_calls and NO content key.
+# Repeat ~10x with a varied user message: LiteLLM caches identical bodies and
+# returns the same response id without reaching a backend, so a fixed body
+# silently tests nothing. Mixed 200/400 = one deployment in the pool is strict.
+curl -s https://litellmsa.deriv.ai/v1/model/info \
+  -H "Authorization: Bearer $LLM_API_KEY" \
+  | jq '[.data[] | select(.model_name=="kimi-k3")
+        | {id: .model_info.id, upstream: .litellm_params.model, api_base: .litellm_params.api_base}]'
+```
 
-So `kimi-k3` fails ~half the time purely because the router keeps landing on
-the Cloudflare compat deployment. `x-litellm-tags` routing is not configured on
-this proxy, so header-based pinning is not available.
+`model_info.id` can be passed as `model` to address one deployment directly,
+which is how a bad one gets isolated — and, if ever needed again, avoided.
 
-Note the window difference: moving off `kimi-k3` means `max_context_size` must
-drop to `262144`, or the CLI over-packs and the request is rejected for an
-entirely different reason. Both the workflow default and the dogfooding caller
-set it accordingly. In practice 256k is ample — a real run measured 25 KB of
-context plus a 57 KB diff, so roughly 20k tokens before the model starts
-reading files.
+Two traps that cost real time here. The CLI **names a log file it never
+creates** (`$HOME/.kimi-code/logs/kimi-code.log`), so the provider response body
+is unrecoverable from a runner — capture the request by pointing
+`KIMI_MODEL_BASE_URL` at a local mock server instead. And LiteLLM **caches
+responses**, as noted above.
 
-**How the pin makes `kimi-k3` usable now.** LiteLLM lets a request target one
-deployment by passing that deployment's `model_info.id` as `model` (verified:
-6/6 against the healthy id, 0/6 against the Cloudflare one). So when
-`engine: kimi` and `model: kimi-k3`, the resolve step does a
-`GET <base_url>/model/info`, picks the deployment whose `litellm_params.model`
-starts with `openrouter/`, and sends the engine that id instead of the alias.
+**Why `engine: anthropic` was never affected**, on the same proxy and key —
+two independent reasons, both verified, and worth knowing because it bounds who
+else a bug like this can touch:
 
-Three properties worth keeping if this code is touched:
+1. **Wire format.** That engine talks to `/v1/messages`, where a tool call *is*
+   content (`content: [{"type": "tool_use", …}]`), so `content` is never absent
+   and the precondition cannot occur. In OpenAI's `/v1/chat/completions`,
+   `tool_calls` is a *sibling* of `content`, so a tool-only turn leaves
+   `content` with nothing to hold. (The Kimi CLI shows the same split
+   internally: its Anthropic converter sets `content` unconditionally.)
+2. **Different backends.** Every `claude-*` deployment is a first-class provider
+   — `anthropic/…`, `bedrock/…`, `vertex_ai/…`, all with `api_base: null`, i.e.
+   LiteLLM's own integration against the vendor endpoint. None goes through a
+   third-party gateway. Note `claude-sonnet-5` is *also* load-balanced and was
+   fine, so multi-deployment aliases were never the problem — a generic
+   `openai/…` passthrough aimed at a "compat" gateway was.
 
-- **The id is resolved at run time, never committed.** It is a hash of the
-  deployment config, so a hardcoded copy would go stale the next time the proxy
-  is reconfigured and resurface as the same opaque 400.
-- **Failure is loud.** If no `openrouter/` deployment is found — proxy layout
-  changed, key cannot read model info — the step exits with a message naming
-  `kimi-k2.7-code` as the alternative. It does not fall back to the plain
-  alias, which would silently restore the 50% failure rate.
-- **Only `kimi-k3` is rewritten**, and the review header and metrics still
-  report `kimi-k3` rather than a bare hash (`model` vs `engine_model` outputs).
-
-The pin also costs `kimi-k3` its load balancing: every request goes to one
-deployment, with no failover if that one is down. That is the trade for it
-working at all, and it is why the *default* stays on `kimi-k2.7-code` — a
-single-deployment alias that needs no special case. This repo's own caller runs
-the pinned path deliberately, so the workaround is exercised on our PRs before
-any consumer depends on it.
-
-**The pin is a workaround; the LiteLLM owners still have the real fix.** In
-order of preference:
-
-1. **A pre-call hook** normalising the message for every client — a
-   `CustomLogger.async_pre_call_hook` setting `content = ""` on assistant
-   messages that have `tool_calls` and no string content. Verified: the same
-   Cloudflare deployment that always 400s returns 200 with that one field
-   added. This is the real fix — any multi-turn tool-using client landing on
-   that deployment is broken today, and single-turn probes hide it entirely.
-2. **Pin or split the alias upstream** — remove the Cloudflare compat
-   deployment from the `kimi-k3` pool, or expose an OpenRouter-only alias.
-
-Once either lands, delete the pin block from the resolve step and drop
-`engine_model` back to `model`.
-
-**Why `engine: anthropic` never saw this**, on the same proxy with the same key
-— two independent reasons, both verified:
-
-1. **Different wire format.** The Anthropic engine talks to `/v1/messages`,
-   where a tool call *is* content (`content: [{"type": "tool_use", …}]`), so
-   `content` is never absent. The bug's precondition cannot occur. In OpenAI's
-   `/v1/chat/completions`, `tool_calls` is a *sibling* of `content`, so a
-   tool-only turn leaves `content` with nothing to hold and the CLI omits the
-   key. (Same asymmetry inside the Kimi CLI itself: its Anthropic converter
-   sets `content` unconditionally, its OpenAI ones only when text exists.)
-2. **Different backends.** Per `GET /model/info`, every `claude-*` deployment
-   is a first-class provider — `anthropic/…`, `bedrock/…`, `vertex_ai/…`, all
-   with `api_base: null`, i.e. LiteLLM's own maintained integration against the
-   vendor endpoint. None routes through a Cloudflare AI Gateway. Note that
-   `claude-sonnet-5` is *also* load-balanced (Anthropic direct + Bedrock) and is
-   fine — so multi-deployment aliases are not the problem. The problem is
-   specifically a generic `openai/…` passthrough pointed at a third-party
-   "compat" gateway, which re-validates OpenAI-shaped JSON more strictly than
-   the spec requires and is the least translated path through the proxy.
-
-So the blast radius of the underlying bug is **OpenAI-format tool-calling
-clients** (Kimi Code, Cline, Aider, OpenCode …). Anthropic-format clients are
-structurally immune, which is why the Claude reviews stayed green on the very
-PRs where the Kimi ones failed 100% of the time.
-
-Two debugging notes for whoever picks this up. The CLI **names a log file it
-never creates** (`$HOME/.kimi-code/logs/kimi-code.log`), so the provider
-response body is genuinely unrecoverable from a runner — reproduce locally
-against a mock instead. And LiteLLM **caches responses**: repeating an
-identical body returns the same response `id` without reaching a backend, so
-any probe must vary the body per attempt or it silently tests nothing.
+So this class of bug hits **OpenAI-format tool-calling clients** and leaves
+Anthropic-format ones untouched.
 
 **On the `/v1` asymmetry:** `base_url` is one engine-neutral input. The Kimi CLI
 wants a `/v1` suffix; the Anthropic SDK appends `/v1/messages` itself and must not
@@ -288,7 +231,7 @@ CLI has its own config format, sandbox model, tool names and entrypoint.
 | `engine` | `kimi` or `anthropic` | ❌ | `kimi` |
 | `model` | Model ID; resolved per engine when empty | ❌ | per engine |
 | `base_url` | LLM API endpoint; `/v1` added or stripped per engine | ❌ | `https://litellmsa.deriv.ai/v1` |
-| `max_context_size` | **[kimi]** Context window in tokens. Must not exceed the model's, or the CLI over-packs and the API rejects the request | ❌ | `262144` |
+| `max_context_size` | **[kimi]** Context window in tokens. Must match the model, or the CLI over-packs and the API rejects the request | ❌ | `1048576` |
 | `cli_version` | **[kimi]** Exact `@moonshot-ai/kimi-code` version | ❌ | `0.34.0` |
 | `provider_type` | **[kimi]** Wire dialect; must match what `base_url` serves | ❌ | `openai` |
 | `legacy_markers` | Newline-separated markers from superseded workflows to also delete | ❌ | `Claude PR Review Complete` |
@@ -388,7 +331,7 @@ summary regardless of dashboard state:
   "agent": "ai_review",
   "event_type": "initial_review | followup_review",
   "timestamp": "…", "pr_number": "…", "repo": "…",
-  "payload": { "commit_sha": "…", "review_size_bytes": 0, "model": "kimi-k2.7-code", "engine": "kimi" }
+  "payload": { "commit_sha": "…", "review_size_bytes": 0, "model": "kimi-k3", "engine": "kimi" }
 }
 ```
 

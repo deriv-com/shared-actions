@@ -47,27 +47,13 @@ jobs:
       issues: write
 
     with:
-      # Pinned rather than inherited, so a change to a shared default cannot
-      # silently alter what this repo runs — which matters more here than
+      # All three pinned rather than inherited, so a change to a shared default
+      # cannot silently alter what this repo runs — which matters more here than
       # anywhere, since this is where those defaults are edited.
       engine: kimi
-      # LiteLLM proxy alias. The Kimi-platform ids (`k3`, `kimi-for-coding`)
-      # resolve only at api.kimi.com/coding/v1 and the proxy answers them with
-      # a bare 400.
-      #
-      # K3 with its full 1M window. The shared workflow special-cases this alias:
-      # one of its two deployments (the Cloudflare AI Gateway "compat" endpoint)
-      # rejects the assistant tool_call shape the Kimi CLI sends, so the resolve
-      # step pins the request to the healthy OpenRouter deployment at run time.
-      #
-      # This repo deliberately runs the pinned path rather than the simpler
-      # single-deployment aliases (kimi-k2.7-code, kimi-k2.6), so the workaround
-      # is exercised here before any consumer relies on it — and so a proxy
-      # change that breaks the pin surfaces on our own PRs first.
+      # LiteLLM proxy alias for K3. The Kimi-platform id `k3` resolves only at
+      # api.kimi.com/coding/v1 and the proxy answers it with a bare 400.
       model: kimi-k3
-      # K3's window. Must accompany model: kimi-k3 — the workflow defaults to
-      # 262144 for the 256k aliases, which would leave 3/4 of K3 unused.
-      max_context_size: "1048576"
       # Wire dialect. Must match what base_url serves: the proxy serves plain
       # /v1/chat/completions, which is `openai`. `kimi` targets the Kimi Code
       # platform and the proxy rejects it, even with a correct model and key.
@@ -82,8 +68,9 @@ jobs:
       legacy_markers: ""
 
     secrets:
-      # LiteLLM virtual key for litellmsa.deriv.ai, authorised for the `model`
-      # alias above.
+      # LiteLLM virtual key, authorised for `kimi-k3` on litellmsa.deriv.ai.
+      # NOTE: this secret does not exist in this repo yet — it must be added
+      # (repo- or org-level) or the run fails at the engine step.
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       # Optional. Unset here, so review events go to the job summary only.
       AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
