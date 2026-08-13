@@ -202,7 +202,32 @@ order of preference:
    deployment from the `kimi-k3` pool, or expose an OpenRouter-only alias.
 
 Once either lands, delete the pin block from the resolve step and drop
-`engine_model` back to `model`. `engine: anthropic` was unaffected throughout.
+`engine_model` back to `model`.
+
+**Why `engine: anthropic` never saw this**, on the same proxy with the same key
+— two independent reasons, both verified:
+
+1. **Different wire format.** The Anthropic engine talks to `/v1/messages`,
+   where a tool call *is* content (`content: [{"type": "tool_use", …}]`), so
+   `content` is never absent. The bug's precondition cannot occur. In OpenAI's
+   `/v1/chat/completions`, `tool_calls` is a *sibling* of `content`, so a
+   tool-only turn leaves `content` with nothing to hold and the CLI omits the
+   key. (Same asymmetry inside the Kimi CLI itself: its Anthropic converter
+   sets `content` unconditionally, its OpenAI ones only when text exists.)
+2. **Different backends.** Per `GET /model/info`, every `claude-*` deployment
+   is a first-class provider — `anthropic/…`, `bedrock/…`, `vertex_ai/…`, all
+   with `api_base: null`, i.e. LiteLLM's own maintained integration against the
+   vendor endpoint. None routes through a Cloudflare AI Gateway. Note that
+   `claude-sonnet-5` is *also* load-balanced (Anthropic direct + Bedrock) and is
+   fine — so multi-deployment aliases are not the problem. The problem is
+   specifically a generic `openai/…` passthrough pointed at a third-party
+   "compat" gateway, which re-validates OpenAI-shaped JSON more strictly than
+   the spec requires and is the least translated path through the proxy.
+
+So the blast radius of the underlying bug is **OpenAI-format tool-calling
+clients** (Kimi Code, Cline, Aider, OpenCode …). Anthropic-format clients are
+structurally immune, which is why the Claude reviews stayed green on the very
+PRs where the Kimi ones failed 100% of the time.
 
 Two debugging notes for whoever picks this up. The CLI **names a log file it
 never creates** (`$HOME/.kimi-code/logs/kimi-code.log`), so the provider
