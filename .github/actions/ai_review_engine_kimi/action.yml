@@ -291,6 +291,12 @@ runs:
         # configure step — would be posted as a review of the wrong PR.
         rm -f "$OUTPUT_PATH"
 
+        # Read once, outside the loop: both attempts then provably run the same
+        # prompt. Re-reading per attempt would also mean an empty prompt reaching
+        # the CLI — and a garbage review — if the file ever went missing between
+        # attempts, rather than failing.
+        REVIEW_PROMPT="$(cat /tmp/review_prompt.txt)"
+
         # No GitHub token in this step's env and no Bash tool in the config: the
         # agent cannot reach the GitHub API at all. The caller's post step is the
         # only thing that can comment on the PR.
@@ -303,7 +309,7 @@ runs:
         # written keeps the cost bounded (worst case two passes inside the
         # caller's 60-minute timeout) and never re-runs a review that worked.
         for attempt in 1 2; do
-          kimi -p "$(cat /tmp/review_prompt.txt)" && KIMI_STATUS=0 || KIMI_STATUS=$?
+          kimi -p "$REVIEW_PROMPT" && KIMI_STATUS=0 || KIMI_STATUS=$?
 
           # A written review is the deliverable, so it outranks the exit code:
           # the CLI can fail on a trailing empty turn AFTER the model has written
