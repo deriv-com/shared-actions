@@ -208,9 +208,14 @@ runs:
         the full review instructions, PR context, previous review (if any),
         acknowledged suggestions to skip, and the required output format — plus a
         "Review Procedure" section telling you what else to read, including the
-        pre-fetched PR diff at ${{ inputs.pr_diff_path }}, and requiring you to
-        write your complete review to ${{ inputs.output_path }} with the Write
-        tool. You have no shell tool; everything you need is on disk.
+        pre-fetched PR diff at ${{ inputs.pr_diff_path }}. You have no shell tool;
+        everything you need is on disk.
+
+        HOW THIS TASK IS DELIVERED: your chat reply is discarded and never reaches
+        anyone. The ONLY output that counts is the file ${{ inputs.output_path }},
+        written with the Write tool. So your final action must be that Write call,
+        containing the complete review. Writing an analysis as your reply instead
+        means the review is lost and the job fails.
         EOF
 
         # Dumps the CLI's own log on failure. Without this the step reports only
@@ -224,11 +229,15 @@ runs:
         # AI_PR_REVIEW_README.md. What stays is what a failing run cannot be
         # debugged without: the resolved config, the input sizes, and the CLI's own
         # log if it wrote one.
+        # ALWAYS call this as `( dump_kimi_log ) || true`. The subshell is what
+        # keeps the `set +e` below from leaking: some call sites now continue
+        # running afterwards (the retry, and the salvage path), and silently
+        # disabling -e for the rest of the step would be a nasty surprise. The
+        # `|| true` covers the function itself ending non-zero.
         dump_kimi_log() {
           # A diagnostic must never be killed by the thing it is diagnosing. The
           # step runs under `bash -e -o pipefail`, so any non-zero command in here
-          # would abort the dump partway and hide the rest. Both call sites `exit`
-          # explicitly straight after, so relaxing this has no other effect.
+          # would abort the dump partway and hide the rest.
           set +e +o pipefail
 
           # tr strips the padding BSD wc emits, harmless on the Linux runner.
@@ -236,6 +245,15 @@ runs:
 
           echo "ℹ️  config: model=$KIMI_MODEL_NAME base_url=$KIMI_MODEL_BASE_URL provider_type=$KIMI_MODEL_PROVIDER_TYPE max_context_size=$KIMI_MODEL_MAX_CONTEXT_SIZE"
           echo "ℹ️  input bytes: context=$(bytes_of "$CONTEXT_PATH") diff=$(bytes_of "$DIFF_PATH") prompt=$(bytes_of /tmp/review_prompt.txt)"
+          # Whether the review survived is the first thing anyone reading this
+          # needs, and it used to be absent: a CLI that dies after writing looks
+          # identical in the log to one that never wrote anything, and the two
+          # have completely different causes.
+          if [[ -s "$OUTPUT_PATH" ]]; then
+            echo "ℹ️  review file: PRESENT at $OUTPUT_PATH ($(bytes_of "$OUTPUT_PATH") bytes) — the review itself survived"
+          else
+            echo "ℹ️  review file: ABSENT at $OUTPUT_PATH — the model never called Write"
+          fi
 
           # The CLI names $HOME/.kimi-code/logs/kimi-code.log in its errors but does
           # not always create it, so search rather than assume.
@@ -261,25 +279,58 @@ runs:
           echo "    agent had started reading files, config is probably fine —"
           echo "    suspect the endpoint rejecting a mid-conversation request, and"
           echo "    check whether the model alias fronts more than one deployment."
+          echo "    'The API returned an empty response' means the model ended its"
+          echo "    turn with no content and no tool call: it stopped without"
+          echo "    writing the review, or the provider returned only reasoning"
+          echo "    content. That one is transient — the retry below covers it."
         }
+
+        # Clean slate first. The checks below treat a non-empty file at this path
+        # as THIS run's deliverable, so a leftover from an earlier job — possible
+        # on a persistent runner, same reason $HOME/.kimi-code is recreated in the
+        # configure step — would be posted as a review of the wrong PR.
+        rm -f "$OUTPUT_PATH"
 
         # No GitHub token in this step's env and no Bash tool in the config: the
         # agent cannot reach the GitHub API at all. The caller's post step is the
         # only thing that can comment on the PR.
-        kimi -p "$(cat /tmp/review_prompt.txt)" && KIMI_STATUS=0 || KIMI_STATUS=$?
+        #
+        # Run it up to twice. The failure this covers is the CLI aborting with
+        # "The API returned an empty response (no content, no tool calls)" —
+        # kimi-k3 ending a turn with neither, which the CLI treats as fatal after
+        # the agent has already spent minutes reading the code. It is transient:
+        # the same PR succeeds on a re-run. Retrying only when NO review was
+        # written keeps the cost bounded (worst case two passes inside the
+        # caller's 60-minute timeout) and never re-runs a review that worked.
+        for attempt in 1 2; do
+          kimi -p "$(cat /tmp/review_prompt.txt)" && KIMI_STATUS=0 || KIMI_STATUS=$?
 
-        if [[ "$KIMI_STATUS" -ne 0 ]]; then
-          echo "❌ Kimi engine: CLI exited $KIMI_STATUS"
-          dump_kimi_log
-          exit "$KIMI_STATUS"
-        fi
+          # A written review is the deliverable, so it outranks the exit code:
+          # the CLI can fail on a trailing empty turn AFTER the model has written
+          # the file, and failing the job then would discard a complete review.
+          # The file is produced by a single Write call, so a non-empty file is a
+          # whole review rather than a partial one.
+          if [[ -s "$OUTPUT_PATH" ]]; then
+            if [[ "$KIMI_STATUS" -ne 0 ]]; then
+              echo "⚠️  Kimi engine: CLI exited $KIMI_STATUS AFTER writing the review — keeping the review and continuing."
+              ( dump_kimi_log ) || true
+            fi
+            break
+          fi
+
+          if [[ "$attempt" -eq 1 ]]; then
+            echo "⚠️  Kimi engine: CLI exited $KIMI_STATUS with no review written — retrying once."
+            ( dump_kimi_log ) || true
+            echo "🔁 Kimi engine: attempt 2 of 2"
+          fi
+        done
 
         # Fail here, named, rather than letting the caller report a generic
         # "review file missing" — all steps in a composite action share one log
         # group, so an engine-attributed error is what makes this locatable.
         if [[ ! -s "$OUTPUT_PATH" ]]; then
-          echo "❌ Kimi engine: the CLI finished but wrote no review to $OUTPUT_PATH"
-          dump_kimi_log
+          echo "❌ Kimi engine: no review written to $OUTPUT_PATH after 2 attempts (last CLI exit: $KIMI_STATUS)"
+          ( dump_kimi_log ) || true
           exit 1
         fi
         echo "✅ Kimi engine: review written ($(wc -c < "$OUTPUT_PATH") bytes)"
