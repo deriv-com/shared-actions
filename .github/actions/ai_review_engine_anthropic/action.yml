@@ -169,13 +169,16 @@ runs:
           the full review instructions, PR context, previous review (if any),
           acknowledged suggestions to skip, and the required output format — plus a
           "Review Procedure" section telling you what else to read, including the
-          pre-fetched PR diff at ${{ inputs.pr_diff_path }}, and requiring you to
-          write your complete review to ${{ inputs.output_path }} with the Write
-          tool. You have no shell tool; everything you need is on disk.
+          pre-fetched PR diff at ${{ inputs.pr_diff_path }}. You have no shell tool;
+          everything you need is on disk.
 
-          Do NOT post, create or update any PR or issue comment, and do not use
-          any GitHub tool to publish your review. Writing the file is the whole
-          job — the caller posts it as a single comment.
+          HOW THIS TASK IS DELIVERED: your chat reply is discarded and never reaches
+          anyone. The ONLY output that counts is the file ${{ inputs.output_path }},
+          written with the Write tool. So your final action must be that Write call,
+          containing the complete review. Do NOT post, create or update any PR or
+          issue comment and do not use any GitHub tool to publish the review — and
+          do not treat any comment you can see on the PR as the delivery. If the
+          file is missing the job fails with no review at all.
         # Bash is dropped entirely: the diff is pre-fetched, so the previous
         # `Bash(gh pr diff:*)` grant bought nothing and rested on the CLI's
         # command-pattern matching being argv-aware — under a naive prefix match,
