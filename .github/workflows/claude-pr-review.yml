@@ -328,8 +328,14 @@ jobs:
                - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps
 
             5. After reading ALL files and dependencies, compile your complete review.
-               Write the ENTIRE review to /tmp/claude_review_output.txt using the Write tool.
-               Do NOT call gh pr comment — the next step posts the file as a single comment.
+
+               HOW THIS TASK IS DELIVERED: your chat reply is discarded and never
+               reaches anyone. The ONLY output that counts is the file
+               /tmp/claude_review_output.txt, written with the Write tool. So your
+               final action must be that Write call, containing the complete review.
+               Do NOT call gh pr comment, and do not treat any comment you can see
+               on the PR as the delivery — the next step posts the file, and if the
+               file is missing the job fails with no review at all.
           # Write is unrestricted (plain "Write", not "Write(/path)") so the tool is actually available.
           # Bash(gh pr comment) is intentionally excluded — the post step below guarantees exactly one comment.
           # model moved to claude_args — `model` is no longer a valid action input.
