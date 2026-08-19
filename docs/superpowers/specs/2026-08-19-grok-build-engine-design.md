@@ -1,7 +1,7 @@
 # Grok Build engine for AI PR review
 
 Date: 2026-08-19  
-Status: draft, awaiting user review  
+Status: approved  
 Repo: `deriv-com/shared-actions`
 
 ## Goal
@@ -25,7 +25,7 @@ Ako’s rule, from `.github/workflows/AI_PR_REVIEW_README.md`:
 
 > A model swap is config; an engine swap is a rewrite. Replacing an engine’s *CLI* means writing a new composite action, because each CLI has its own config format, sandbox model, tool names and entrypoint.
 
-| Engine today | CLI | Default LiteLLM model |
+| Engine | CLI | Default LiteLLM model |
 |---|---|---|
 | `kimi` | `@moonshot-ai/kimi-code` | `kimi-k3` |
 | `anthropic` | `anthropics/claude-code-action` | `claude-sonnet-5` |
