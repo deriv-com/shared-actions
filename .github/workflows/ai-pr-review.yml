@@ -3,7 +3,7 @@ name: AI PR Review
 # AI PR review workflow. The LLM engine is pluggable via the `engine` input.
 # Full docs: .github/workflows/AI_PR_REVIEW_README.md
 #
-#   Model swap — set `model` (and `max_context_size` on the Kimi engine). Any
+#   Model swap — set `model` (and `max_context_size` on the Kimi/Grok engines). Any
 #   model the LiteLLM proxy fronts works; the proxy normalises the API.
 #
 #   Engine swap — set `engine`. Each engine is a composite action under
@@ -26,12 +26,12 @@ on:
   workflow_call:
     inputs:
       engine:
-        description: "Review engine: `kimi` (Kimi Code CLI) or `anthropic` (Claude Code Action). Each is a composite action under .github/actions/ai_review_engine_<engine>/. Set this explicitly — the default is `kimi`, so an omitted value on a repo migrating from claude-pr-review.yml would switch LLM vendor."
+        description: "Review engine: `kimi` (Kimi Code CLI), `anthropic` (Claude Code Action), or `grok` (Grok Build CLI). Each is a composite action under .github/actions/ai_review_engine_<engine>/. Set this explicitly — the default is `kimi`, so an omitted value on a repo migrating from claude-pr-review.yml would switch LLM vendor."
         required: false
         default: "kimi"
         type: string
       model:
-        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
+        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5, grok -> grok-4.6). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
         required: false
         default: ""
         type: string
@@ -41,12 +41,12 @@ on:
         default: ""
         type: string
       max_context_size:
-        description: "[engine-specific: kimi] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; the 256k variants are 262144. If a request fails with a 400 after the model name is confirmed correct, try lowering this. Empty resolves to 1048576. Ignored when engine is not `kimi`."
+        description: "[engine-specific: kimi, grok] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; grok-4.6 is 500000; the 256k Kimi variants are 262144. Empty resolves per engine. Ignored when engine is `anthropic`."
         required: false
         default: ""
         type: string
       cli_version:
-        description: "[engine-specific: kimi] Exact @moonshot-ai/kimi-code version to install. Pinned deliberately — the package is pre-1.0 and ships minor releases weekly, so `latest` risks both breaking changes and unreviewed code in a privileged job. Empty resolves to the pinned version in the 'Resolve and validate engine' step; bump it there via PR. Ignored when engine is not `kimi`."
+        description: "[engine-specific: kimi, grok] Exact CLI version to install (`@moonshot-ai/kimi-code` for kimi, `@xai-official/grok` for grok). Pinned deliberately — `latest` risks both breaking changes and unreviewed code in a privileged job. Empty resolves to the per-engine pin in the 'Resolve and validate engine' step; bump it there via PR. Ignored when engine is `anthropic`."
         required: false
         default: ""
         type: string
@@ -197,15 +197,28 @@ jobs:
               DEFAULT_MODEL="kimi-k3"
               METRICS_AGENT="ai_review"
               ARTIFACT_PREFIX="ai-review"
+              DEFAULT_MAX_CONTEXT="1048576"
+              DEFAULT_CLI_VERSION="0.34.0"
               ;;
             anthropic)
               DEFAULT_MODEL="claude-sonnet-5"
               METRICS_AGENT="claude_review"
               ARTIFACT_PREFIX="claude-review"
+              DEFAULT_MAX_CONTEXT="1048576"
+              DEFAULT_CLI_VERSION="0.34.0"
+              ;;
+            grok)
+              # LiteLLM alias for Grok 4.6. Context is the advertised 500k
+              # input window — 1M over-packs and the proxy 400s.
+              DEFAULT_MODEL="grok-4.6"
+              METRICS_AGENT="grok_review"
+              ARTIFACT_PREFIX="grok-review"
+              DEFAULT_MAX_CONTEXT="500000"
+              DEFAULT_CLI_VERSION="1.0.5"
               ;;
             *)
               echo "❌ Unknown engine: '$ENGINE'"
-              echo "   Supported values for the \`engine\` input: kimi, anthropic"
+              echo "   Supported values for the \`engine\` input: kimi, anthropic, grok"
               exit 1
               ;;
           esac
@@ -223,8 +236,8 @@ jobs:
           # instructions for every consumer with no PR and no audit trail. To
           # ship a new prompt, edit the gist, then bump this hash via PR.
           BASE_URL="${BASE_URL_INPUT:-https://litellmsa.deriv.ai/v1}"
-          MAX_CONTEXT="${MAX_CONTEXT_INPUT:-1048576}"
-          CLI_VERSION="${CLI_VERSION_INPUT:-0.34.0}"
+          MAX_CONTEXT="${MAX_CONTEXT_INPUT:-$DEFAULT_MAX_CONTEXT}"
+          CLI_VERSION="${CLI_VERSION_INPUT:-$DEFAULT_CLI_VERSION}"
           PROVIDER_TYPE="${PROVIDER_TYPE_INPUT:-openai}"
           PROMPT_GIST_URL="${PROMPT_GIST_URL_INPUT:-https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/2d5131aa058801e99fe77f69db124bf583f7d3ea/claude-review-format.md}"
 
@@ -651,6 +664,23 @@ jobs:
           model: ${{ steps.engine.outputs.model }}
           base_url: ${{ steps.engine.outputs.base_url }}
           api_key: ${{ secrets.LLM_API_KEY }}
+
+      - name: AI review (Grok Build engine)
+        id: engine-grok
+        if: steps.engine.outputs.engine == 'grok'
+        timeout-minutes: 60
+        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_grok@master
+        with:
+          repository: ${{ github.repository }}
+          pr_number: ${{ github.event.pull_request.number }}
+          review_context_path: ${{ env.REVIEW_CONTEXT_FILE }}
+          pr_diff_path: ${{ env.PR_DIFF_FILE }}
+          output_path: ${{ env.REVIEW_OUTPUT_FILE }}
+          model: ${{ steps.engine.outputs.model }}
+          base_url: ${{ steps.engine.outputs.base_url }}
+          api_key: ${{ secrets.LLM_API_KEY }}
+          max_context_size: ${{ steps.engine.outputs.max_context_size }}
+          cli_version: ${{ steps.engine.outputs.cli_version }}
 
       # ====================== END ENGINE DISPATCH ==========================
 
