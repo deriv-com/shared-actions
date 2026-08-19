@@ -85,15 +85,18 @@ runs:
         # as an agent reads files there, and this review's prompt explicitly tells
         # it to traverse into dependencies. .git is pruned so the sweep cannot
         # corrupt the checkout.
+        # -iname: Grok's documented names include mixed case (AGENTS.md / Agents.md
+        # / AGENT.md). A lowercase agents.md or claude.md would slip past -name
+        # and become trusted instructions in a job holding the LLM API key.
         find . -name .git -prune -o -type f \
-          \( -name 'AGENTS.md' -o -name 'Agents.md' -o -name 'AGENT.md' \
-             -o -name 'CLAUDE.md' -o -name 'Claude.md' -o -name 'CLAUDE.local.md' \
-             -o -name 'KIMI.md' -o -name '.mcp.json' \) \
+          \( -iname 'agents.md' -o -iname 'agent.md' \
+             -o -iname 'claude.md' -o -iname 'claude.local.md' \
+             -o -iname 'kimi.md' -o -iname '.mcp.json' -o -iname '.cursorrules' \) \
           -print0 | xargs -0 -r rm -f
         find . -name .git -prune -o -type d \
-          \( -name '.grok' -o -name '.claude' -o -name '.claude-plugin' -o -name '.agents' \) \
+          \( -iname '.grok' -o -iname '.claude' -o -iname '.claude-plugin' -o -iname '.agents' \) \
           -print0 | xargs -0 -r rm -rf
-        find . -name .git -prune -o -type d -path '*/.cursor/rules' \
+        find . -name .git -prune -o -type d -ipath '*/.cursor/rules' \
           -print0 | xargs -0 -r rm -rf
         echo "✅ Stripped PR-supplied agent config (recursive)"
 
@@ -140,6 +143,11 @@ runs:
             exit 1
             ;;
         esac
+
+        [[ "$MAX_CONTEXT" =~ ^[1-9][0-9]*$ ]] || {
+          echo "❌ Grok engine: max_context_size must be a positive integer, got '$MAX_CONTEXT'"
+          exit 1
+        }
 
         BASE_URL="${INPUT_BASE_URL%/}"
         [[ "$BASE_URL" == */v1 ]] || BASE_URL="${BASE_URL}/v1"

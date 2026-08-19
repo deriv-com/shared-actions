@@ -67,7 +67,7 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 | Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (agent mode mounts **no** GitHub MCP servers — see below) | `Read`, `Grep`, `Write`/`Edit` **output dir only** |
 | Shell | none (absent from `enabled` **and** denied by rule) | none (`--allowedTools` omits Bash, `--disallowedTools` re-denies it) | none (`dontAsk` + `--tools` allowlist + `--deny Bash`) |
 | `Write` scope | output directory only (allow + catch-all deny) | **unscoped** — see below | output directory only (`dontAsk`; Grok deny-wins, so no catch-all deny) |
-| Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` | `AGENTS.md` family, `CLAUDE.md` family, `KIMI.md`, `.mcp.json`, `.grok/`, `.claude/`, `.claude-plugin/`, `.agents/`, `.cursor/rules/` |
+| Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `.mcp.json` / `.cursorrules`; dirs `.grok/`, `.claude/`, `.claude-plugin/`, `.agents/`, `.cursor/rules/` |
 | Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type` | all except `max_context_size`, `cli_version`, `provider_type` | all except `provider_type` |
 | `agent` reported | `ai_review` | `claude_review` | `grok_review` |
 | Artifact | `ai-review-summary-*` | `claude-review-summary-*` | `grok-review-summary-*` |
