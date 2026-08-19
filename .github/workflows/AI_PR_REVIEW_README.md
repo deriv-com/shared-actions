@@ -134,9 +134,12 @@ assuming parity:
 - **Grok** — permissions (`dontAsk`) plus `--tools Read,Grep,Write,Edit` are the
   guarantee; `--sandbox read-only` is extra (cannot write the checkout; temp
   and `$GROK_HOME` stay writable). Bash, WebFetch and WebSearch are denied and
-  removed. `--always-approve` is never passed. Grok's **deny-wins**, so there is
-  no catch-all deny for Write/Edit — that would block the scoped output-dir
-  allow. Unlisted tools are denied by `dontAsk`. No GitHub token reaches the
+  removed. `--always-approve` is never passed. Grok's **deny-wins** (`deny`
+  always wins over `allow`: https://docs.x.ai/build/features/permissions;
+  evaluation order deny > ask > allow:
+  https://docs.x.ai/build/settings/reference), so there is no catch-all deny
+  for Write/Edit — that would block the scoped output-dir allow. Unlisted
+  tools are denied by `dontAsk`. No GitHub token reaches the
   step. `output_path` must be under temp or the engine fails closed rather than
   loosening the sandbox. `GROK_HOME` is `/tmp/grok-engine-home` and is wiped
   *before* `npm install` so leftover runner state cannot survive, without

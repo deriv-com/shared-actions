@@ -132,6 +132,19 @@ runs:
         MODEL: ${{ inputs.model }}
         INPUT_BASE_URL: ${{ inputs.base_url }}
         MAX_CONTEXT: ${{ inputs.max_context_size }}
+        # Defaults on: Grok scans $HOME Cursor/Claude configs even when
+        # GROK_HOME is isolated. Disable for this process so leftover runner
+        # profiles cannot inject MCP/skills. Do not delete $HOME/.cursor.
+        GROK_CURSOR_SKILLS_ENABLED: "0"
+        GROK_CURSOR_RULES_ENABLED: "0"
+        GROK_CURSOR_AGENTS_ENABLED: "0"
+        GROK_CURSOR_MCPS_ENABLED: "0"
+        GROK_CURSOR_HOOKS_ENABLED: "0"
+        GROK_CLAUDE_SKILLS_ENABLED: "0"
+        GROK_CLAUDE_RULES_ENABLED: "0"
+        GROK_CLAUDE_AGENTS_ENABLED: "0"
+        GROK_CLAUDE_MCPS_ENABLED: "0"
+        GROK_CLAUDE_HOOKS_ENABLED: "0"
       run: |
         # --sandbox read-only only allows writes to temp and GROK_HOME. Fail
         # closed rather than silently skip Write if a caller pointed output
@@ -172,11 +185,18 @@ runs:
         [sandbox]
         profile = "read-only"
 
+        # Verbose rules use lowercase tool ids (bash, read, edit, grep, mcp,
+        # webfetch, websearch). CLI --allow/--deny/--tools use PascalCase
+        # (Bash, Read, Edit, Write, …). Both are vendor-canonical for their
+        # surface: https://docs.x.ai/build/features/permissions and
+        # https://docs.x.ai/build/settings/reference
+        # Write is an Edit-class alias on the CLI; the structured `tool`
+        # field has no `write`, so scoped writes are `edit` here plus
+        # --allow Write(...) on the run step.
         [permission]
         rules = [
           { action = "allow", tool = "read" },
           { action = "allow", tool = "grep" },
-          { action = "allow", tool = "write", pattern = "${OUT_DIR}/*" },
           { action = "allow", tool = "edit", pattern = "${OUT_DIR}/*" },
           { action = "deny", tool = "bash" },
           { action = "deny", tool = "webfetch" },
@@ -186,6 +206,8 @@ runs:
         EOF
 
         echo "🔧 Grok engine | model=$MODEL | base_url=$BASE_URL | context_window=$MAX_CONTEXT"
+        # Real subcommand (grok inspect --help). Fail closed: leftover
+        # AGENTS/MCP in inspect output is a strip miss, not a diagnostic.
         grok inspect
         echo "✅ Grok Build config written"
 
@@ -199,6 +221,16 @@ runs:
         GROK_DISABLE_AUTOUPDATER: "1"
         GROK_SANDBOX: read-only
         CI: "1"
+        GROK_CURSOR_SKILLS_ENABLED: "0"
+        GROK_CURSOR_RULES_ENABLED: "0"
+        GROK_CURSOR_AGENTS_ENABLED: "0"
+        GROK_CURSOR_MCPS_ENABLED: "0"
+        GROK_CURSOR_HOOKS_ENABLED: "0"
+        GROK_CLAUDE_SKILLS_ENABLED: "0"
+        GROK_CLAUDE_RULES_ENABLED: "0"
+        GROK_CLAUDE_AGENTS_ENABLED: "0"
+        GROK_CLAUDE_MCPS_ENABLED: "0"
+        GROK_CLAUDE_HOOKS_ENABLED: "0"
         CONTEXT_PATH: ${{ inputs.review_context_path }}
         DIFF_PATH: ${{ inputs.pr_diff_path }}
         OUTPUT_PATH: ${{ inputs.output_path }}
@@ -276,8 +308,12 @@ runs:
 
         # No GitHub token in this step's env. dontAsk + --tools allowlist +
         # --sandbox read-only is the sandbox; --always-approve is forbidden.
-        # Grok's deny-wins, so there is no catch-all deny for Write/Edit —
-        # that would block the scoped allow. Unlisted tools are denied by dontAsk.
+        # deny always wins over allow
+        # (https://docs.x.ai/build/features/permissions,
+        # https://docs.x.ai/build/settings/reference — deny > ask > allow),
+        # so a catch-all deny for Write/Edit would cancel the scoped allow.
+        # Unlisted tools are denied by dontAsk. Flag names are from
+        # grok 1.0.5 --help.
         for attempt in 1 2; do
           grok --no-alt-screen \
             --permission-mode dontAsk \
