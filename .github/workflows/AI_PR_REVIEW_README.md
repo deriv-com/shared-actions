@@ -10,14 +10,14 @@
 </pre>
 
 A reusable GitHub Actions workflow that reviews pull requests with an LLM. The
-engine is pluggable: pick `kimi` or `anthropic` with one input.
+engine is pluggable: pick `kimi`, `anthropic`, or `grok` with one input.
 
 ## Features
 
 - 🤖 Full-context review — reads changed files whole, plus their imports, types, callers and tests
 - 🔄 Follow-up mode — on re-push, feeds the previous review plus an incremental diff so fixed items are not re-reported
 - 🧹 Exactly one review comment per PR — the old one is captured at the start and deleted only after its replacement is live, so a failed or cancelled run never leaves the PR without its review
-- 🔌 Pluggable engine (`kimi` | `anthropic`), each a composite action with its own CLI and sandbox
+- 🔌 Pluggable engine (`kimi` | `anthropic` | `grok`), each a composite action with its own CLI and sandbox
 - 🔒 The model gets **no shell tool** and no GitHub token — it cannot comment, and PR-supplied agent config is stripped before it starts
 - 🛡️ The post step refuses to publish a review containing the LLM API key (comment bodies are not covered by Actions secret masking), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
@@ -42,7 +42,7 @@ jobs:
       id-token: write
       actions: write
     with:
-      engine: kimi          # or: anthropic
+      engine: kimi          # or: anthropic | grok
     secrets:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
@@ -59,18 +59,18 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 
 ## Engines
 
-| | `kimi` | `anthropic` |
-|---|---|---|
-| Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) |
-| Default model | `kimi-k3` | `claude-sonnet-5` |
-| `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** |
-| Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (agent mode mounts **no** GitHub MCP servers — see below) |
-| Shell | none (absent from `enabled` **and** denied by rule) | none (`--allowedTools` omits Bash, `--disallowedTools` re-denies it) |
-| `Write` scope | output directory only (allow + catch-all deny) | **unscoped** — see below |
-| Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` |
-| Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type` | all except `max_context_size`, `cli_version`, `provider_type` |
-| `agent` reported | `ai_review` | `claude_review` |
-| Artifact | `ai-review-summary-*` | `claude-review-summary-*` |
+| | `kimi` | `anthropic` | `grok` |
+|---|---|---|---|
+| Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) | `@xai-official/grok` CLI — Grok Build (npm, pinned) |
+| Default model | `kimi-k3` | `claude-sonnet-5` | `grok-4.6` |
+| `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** | proxy origin **+ `/v1`** |
+| Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (agent mode mounts **no** GitHub MCP servers — see below) | `Read`, `Grep`, `Write`/`Edit` **output dir only** |
+| Shell | none (absent from `enabled` **and** denied by rule) | none (`--allowedTools` omits Bash, `--disallowedTools` re-denies it) | none (`dontAsk` + `--tools` allowlist + `--deny Bash`) |
+| `Write` scope | output directory only (allow + catch-all deny) | **unscoped** — see below | output directory only (`dontAsk`; Grok deny-wins, so no catch-all deny) |
+| Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` | `AGENTS.md` family, `CLAUDE.md` family, `KIMI.md`, `.mcp.json`, `.grok/`, `.claude/`, `.claude-plugin/`, `.agents/`, `.cursor/rules/` |
+| Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type` | all except `max_context_size`, `cli_version`, `provider_type` | all except `provider_type` |
+| `agent` reported | `ai_review` | `claude_review` | `grok_review` |
+| Artifact | `ai-review-summary-*` | `claude-review-summary-*` | `grok-review-summary-*` |
 
 **`provider_type` must match what `base_url` serves.** This is the Kimi engine's
 sharpest trap, because a mismatch produces a bare `400 The request was invalid`
@@ -131,6 +131,17 @@ assuming parity:
   replaced recorded that a scoped `Write(/path)` made the tool unavailable
   entirely. The action does hold a token for its own actor checks.
 
+- **Grok** — permissions (`dontAsk`) plus `--tools Read,Grep,Write,Edit` are the
+  guarantee; `--sandbox read-only` is extra (cannot write the checkout; temp
+  and `$GROK_HOME` stay writable). Bash, WebFetch and WebSearch are denied and
+  removed. `--always-approve` is never passed. Grok's **deny-wins**, so there is
+  no catch-all deny for Write/Edit — that would block the scoped output-dir
+  allow. Unlisted tools are denied by `dontAsk`. No GitHub token reaches the
+  step. `output_path` must be under temp or the engine fails closed rather than
+  loosening the sandbox. `GROK_HOME` is `/tmp/grok-engine-home` and is wiped
+  *before* `npm install` so leftover runner state cannot survive, without
+  deleting the binary postinstall just wrote.
+
 Tightening the Anthropic `Write` grant (or scoping the Kimi `Read`) needs a
 verification run, since a pattern the CLI reads as "tool unavailable" means the
 engine reviews and writes nothing. Do not "fix" either blind.
@@ -142,24 +153,27 @@ content), and truncates bodies over GitHub's 65,536-character comment limit
 (full text preserved in the job log) instead of failing the run.
 
 **A model swap is config; an engine swap is a rewrite.** Any model the LiteLLM
-proxy fronts can be reached by setting `model` (and `max_context_size` on Kimi).
-Replacing an engine's *CLI* means writing a new composite action, because each
-CLI has its own config format, sandbox model, tool names and entrypoint.
+proxy fronts can be reached by setting `model` (and `max_context_size` on Kimi
+or Grok). Replacing an engine's *CLI* means writing a new composite action,
+because each CLI has its own config format, sandbox model, tool names and
+entrypoint. Grok 4.6 as a *model* on the Kimi CLI is a model swap; Grok Build
+as the *agent* is this engine.
 
 ## Inputs
 
 | Input | Description | Required | Default (resolved when empty) |
 |-------|-------------|----------|---------|
-| `engine` | `kimi` or `anthropic` | ❌ | `kimi` |
+| `engine` | `kimi`, `anthropic`, or `grok` | ❌ | `kimi` |
 | `model` | Model ID; resolved per engine when empty | ❌ | per engine |
 | `base_url` | LLM API endpoint; `/v1` added or stripped per engine | ❌ | `https://litellmsa.deriv.ai/v1` |
-| `max_context_size` | **[kimi]** Context window in tokens. Must match the model, or the CLI over-packs and the API rejects the request | ❌ | `1048576` |
-| `cli_version` | **[kimi]** Exact `@moonshot-ai/kimi-code` version | ❌ | `0.34.0` |
+| `max_context_size` | **[kimi, grok]** Context window in tokens. Must match the model, or the CLI over-packs and the API rejects the request | ❌ | per engine (`1048576` kimi, `500000` grok) |
+| `cli_version` | **[kimi, grok]** Exact CLI version (`@moonshot-ai/kimi-code` or `@xai-official/grok`) | ❌ | per engine (`0.34.0` kimi, `1.0.5` grok) |
 | `provider_type` | **[kimi]** Wire dialect; must match what `base_url` serves | ❌ | `openai` |
 | `legacy_markers` | Newline-separated markers from superseded workflows to also delete | ❌ | `Claude PR Review Complete` |
 | `prompt_gist_url` | Review prompt template | ❌ | DerivFE gist, **pinned to a revision** |
 
-Inputs marked **[kimi]** are ignored by other engines. Every input except
+Inputs marked **[kimi]** / **[kimi, grok]** are ignored by engines that do not
+use them. Every input except
 `engine` and `legacy_markers` declares `default: ""` and is resolved to the
 values above inside the `Resolve and validate engine` step — so each default
 exists in exactly one place, and that step is where you bump any of them.
@@ -169,9 +183,9 @@ URL is mutable, and a gist edit would rewrite the review agent's instructions
 for every consumer live, with no PR and no audit trail. To roll out a new
 prompt, edit the gist, then bump the revision hash in the resolve step via PR.
 
-`cli_version` is pinned deliberately: `@moonshot-ai/kimi-code` is pre-1.0 and
-ships minor releases weekly, so `latest` would pull both breaking changes and
-unreviewed code into a job holding `LLM_API_KEY` and a write-scoped
+`cli_version` is pinned deliberately: both `@moonshot-ai/kimi-code` and
+`@xai-official/grok` ship frequently, so `latest` would pull both breaking
+changes and unreviewed code into a job holding `LLM_API_KEY` and a write-scoped
 `GITHUB_TOKEN`. Bump it by PR. The Anthropic engine's action SHA is pinned the
 same way but *inside* the action, because `uses:` accepts no expressions.
 
