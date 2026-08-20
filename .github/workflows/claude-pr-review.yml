@@ -83,6 +83,64 @@ jobs:
           printf '%s' "$PROMPT_TEMPLATE" > /tmp/prompt_template.txt
           echo "✅ Prompt template saved ($(wc -c < /tmp/prompt_template.txt) bytes)"
 
+      - name: Post progress comment
+        # Caller-owned, Grok-style "working on it". This is the same comment
+        # the post step PATCHes into the finished review (same id, same URL).
+        # Do not put "Claude PR Review Complete" in this body — capture below
+        # deletes that string at the start of the run. A unique progress
+        # marker so capture cannot treat this as the previous review.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+          PROGRESS_MARKER="<!-- deriv-claude-review-progress -->"
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            | jq -s 'add // []' \
+            | jq -r --arg marker "$PROGRESS_MARKER" \
+              'map(select(.user.login == "github-actions[bot]" and (.body | split("\n") | any(. == $marker))) | .id)[]' \
+            > /tmp/stale_progress_ids.txt
+          if [[ -s /tmp/stale_progress_ids.txt ]]; then
+            xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE < /tmp/stale_progress_ids.txt
+            echo "🧹 Removed stale progress comment(s)"
+          fi
+
+          {
+            printf '**Model:** `%s`\n\n' "$CLAUDE_MODEL"
+            printf '## 🤖 Claude PR Review\n\n'
+            printf 'Claude is working on this pull request.\n\n'
+            printf '%s\n\n' "I'll analyze the changes and get back to you with the review."
+            printf '[View job](%s)\n\n' "$RUN_URL"
+            printf '%s\n' "$PROGRESS_MARKER"
+          } > /tmp/progress_comment.md
+
+          # Progress is UX, not a security boundary: if this POST fails, keep
+          # running — the post step already falls back to a new comment.
+          set +e
+          jq -n --arg body "$(cat /tmp/progress_comment.md)" '{body: $body}' \
+            | gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --method POST --input - \
+            > /tmp/progress_comment.json
+          POST_STATUS=$?
+          set -e
+          if [[ "$POST_STATUS" -ne 0 ]]; then
+            echo "⚠️ Progress comment failed to post (exit $POST_STATUS) — continuing without it."
+            echo "PROGRESS_COMMENT_ID=" >> "$GITHUB_ENV"
+            echo "PROGRESS_MARKER=$PROGRESS_MARKER" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          PROGRESS_ID=$(jq -r '.id // empty' /tmp/progress_comment.json)
+          if [[ -z "$PROGRESS_ID" || "$PROGRESS_ID" == "null" ]]; then
+            echo "⚠️ Progress comment POST returned no id — continuing without it."
+            echo "PROGRESS_COMMENT_ID=" >> "$GITHUB_ENV"
+            echo "PROGRESS_MARKER=$PROGRESS_MARKER" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "PROGRESS_COMMENT_ID=$PROGRESS_ID" >> "$GITHUB_ENV"
+          echo "PROGRESS_MARKER=$PROGRESS_MARKER" >> "$GITHUB_ENV"
+          echo "⏳ Progress comment posted ($PROGRESS_ID)"
+
       - name: Capture and cleanup previous review
         id: previous-review
         env:
@@ -340,10 +398,11 @@ jobs:
             5. After reading ALL files and dependencies, compile your complete review.
 
                HOW THIS TASK IS DELIVERED: your chat reply is discarded and never
-               reaches anyone. Existing PR comments titled "Claude finished" or
-               "Claude Code is working" are leftover trackers from older runs —
-               they are not this job and you must not edit them. This is not the
-               @claude mention / tag-mode flow.
+               reaches anyone. Existing PR comments titled "Claude finished",
+               "Claude Code is working", or "Claude is working on this pull
+               request" are leftover or in-progress trackers — they are not this
+               job and you must not edit them. This is not the @claude mention /
+               tag-mode flow.
 
                The ONLY output that counts is the file
                /tmp/claude_review_output.txt, written with the Write tool. That
@@ -377,9 +436,37 @@ jobs:
             exit 1
           fi
 
-          echo "📬 Posting review ($(wc -c < /tmp/claude_review_output.txt) bytes)..."
-          gh pr comment "$PR_NUMBER" --body-file /tmp/claude_review_output.txt
-          echo "✅ Review posted"
+          # Edit the progress comment into the review (same comment id, same
+          # URL). Fall back to a new comment if progress never posted.
+          if [[ -n "${PROGRESS_COMMENT_ID:-}" ]]; then
+            echo "📬 Updating progress comment $PROGRESS_COMMENT_ID ($(wc -c < /tmp/claude_review_output.txt) bytes)..."
+            jq -n --arg body "$(cat /tmp/claude_review_output.txt)" '{body: $body}' \
+              | gh api "repos/${{ github.repository }}/issues/comments/${PROGRESS_COMMENT_ID}" --method PATCH --input -
+            echo "✅ Review written over the progress comment"
+          else
+            echo "📬 Progress comment missing — posting a new review ($(wc -c < /tmp/claude_review_output.txt) bytes)..."
+            gh pr comment "$PR_NUMBER" --body-file /tmp/claude_review_output.txt
+            echo "✅ Review posted"
+          fi
+          # So a later reap/fail handler cannot overwrite this completed review.
+          echo "REVIEW_POSTED=1" >> "$GITHUB_ENV"
+
+      - name: Mark progress comment failed
+        if: ${{ failure() && env.PROGRESS_COMMENT_ID != '' && env.REVIEW_POSTED != '1' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            printf '**Model:** `%s`\n\n' "$CLAUDE_MODEL"
+            printf '## 🤖 Claude PR Review\n\n'
+            printf 'Claude did not finish this review.\n\n'
+            printf 'See the [job log](%s) for details. The previous review comment, if any, is unchanged.\n\n' "$RUN_URL"
+            printf '%s\n' "${PROGRESS_MARKER:-<!-- deriv-claude-review-progress -->}"
+          } > /tmp/progress_failed.md
+          jq -n --arg body "$(cat /tmp/progress_failed.md)" '{body: $body}' \
+            | gh api "repos/${{ github.repository }}/issues/comments/${PROGRESS_COMMENT_ID}" --method PATCH --input -
+          echo "⚠️ Progress comment updated to failed"
 
       - name: Emit review event to metrics dashboard
         if: always()
