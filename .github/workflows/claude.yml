@@ -1,19 +1,12 @@
 name: Claude PR Review
 
-# TEMPORARY for PR 122: pull_request + @feat/grok-build-engine so this PR
-# runs track_progress: false and the caller-owned progress comment + PATCH
-# in claude-pr-review.yml (file delivery, not the action's tracker). Master's
-# claude.yml is still pull_request_target @master and may fail or cancel
-# until merge. Revert this file to pull_request_target + @master before
-# merge — do not leave the live pin on master.
-
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
 
 jobs:
   claude-review:
-    uses: deriv-com/shared-actions/.github/workflows/claude-pr-review.yml@feat/grok-build-engine
+    uses: deriv-com/shared-actions/.github/workflows/claude-pr-review.yml@master
     permissions:
       contents: read
       pull-requests: write

@@ -757,8 +757,7 @@ jobs:
         id: engine-grok
         if: steps.engine.outputs.engine == 'grok'
         timeout-minutes: 60
-        # TEMPORARY pin for PR 122 live test. Revert to @master before merge.
-        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_grok@feat/grok-build-engine
+        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_grok@master
         with:
           repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
