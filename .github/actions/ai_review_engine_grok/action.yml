@@ -123,13 +123,34 @@ runs:
         npm install -g "@xai-official/grok@${CLI_VERSION}"
         grok --version
 
-        # Linux read-only/strict sandbox enforces the deny list with bubblewrap.
-        # Without it grok refuses to start: "bwrap exec failed: No such file or
-        # directory". Kimi/Claude do not need this. GitHub-hosted runners in
-        # this org's reviewer group do not image it.
+        # Linux read-only/strict sandbox uses bubblewrap for the deny list.
+        # GitHub-hosted Ubuntu 24.04 images do not ship bwrap, and even after
+        # apt install AppArmor blocks unprivileged user namespaces
+        # (bwrap: setting up uid map: Permission denied). Load a userns
+        # profile, same workaround Ubuntu documents for bwrap on noble.
         if ! command -v bwrap >/dev/null 2>&1; then
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap apparmor-profiles
+        fi
+        if [[ -f /usr/share/apparmor/extra-profiles/bwrap-userns-restrict ]]; then
+          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+            /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+        elif [[ ! -f /etc/apparmor.d/bwrap ]]; then
+          printf '%s\n' \
+            'abi <abi/4.0>,' \
+            'include <tunables/global>' \
+            '' \
+            'profile bwrap /usr/bin/bwrap flags=(unconfined) {' \
+            '  userns,' \
+            '  include if exists <local/bwrap>' \
+            '}' \
+            | sudo tee /etc/apparmor.d/bwrap >/dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+        fi
+        if ! bwrap --unshare-user --die-with-parent --ro-bind / / --dev /dev true; then
+          echo "❌ Grok engine: bubblewrap cannot create a user namespace on this runner (uid map denied). The read-only sandbox cannot start."
+          exit 1
         fi
         bwrap --version
         echo "✅ Grok Build CLI ${CLI_VERSION} installed (GROK_HOME=$GROK_HOME)"
