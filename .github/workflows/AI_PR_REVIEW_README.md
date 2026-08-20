@@ -251,11 +251,17 @@ the start of the run, which meant every engine failure or cancel-in-progress
 in the up-to-an-hour gap destroyed the previous review and its reviewed-commit
 SHA.)
 Detection uses a canonical hidden marker, `<!-- deriv-pr-review-<engine> -->`
-(for example `<!-- deriv-pr-review-grok -->`), which the **post step appends** —
-it is not something the model is asked to emit. The marker is per-engine so a
-Kimi run and a Grok run on the same PR keep both comments. Earlier versions
-used a shared `<!-- deriv-pr-review -->` and depended on the model reproducing
-a visible header, which meant one reworded header left a duplicate forever.
+(for example `<!-- deriv-pr-review-grok -->`), which the **post step appends**
+as its own unindented line — it is not something the model is asked to emit.
+Capture and reap match that **exact line** in the last 20 lines of the
+comment, not a substring anywhere in the body. Visible titles such as
+`Grok PR Review Complete` are not markers: a follow-up that quotes this
+workflow's YAML would otherwise be deleted by the other engine. The marker
+is per-engine so a Kimi run and a Grok run on the same PR keep both
+comments. `engine: kimi` and `engine: anthropic` also match the older
+shared line `<!-- deriv-pr-review -->` so comments posted before the
+split stay in follow-up mode. Grok does **not** match that old tag, or a
+Grok run would reap Kimi during a bake-off.
 
 `legacy_markers` exists purely for migrations: a run also deletes comments
 matching those strings, so a PR that has been through more than one review
