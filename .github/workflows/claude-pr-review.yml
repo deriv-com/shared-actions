@@ -43,6 +43,9 @@ jobs:
 
     env:
       CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-sonnet-5' }}
+      # Same asset anthropics/claude-code-action uses on its tracker comment.
+      # Copied here so we can keep that look with track_progress: false.
+      CLAUDE_LOGO_IMG: '<img src="https://github.com/user-attachments/assets/5ac382c7-e004-429b-8e35-7feb3e8f9c6f" width="14px" height="14px" style="vertical-align: middle; margin-left: 4px;" />'
 
     steps:
       - name: Security Check - Validate User Access
@@ -84,11 +87,12 @@ jobs:
           echo "✅ Prompt template saved ($(wc -c < /tmp/prompt_template.txt) bytes)"
 
       - name: Post progress comment
-        # Caller-owned, Grok-style "working on it". This is the same comment
-        # the post step PATCHes into the finished review (same id, same URL).
-        # Do not put "Claude PR Review Complete" in this body — capture below
-        # deletes that string at the start of the run. A unique progress
-        # marker so capture cannot treat this as the previous review.
+        # Caller-owned copy of the Claude Code tracker (logo + "working…").
+        # This is the same comment the post step PATCHes into the finished
+        # review (same id, same URL). Do not put "Claude PR Review Complete"
+        # in this body — capture below deletes that string at the start of
+        # the run. A unique progress marker so capture cannot treat this as
+        # the previous review.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -96,6 +100,7 @@ jobs:
           PR_NUMBER="${{ github.event.pull_request.number }}"
           REPO="${{ github.repository }}"
           PROGRESS_MARKER="<!-- deriv-claude-review-progress -->"
+          echo "CLAUDE_REVIEW_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
 
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
             | jq -s 'add // []' \
@@ -108,11 +113,9 @@ jobs:
           fi
 
           {
-            printf '**Model:** `%s`\n\n' "$CLAUDE_MODEL"
-            printf '## 🤖 Claude PR Review\n\n'
-            printf 'Claude is working on this pull request.\n\n'
-            printf '%s\n\n' "I'll analyze the changes and get back to you with the review."
-            printf '[View job](%s)\n\n' "$RUN_URL"
+            printf 'Claude Code is working… %s\n\n' "$CLAUDE_LOGO_IMG"
+            printf '%s\n\n' "I'll analyze this and get back to you."
+            printf '[View job run](%s)\n\n' "$RUN_URL"
             printf '%s\n' "$PROGRESS_MARKER"
           } > /tmp/progress_comment.md
 
@@ -421,6 +424,8 @@ jobs:
       - name: Post review as single PR comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ACTOR: ${{ github.actor }}
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
@@ -436,16 +441,36 @@ jobs:
             exit 1
           fi
 
+          NOW=$(date +%s)
+          STARTED="${CLAUDE_REVIEW_STARTED_AT:-}"
+          if [[ -n "$STARTED" ]]; then
+            ELAPSED=$(( NOW - STARTED ))
+            if (( ELAPSED >= 60 )); then
+              DURATION="$((ELAPSED / 60))m $((ELAPSED % 60))s"
+            else
+              DURATION="${ELAPSED}s"
+            fi
+            HEADER=$(printf '**Claude finished @%s'\''s task in %s** —— [View job](%s)' "$ACTOR" "$DURATION" "$RUN_URL")
+          else
+            HEADER=$(printf '**Claude finished @%s'\''s task** —— [View job](%s)' "$ACTOR" "$RUN_URL")
+          fi
+          {
+            printf '%s\n\n' "$HEADER"
+            printf -- '---\n'
+            printf '### Review complete %s\n\n' "$CLAUDE_LOGO_IMG"
+            cat /tmp/claude_review_output.txt
+          } > /tmp/claude_review_posted.txt
+
           # Edit the progress comment into the review (same comment id, same
           # URL). Fall back to a new comment if progress never posted.
           if [[ -n "${PROGRESS_COMMENT_ID:-}" ]]; then
-            echo "📬 Updating progress comment $PROGRESS_COMMENT_ID ($(wc -c < /tmp/claude_review_output.txt) bytes)..."
-            jq -n --arg body "$(cat /tmp/claude_review_output.txt)" '{body: $body}' \
+            echo "📬 Updating progress comment $PROGRESS_COMMENT_ID ($(wc -c < /tmp/claude_review_posted.txt) bytes)..."
+            jq -n --arg body "$(cat /tmp/claude_review_posted.txt)" '{body: $body}' \
               | gh api "repos/${{ github.repository }}/issues/comments/${PROGRESS_COMMENT_ID}" --method PATCH --input -
             echo "✅ Review written over the progress comment"
           else
-            echo "📬 Progress comment missing — posting a new review ($(wc -c < /tmp/claude_review_output.txt) bytes)..."
-            gh pr comment "$PR_NUMBER" --body-file /tmp/claude_review_output.txt
+            echo "📬 Progress comment missing — posting a new review ($(wc -c < /tmp/claude_review_posted.txt) bytes)..."
+            gh pr comment "$PR_NUMBER" --body-file /tmp/claude_review_posted.txt
             echo "✅ Review posted"
           fi
           # So a later reap/fail handler cannot overwrite this completed review.
@@ -458,9 +483,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           {
-            printf '**Model:** `%s`\n\n' "$CLAUDE_MODEL"
-            printf '## 🤖 Claude PR Review\n\n'
-            printf 'Claude did not finish this review.\n\n'
+            printf 'Claude did not finish this review. %s\n\n' "$CLAUDE_LOGO_IMG"
             printf 'See the [job log](%s) for details. The previous review comment, if any, is unchanged.\n\n' "$RUN_URL"
             printf '%s\n' "${PROGRESS_MARKER:-<!-- deriv-claude-review-progress -->}"
           } > /tmp/progress_failed.md
