@@ -214,8 +214,9 @@ jobs:
               DEFAULT_MODEL="claude-sonnet-5"
               METRICS_AGENT="claude_review"
               ARTIFACT_PREFIX="claude-review"
-              DEFAULT_MAX_CONTEXT="1048576"
-              DEFAULT_CLI_VERSION="0.34.0"
+              # Unused by this engine — the anthropic dispatch consumes neither.
+              DEFAULT_MAX_CONTEXT=""
+              DEFAULT_CLI_VERSION=""
               REVIEW_TITLE="Claude PR Review"
               ;;
             grok)
@@ -292,15 +293,21 @@ jobs:
           REPO="${{ github.repository }}"
           PROGRESS_MARKER="<!-- deriv-pr-review-progress-${REVIEW_ENGINE} -->"
 
+          # Progress is UX: a transient list/DELETE failure must not abort the
+          # review. Worst case of skipping the sweep is one extra stale
+          # progress comment, which the next run removes.
+          set +e
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
             | jq -s 'add // []' \
             | jq -r --arg marker "$PROGRESS_MARKER" \
               'map(select(.user.login == "github-actions[bot]" and (.body | split("\n") | any(. == $marker))) | .id)[]' \
             > /tmp/stale_progress_ids.txt
           if [[ -s /tmp/stale_progress_ids.txt ]]; then
-            xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE < /tmp/stale_progress_ids.txt
-            echo "🧹 Removed stale progress comment(s)"
+            xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE < /tmp/stale_progress_ids.txt \
+              && echo "🧹 Removed stale progress comment(s)" \
+              || echo "⚠️ Stale progress cleanup failed — continuing."
           fi
+          set -e
 
           {
             printf '**Model:** `%s`\n\n' "$REVIEW_MODEL"
@@ -697,6 +704,12 @@ jobs:
           fi
 
           echo "✅ PR diff fetched ($(wc -c < /tmp/pr_diff_raw.txt) bytes raw, $(wc -c < "$PR_DIFF_FILE") after noise filter)"
+
+      - name: Clear review output
+        # Persistent runners can leave a previous job's file. The post step
+        # treats a non-empty path as THIS run's review. Kimi/Grok also rm -f
+        # internally; the Anthropic engine relies on this step.
+        run: rm -f "$REVIEW_OUTPUT_FILE"
 
       # ======================== ENGINE DISPATCH ============================
       # Exactly one step below runs. `uses:` accepts no expressions, so engine
