@@ -11,9 +11,10 @@ description: >
 # pr_diff_path exist and are non-empty; the access gate has passed.
 #
 # This engine must: strip PR-supplied agent config FIRST, grant the model no
-# shell tool, write the review to output_path, and fail with an engine-named
-# message if it wrote nothing. It must not post PR comments or reach the GitHub
-# API on the model's behalf.
+# shell tool, write the review to output_path, write usage/cost to
+# /tmp/ai_review_usage.json when the CLI reports it (missing file is allowed),
+# and fail with an engine-named message if it wrote nothing. It must not post
+# PR comments or reach the GitHub API on the model's behalf.
 #
 # Composite-action gotchas that constrain this file:
 #   - `secrets` is not readable here, so api_key arrives as an input.
@@ -76,6 +77,9 @@ outputs:
   output_path:
     description: "Path the review markdown was written to."
     value: ${{ steps.run.outputs.output_path }}
+  usage_path:
+    description: "Path the usage/cost sidecar was written to, when the CLI reported any."
+    value: ${{ steps.run.outputs.usage_path }}
 
 runs:
   using: composite
@@ -285,11 +289,47 @@ runs:
           echo "    content. That one is transient — the retry below covers it."
         }
 
+        # Harvest tokens from session wire.jsonl (usage.record per model step).
+        # stream-json stdout has no usage/cost. Dollar cost is usually absent
+        # here; the caller must not treat a missing cost as $0. ALWAYS call as
+        # `( capture_kimi_usage ) || true`.
+        capture_kimi_usage() {
+          set +e +o pipefail
+          rm -f /tmp/kimi_usage_records.jsonl
+          find "$HOME/.kimi-code" -type f -name wire.jsonl -print0 2>/dev/null \
+            | xargs -0 -r jq -c 'select(.type == "usage.record")' 2>/dev/null \
+            > /tmp/kimi_usage_records.jsonl || true
+          if [[ ! -s /tmp/kimi_usage_records.jsonl ]]; then
+            echo "ℹ️  Kimi engine: no usage.record lines in session wire.jsonl"
+            return 0
+          fi
+          jq -s '
+            map(select(.usageScope == "turn" or .usageScope == null or .usageScope == ""))
+            | {
+                cost_usd: (
+                  [.[].usage.cost, .[].usage.costUSD, .[].cost_usd, .[].cost]
+                  | map(select(. != null))
+                  | if length == 0 then null else add end
+                ),
+                input_tokens: (map(.usage.inputOther // 0) | add),
+                output_tokens: (map(.usage.output // 0) | add),
+                cache_read_tokens: (map(.usage.inputCacheRead // 0) | add),
+                cache_creation_tokens: (map(.usage.inputCacheCreation // 0) | add),
+                num_turns: length,
+                source: "kimi-wire-jsonl"
+              }
+            | .cost_available = (.cost_usd != null)
+            | .total_tokens = (.input_tokens + .output_tokens + .cache_read_tokens + .cache_creation_tokens)
+          ' /tmp/kimi_usage_records.jsonl > /tmp/ai_review_usage.json
+          echo "ℹ️  Kimi engine: usage $(jq -c . /tmp/ai_review_usage.json)"
+          echo "usage_path=/tmp/ai_review_usage.json" >> "$GITHUB_OUTPUT"
+        }
+
         # Clean slate first. The checks below treat a non-empty file at this path
         # as THIS run's deliverable, so a leftover from an earlier job — possible
         # on a persistent runner, same reason $HOME/.kimi-code is recreated in the
         # configure step — would be posted as a review of the wrong PR.
-        rm -f "$OUTPUT_PATH"
+        rm -f "$OUTPUT_PATH" /tmp/ai_review_usage.json
 
         # Read once, outside the loop: both attempts then provably run the same
         # prompt. Re-reading per attempt would also mean an empty prompt reaching
@@ -330,6 +370,8 @@ runs:
             echo "🔁 Kimi engine: attempt 2 of 2"
           fi
         done
+
+        ( capture_kimi_usage ) || true
 
         # Fail here, named, rather than letting the caller report a generic
         # "review file missing" — all steps in a composite action share one log

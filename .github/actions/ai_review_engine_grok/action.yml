@@ -11,9 +11,10 @@ description: >
 # pr_diff_path exist and are non-empty; the access gate has passed.
 #
 # This engine must: strip PR-supplied agent config FIRST, grant the model no
-# shell tool, write the review to output_path, and fail with an engine-named
-# message if it wrote nothing. It must not post PR comments or reach the GitHub
-# API on the model's behalf.
+# shell tool, write the review to output_path, write usage/cost to
+# /tmp/ai_review_usage.json when the CLI reports it (missing file is allowed),
+# and fail with an engine-named message if it wrote nothing. It must not post
+# PR comments or reach the GitHub API on the model's behalf.
 #
 # Composite-action gotchas that constrain this file:
 #   - The secrets context is not readable here, so api_key arrives as an input.
@@ -68,6 +69,9 @@ outputs:
   output_path:
     description: "Path the review markdown was written to."
     value: ${{ steps.run.outputs.output_path }}
+  usage_path:
+    description: "Path the usage/cost sidecar was written to, when the CLI reported any."
+    value: ${{ steps.run.outputs.usage_path }}
 
 runs:
   using: composite
@@ -208,6 +212,10 @@ runs:
         # command not found). TOML tool ids are lowercase; CLI flags are
         # PascalCase. Write is an Edit-class alias, so scoped writes are
         # tool = edit here plus --allow Write(...) on the run step.
+        #
+        # extra_headers tags LiteLLM spend logs with this Actions run id so a
+        # later spend query can attribute cost without mixing concurrent jobs
+        # on the same virtual key. LiteLLM consumes x-litellm-tags itself.
         cat > "$GROK_HOME/config.toml" <<EOF
         [models]
         default = "review"
@@ -218,6 +226,7 @@ runs:
         env_key = "XAI_API_KEY"
         api_backend = "chat_completions"
         context_window = ${MAX_CONTEXT}
+        extra_headers = { "x-litellm-tags" = "ai-pr-review,gh-run-${{ github.run_id }}" }
 
         [sandbox]
         profile = "read-only"
@@ -332,7 +341,51 @@ runs:
           echo "    has started reading files, config is probably fine."
         }
 
-        rm -f "$OUTPUT_PATH"
+        # Harvest cost/tokens from --output-format json. The review itself is
+        # the Write-tool file; stdout JSON is discarded except for this. Never
+        # fail the review because usage parsing failed. ALWAYS call as
+        # `( capture_grok_usage ) || true` so set +e cannot leak.
+        capture_grok_usage() {
+          set +e +o pipefail
+          files=()
+          for f in /tmp/grok_session_1.json /tmp/grok_session_2.json; do
+            if [[ -s "$f" ]] && jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
+              files+=("$f")
+              echo "::group::$(basename "$f") usage"
+              jq '{stopReason, sessionId, requestId, num_turns, usage, total_cost_usd, modelUsage}' "$f" 2>/dev/null \
+                || jq 'keys' "$f"
+              echo "::endgroup::"
+            fi
+          done
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "ℹ️  Grok engine: no JSON session output to harvest usage from"
+            return 0
+          fi
+          jq -s '
+            def num(p): map(p // 0) | map(tonumber? // 0) | add // 0;
+            def costs: map(.total_cost_usd // .totalCostUsd) | map(select(. != null));
+            {
+              cost_usd: (costs | if length == 0 then null else add end),
+              cost_available: ((costs | length) > 0),
+              input_tokens: num(.usage.input_tokens // .usage.prompt_tokens),
+              output_tokens: num(.usage.output_tokens // .usage.completion_tokens),
+              cache_read_tokens: num(.usage.cache_read_input_tokens // .usage.cacheReadInputTokens),
+              cache_creation_tokens: num(.usage.cache_creation_input_tokens // .usage.cacheCreationInputTokens),
+              total_tokens: num(.usage.total_tokens),
+              num_turns: num(.num_turns // .numTurns),
+              source: "grok-cli-json"
+            }
+            | .total_tokens = (
+                if .total_tokens > 0 then .total_tokens
+                else (.input_tokens + .output_tokens + .cache_read_tokens + .cache_creation_tokens)
+                end
+              )
+          ' "${files[@]}" > /tmp/ai_review_usage.json
+          echo "ℹ️  Grok engine: usage $(jq -c . /tmp/ai_review_usage.json)"
+          echo "usage_path=/tmp/ai_review_usage.json" >> "$GITHUB_OUTPUT"
+        }
+
+        rm -f "$OUTPUT_PATH" /tmp/grok_session_1.json /tmp/grok_session_2.json /tmp/ai_review_usage.json
         REVIEW_PROMPT="$(cat /tmp/review_prompt.txt)"
 
         # No GitHub token in this step's env. dontAsk + --tools allowlist +
@@ -343,6 +396,11 @@ runs:
         # so a catch-all deny for Write/Edit would cancel the scoped allow.
         # Unlisted tools are denied by dontAsk. Flag names are from
         # grok 1.0.5 --help.
+        #
+        # --output-format json: stdout is a single object with usage/cost
+        # (https://docs.x.ai/build/cli/headless-scripting). Update messages
+        # stay on stderr. Cost floats are omitted when the server did not
+        # stamp a complete bill — never treat a missing field as $0.
         for attempt in 1 2; do
           grok --no-alt-screen \
             --permission-mode dontAsk \
@@ -350,6 +408,7 @@ runs:
             --disable-web-search \
             --no-subagents \
             --no-plan \
+            --output-format json \
             --tools Read,Grep,Write,Edit \
             --disallowed-tools Bash,WebFetch,WebSearch \
             --allow Read \
@@ -359,7 +418,7 @@ runs:
             --deny Bash \
             --deny WebFetch \
             --deny WebSearch \
-            -p "$REVIEW_PROMPT" && GROK_STATUS=0 || GROK_STATUS=$?
+            -p "$REVIEW_PROMPT" > "/tmp/grok_session_${attempt}.json" && GROK_STATUS=0 || GROK_STATUS=$?
 
           if [[ -s "$OUTPUT_PATH" ]]; then
             if [[ "$GROK_STATUS" -ne 0 ]]; then
@@ -375,6 +434,8 @@ runs:
             echo "🔁 Grok engine: attempt 2 of 2"
           fi
         done
+
+        ( capture_grok_usage ) || true
 
         if [[ ! -s "$OUTPUT_PATH" ]]; then
           echo "❌ Grok engine: no review written to $OUTPUT_PATH after 2 attempts (last CLI exit: $GROK_STATUS)"

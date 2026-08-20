@@ -22,6 +22,8 @@ engine is pluggable: pick `kimi`, `anthropic`, or `grok` with one input.
 - 🛡️ The post step refuses to publish a review containing the LLM API key (comment bodies are not covered by Actions secret masking), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
 - 📊 Emits events to the OneAboveAll metrics dashboard, and always to the job summary
+- 💸 Appends run cost (when the CLI stamps it) and token counts at the end of the PR comment
+- ⏳ Posts a caller-owned "working on it" comment (model at the top) before the engine runs; the CLI never gets a GitHub token
 
 ## Usage
 
@@ -245,10 +247,12 @@ fails at any point leaves the old comment untouched. The worst case is a
 transient duplicate, which the next run reaps. (Deletion used to happen at the
 start of the run, which meant every engine failure or cancel-in-progress in the
 up-to-an-hour gap destroyed the previous review and its reviewed-commit SHA.)
-Detection uses a canonical hidden marker, `<!-- deriv-pr-review -->`, which
-the **post step appends** — it is not something the model is asked to emit.
-Earlier versions depended on the model reproducing a visible header, which meant
-one reworded header left a duplicate comment on the PR forever.
+Detection uses a canonical hidden marker, `<!-- deriv-pr-review-<engine> -->`
+(for example `<!-- deriv-pr-review-grok -->`), which the **post step appends** —
+it is not something the model is asked to emit. The marker is per-engine so a
+Kimi run and a Grok run on the same PR keep both comments. Earlier versions
+used a shared `<!-- deriv-pr-review -->` and depended on the model reproducing
+a visible header, which meant one reworded header left a duplicate forever.
 
 `legacy_markers` exists purely for migrations: a run also deletes comments
 matching those strings, so a PR that has been through more than one review
@@ -331,7 +335,9 @@ the access gate has passed.
 
 An engine **must** strip PR-supplied agent config as its *first* step, grant the
 model no shell tool, read the context and diff, write the review to
-`output_path`, and fail with an engine-named message if it wrote nothing. It
+`output_path`, and fail with an engine-named message if it wrote nothing. When
+the CLI reports usage, it **must** write `/tmp/ai_review_usage.json` (cost and
+tokens); a missing file is allowed, inventing `$0` is not. It
 **must not** post PR comments, reach the GitHub API on the model's behalf, or
 assume it owns checkout, prompt fetch, previous-review handling, context build,
 diff fetch, comment posting, metrics or artifacts.
@@ -368,23 +374,31 @@ CLI reads.
 1. **Access gate** — actor must be a `deriv-com` member or a repo collaborator.
 2. **Resolve engine** — validate `engine`, resolve per-engine and engine-neutral
    defaults (the single place every default value lives).
-3. **Checkout** the event's `head.sha` — not the branch, which could have moved
+3. **Progress comment** — the caller (not the engine) posts a Claude-style
+   "working on it" comment with the model at the top and a job link. The CLI
+   never receives `GITHUB_TOKEN`.
+4. **Checkout** the event's `head.sha` — not the branch, which could have moved
    past what the gate validated — at depth 20, for the incremental diff.
-4. **Fetch prompt** template from the pinned gist revision; inject the Click2Fix URL.
-5. **Capture** the newest prior review comment (canonical + legacy markers,
+5. **Fetch prompt** template from the pinned gist revision; inject the Click2Fix URL.
+6. **Capture** the newest prior review comment (canonical + legacy markers,
    paginated) as `PREVIOUS_REVIEW` and extract its `reviewed-commit` SHA.
-   Capture only — deletion waits until step 10.
-6. **Collect acknowledged suggestions** from `Click2Fix - Acknowledge` comments
+   Capture only — deletion waits until step 11. Progress comments use a
+   different marker and are not captured as reviews.
+7. **Collect acknowledged suggestions** from `Click2Fix - Acknowledge` comments
    posted by the bot or by accounts with repo standing (`author_association`),
    so a drive-by comment cannot suppress findings.
-7. **Build `/tmp/review_context.md`** — instructions, previous review,
+8. **Build `/tmp/review_context.md`** — instructions, previous review,
    noise-filtered incremental diff, acknowledged items, PR metadata, review
    procedure, output format.
-8. **Pre-fetch the diff** to `/tmp/pr_diff.txt` with the trusted token (so the
+9. **Pre-fetch the diff** to `/tmp/pr_diff.txt` with the trusted token (so the
    engine needs no shell), filtered for build noise only — lockfiles and
    generated output, never test or doc files, which the review must see.
-9. **Dispatch to the engine** — it writes `/tmp/ai_review_output.txt`.
-10. **Post**: scan the review for the API key (refuse if found), truncate over
-    GitHub's comment limit, append the detection markers, post the replacement,
-    **then** delete the prior review comments captured just before posting.
-11. **Emit metrics** to the dashboard and the job summary; upload the payload.
+10. **Dispatch to the engine** — it writes `/tmp/ai_review_output.txt` and, when
+    the CLI reports usage, `/tmp/ai_review_usage.json` (Grok/Claude include USD
+    when stamped; Kimi usually has tokens only).
+11. **Post**: scan the review for the API key (refuse if found), truncate over
+    GitHub's comment limit, prepend the model and engine title, append the
+    cost/usage footer and detection markers, post the replacement, **then**
+    delete the prior review comments and the progress placeholder.
+12. **Emit metrics** to the dashboard and the job summary (including cost and
+    tokens when captured); upload the payload.
