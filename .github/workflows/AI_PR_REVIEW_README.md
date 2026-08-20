@@ -16,14 +16,14 @@ engine is pluggable: pick `kimi`, `anthropic`, or `grok` with one input.
 
 - 🤖 Full-context review — reads changed files whole, plus their imports, types, callers and tests
 - 🔄 Follow-up mode — on re-push, feeds the previous review plus an incremental diff so fixed items are not re-reported
-- 🧹 Exactly one review comment per PR — the old one is captured at the start and deleted only after its replacement is live, so a failed or cancelled run never leaves the PR without its review
+- 🧹 Exactly one review comment per engine per PR — a "working on it" comment is posted first, then **edited** into the finished review (same comment URL). The previous review is deleted only after that edit, so a failed or cancelled run never leaves the PR without its last completed review
 - 🔌 Pluggable engine (`kimi` | `anthropic` | `grok`), each a composite action with its own CLI and sandbox
 - 🔒 The model gets **no shell tool** and no GitHub token — it cannot comment, and PR-supplied agent config is stripped before it starts
 - 🛡️ The post step refuses to publish a review containing the LLM API key (comment bodies are not covered by Actions secret masking), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
 - 📊 Emits events to the OneAboveAll metrics dashboard, and always to the job summary
-- 💸 Appends run cost (when the CLI stamps it) and token counts at the end of the PR comment
-- ⏳ Posts a caller-owned "working on it" comment (model at the top) before the engine runs; the CLI never gets a GitHub token
+- ⏳ Posts a caller-owned "working on it" comment (model at the top) before the engine runs, then edits that same comment into the review; the CLI never gets a GitHub token
+- 🏷️ The reusable job is named after the engine (`Grok PR Review` / `Kimi PR Review` / `Claude PR Review`) so Checks can tell concurrent engines apart
 
 ## Usage
 
@@ -240,13 +240,16 @@ composite actions consistently, not just here — is a reasonable follow-up.
 
 ## Comment markers and cleanup
 
-Each run deletes prior review comments **only after the replacement has
-posted** (the reap-list is captured just before posting, so the new comment
-cannot match its own filter), so a PR carries exactly one — and a run that
-fails at any point leaves the old comment untouched. The worst case is a
-transient duplicate, which the next run reaps. (Deletion used to happen at the
-start of the run, which meant every engine failure or cancel-in-progress in the
-up-to-an-hour gap destroyed the previous review and its reviewed-commit SHA.)
+Each run **edits** the progress comment into the finished review (same
+comment id and URL), then deletes prior review comments. The reap-list is
+captured just before that edit and **excludes** the comment being patched, so
+the replacement cannot match its own filter. A run that fails at any point
+leaves the last completed review untouched and PATCHes the progress comment
+to "did not finish". The worst case is a transient duplicate (progress plus
+the previous review), which the next run reaps. (Deletion used to happen at
+the start of the run, which meant every engine failure or cancel-in-progress
+in the up-to-an-hour gap destroyed the previous review and its reviewed-commit
+SHA.)
 Detection uses a canonical hidden marker, `<!-- deriv-pr-review-<engine> -->`
 (for example `<!-- deriv-pr-review-grok -->`), which the **post step appends** —
 it is not something the model is asked to emit. The marker is per-engine so a
@@ -308,9 +311,13 @@ the repo README. To migrate a consumer, edit its caller (three changes —
        AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
 ```
 
-Keep the caller's filename, `name:` and job id — they determine the status-check
-name, and changing one can block merges on a repo with branch protection. Do
-cosmetic renames separately, after auditing required checks.
+Keep the caller's filename, `name:` and job id — they determine the left
+half of the status-check name (`{caller job} / {reusable job}`), and
+changing one can block merges on a repo with branch protection. The
+reusable job is named after `engine` (`Kimi PR Review`, `Grok PR Review`,
+`Claude PR Review`) so two engines on one PR are distinguishable in
+Checks. After adopting this, update any required check that still names
+`ai-review / ai-review`. Do other cosmetic renames separately.
 
 Switching that repo to Kimi afterwards is a separate decision: set
 `engine: kimi`, drop `max_context_size` if the model's window differs, and expect
@@ -335,12 +342,12 @@ the access gate has passed.
 
 An engine **must** strip PR-supplied agent config as its *first* step, grant the
 model no shell tool, read the context and diff, write the review to
-`output_path`, and fail with an engine-named message if it wrote nothing. When
-the CLI reports usage, it **must** write `/tmp/ai_review_usage.json` (cost and
-tokens); a missing file is allowed, inventing `$0` is not. It
-**must not** post PR comments, reach the GitHub API on the model's behalf, or
-assume it owns checkout, prompt fetch, previous-review handling, context build,
-diff fetch, comment posting, metrics or artifacts.
+`output_path`, and fail with an engine-named message if it wrote nothing. It
+**must not** harvest or invent cost/usage for the PR comment (the caller does
+not publish a usage footer). It **must not** post PR comments, reach the GitHub
+API on the model's behalf, or assume it owns checkout, prompt fetch,
+previous-review handling, context build, diff fetch, comment posting, metrics
+or artifacts.
 
 The stripping step is a **security boundary, and its paths are engine-specific**
 — `.claude/settings.json` can declare hooks that execute arbitrary commands and
@@ -375,8 +382,9 @@ CLI reads.
 2. **Resolve engine** — validate `engine`, resolve per-engine and engine-neutral
    defaults (the single place every default value lives).
 3. **Progress comment** — the caller (not the engine) posts a Claude-style
-   "working on it" comment with the model at the top and a job link. The CLI
-   never receives `GITHUB_TOKEN`.
+   "working on it" comment with the model at the top and a job link. This is
+   the comment that later becomes the review (same id). The CLI never
+   receives `GITHUB_TOKEN`.
 4. **Checkout** the event's `head.sha` — not the branch, which could have moved
    past what the gate validated — at depth 20, for the incremental diff.
 5. **Fetch prompt** template from the pinned gist revision; inject the Click2Fix URL.
@@ -393,12 +401,11 @@ CLI reads.
 9. **Pre-fetch the diff** to `/tmp/pr_diff.txt` with the trusted token (so the
    engine needs no shell), filtered for build noise only — lockfiles and
    generated output, never test or doc files, which the review must see.
-10. **Dispatch to the engine** — it writes `/tmp/ai_review_output.txt` and, when
-    the CLI reports usage, `/tmp/ai_review_usage.json` (Grok/Claude include USD
-    when stamped; Kimi usually has tokens only).
+10. **Dispatch to the engine** — it writes `/tmp/ai_review_output.txt`.
 11. **Post**: scan the review for the API key (refuse if found), truncate over
-    GitHub's comment limit, prepend the model and engine title, append the
-    cost/usage footer and detection markers, post the replacement, **then**
-    delete the prior review comments and the progress placeholder.
-12. **Emit metrics** to the dashboard and the job summary (including cost and
-    tokens when captured); upload the payload.
+    GitHub's comment limit, prepend the model and engine title, append
+    detection markers, **PATCH the progress comment** into that body (or
+    `gh pr comment` if progress never posted), **then** delete the prior
+    review comments (never the comment just patched). On failure, PATCH the
+    progress comment to "did not finish".
+12. **Emit metrics** to the dashboard and the job summary; upload the payload.

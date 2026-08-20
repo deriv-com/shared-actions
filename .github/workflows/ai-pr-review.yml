@@ -18,10 +18,7 @@ name: AI PR Review
 #
 # Everything outside ENGINE DISPATCH is engine-neutral scaffolding: access gate,
 # prompt fetch, previous-review capture/cleanup, context build, diff pre-fetch,
-# comment posting, metrics. Engines never touch those concerns. Each engine
-# writes /tmp/ai_review_usage.json when its CLI reports cost/tokens; the post
-# step appends that as a footer and metrics includes it. Missing file = skip,
-# never invent $0.
+# comment posting, metrics. Engines never touch those concerns.
 #
 # Inputs tagged [engine-specific] apply to some engines only.
 
@@ -81,6 +78,7 @@ on:
 
 jobs:
   ai-review:
+    name: ${{ inputs.engine == 'grok' && 'Grok PR Review' || (inputs.engine == 'anthropic' && 'Claude PR Review' || 'Kimi PR Review') }}
     runs-on:
       group: github_claude_code_reviewer
     # Bot actors are skipped, not failed: dependabot and friends are not org
@@ -124,7 +122,6 @@ jobs:
       # each other. REVIEW_MODEL is NOT here — it depends on `engine`, so the
       # "Resolve and validate engine" step writes it to $GITHUB_ENV.
       REVIEW_OUTPUT_FILE: /tmp/ai_review_output.txt
-      REVIEW_USAGE_FILE: /tmp/ai_review_usage.json
       REVIEW_CONTEXT_FILE: /tmp/review_context.md
       PR_DIFF_FILE: /tmp/pr_diff.txt
 
@@ -274,11 +271,13 @@ jobs:
           echo "✅ Engine: $ENGINE | Model: $MODEL | Metrics agent: $METRICS_AGENT"
 
       - name: Post progress comment
-        # Caller-owned, Claude-style "working on it". The engine never sees
-        # GH_TOKEN and cannot comment. Posted before the long engine run so the
-        # PR is not silent for an hour. A unique progress marker (not the review
-        # marker) so capture/reap of real reviews cannot treat this as the
-        # previous review. Stale progress from a cancelled run is deleted first.
+        # Caller-owned, Claude-style "working on it". This is the same comment
+        # the post step PATCHes into the finished review (same id, same URL).
+        # The engine never sees GH_TOKEN and cannot comment. Posted before the
+        # long engine run so the PR is not silent for an hour. A unique
+        # progress marker (not the review marker) so capture/reap of real
+        # reviews cannot treat this as the previous review. Stale progress
+        # from a cancelled or failed run is deleted first.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -625,8 +624,8 @@ jobs:
             # tags, or a compliant model plus the caller yields duplicates.
             echo "## Review Output Format Requirements"
             echo "Do not begin with a heading, a **Model:** line, or HTML comments."
-            echo "Write only the review body. The caller wraps it with the model,"
-            echo "title, and cost."
+            echo "Write only the review body. The caller wraps it with the model"
+            echo "and title."
 
           } > "$REVIEW_CONTEXT_FILE"
 
@@ -684,8 +683,7 @@ jobs:
       #
       # Each engine owns: stripping PR-supplied agent config, its own CLI and
       # sandbox config, and granting the model NO shell tool. Each reads
-      # review_context_path + pr_diff_path and writes output_path plus, when the
-      # CLI reports it, /tmp/ai_review_usage.json. None of them
+      # review_context_path + pr_diff_path and writes output_path. None of them
       # post comments — the post step below is the only thing that can.
       # =====================================================================
 
@@ -771,8 +769,8 @@ jobs:
           fi
 
           # GitHub caps issue comments at 65536 characters; a 422 here used to
-          # fail the run. Truncate with headroom for the usage footer and
-          # markers appended below,
+          # fail the run. Truncate with headroom for the header and markers
+          # appended below,
           # preserving the full text in the step log first. head -c can split a
           # multibyte character at the cut; iconv -c drops the partial sequence
           # so the body stays valid UTF-8 (GitHub rejects invalid encodings).
@@ -803,37 +801,6 @@ jobs:
           } > /tmp/review_with_header.txt
           mv /tmp/review_with_header.txt "$REVIEW_OUTPUT_FILE"
 
-          # Append usage/cost here, not via the model. Engines write a sidecar
-          # at REVIEW_USAGE_FILE; missing or unparseable means we skip the
-          # footer rather than invent $0. After truncation, so it cannot be cut.
-          if [[ -s "$REVIEW_USAGE_FILE" ]] && jq -e 'type == "object"' "$REVIEW_USAGE_FILE" >/dev/null 2>&1; then
-            {
-              printf '\n---\n'
-              jq -r '
-                def n(v): (v // 0) | tonumber;
-                def parts:
-                  [
-                    (if n(.input_tokens) > 0 then "\(n(.input_tokens)) input" else empty end),
-                    (if n(.cache_read_tokens) > 0 then "\(n(.cache_read_tokens)) cache-read" else empty end),
-                    (if n(.cache_creation_tokens) > 0 then "\(n(.cache_creation_tokens)) cache-write" else empty end),
-                    (if n(.output_tokens) > 0 then "\(n(.output_tokens)) output" else empty end)
-                  ] | join(" + ");
-                if (.cost_available == true) and (.cost_usd != null) then
-                  if parts != "" then
-                    "*Cost: $\(.cost_usd) · \(parts) tokens*"
-                  else
-                    "*Cost: $\(.cost_usd)*"
-                  end
-                elif parts != "" then
-                  "*Usage: \(parts) tokens (dollar cost not reported by this engine)*"
-                else
-                  empty
-                end
-              ' "$REVIEW_USAGE_FILE"
-              printf '\n'
-            } >> "$REVIEW_OUTPUT_FILE"
-          fi
-
           # Append the detection metadata here rather than asking the model to
           # emit it. Dedup on the next push then depends on this step, not on LLM
           # instruction-following: one reworded header used to mean the next run
@@ -861,30 +828,31 @@ jobs:
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
             | jq -s 'add // []' > /tmp/comments_at_post.json
           jq -f /tmp/review_marker_filter.jq /tmp/comments_at_post.json \
-            | jq -r '.[].id' > /tmp/reap_ids.txt
+            | jq -r --arg skip "${PROGRESS_COMMENT_ID:-}" \
+              '.[] | select((.id | tostring) != $skip) | .id' > /tmp/reap_ids.txt
 
-          echo "📬 Posting review ($(wc -c < "$REVIEW_OUTPUT_FILE") bytes)..."
-          gh pr comment "$PR_NUMBER" --body-file "$REVIEW_OUTPUT_FILE"
+          # Edit the progress comment into the review (same comment id, same
+          # URL) so the thread is one conversation, like Claude's tracker.
+          # Fall back to a new comment if progress never posted.
+          if [[ -n "${PROGRESS_COMMENT_ID:-}" ]]; then
+            echo "📬 Updating progress comment $PROGRESS_COMMENT_ID ($(wc -c < "$REVIEW_OUTPUT_FILE") bytes)..."
+            jq -n --arg body "$(cat "$REVIEW_OUTPUT_FILE")" '{body: $body}' \
+              | gh api "repos/${REPO}/issues/comments/${PROGRESS_COMMENT_ID}" --method PATCH --input -
+            echo "✅ Review written over the progress comment"
+          else
+            echo "📬 Progress comment missing — posting a new review ($(wc -c < "$REVIEW_OUTPUT_FILE") bytes)..."
+            gh pr comment "$PR_NUMBER" --body-file "$REVIEW_OUTPUT_FILE"
+            echo "✅ Review posted"
+          fi
+          # So a later reap failure cannot overwrite this completed review with
+          # "did not finish".
+          echo "REVIEW_POSTED=1" >> "$GITHUB_ENV"
 
           xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE < /tmp/reap_ids.txt
-          echo "✅ Review posted, previous review(s) reaped"
-
-          # Drop the progress placeholder now that the real review is live.
-          # Marker sweep, not just PROGRESS_COMMENT_ID: a retry inside this job
-          # could have posted a second one, and a cancelled prior run's leftover
-          # is the same marker.
-          if [[ -n "${PROGRESS_MARKER:-}" ]]; then
-            gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-              | jq -s 'add // []' \
-              | jq -r --arg marker "$PROGRESS_MARKER" \
-                'map(select(.user.login == "github-actions[bot]" and (.body | contains($marker))) | .id)[]' \
-              > /tmp/progress_ids.txt
-            xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE < /tmp/progress_ids.txt
-            echo "🧹 Progress comment(s) removed"
-          fi
+          echo "✅ Previous review(s) reaped"
 
       - name: Mark progress comment failed
-        if: ${{ failure() && env.PROGRESS_COMMENT_ID != '' }}
+        if: ${{ failure() && env.PROGRESS_COMMENT_ID != '' && env.REVIEW_POSTED != '1' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -915,25 +883,6 @@ jobs:
           REVIEW_SIZE="${REVIEW_SIZE//[[:space:]]/}"
           [[ "$REVIEW_SIZE" =~ ^[0-9]+$ ]] || REVIEW_SIZE=0
 
-          COST_USD=null
-          COST_AVAILABLE=false
-          INPUT_TOKENS=0
-          OUTPUT_TOKENS=0
-          CACHE_READ_TOKENS=0
-          CACHE_CREATION_TOKENS=0
-          TOTAL_TOKENS=0
-          USAGE_SOURCE=""
-          if [[ -s "$REVIEW_USAGE_FILE" ]] && jq -e 'type == "object"' "$REVIEW_USAGE_FILE" >/dev/null 2>&1; then
-            COST_USD=$(jq -c '.cost_usd' "$REVIEW_USAGE_FILE")
-            COST_AVAILABLE=$(jq -c '.cost_available // false' "$REVIEW_USAGE_FILE")
-            INPUT_TOKENS=$(jq -c '.input_tokens // 0' "$REVIEW_USAGE_FILE")
-            OUTPUT_TOKENS=$(jq -c '.output_tokens // 0' "$REVIEW_USAGE_FILE")
-            CACHE_READ_TOKENS=$(jq -c '.cache_read_tokens // 0' "$REVIEW_USAGE_FILE")
-            CACHE_CREATION_TOKENS=$(jq -c '.cache_creation_tokens // 0' "$REVIEW_USAGE_FILE")
-            TOTAL_TOKENS=$(jq -c '.total_tokens // 0' "$REVIEW_USAGE_FILE")
-            USAGE_SOURCE=$(jq -r '.source // empty' "$REVIEW_USAGE_FILE")
-          fi
-
           # $METRICS_AGENT comes from "Resolve and validate engine" and is pinned
           # per engine so migrating a repo onto this workflow keeps feeding the
           # dashboard series it already had. payload.engine is the durable
@@ -952,14 +901,6 @@ jobs:
             --argjson review_size_bytes "$REVIEW_SIZE" \
             --arg model "${REVIEW_MODEL:-unknown}" \
             --arg engine "${REVIEW_ENGINE:-unknown}" \
-            --argjson cost_usd "$COST_USD" \
-            --argjson cost_available "$COST_AVAILABLE" \
-            --argjson input_tokens "$INPUT_TOKENS" \
-            --argjson output_tokens "$OUTPUT_TOKENS" \
-            --argjson cache_read_tokens "$CACHE_READ_TOKENS" \
-            --argjson cache_creation_tokens "$CACHE_CREATION_TOKENS" \
-            --argjson total_tokens "$TOTAL_TOKENS" \
-            --arg usage_source "$USAGE_SOURCE" \
             '{
               agent: $agent,
               event_type: $event_type,
@@ -970,15 +911,7 @@ jobs:
                 commit_sha: $commit_sha,
                 review_size_bytes: $review_size_bytes,
                 model: $model,
-                engine: $engine,
-                cost_usd: $cost_usd,
-                cost_available: $cost_available,
-                input_tokens: $input_tokens,
-                output_tokens: $output_tokens,
-                cache_read_tokens: $cache_read_tokens,
-                cache_creation_tokens: $cache_creation_tokens,
-                total_tokens: $total_tokens,
-                usage_source: $usage_source
+                engine: $engine
               }
             }')
 
@@ -993,12 +926,6 @@ jobs:
           echo "| **commit_sha** | \`$CURRENT_SHA\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **engine** | \`${REVIEW_ENGINE:-unknown}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **model** | \`${REVIEW_MODEL:-unknown}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **cost_usd** | ${COST_USD} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **input_tokens** | $INPUT_TOKENS |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **output_tokens** | $OUTPUT_TOKENS |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **cache_read_tokens** | $CACHE_READ_TOKENS |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **total_tokens** | $TOTAL_TOKENS |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **usage_source** | \`${USAGE_SOURCE:-none}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **review_size_bytes** | $REVIEW_SIZE |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **timestamp** | $TIMESTAMP |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
