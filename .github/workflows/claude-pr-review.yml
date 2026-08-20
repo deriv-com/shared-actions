@@ -306,7 +306,12 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          track_progress: true
+          # Off on purpose. true puts the action in tag mode, which posts and
+          # edits its own tracking comment. The model then treats that comment
+          # as delivery and skips Write of /tmp/claude_review_output.txt — the
+          # post step fails red while a review is already visible on the PR.
+          # Same contract as ai_review_engine_anthropic.
+          track_progress: false
           show_full_output: true
           prompt: |
             REPO: ${{ github.repository }}
