@@ -11,31 +11,22 @@ name: Kimi PR Review
 #   "## 🤖 Kimi PR Review Complete"   <- this workflow (Kimi K3)
 #   "## 🤖 Claude PR Review Complete" <- claude.yml (claude-sonnet-5)
 #
-# TWO SELF-REFERENCE CAVEATS, both worth knowing before trusting a green run here:
-#
-#   1. The trigger is pull_request_target, so GitHub runs the workflow file from
-#      the BASE branch. A PR that edits this caller is therefore reviewed by
-#      master's copy, not its own.
-#   2. The reusable workflow and the engine actions are pulled at @master. A PR
-#      that changes ai-pr-review.yml or an engine action is reviewed by the
-#      version already on master, not the version in the PR.
-#
-#   So this dogfoods what is MERGED, not what is proposed. To exercise an engine
-#   change before merge, temporarily point the refs in ai-pr-review.yml at
-#   @<branch> and revert before merging.
+# TEMPORARY for PR 122: pull_request + @feat/grok-build-engine so this PR's
+# Kimi comment uses "## 🤖 Kimi PR Review Complete" (and the progress PATCH)
+# from this branch. Master's ai-review.yml is still pull_request_target @master
+# and will keep posting "## 🤖 AI PR Review Complete" until merge; the branch
+# run reaps that old marker. Revert this file to pull_request_target + @master
+# before merge — long-term Kimi dogfood stays @master.
 #
 # Docs: .github/workflows/AI_PR_REVIEW_README.md
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
 jobs:
   ai-review:
-    # Absolute path at @master rather than a local `./` path, matching claude.yml
-    # and docsync-ai.yml. It also keeps this caller identical in shape to the
-    # consumer repos', so dogfooding exercises the same resolution path they use.
-    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@master
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@feat/grok-build-engine
 
     # Exactly what the shared workflow declares. `actions: write` and
     # `id-token: write` were dropped from it (nothing calls the Actions API, no
