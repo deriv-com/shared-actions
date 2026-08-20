@@ -111,7 +111,9 @@ jobs:
       issues: write
 
     concurrency:
-      group: ai-pr-review-${{ github.event.pull_request.number }}
+      # Include engine so a temporary kimi+grok bake-off does not cancel itself.
+      # One engine per PR still cancels in-progress runs of that same engine.
+      group: ai-pr-review-${{ github.event.pull_request.number }}-${{ inputs.engine }}
       cancel-in-progress: true
 
     env:
@@ -669,7 +671,8 @@ jobs:
         id: engine-grok
         if: steps.engine.outputs.engine == 'grok'
         timeout-minutes: 60
-        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_grok@master
+        # TEMPORARY pin for PR 122 live test. Revert to @master before merge.
+        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_grok@feat/grok-build-engine
         with:
           repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}

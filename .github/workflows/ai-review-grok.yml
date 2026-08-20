@@ -1,0 +1,34 @@
+name: AI PR Review (Grok)
+
+# TEMPORARY live test of engine: grok on PR 122. Not the long-term dogfood.
+#
+# pull_request (not pull_request_target) so GitHub runs THIS file from the PR
+# head. pull_request_target would run master's workflows, where this file does
+# not exist.
+#
+# Both uses: refs are pinned to @feat/grok-build-engine because @master does not
+# have the Grok engine yet. After a review comment posts, revert those pins to
+# @master and remove or disable this caller before merge — otherwise every later
+# PR gets Kimi and Grok, and they share a comment marker.
+#
+# Kimi stays in ai-review.yml. Claude stays in claude.yml.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  ai-review:
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@feat/grok-build-engine
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    with:
+      engine: grok
+      # Do not delete Claude's comment while claude.yml still runs.
+      legacy_markers: ""
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+      AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
