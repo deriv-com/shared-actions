@@ -122,6 +122,16 @@ runs:
 
         npm install -g "@xai-official/grok@${CLI_VERSION}"
         grok --version
+
+        # Linux read-only/strict sandbox enforces the deny list with bubblewrap.
+        # Without it grok refuses to start: "bwrap exec failed: No such file or
+        # directory". Kimi/Claude do not need this. GitHub-hosted runners in
+        # this org's reviewer group do not image it.
+        if ! command -v bwrap >/dev/null 2>&1; then
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+        fi
+        bwrap --version
         echo "✅ Grok Build CLI ${CLI_VERSION} installed (GROK_HOME=$GROK_HOME)"
 
     - name: Configure review CLI (Grok Build)
@@ -171,6 +181,12 @@ runs:
         # Credentials stay in XAI_API_KEY on the run step — nothing sensitive
         # is written to disk. api_backend is chat_completions because that is
         # what the LiteLLM proxy serves for grok-4.6.
+        #
+        # Permission notes stay OUT of this unquoted heredoc. Backticks in the
+        # body are command substitutions (that is what printed tool/edit:
+        # command not found). TOML tool ids are lowercase; CLI flags are
+        # PascalCase. Write is an Edit-class alias, so scoped writes are
+        # tool = edit here plus --allow Write(...) on the run step.
         cat > "$GROK_HOME/config.toml" <<EOF
         [models]
         default = "review"
@@ -185,14 +201,6 @@ runs:
         [sandbox]
         profile = "read-only"
 
-        # Verbose rules use lowercase tool ids (bash, read, edit, grep, mcp,
-        # webfetch, websearch). CLI --allow/--deny/--tools use PascalCase
-        # (Bash, Read, Edit, Write, …). Both are vendor-canonical for their
-        # surface: https://docs.x.ai/build/features/permissions and
-        # https://docs.x.ai/build/settings/reference
-        # Write is an Edit-class alias on the CLI; the structured `tool`
-        # field has no `write`, so scoped writes are `edit` here plus
-        # --allow Write(...) on the run step.
         [permission]
         rules = [
           { action = "allow", tool = "read" },
