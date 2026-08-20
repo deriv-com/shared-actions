@@ -1,0 +1,385 @@
+name: ai_review_engine_grok
+description: >
+  AI PR review engine — Grok Build CLI. Reads a pre-built review context and a
+  pre-fetched PR diff, reviews the checked-out code, and writes the review
+  markdown to a file. It posts nothing: it is given no GitHub token and no shell
+  tool. The calling workflow owns comment posting.
+
+# ENGINE CONTRACT (see .github/workflows/AI_PR_REVIEW_README.md)
+#
+# The caller guarantees: PR head is checked out; review_context_path and
+# pr_diff_path exist and are non-empty; the access gate has passed.
+#
+# This engine must: strip PR-supplied agent config FIRST, grant the model no
+# shell tool, write the review to output_path, and fail with an engine-named
+# message if it wrote nothing. It must not post PR comments or reach the GitHub
+# API on the model's behalf.
+#
+# Composite-action gotchas that constrain this file:
+#   - The secrets context is not readable here, so api_key arrives as an input.
+#   - timeout-minutes is invalid on the steps below; the caller's dispatch
+#     step carries it.
+#   - All steps share one log group, so failures must name this engine.
+
+inputs:
+  review_context_path:
+    description: "Path to the pre-built review context markdown (instructions, PR metadata, previous review, acknowledged suggestions, required output format). Built by the caller."
+    required: false
+    default: "/tmp/review_context.md"
+  pr_diff_path:
+    description: "Path to the pre-fetched PR diff. Fetched by the caller with the trusted token so this engine needs neither a shell tool nor network access."
+    required: false
+    default: "/tmp/pr_diff.txt"
+  output_path:
+    description: "Path this engine MUST write the final review markdown to. Must be under temp (/tmp or /var/tmp) so Grok Build's read-only sandbox can write it. Parent directory is the only location the CLI is permitted to write."
+    required: false
+    default: "/tmp/ai_review_output.txt"
+  repository:
+    description: "owner/repo of the PR under review (prompt preamble only)."
+    required: true
+  pr_number:
+    description: "Number of the PR under review (prompt preamble only)."
+    required: true
+  model:
+    description: "Model ID as the endpoint in base_url names it. With the LiteLLM proxy that is a proxy alias, e.g. grok-4.6. Maps to config.toml [model.review].model."
+    required: false
+    default: "grok-4.6"
+  base_url:
+    description: "LLM API base URL. A trailing /v1 is appended when absent, so the identical value also works for the anthropic engine (which needs it removed). Maps to [model.review].base_url."
+    required: false
+    default: "https://litellmsa.deriv.ai/v1"
+  api_key:
+    description: "API key for base_url. Composite actions cannot read the secrets context, so the caller must pass this explicitly. Mapped to XAI_API_KEY in the run step env and never written to disk."
+    required: true
+  max_context_size:
+    description: "Maximum context window in tokens. Must not exceed what the endpoint allows for the selected model, or the CLI over-packs context and the request is rejected. grok-4.6 input window is 500000. If a 400 persists after confirming the model name, try lowering this. Maps to [model.review].context_window."
+    required: false
+    default: "500000"
+  cli_version:
+    description: "Exact @xai-official/grok version to install. Pinned deliberately — unpinned latest would pull both breaking changes and unreviewed code into a privileged job. Bump via PR. Do not use the alpha dist-tag."
+    required: false
+    default: "1.0.5"
+  node_version:
+    description: "Node.js version used to install and run the CLI."
+    required: false
+    default: "22"
+
+outputs:
+  output_path:
+    description: "Path the review markdown was written to."
+    value: ${{ steps.run.outputs.output_path }}
+
+runs:
+  using: composite
+  steps:
+    # Security boundary, not hygiene. Grok Build auto-loads AGENTS.md, CLAUDE.md,
+    # .grok/ (skills, plugins, hooks, MCP), .claude/, .cursor/rules, and
+    # .agents/ — none of that is gated by the tool allowlist below, and all of
+    # it is PR-controlled. These paths are engine-specific: another engine must
+    # revisit this list, never inherit it.
+    - name: Strip PR-supplied agent config (Grok Build)
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        # Recursive, not root-only. Instruction files are discovered per-directory
+        # as an agent reads files there, and this review's prompt explicitly tells
+        # it to traverse into dependencies. .git is pruned so the sweep cannot
+        # corrupt the checkout.
+        # -iname: Grok's documented names include mixed case (AGENTS.md / Agents.md
+        # / AGENT.md). A lowercase agents.md or claude.md would slip past -name
+        # and become trusted instructions in a job holding the LLM API key.
+        find . -name .git -prune -o -type f \
+          \( -iname 'agents.md' -o -iname 'agent.md' \
+             -o -iname 'claude.md' -o -iname 'claude.local.md' \
+             -o -iname 'kimi.md' -o -iname '.mcp.json' -o -iname '.cursorrules' \) \
+          -print0 | xargs -0 -r rm -f
+        find . -name .git -prune -o -type d \
+          \( -iname '.grok' -o -iname '.claude' -o -iname '.claude-plugin' -o -iname '.agents' \) \
+          -print0 | xargs -0 -r rm -rf
+        find . -name .git -prune -o -type d -ipath '*/.cursor/rules' \
+          -print0 | xargs -0 -r rm -rf
+        echo "✅ Stripped PR-supplied agent config (recursive)"
+
+    - name: Set up Node.js
+      # Pinned to a commit SHA, not a tag: tags are mutable, so a retagged
+      # release would execute in a job holding the LLM API key and a
+      # write-scoped GITHUB_TOKEN. Same pin as the Kimi engine. Bump via PR.
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: ${{ inputs.node_version }}
+
+    - name: Install review CLI (Grok Build)
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli_version }}
+        GROK_HOME: /tmp/grok-engine-home
+      run: |
+        # Wipe BEFORE npm install: postinstall writes $GROK_HOME/bin. Wiping
+        # afterwards would delete the binary. Also clear leftover default-home
+        # state on a persistent self-hosted runner.
+        rm -rf "$GROK_HOME" "$HOME/.grok" "$HOME/.agents" "$HOME/.claude"
+        mkdir -p "$GROK_HOME"
+
+        npm install -g "@xai-official/grok@${CLI_VERSION}"
+        grok --version
+
+        # Linux read-only/strict sandbox uses bubblewrap for the deny list.
+        # GitHub-hosted Ubuntu 24.04 images do not ship bwrap, and even after
+        # apt install AppArmor blocks unprivileged user namespaces
+        # (bwrap: setting up uid map: Permission denied). Load a userns
+        # profile, same workaround Ubuntu documents for bwrap on noble.
+        if ! command -v bwrap >/dev/null 2>&1; then
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap apparmor-profiles
+        fi
+        if [[ -f /usr/share/apparmor/extra-profiles/bwrap-userns-restrict ]]; then
+          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+            /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+        elif [[ ! -f /etc/apparmor.d/bwrap ]]; then
+          printf '%s\n' \
+            'abi <abi/4.0>,' \
+            'include <tunables/global>' \
+            '' \
+            'profile bwrap /usr/bin/bwrap flags=(unconfined) {' \
+            '  userns,' \
+            '  include if exists <local/bwrap>' \
+            '}' \
+            | sudo tee /etc/apparmor.d/bwrap >/dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+        fi
+        if ! bwrap --unshare-user --die-with-parent --ro-bind / / --dev /dev true; then
+          echo "❌ Grok engine: bubblewrap cannot create a user namespace on this runner (uid map denied). The read-only sandbox cannot start."
+          exit 1
+        fi
+        bwrap --version
+        echo "✅ Grok Build CLI ${CLI_VERSION} installed (GROK_HOME=$GROK_HOME)"
+
+    - name: Configure review CLI (Grok Build)
+      shell: bash
+      env:
+        GROK_HOME: /tmp/grok-engine-home
+        OUTPUT_PATH: ${{ inputs.output_path }}
+        MODEL: ${{ inputs.model }}
+        INPUT_BASE_URL: ${{ inputs.base_url }}
+        MAX_CONTEXT: ${{ inputs.max_context_size }}
+        # Defaults on: Grok scans $HOME Cursor/Claude configs even when
+        # GROK_HOME is isolated. Disable for this process so leftover runner
+        # profiles cannot inject MCP/skills. Do not delete $HOME/.cursor.
+        GROK_CURSOR_SKILLS_ENABLED: "0"
+        GROK_CURSOR_RULES_ENABLED: "0"
+        GROK_CURSOR_AGENTS_ENABLED: "0"
+        GROK_CURSOR_MCPS_ENABLED: "0"
+        GROK_CURSOR_HOOKS_ENABLED: "0"
+        GROK_CLAUDE_SKILLS_ENABLED: "0"
+        GROK_CLAUDE_RULES_ENABLED: "0"
+        GROK_CLAUDE_AGENTS_ENABLED: "0"
+        GROK_CLAUDE_MCPS_ENABLED: "0"
+        GROK_CLAUDE_HOOKS_ENABLED: "0"
+      run: |
+        # --sandbox read-only only allows writes to temp and GROK_HOME. Fail
+        # closed rather than silently skip Write if a caller pointed output
+        # at the checkout.
+        case "$OUTPUT_PATH" in
+          /tmp/*|/var/tmp/*) ;;
+          *)
+            echo "❌ Grok engine: output_path must be under temp so --sandbox read-only can write it: $OUTPUT_PATH"
+            exit 1
+            ;;
+        esac
+
+        [[ "$MAX_CONTEXT" =~ ^[1-9][0-9]*$ ]] || {
+          echo "❌ Grok engine: max_context_size must be a positive integer, got '$MAX_CONTEXT'"
+          exit 1
+        }
+
+        BASE_URL="${INPUT_BASE_URL%/}"
+        [[ "$BASE_URL" == */v1 ]] || BASE_URL="${BASE_URL}/v1"
+        OUT_DIR="$(dirname "$OUTPUT_PATH")"
+
+        mkdir -p "$GROK_HOME"
+
+        # Credentials stay in XAI_API_KEY on the run step — nothing sensitive
+        # is written to disk. api_backend is chat_completions because that is
+        # what the LiteLLM proxy serves for grok-4.6.
+        #
+        # Permission notes stay OUT of this unquoted heredoc. Backticks in the
+        # body are command substitutions (that is what printed tool/edit:
+        # command not found). TOML tool ids are lowercase; CLI flags are
+        # PascalCase. Write is an Edit-class alias, so scoped writes are
+        # tool = edit here plus --allow Write(...) on the run step.
+        cat > "$GROK_HOME/config.toml" <<EOF
+        [models]
+        default = "review"
+
+        [model.review]
+        model = "${MODEL}"
+        base_url = "${BASE_URL}"
+        env_key = "XAI_API_KEY"
+        api_backend = "chat_completions"
+        context_window = ${MAX_CONTEXT}
+
+        [sandbox]
+        profile = "read-only"
+
+        [permission]
+        rules = [
+          { action = "allow", tool = "read" },
+          { action = "allow", tool = "grep" },
+          { action = "allow", tool = "edit", pattern = "${OUT_DIR}/*" },
+          { action = "deny", tool = "bash" },
+          { action = "deny", tool = "webfetch" },
+          { action = "deny", tool = "websearch" },
+          { action = "deny", tool = "mcp" },
+        ]
+        EOF
+
+        echo "🔧 Grok engine | model=$MODEL | base_url=$BASE_URL | context_window=$MAX_CONTEXT"
+        # Real subcommand (grok inspect --help). Fail closed: leftover
+        # AGENTS/MCP in inspect output is a strip miss, not a diagnostic.
+        grok inspect
+        echo "✅ Grok Build config written"
+
+    - name: Run AI PR review (Grok Build)
+      id: run
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        GROK_HOME: /tmp/grok-engine-home
+        XAI_API_KEY: ${{ inputs.api_key }}
+        GROK_DISABLE_AUTOUPDATER: "1"
+        GROK_SANDBOX: read-only
+        CI: "1"
+        GROK_CURSOR_SKILLS_ENABLED: "0"
+        GROK_CURSOR_RULES_ENABLED: "0"
+        GROK_CURSOR_AGENTS_ENABLED: "0"
+        GROK_CURSOR_MCPS_ENABLED: "0"
+        GROK_CURSOR_HOOKS_ENABLED: "0"
+        GROK_CLAUDE_SKILLS_ENABLED: "0"
+        GROK_CLAUDE_RULES_ENABLED: "0"
+        GROK_CLAUDE_AGENTS_ENABLED: "0"
+        GROK_CLAUDE_MCPS_ENABLED: "0"
+        GROK_CLAUDE_HOOKS_ENABLED: "0"
+        CONTEXT_PATH: ${{ inputs.review_context_path }}
+        DIFF_PATH: ${{ inputs.pr_diff_path }}
+        OUTPUT_PATH: ${{ inputs.output_path }}
+        MODEL: ${{ inputs.model }}
+      run: |
+        [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Grok engine: missing or empty review context at $CONTEXT_PATH"; exit 1; }
+        [[ -s "$DIFF_PATH"    ]] || { echo "❌ Grok engine: missing or empty PR diff at $DIFF_PATH"; exit 1; }
+
+        OUT_DIR="$(dirname "$OUTPUT_PATH")"
+        echo "🔧 Grok engine | model=$MODEL | grok_home=$GROK_HOME"
+
+        # Quoted heredoc: the inputs.* expressions below are substituted by
+        # Actions before bash sees this script, so no shell expansion happens in
+        # the prompt body.
+        #
+        # Do NOT write an empty Actions expression pair in this block. Actions
+        # scans the whole run: string for expressions, including text bash treats
+        # as a comment, and an empty one fails manifest validation before any
+        # step runs.
+        # The step-by-step review procedure lives in the caller-built context
+        # file (its "Review Procedure" section), NOT here — it is engine-neutral,
+        # and duplicating it per engine let the copies drift. This prompt only
+        # bootstraps the model into that file.
+        cat > /tmp/review_prompt.txt <<'EOF'
+        REPO: ${{ inputs.repository }}
+        PR NUMBER: ${{ inputs.pr_number }}
+
+        Read ${{ inputs.review_context_path }} and follow it exactly. It contains
+        the full review instructions, PR context, previous review (if any),
+        acknowledged suggestions to skip, and the required output format — plus a
+        "Review Procedure" section telling you what else to read, including the
+        pre-fetched PR diff at ${{ inputs.pr_diff_path }}. You have no shell tool;
+        everything you need is on disk.
+
+        HOW THIS TASK IS DELIVERED: your chat reply is discarded and never reaches
+        anyone. The ONLY output that counts is the file ${{ inputs.output_path }},
+        written with the Write tool. So your final action must be that Write call,
+        containing the complete review. Writing an analysis as your reply instead
+        means the review is lost and the job fails.
+        EOF
+
+        dump_grok_log() {
+          set +e +o pipefail
+          bytes_of() { wc -c < "$1" 2>/dev/null | tr -d '[:space:]' || echo '?'; }
+
+          echo "ℹ️  config: model=$MODEL grok_home=$GROK_HOME"
+          echo "ℹ️  input bytes: context=$(bytes_of "$CONTEXT_PATH") diff=$(bytes_of "$DIFF_PATH") prompt=$(bytes_of /tmp/review_prompt.txt)"
+          if [[ -s "$OUTPUT_PATH" ]]; then
+            echo "ℹ️  review file: PRESENT at $OUTPUT_PATH ($(bytes_of "$OUTPUT_PATH") bytes) — the review itself survived"
+          else
+            echo "ℹ️  review file: ABSENT at $OUTPUT_PATH — the model never called Write"
+          fi
+
+          GROK_LOGS=$(find "$GROK_HOME" /tmp -maxdepth 5 -type f \( -name '*.log' -o -name '*.jsonl' \) 2>/dev/null | grep -i grok | head -3 || true)
+          if [[ -n "$GROK_LOGS" ]]; then
+            while IFS= read -r log; do
+              lines=$(wc -l < "$log" | tr -d '[:space:]')
+              echo "::group::$log (last 200 of $lines lines)"
+              tail -n 200 "$log"
+              echo "::endgroup::"
+              [[ "$lines" -gt 200 ]] && echo "⚠️  truncated: $log has $lines lines"
+            done <<< "$GROK_LOGS"
+          else
+            echo "ℹ️  no grok log written; provider response body unavailable"
+          fi
+
+          echo "ℹ️  Troubleshooting: a 400 on the FIRST request is config —"
+          echo "    api_backend (chat_completions vs responses) or max_context_size"
+          echo "    above the window LiteLLM allows for grok-4.6. After the agent"
+          echo "    has started reading files, config is probably fine."
+        }
+
+        rm -f "$OUTPUT_PATH"
+        REVIEW_PROMPT="$(cat /tmp/review_prompt.txt)"
+
+        # No GitHub token in this step's env. dontAsk + --tools allowlist +
+        # --sandbox read-only is the sandbox; --always-approve is forbidden.
+        # deny always wins over allow
+        # (https://docs.x.ai/build/features/permissions,
+        # https://docs.x.ai/build/settings/reference — deny > ask > allow),
+        # so a catch-all deny for Write/Edit would cancel the scoped allow.
+        # Unlisted tools are denied by dontAsk. Flag names are from
+        # grok 1.0.5 --help.
+        for attempt in 1 2; do
+          grok --no-alt-screen \
+            --permission-mode dontAsk \
+            --sandbox read-only \
+            --disable-web-search \
+            --no-subagents \
+            --no-plan \
+            --tools Read,Grep,Write,Edit \
+            --disallowed-tools Bash,WebFetch,WebSearch \
+            --allow Read \
+            --allow Grep \
+            --allow "Write(${OUT_DIR}/*)" \
+            --allow "Edit(${OUT_DIR}/*)" \
+            --deny Bash \
+            --deny WebFetch \
+            --deny WebSearch \
+            -p "$REVIEW_PROMPT" && GROK_STATUS=0 || GROK_STATUS=$?
+
+          if [[ -s "$OUTPUT_PATH" ]]; then
+            if [[ "$GROK_STATUS" -ne 0 ]]; then
+              echo "⚠️  Grok engine: CLI exited $GROK_STATUS AFTER writing the review — keeping the review and continuing."
+              ( dump_grok_log ) || true
+            fi
+            break
+          fi
+
+          if [[ "$attempt" -eq 1 ]]; then
+            echo "⚠️  Grok engine: CLI exited $GROK_STATUS with no review written — retrying once."
+            ( dump_grok_log ) || true
+            echo "🔁 Grok engine: attempt 2 of 2"
+          fi
+        done
+
+        if [[ ! -s "$OUTPUT_PATH" ]]; then
+          echo "❌ Grok engine: no review written to $OUTPUT_PATH after 2 attempts (last CLI exit: $GROK_STATUS)"
+          ( dump_grok_log ) || true
+          exit 1
+        fi
+        echo "✅ Grok engine: review written ($(wc -c < "$OUTPUT_PATH") bytes)"
+        echo "output_path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"

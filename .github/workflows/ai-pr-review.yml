@@ -3,7 +3,7 @@ name: AI PR Review
 # AI PR review workflow. The LLM engine is pluggable via the `engine` input.
 # Full docs: .github/workflows/AI_PR_REVIEW_README.md
 #
-#   Model swap — set `model` (and `max_context_size` on the Kimi engine). Any
+#   Model swap — set `model` (and `max_context_size` on the Kimi/Grok engines). Any
 #   model the LiteLLM proxy fronts works; the proxy normalises the API.
 #
 #   Engine swap — set `engine`. Each engine is a composite action under
@@ -26,12 +26,12 @@ on:
   workflow_call:
     inputs:
       engine:
-        description: "Review engine: `kimi` (Kimi Code CLI) or `anthropic` (Claude Code Action). Each is a composite action under .github/actions/ai_review_engine_<engine>/. Set this explicitly — the default is `kimi`, so an omitted value on a repo migrating from claude-pr-review.yml would switch LLM vendor."
+        description: "Review engine: `kimi` (Kimi Code CLI), `anthropic` (Claude Code Action), or `grok` (Grok Build CLI). Each is a composite action under .github/actions/ai_review_engine_<engine>/. Set this explicitly — the default is `kimi`, so an omitted value on a repo migrating from claude-pr-review.yml would switch LLM vendor."
         required: false
         default: "kimi"
         type: string
       model:
-        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
+        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5, grok -> grok-4.6). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
         required: false
         default: ""
         type: string
@@ -41,12 +41,12 @@ on:
         default: ""
         type: string
       max_context_size:
-        description: "[engine-specific: kimi] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; the 256k variants are 262144. If a request fails with a 400 after the model name is confirmed correct, try lowering this. Empty resolves to 1048576. Ignored when engine is not `kimi`."
+        description: "[engine-specific: kimi, grok] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; grok-4.6 is 500000; the 256k Kimi variants are 262144. Empty resolves per engine. Ignored when engine is `anthropic`."
         required: false
         default: ""
         type: string
       cli_version:
-        description: "[engine-specific: kimi] Exact @moonshot-ai/kimi-code version to install. Pinned deliberately — the package is pre-1.0 and ships minor releases weekly, so `latest` risks both breaking changes and unreviewed code in a privileged job. Empty resolves to the pinned version in the 'Resolve and validate engine' step; bump it there via PR. Ignored when engine is not `kimi`."
+        description: "[engine-specific: kimi, grok] Exact CLI version to install (`@moonshot-ai/kimi-code` for kimi, `@xai-official/grok` for grok). Pinned deliberately — `latest` risks both breaking changes and unreviewed code in a privileged job. Empty resolves to the per-engine pin in the 'Resolve and validate engine' step; bump it there via PR. Ignored when engine is `anthropic`."
         required: false
         default: ""
         type: string
@@ -78,6 +78,7 @@ on:
 
 jobs:
   ai-review:
+    name: ${{ inputs.engine == 'grok' && 'Grok PR Review' || (inputs.engine == 'anthropic' && 'Claude PR Review' || 'Kimi PR Review') }}
     runs-on:
       group: github_claude_code_reviewer
     # Bot actors are skipped, not failed: dependabot and friends are not org
@@ -111,13 +112,15 @@ jobs:
       issues: write
 
     concurrency:
-      group: ai-pr-review-${{ github.event.pull_request.number }}
+      # Include engine so a temporary kimi+grok bake-off does not cancel itself.
+      # One engine per PR still cancels in-progress runs of that same engine.
+      group: ai-pr-review-${{ github.event.pull_request.number }}-${{ inputs.engine }}
       cancel-in-progress: true
 
     env:
-      # Single source of truth for the three files the steps and the engine
-      # hand to each other. REVIEW_MODEL is NOT here — it depends on `engine`,
-      # so the "Resolve and validate engine" step writes it to $GITHUB_ENV.
+      # Single source of truth for the files the steps and the engine hand to
+      # each other. REVIEW_MODEL is NOT here — it depends on `engine`, so the
+      # "Resolve and validate engine" step writes it to $GITHUB_ENV.
       REVIEW_OUTPUT_FILE: /tmp/ai_review_output.txt
       REVIEW_CONTEXT_FILE: /tmp/review_context.md
       PR_DIFF_FILE: /tmp/pr_diff.txt
@@ -134,14 +137,20 @@ jobs:
       NOISE_PATTERN: 'package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.snap|\.min\.js|\.min\.css|dist/|build/|\.generated\.|__generated__|/vendor/|\.pb\.go|_test\.snap'
 
       # Comment markers identifying a review comment as ours. Canonical marker
-      # first — appended deterministically by the post step, so detection never
-      # depends on the model reproducing a visible header. Legacy markers let a
-      # run also reap comments left by workflows this one supersedes. Job-level
-      # because both the capture step and the post step (which deletes) need it.
+      # is engine-specific so a Kimi run and a Grok run on the same PR do not
+      # reap each other. Detection never depends on the model reproducing a
+      # visible header — the post step appends the HTML comment as its own
+      # unindented line. Visible titles are NOT markers: a follow-up that
+      # quotes "Grok PR Review Complete" from this repo's YAML would otherwise
+      # be deleted by the Grok reap. kimi/anthropic also match the pre-split
+      # `<!-- deriv-pr-review -->` line so existing comments stay in follow-up
+      # mode after merge. Grok must not, or it would reap Kimi during a bake-off.
+      # legacy_markers is the only substring list (Claude migration leftovers).
       REVIEW_MARKERS: |
-        <!-- deriv-pr-review -->
-        AI PR Review Complete
-        ${{ inputs.legacy_markers }}
+        <!-- deriv-pr-review-${{ inputs.engine }} -->
+        ${{ inputs.engine == 'kimi' && '<!-- deriv-pr-review -->' || '' }}
+        ${{ inputs.engine == 'anthropic' && '<!-- deriv-pr-review -->' || '' }}
+      LEGACY_MARKERS: ${{ inputs.legacy_markers }}
 
     steps:
       - name: Security Check - Validate User Access
@@ -197,15 +206,32 @@ jobs:
               DEFAULT_MODEL="kimi-k3"
               METRICS_AGENT="ai_review"
               ARTIFACT_PREFIX="ai-review"
+              DEFAULT_MAX_CONTEXT="1048576"
+              DEFAULT_CLI_VERSION="0.34.0"
+              REVIEW_TITLE="Kimi PR Review"
               ;;
             anthropic)
               DEFAULT_MODEL="claude-sonnet-5"
               METRICS_AGENT="claude_review"
               ARTIFACT_PREFIX="claude-review"
+              # Unused by this engine — the anthropic dispatch consumes neither.
+              DEFAULT_MAX_CONTEXT=""
+              DEFAULT_CLI_VERSION=""
+              REVIEW_TITLE="Claude PR Review"
+              ;;
+            grok)
+              # LiteLLM alias for Grok 4.6. Context is the advertised 500k
+              # input window — 1M over-packs and the proxy 400s.
+              DEFAULT_MODEL="grok-4.6"
+              METRICS_AGENT="grok_review"
+              ARTIFACT_PREFIX="grok-review"
+              DEFAULT_MAX_CONTEXT="500000"
+              DEFAULT_CLI_VERSION="1.0.5"
+              REVIEW_TITLE="Grok PR Review"
               ;;
             *)
               echo "❌ Unknown engine: '$ENGINE'"
-              echo "   Supported values for the \`engine\` input: kimi, anthropic"
+              echo "   Supported values for the \`engine\` input: kimi, anthropic, grok"
               exit 1
               ;;
           esac
@@ -223,8 +249,8 @@ jobs:
           # instructions for every consumer with no PR and no audit trail. To
           # ship a new prompt, edit the gist, then bump this hash via PR.
           BASE_URL="${BASE_URL_INPUT:-https://litellmsa.deriv.ai/v1}"
-          MAX_CONTEXT="${MAX_CONTEXT_INPUT:-1048576}"
-          CLI_VERSION="${CLI_VERSION_INPUT:-0.34.0}"
+          MAX_CONTEXT="${MAX_CONTEXT_INPUT:-$DEFAULT_MAX_CONTEXT}"
+          CLI_VERSION="${CLI_VERSION_INPUT:-$DEFAULT_CLI_VERSION}"
           PROVIDER_TYPE="${PROVIDER_TYPE_INPUT:-openai}"
           PROMPT_GIST_URL="${PROMPT_GIST_URL_INPUT:-https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/2d5131aa058801e99fe77f69db124bf583f7d3ea/claude-review-format.md}"
 
@@ -245,10 +271,79 @@ jobs:
           {
             echo "REVIEW_MODEL=$MODEL"
             echo "REVIEW_ENGINE=$ENGINE"
+            echo "REVIEW_TITLE=$REVIEW_TITLE"
             echo "METRICS_AGENT=$METRICS_AGENT"
           } >> "$GITHUB_ENV"
 
           echo "✅ Engine: $ENGINE | Model: $MODEL | Metrics agent: $METRICS_AGENT"
+
+      - name: Post progress comment
+        # Caller-owned, Claude-style "working on it". This is the same comment
+        # the post step PATCHes into the finished review (same id, same URL).
+        # The engine never sees GH_TOKEN and cannot comment. Posted before the
+        # long engine run so the PR is not silent for an hour. A unique
+        # progress marker (not the review marker) so capture/reap of real
+        # reviews cannot treat this as the previous review. Stale progress
+        # from a cancelled or failed run is deleted first.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+          PROGRESS_MARKER="<!-- deriv-pr-review-progress-${REVIEW_ENGINE} -->"
+
+          # Progress is UX: a transient list/DELETE failure must not abort the
+          # review. Worst case of skipping the sweep is one extra stale
+          # progress comment, which the next run removes.
+          set +e
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            | jq -s 'add // []' \
+            | jq -r --arg marker "$PROGRESS_MARKER" \
+              'map(select(.user.login == "github-actions[bot]" and (.body | split("\n") | any(. == $marker))) | .id)[]' \
+            > /tmp/stale_progress_ids.txt
+          if [[ -s /tmp/stale_progress_ids.txt ]]; then
+            xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE < /tmp/stale_progress_ids.txt \
+              && echo "🧹 Removed stale progress comment(s)" \
+              || echo "⚠️ Stale progress cleanup failed — continuing."
+          fi
+          set -e
+
+          {
+            printf '**Model:** `%s`\n\n' "$REVIEW_MODEL"
+            printf '## 🤖 %s\n\n' "$REVIEW_TITLE"
+            printf '%s is working on this pull request.\n\n' "${REVIEW_TITLE%% PR Review}"
+            printf '%s\n\n' "I'll analyze the changes and get back to you with the review."
+            printf '[View job](%s)\n\n' "$RUN_URL"
+            printf '%s\n' "$PROGRESS_MARKER"
+          } > /tmp/progress_comment.md
+
+          # jq --arg of a string built from our env, then --input, so the
+          # body is JSON-escaped and never interpolated into a shell command.
+          # Progress is UX, not a security boundary: if this POST fails, keep
+          # running — the post step already falls back to a new comment.
+          set +e
+          jq -n --arg body "$(cat /tmp/progress_comment.md)" '{body: $body}' \
+            | gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --method POST --input - \
+            > /tmp/progress_comment.json
+          POST_STATUS=$?
+          set -e
+          if [[ "$POST_STATUS" -ne 0 ]]; then
+            echo "⚠️ Progress comment failed to post (exit $POST_STATUS) — continuing without it."
+            echo "PROGRESS_COMMENT_ID=" >> "$GITHUB_ENV"
+            echo "PROGRESS_MARKER=$PROGRESS_MARKER" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          PROGRESS_ID=$(jq -r '.id // empty' /tmp/progress_comment.json)
+          if [[ -z "$PROGRESS_ID" || "$PROGRESS_ID" == "null" ]]; then
+            echo "⚠️ Progress comment POST returned no id — continuing without it."
+            echo "PROGRESS_COMMENT_ID=" >> "$GITHUB_ENV"
+            echo "PROGRESS_MARKER=$PROGRESS_MARKER" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "PROGRESS_COMMENT_ID=$PROGRESS_ID" >> "$GITHUB_ENV"
+          echo "PROGRESS_MARKER=$PROGRESS_MARKER" >> "$GITHUB_ENV"
+          echo "⏳ Progress comment posted ($PROGRESS_ID)"
 
       - name: Checkout PR head
         # Third-party actions are pinned to a commit SHA, not a tag: tags are
@@ -305,19 +400,29 @@ jobs:
           # match different comment sets. REVIEW_MARKERS is job-level env for the
           # same reason ($ENV.REVIEW_MARKERS reads it at jq run time).
           #
-          # Substring matching, not regex, so marker content needs no escaping.
-          #
+          # HTML markers: exact unindented line, and only in the last 20 lines
+          # (where the post step appends them). Substring contains() on the
+          # whole body would reap a Kimi follow-up that quoted this repo's
+          # YAML (`Grok PR Review Complete`, `<!-- deriv-pr-review-grok -->`).
           # The marker MUST be captured with `. as $marker` before piping into
-          # `$body`. Writing the condition as `$body | contains(.)` looks right but
-          # rebinds `.` to $body inside the pipe, making it `$body contains $body`
-          # — always true. That silently matched EVERY github-actions[bot] comment
-          # on the PR, so the delete would reap unrelated bot comments
-          # (DocSync, QA checklist, ...) instead of just prior reviews.
+          # `$body`. Writing contains(.) rebinds `.` to $body — always true —
+          # and would reap every github-actions[bot] comment (DocSync, QA, …).
+          #
+          # legacy_markers stay substring-matched: they are visible titles from
+          # superseded workflows (default `Claude PR Review Complete`), not
+          # HTML lines this workflow appends.
           cat > /tmp/review_marker_filter.jq <<'JQ'
-          ($ENV.REVIEW_MARKERS | split("\n") | map(select(length > 0))) as $markers
+          ($ENV.REVIEW_MARKERS | split("\n") | map(select(length > 0))) as $html
+          | ($ENV.LEGACY_MARKERS // "" | split("\n") | map(select(length > 0))) as $legacy
           | map(select(
               .user.login == "github-actions[bot]"
-              and (.body as $body | any($markers[]; . as $marker | $body | contains($marker)))
+              and (
+                (.body | split("\n") | .[-20:] | any(
+                  . as $line | any($html[]; $line == .)
+                ))
+                or
+                (($legacy | length) > 0 and (.body as $body | any($legacy[]; . as $marker | $body | contains($marker))))
+              )
             ))
           | sort_by(.created_at)
           JQ
@@ -435,6 +540,7 @@ jobs:
           [[ "$HAS_PREVIOUS" == "true" ]] && REVIEW_TYPE="🔄 Follow-up Review" || REVIEW_TYPE="📋 Initial Review"
           [[ "$HAS_PREVIOUS" == "true" ]] && EVENT_TYPE="followup_review" || EVENT_TYPE="initial_review"
           echo "event_type=$EVENT_TYPE" >> $GITHUB_OUTPUT
+          echo "REVIEW_TYPE=$REVIEW_TYPE" >> "$GITHUB_ENV"
 
           # Pre-compute incremental diff (changes since last review) for follow-up
           # mode. The shared NOISE_PATTERN (job env) is extended with test, style
@@ -471,11 +577,17 @@ jobs:
               # agent (which may echo it and break the next run's parsing).
               # `Review generated via .*` collapses the historical variants.
               sed -E \
-                -e '/^## 🤖 (AI|Claude) PR Review Complete$/d' \
+                -e '/^## 🤖 (AI|Claude|Kimi|Grok) PR Review Complete$/d' \
+                -e '/^## 🤖 .+ PR Review$/d' \
                 -e '/^\*\*Model:\*\*/d' \
+                -e '/^\*\*Review Type:\*\*/d' \
+                -e '/^📋 Initial Review$/d' \
+                -e '/^🔄 Follow-up Review$/d' \
                 -e '/^\*Review generated via .*\*$/d' \
+                -e '/^\*Cost: /d' \
+                -e '/^\*Usage: /d' \
                 -e '/^<!-- reviewed-commit:.*-->$/d' \
-                -e '/^<!-- deriv-pr-review *-->$/d' \
+                -e '/^<!-- deriv-pr-review.*-->$/d' \
                 /tmp/previous_review.txt
               echo "---END_PREVIOUS_REVIEW---"
               echo ""
@@ -546,18 +658,14 @@ jobs:
             echo "4. After reading ALL files and dependencies, compile your complete review and write the ENTIRE review to $REVIEW_OUTPUT_FILE using the Write tool. Do not post, create, or update any PR or issue comment — writing that file is the whole job; the caller posts it as a single comment."
             echo ""
 
-            # Output format — the header is for human readers only. Follow-up
-            # detection no longer depends on the model reproducing it: the post
-            # step appends the canonical <!-- deriv-pr-review --> marker and the
-            # reviewed-commit tag itself. Do NOT ask the model to emit those tags,
-            # or a compliant model plus the append yields two and the SHA grep
-            # returns two values.
+            # Output format — the visible header is prepended by the post step,
+            # not by the model. Follow-up detection uses the HTML marker the
+            # post step appends. Do NOT emit a title, a Model line, or those
+            # tags, or a compliant model plus the caller yields duplicates.
             echo "## Review Output Format Requirements"
-            echo "Begin your PR review comment with exactly this header (no extra text before it):"
-            echo ""
-            echo "## 🤖 AI PR Review Complete"
-            echo ""
-            printf '**Model:** \`%s\` | **Review Type:** %s\n' "$REVIEW_MODEL" "$REVIEW_TYPE"
+            echo "Do not begin with a heading, a **Model:** line, or HTML comments."
+            echo "Write only the review body. The caller wraps it with the model"
+            echo "and title."
 
           } > "$REVIEW_CONTEXT_FILE"
 
@@ -596,6 +704,12 @@ jobs:
           fi
 
           echo "✅ PR diff fetched ($(wc -c < /tmp/pr_diff_raw.txt) bytes raw, $(wc -c < "$PR_DIFF_FILE") after noise filter)"
+
+      - name: Clear review output
+        # Persistent runners can leave a previous job's file. The post step
+        # treats a non-empty path as THIS run's review. Kimi/Grok also rm -f
+        # internally; the Anthropic engine relies on this step.
+        run: rm -f "$REVIEW_OUTPUT_FILE"
 
       # ======================== ENGINE DISPATCH ============================
       # Exactly one step below runs. `uses:` accepts no expressions, so engine
@@ -652,6 +766,23 @@ jobs:
           base_url: ${{ steps.engine.outputs.base_url }}
           api_key: ${{ secrets.LLM_API_KEY }}
 
+      - name: AI review (Grok Build engine)
+        id: engine-grok
+        if: steps.engine.outputs.engine == 'grok'
+        timeout-minutes: 60
+        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_grok@master
+        with:
+          repository: ${{ github.repository }}
+          pr_number: ${{ github.event.pull_request.number }}
+          review_context_path: ${{ env.REVIEW_CONTEXT_FILE }}
+          pr_diff_path: ${{ env.PR_DIFF_FILE }}
+          output_path: ${{ env.REVIEW_OUTPUT_FILE }}
+          model: ${{ steps.engine.outputs.model }}
+          base_url: ${{ steps.engine.outputs.base_url }}
+          api_key: ${{ secrets.LLM_API_KEY }}
+          max_context_size: ${{ steps.engine.outputs.max_context_size }}
+          cli_version: ${{ steps.engine.outputs.cli_version }}
+
       # ====================== END ENGINE DISPATCH ==========================
 
       - name: Post review as single PR comment
@@ -683,7 +814,8 @@ jobs:
           fi
 
           # GitHub caps issue comments at 65536 characters; a 422 here used to
-          # fail the run. Truncate with headroom for the markers appended below,
+          # fail the run. Truncate with headroom for the header and markers
+          # appended below,
           # preserving the full text in the step log first. head -c can split a
           # multibyte character at the cut; iconv -c drops the partial sequence
           # so the body stays valid UTF-8 (GitHub rejects invalid encodings).
@@ -703,6 +835,17 @@ jobs:
             mv /tmp/review_truncated.txt "$REVIEW_OUTPUT_FILE"
           fi
 
+          # Visible header is injected here so it cannot drift per model and the
+          # model name is always the first line. Truncation already happened, so
+          # the header cannot be cut off.
+          {
+            printf '**Model:** `%s`\n\n' "$REVIEW_MODEL"
+            printf '## 🤖 %s Complete\n\n' "$REVIEW_TITLE"
+            printf '%s\n\n' "${REVIEW_TYPE:-📋 Initial Review}"
+            cat "$REVIEW_OUTPUT_FILE"
+          } > /tmp/review_with_header.txt
+          mv /tmp/review_with_header.txt "$REVIEW_OUTPUT_FILE"
+
           # Append the detection metadata here rather than asking the model to
           # emit it. Dedup on the next push then depends on this step, not on LLM
           # instruction-following: one reworded header used to mean the next run
@@ -711,7 +854,7 @@ jobs:
           {
             printf '\n'
             printf '<!-- reviewed-commit: %s -->\n' "$CURRENT_SHA"
-            printf '<!-- deriv-pr-review -->\n'
+            printf '<!-- deriv-pr-review-%s -->\n' "$REVIEW_ENGINE"
           } >> "$REVIEW_OUTPUT_FILE"
 
           # Reap-list for prior reviews, captured BEFORE posting — the new
@@ -730,13 +873,45 @@ jobs:
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
             | jq -s 'add // []' > /tmp/comments_at_post.json
           jq -f /tmp/review_marker_filter.jq /tmp/comments_at_post.json \
-            | jq -r '.[].id' > /tmp/reap_ids.txt
+            | jq -r --arg skip "${PROGRESS_COMMENT_ID:-}" \
+              '.[] | select((.id | tostring) != $skip) | .id' > /tmp/reap_ids.txt
 
-          echo "📬 Posting review ($(wc -c < "$REVIEW_OUTPUT_FILE") bytes)..."
-          gh pr comment "$PR_NUMBER" --body-file "$REVIEW_OUTPUT_FILE"
+          # Edit the progress comment into the review (same comment id, same
+          # URL) so the thread is one conversation, like Claude's tracker.
+          # Fall back to a new comment if progress never posted.
+          if [[ -n "${PROGRESS_COMMENT_ID:-}" ]]; then
+            echo "📬 Updating progress comment $PROGRESS_COMMENT_ID ($(wc -c < "$REVIEW_OUTPUT_FILE") bytes)..."
+            jq -n --arg body "$(cat "$REVIEW_OUTPUT_FILE")" '{body: $body}' \
+              | gh api "repos/${REPO}/issues/comments/${PROGRESS_COMMENT_ID}" --method PATCH --input -
+            echo "✅ Review written over the progress comment"
+          else
+            echo "📬 Progress comment missing — posting a new review ($(wc -c < "$REVIEW_OUTPUT_FILE") bytes)..."
+            gh pr comment "$PR_NUMBER" --body-file "$REVIEW_OUTPUT_FILE"
+            echo "✅ Review posted"
+          fi
+          # So a later reap failure cannot overwrite this completed review with
+          # "did not finish".
+          echo "REVIEW_POSTED=1" >> "$GITHUB_ENV"
 
           xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE < /tmp/reap_ids.txt
-          echo "✅ Review posted, previous review(s) reaped"
+          echo "✅ Previous review(s) reaped"
+
+      - name: Mark progress comment failed
+        if: ${{ failure() && env.PROGRESS_COMMENT_ID != '' && env.REVIEW_POSTED != '1' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            printf '**Model:** `%s`\n\n' "$REVIEW_MODEL"
+            printf '## 🤖 %s\n\n' "$REVIEW_TITLE"
+            printf '%s did not finish this review.\n\n' "${REVIEW_TITLE%% PR Review}"
+            printf 'See the [job log](%s) for details. The previous review comment, if any, is unchanged.\n\n' "$RUN_URL"
+            printf '%s\n' "${PROGRESS_MARKER:-<!-- deriv-pr-review-progress-${REVIEW_ENGINE} -->}"
+          } > /tmp/progress_failed.md
+          jq -n --arg body "$(cat /tmp/progress_failed.md)" '{body: $body}' \
+            | gh api "repos/${{ github.repository }}/issues/comments/${PROGRESS_COMMENT_ID}" --method PATCH --input -
+          echo "⚠️ Progress comment updated to failed"
 
       - name: Emit review event to metrics dashboard
         if: always()
@@ -750,6 +925,8 @@ jobs:
           REPO="${{ github.repository }}"
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           REVIEW_SIZE=$(wc -c < "$REVIEW_OUTPUT_FILE" 2>/dev/null || echo "0")
+          REVIEW_SIZE="${REVIEW_SIZE//[[:space:]]/}"
+          [[ "$REVIEW_SIZE" =~ ^[0-9]+$ ]] || REVIEW_SIZE=0
 
           # $METRICS_AGENT comes from "Resolve and validate engine" and is pinned
           # per engine so migrating a repo onto this workflow keeps feeding the

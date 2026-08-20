@@ -10,18 +10,20 @@
 </pre>
 
 A reusable GitHub Actions workflow that reviews pull requests with an LLM. The
-engine is pluggable: pick `kimi` or `anthropic` with one input.
+engine is pluggable: pick `kimi`, `anthropic`, or `grok` with one input.
 
 ## Features
 
 - 🤖 Full-context review — reads changed files whole, plus their imports, types, callers and tests
 - 🔄 Follow-up mode — on re-push, feeds the previous review plus an incremental diff so fixed items are not re-reported
-- 🧹 Exactly one review comment per PR — the old one is captured at the start and deleted only after its replacement is live, so a failed or cancelled run never leaves the PR without its review
-- 🔌 Pluggable engine (`kimi` | `anthropic`), each a composite action with its own CLI and sandbox
+- 🧹 Exactly one review comment per engine per PR — a "working on it" comment is posted first, then **edited** into the finished review (same comment URL). The previous review is deleted only after that edit, so a failed or cancelled run never leaves the PR without its last completed review
+- 🔌 Pluggable engine (`kimi` | `anthropic` | `grok`), each a composite action with its own CLI and sandbox
 - 🔒 The model gets **no shell tool** and no GitHub token — it cannot comment, and PR-supplied agent config is stripped before it starts
 - 🛡️ The post step refuses to publish a review containing the LLM API key (comment bodies are not covered by Actions secret masking), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
 - 📊 Emits events to the OneAboveAll metrics dashboard, and always to the job summary
+- ⏳ Posts a caller-owned "working on it" comment (model at the top) before the engine runs, then edits that same comment into the review; the CLI never gets a GitHub token
+- 🏷️ The reusable job is named after the engine (`Grok PR Review` / `Kimi PR Review` / `Claude PR Review`) so Checks can tell concurrent engines apart
 
 ## Usage
 
@@ -42,7 +44,7 @@ jobs:
       id-token: write
       actions: write
     with:
-      engine: kimi          # or: anthropic
+      engine: kimi          # or: anthropic | grok
     secrets:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
@@ -59,18 +61,18 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 
 ## Engines
 
-| | `kimi` | `anthropic` |
-|---|---|---|
-| Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) |
-| Default model | `kimi-k3` | `claude-sonnet-5` |
-| `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** |
-| Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (agent mode mounts **no** GitHub MCP servers — see below) |
-| Shell | none (absent from `enabled` **and** denied by rule) | none (`--allowedTools` omits Bash, `--disallowedTools` re-denies it) |
-| `Write` scope | output directory only (allow + catch-all deny) | **unscoped** — see below |
-| Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` |
-| Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type` | all except `max_context_size`, `cli_version`, `provider_type` |
-| `agent` reported | `ai_review` | `claude_review` |
-| Artifact | `ai-review-summary-*` | `claude-review-summary-*` |
+| | `kimi` | `anthropic` | `grok` |
+|---|---|---|---|
+| Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) | `@xai-official/grok` CLI — Grok Build (npm, pinned) |
+| Default model | `kimi-k3` | `claude-sonnet-5` | `grok-4.6` |
+| `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** | proxy origin **+ `/v1`** |
+| Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (agent mode mounts **no** GitHub MCP servers — see below) | `Read`, `Grep`, `Write`/`Edit` **output dir only** |
+| Shell | none (absent from `enabled` **and** denied by rule) | none (`--allowedTools` omits Bash, `--disallowedTools` re-denies it) | none (`dontAsk` + `--tools` allowlist + `--deny Bash`) |
+| `Write` scope | output directory only (allow + catch-all deny) | **unscoped** — see below | output directory only (`dontAsk`; Grok deny-wins, so no catch-all deny) |
+| Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `.mcp.json` / `.cursorrules`; dirs `.grok/`, `.claude/`, `.claude-plugin/`, `.agents/`, `.cursor/rules/` |
+| Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type` | all except `max_context_size`, `cli_version`, `provider_type` | all except `provider_type` |
+| `agent` reported | `ai_review` | `claude_review` | `grok_review` |
+| Artifact | `ai-review-summary-*` | `claude-review-summary-*` | `grok-review-summary-*` |
 
 **`provider_type` must match what `base_url` serves.** This is the Kimi engine's
 sharpest trap, because a mismatch produces a bare `400 The request was invalid`
@@ -131,6 +133,20 @@ assuming parity:
   replaced recorded that a scoped `Write(/path)` made the tool unavailable
   entirely. The action does hold a token for its own actor checks.
 
+- **Grok** — permissions (`dontAsk`) plus `--tools Read,Grep,Write,Edit` are the
+  guarantee; `--sandbox read-only` is extra (cannot write the checkout; temp
+  and `$GROK_HOME` stay writable). Bash, WebFetch and WebSearch are denied and
+  removed. `--always-approve` is never passed. Grok's **deny-wins** (`deny`
+  always wins over `allow`: https://docs.x.ai/build/features/permissions;
+  evaluation order deny > ask > allow:
+  https://docs.x.ai/build/settings/reference), so there is no catch-all deny
+  for Write/Edit — that would block the scoped output-dir allow. Unlisted
+  tools are denied by `dontAsk`. No GitHub token reaches the
+  step. `output_path` must be under temp or the engine fails closed rather than
+  loosening the sandbox. `GROK_HOME` is `/tmp/grok-engine-home` and is wiped
+  *before* `npm install` so leftover runner state cannot survive, without
+  deleting the binary postinstall just wrote.
+
 Tightening the Anthropic `Write` grant (or scoping the Kimi `Read`) needs a
 verification run, since a pattern the CLI reads as "tool unavailable" means the
 engine reviews and writes nothing. Do not "fix" either blind.
@@ -142,24 +158,27 @@ content), and truncates bodies over GitHub's 65,536-character comment limit
 (full text preserved in the job log) instead of failing the run.
 
 **A model swap is config; an engine swap is a rewrite.** Any model the LiteLLM
-proxy fronts can be reached by setting `model` (and `max_context_size` on Kimi).
-Replacing an engine's *CLI* means writing a new composite action, because each
-CLI has its own config format, sandbox model, tool names and entrypoint.
+proxy fronts can be reached by setting `model` (and `max_context_size` on Kimi
+or Grok). Replacing an engine's *CLI* means writing a new composite action,
+because each CLI has its own config format, sandbox model, tool names and
+entrypoint. Grok 4.6 as a *model* on the Kimi CLI is a model swap; Grok Build
+as the *agent* is this engine.
 
 ## Inputs
 
 | Input | Description | Required | Default (resolved when empty) |
 |-------|-------------|----------|---------|
-| `engine` | `kimi` or `anthropic` | ❌ | `kimi` |
+| `engine` | `kimi`, `anthropic`, or `grok` | ❌ | `kimi` |
 | `model` | Model ID; resolved per engine when empty | ❌ | per engine |
 | `base_url` | LLM API endpoint; `/v1` added or stripped per engine | ❌ | `https://litellmsa.deriv.ai/v1` |
-| `max_context_size` | **[kimi]** Context window in tokens. Must match the model, or the CLI over-packs and the API rejects the request | ❌ | `1048576` |
-| `cli_version` | **[kimi]** Exact `@moonshot-ai/kimi-code` version | ❌ | `0.34.0` |
+| `max_context_size` | **[kimi, grok]** Context window in tokens. Must match the model, or the CLI over-packs and the API rejects the request | ❌ | per engine (`1048576` kimi, `500000` grok) |
+| `cli_version` | **[kimi, grok]** Exact CLI version (`@moonshot-ai/kimi-code` or `@xai-official/grok`) | ❌ | per engine (`0.34.0` kimi, `1.0.5` grok) |
 | `provider_type` | **[kimi]** Wire dialect; must match what `base_url` serves | ❌ | `openai` |
 | `legacy_markers` | Newline-separated markers from superseded workflows to also delete | ❌ | `Claude PR Review Complete` |
 | `prompt_gist_url` | Review prompt template | ❌ | DerivFE gist, **pinned to a revision** |
 
-Inputs marked **[kimi]** are ignored by other engines. Every input except
+Inputs marked **[kimi]** / **[kimi, grok]** are ignored by engines that do not
+use them. Every input except
 `engine` and `legacy_markers` declares `default: ""` and is resolved to the
 values above inside the `Resolve and validate engine` step — so each default
 exists in exactly one place, and that step is where you bump any of them.
@@ -169,9 +188,9 @@ URL is mutable, and a gist edit would rewrite the review agent's instructions
 for every consumer live, with no PR and no audit trail. To roll out a new
 prompt, edit the gist, then bump the revision hash in the resolve step via PR.
 
-`cli_version` is pinned deliberately: `@moonshot-ai/kimi-code` is pre-1.0 and
-ships minor releases weekly, so `latest` would pull both breaking changes and
-unreviewed code into a job holding `LLM_API_KEY` and a write-scoped
+`cli_version` is pinned deliberately: both `@moonshot-ai/kimi-code` and
+`@xai-official/grok` ship frequently, so `latest` would pull both breaking
+changes and unreviewed code into a job holding `LLM_API_KEY` and a write-scoped
 `GITHUB_TOKEN`. Bump it by PR. The Anthropic engine's action SHA is pinned the
 same way but *inside* the action, because `uses:` accepts no expressions.
 
@@ -221,17 +240,28 @@ composite actions consistently, not just here — is a reasonable follow-up.
 
 ## Comment markers and cleanup
 
-Each run deletes prior review comments **only after the replacement has
-posted** (the reap-list is captured just before posting, so the new comment
-cannot match its own filter), so a PR carries exactly one — and a run that
-fails at any point leaves the old comment untouched. The worst case is a
-transient duplicate, which the next run reaps. (Deletion used to happen at the
-start of the run, which meant every engine failure or cancel-in-progress in the
-up-to-an-hour gap destroyed the previous review and its reviewed-commit SHA.)
-Detection uses a canonical hidden marker, `<!-- deriv-pr-review -->`, which
-the **post step appends** — it is not something the model is asked to emit.
-Earlier versions depended on the model reproducing a visible header, which meant
-one reworded header left a duplicate comment on the PR forever.
+Each run **edits** the progress comment into the finished review (same
+comment id and URL), then deletes prior review comments. The reap-list is
+captured just before that edit and **excludes** the comment being patched, so
+the replacement cannot match its own filter. A run that fails at any point
+leaves the last completed review untouched and PATCHes the progress comment
+to "did not finish". The worst case is a transient duplicate (progress plus
+the previous review), which the next run reaps. (Deletion used to happen at
+the start of the run, which meant every engine failure or cancel-in-progress
+in the up-to-an-hour gap destroyed the previous review and its reviewed-commit
+SHA.)
+Detection uses a canonical hidden marker, `<!-- deriv-pr-review-<engine> -->`
+(for example `<!-- deriv-pr-review-grok -->`), which the **post step appends**
+as its own unindented line — it is not something the model is asked to emit.
+Capture and reap match that **exact line** in the last 20 lines of the
+comment, not a substring anywhere in the body. Visible titles such as
+`Grok PR Review Complete` are not markers: a follow-up that quotes this
+workflow's YAML would otherwise be deleted by the other engine. The marker
+is per-engine so a Kimi run and a Grok run on the same PR keep both
+comments. `engine: kimi` and `engine: anthropic` also match the older
+shared line `<!-- deriv-pr-review -->` so comments posted before the
+split stay in follow-up mode. Grok does **not** match that old tag, or a
+Grok run would reap Kimi during a bake-off.
 
 `legacy_markers` exists purely for migrations: a run also deletes comments
 matching those strings, so a PR that has been through more than one review
@@ -287,9 +317,13 @@ the repo README. To migrate a consumer, edit its caller (three changes —
        AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
 ```
 
-Keep the caller's filename, `name:` and job id — they determine the status-check
-name, and changing one can block merges on a repo with branch protection. Do
-cosmetic renames separately, after auditing required checks.
+Keep the caller's filename, `name:` and job id — they determine the left
+half of the status-check name (`{caller job} / {reusable job}`), and
+changing one can block merges on a repo with branch protection. The
+reusable job is named after `engine` (`Kimi PR Review`, `Grok PR Review`,
+`Claude PR Review`) so two engines on one PR are distinguishable in
+Checks. After adopting this, update any required check that still names
+`ai-review / ai-review`. Do other cosmetic renames separately.
 
 Switching that repo to Kimi afterwards is a separate decision: set
 `engine: kimi`, drop `max_context_size` if the model's window differs, and expect
@@ -315,9 +349,11 @@ the access gate has passed.
 An engine **must** strip PR-supplied agent config as its *first* step, grant the
 model no shell tool, read the context and diff, write the review to
 `output_path`, and fail with an engine-named message if it wrote nothing. It
-**must not** post PR comments, reach the GitHub API on the model's behalf, or
-assume it owns checkout, prompt fetch, previous-review handling, context build,
-diff fetch, comment posting, metrics or artifacts.
+**must not** harvest or invent cost/usage for the PR comment (the caller does
+not publish a usage footer). It **must not** post PR comments, reach the GitHub
+API on the model's behalf, or assume it owns checkout, prompt fetch,
+previous-review handling, context build, diff fetch, comment posting, metrics
+or artifacts.
 
 The stripping step is a **security boundary, and its paths are engine-specific**
 — `.claude/settings.json` can declare hooks that execute arbitrary commands and
@@ -351,23 +387,31 @@ CLI reads.
 1. **Access gate** — actor must be a `deriv-com` member or a repo collaborator.
 2. **Resolve engine** — validate `engine`, resolve per-engine and engine-neutral
    defaults (the single place every default value lives).
-3. **Checkout** the event's `head.sha` — not the branch, which could have moved
+3. **Progress comment** — the caller (not the engine) posts a Claude-style
+   "working on it" comment with the model at the top and a job link. This is
+   the comment that later becomes the review (same id). The CLI never
+   receives `GITHUB_TOKEN`.
+4. **Checkout** the event's `head.sha` — not the branch, which could have moved
    past what the gate validated — at depth 20, for the incremental diff.
-4. **Fetch prompt** template from the pinned gist revision; inject the Click2Fix URL.
-5. **Capture** the newest prior review comment (canonical + legacy markers,
+5. **Fetch prompt** template from the pinned gist revision; inject the Click2Fix URL.
+6. **Capture** the newest prior review comment (canonical + legacy markers,
    paginated) as `PREVIOUS_REVIEW` and extract its `reviewed-commit` SHA.
-   Capture only — deletion waits until step 10.
-6. **Collect acknowledged suggestions** from `Click2Fix - Acknowledge` comments
+   Capture only — deletion waits until step 11. Progress comments use a
+   different marker and are not captured as reviews.
+7. **Collect acknowledged suggestions** from `Click2Fix - Acknowledge` comments
    posted by the bot or by accounts with repo standing (`author_association`),
    so a drive-by comment cannot suppress findings.
-7. **Build `/tmp/review_context.md`** — instructions, previous review,
+8. **Build `/tmp/review_context.md`** — instructions, previous review,
    noise-filtered incremental diff, acknowledged items, PR metadata, review
    procedure, output format.
-8. **Pre-fetch the diff** to `/tmp/pr_diff.txt` with the trusted token (so the
+9. **Pre-fetch the diff** to `/tmp/pr_diff.txt` with the trusted token (so the
    engine needs no shell), filtered for build noise only — lockfiles and
    generated output, never test or doc files, which the review must see.
-9. **Dispatch to the engine** — it writes `/tmp/ai_review_output.txt`.
-10. **Post**: scan the review for the API key (refuse if found), truncate over
-    GitHub's comment limit, append the detection markers, post the replacement,
-    **then** delete the prior review comments captured just before posting.
-11. **Emit metrics** to the dashboard and the job summary; upload the payload.
+10. **Dispatch to the engine** — it writes `/tmp/ai_review_output.txt`.
+11. **Post**: scan the review for the API key (refuse if found), truncate over
+    GitHub's comment limit, prepend the model and engine title, append
+    detection markers, **PATCH the progress comment** into that body (or
+    `gh pr comment` if progress never posted), **then** delete the prior
+    review comments (never the comment just patched). On failure, PATCH the
+    progress comment to "did not finish".
+12. **Emit metrics** to the dashboard and the job summary; upload the payload.

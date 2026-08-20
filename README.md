@@ -13,7 +13,7 @@ Everything here is consumed at `@master`, so **changes are live for every consum
 
 | Workflow | Purpose | Docs | Status |
 |---|---|---|---|
-| [`ai-pr-review.yml`](.github/workflows/ai-pr-review.yml) | LLM PR review; engine selectable (`kimi` \| `anthropic`) | [AI_PR_REVIEW_README.md](.github/workflows/AI_PR_REVIEW_README.md) | ✅ active |
+| [`ai-pr-review.yml`](.github/workflows/ai-pr-review.yml) | LLM PR review; engine selectable (`kimi` \| `anthropic` \| `grok`) | [AI_PR_REVIEW_README.md](.github/workflows/AI_PR_REVIEW_README.md) | ✅ active |
 | [`claude-pr-review.yml`](.github/workflows/claude-pr-review.yml) | Claude PR review | — | ⚠️ **deprecated** → use `ai-pr-review.yml` with `engine: anthropic` |
 | [`docsync-ai.yml`](.github/workflows/docsync-ai.yml) | Keeps docs in sync with code; scheduled + comment-triggered | — | ✅ active |
 | [`dependonme-bot.yml`](.github/workflows/dependonme-bot.yml) | Auto-fixes Dependabot security alerts | [DEPENDONME_BOT_README.md](.github/workflows/DEPENDONME_BOT_README.md) | ✅ active |

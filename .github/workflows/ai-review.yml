@@ -1,4 +1,4 @@
-name: AI PR Review (Kimi K3)
+name: Kimi PR Review
 
 # Dogfoods this repo's own review workflow on this repo's own PRs.
 #
@@ -8,7 +8,7 @@ name: AI PR Review (Kimi K3)
 #
 # Runs ALONGSIDE claude.yml on purpose, so Kimi K3 and Claude review the same PRs
 # and can be compared. Every PR gets two review comments, told apart by header:
-#   "## 🤖 AI PR Review Complete"     <- this workflow (Kimi K3)
+#   "## 🤖 Kimi PR Review Complete"   <- this workflow (Kimi K3)
 #   "## 🤖 Claude PR Review Complete" <- claude.yml (claude-sonnet-5)
 #
 # TWO SELF-REFERENCE CAVEATS, both worth knowing before trusting a green run here:
