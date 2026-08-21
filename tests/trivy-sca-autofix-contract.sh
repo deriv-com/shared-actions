@@ -33,6 +33,18 @@ if [[ -f "$ACTION" ]]; then
   check 'grep -q "/tmp/fix_prompt.md" "$ACTION"' "prompt action copies to /tmp/fix_prompt.md"
 fi
 
+KIMI="$ROOT/.github/actions/ai_sca_engine_kimi/action.yml"
+check '[[ -f "$KIMI" ]]' "ai_sca_engine_kimi/action.yml exists"
+if [[ -f "$KIMI" ]]; then
+  check '! grep -nE "timeout-minutes:" "$KIMI"' "kimi SCA has no timeout-minutes"
+  check '! grep -nE "secrets\\." "$KIMI"' "kimi SCA does not mention secrets."
+  check '! grep -nE "\\$\\{\\{[[:space:]]*\\}\\}" "$KIMI"' "kimi SCA has no empty expression pair"
+  check '! grep -nE "github\\.token" "$KIMI"' "kimi SCA does not use github.token"
+  check 'grep -q "decision = \"deny\"" "$KIMI" || grep -q "pattern = \"Bash\"" "$KIMI"' "kimi SCA denies Bash"
+  check 'grep -q "autofix_result.md" "$KIMI"' "kimi SCA writes autofix_result.md"
+  check 'grep -q "Kimi SCA engine" "$KIMI"' "kimi SCA failures are engine-named"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "contract checks failed"
   exit 1
