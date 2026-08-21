@@ -58,6 +58,19 @@ if [[ -f "$ANTH" ]]; then
   check 'grep -q "fefa07e9c665b7320f08c3b525980457f22f58aa" "$ANTH"' "anthropic SCA pins the same claude-code-action SHA as review"
 fi
 
+GROK="$ROOT/.github/actions/ai_sca_engine_grok/action.yml"
+check '[[ -f "$GROK" ]]' "ai_sca_engine_grok/action.yml exists"
+if [[ -f "$GROK" ]]; then
+  check '! grep -nE "timeout-minutes:" "$GROK"' "grok SCA has no timeout-minutes"
+  check '! grep -nE "secrets\\." "$GROK"' "grok SCA does not mention secrets."
+  check '! grep -nE "\\$\\{\\{[[:space:]]*\\}\\}" "$GROK"' "grok SCA has no empty expression pair"
+  check '! grep -nE "github\\.token" "$GROK"' "grok SCA does not use github.token"
+  check 'grep -q "workspace-write" "$GROK"' "grok SCA uses workspace-write sandbox"
+  check '! grep -q "GROK_SANDBOX: read-only" "$GROK"' "grok SCA does not use read-only sandbox"
+  check 'grep -q "Grok SCA engine" "$GROK"' "grok SCA failures are engine-named"
+  check 'grep -q "deny Bash" "$GROK" || grep -q "--deny Bash" "$GROK"' "grok SCA denies Bash"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "contract checks failed"
   exit 1
