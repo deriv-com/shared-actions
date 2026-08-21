@@ -91,6 +91,17 @@ if [[ -f "$WF" ]]; then
   check 'grep -q "GITHUB_TOKEN:" "$WF"' "engine dispatch mentions GITHUB_TOKEN (cleared to empty)"
 fi
 
+DOC="$ROOT/.github/workflows/TRIVY_SCA_AUTOFIX_README.md"
+README="$ROOT/README.md"
+check '[[ -f "$DOC" ]]' "TRIVY_SCA_AUTOFIX_README.md exists"
+check 'grep -q "trivy-sca-autofix.yml" "$README"' "root README lists the workflow"
+if [[ -f "$DOC" ]]; then
+  check 'grep -q "AUTOFIX_GITHUB_TOKEN" "$DOC"' "docs mention the PAT"
+  check 'grep -q "engine:" "$DOC"' "docs show engine switch"
+  check 'grep -q "nothing to do" "$DOC"' "docs include the clean-master case"
+  check 'grep -q "chore/trivy-sca-autofix" "$DOC"' "docs name the singleton branch"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "contract checks failed"
   exit 1
