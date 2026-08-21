@@ -1,0 +1,236 @@
+name: ai_sca_engine_kimi
+description: >
+  Trivy SCA fix engine — Kimi Code CLI. Reads pre-built fix context and a
+  Trivy JSON report, edits JS manifests/lockfiles with the Write tool, and
+  writes /tmp/autofix_result.md. No shell tool. No GitHub token. The caller
+  owns lockfile refresh, git, and PR creation.
+
+inputs:
+  fix_context_path:
+    description: Path to caller-built fix context markdown
+    required: false
+    default: "/tmp/fix_context.md"
+  trivy_json_path:
+    description: Path to Trivy JSON report
+    required: false
+    default: "/tmp/trivy.json"
+  output_path:
+    description: Path this engine MUST write the result markdown to
+    required: false
+    default: "/tmp/autofix_result.md"
+  repository:
+    description: owner/repo (prompt preamble only)
+    required: true
+  model:
+    description: LiteLLM alias, e.g. kimi-k3
+    required: false
+    default: "kimi-k3"
+  base_url:
+    description: LLM API base URL; /v1 appended when absent
+    required: false
+    default: "https://litellmsa.deriv.ai/v1"
+  api_key:
+    description: API key for base_url. Composite actions cannot read the secrets context, so the caller must pass this explicitly.
+    required: true
+  max_context_size:
+    description: Context window in tokens
+    required: false
+    default: "1048576"
+  provider_type:
+    description: Wire dialect; must match base_url (openai for the LiteLLM proxy)
+    required: false
+    default: "openai"
+  cli_version:
+    description: Exact @moonshot-ai/kimi-code version
+    required: false
+    default: "0.34.0"
+  node_version:
+    description: Node.js version to install the CLI
+    required: false
+    default: "22"
+
+outputs:
+  output_path:
+    description: Path the result markdown was written to
+    value: ${{ steps.run.outputs.output_path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Strip repo-supplied agent config (Kimi Code)
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        find . -name .git -prune -o -type f \
+          \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' -o -name 'KIMI.md' \) \
+          -print0 | xargs -0 -r rm -f
+        find . -name .git -prune -o -type d -name '.kimi-code' \
+          -print0 | xargs -0 -r rm -rf
+        echo "✅ Kimi SCA engine: stripped agent config (recursive)"
+
+    - name: Set up Node.js
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: ${{ inputs.node_version }}
+
+    - name: Install SCA CLI (Kimi Code)
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli_version }}
+      run: |
+        npm install -g "@moonshot-ai/kimi-code@${CLI_VERSION}"
+        kimi --version
+
+    - name: Configure SCA CLI (Kimi Code)
+      shell: bash
+      env:
+        OUTPUT_PATH: ${{ inputs.output_path }}
+      run: |
+        OUT_DIR="$(dirname "$OUTPUT_PATH")"
+        rm -rf "$HOME/.kimi-code"
+        mkdir -p "$HOME/.kimi-code"
+        cat > "$HOME/.kimi-code/config.toml" <<EOF
+        default_permission_mode = "auto"
+
+        [tools]
+        enabled = ["Read", "Write", "Grep", "Glob"]
+
+        [[permission.rules]]
+        decision = "allow"
+        pattern = "Write(${OUT_DIR}/*)"
+
+        [[permission.rules]]
+        decision = "allow"
+        pattern = "Write(package.json)"
+
+        [[permission.rules]]
+        decision = "allow"
+        pattern = "Write(package-lock.json)"
+
+        [[permission.rules]]
+        decision = "allow"
+        pattern = "Write(yarn.lock)"
+
+        [[permission.rules]]
+        decision = "allow"
+        pattern = "Write(pnpm-lock.yaml)"
+
+        [[permission.rules]]
+        decision = "allow"
+        pattern = "Write(**/package.json)"
+
+        [[permission.rules]]
+        decision = "allow"
+        pattern = "Write(**/package-lock.json)"
+
+        [[permission.rules]]
+        decision = "allow"
+        pattern = "Write(**/yarn.lock)"
+
+        [[permission.rules]]
+        decision = "allow"
+        pattern = "Write(**/pnpm-lock.yaml)"
+
+        [[permission.rules]]
+        decision = "deny"
+        pattern = "Write"
+
+        [[permission.rules]]
+        decision = "deny"
+        pattern = "Bash"
+        EOF
+        kimi doctor config
+
+    - name: Run Trivy SCA fix (Kimi Code)
+      id: run
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        KIMI_MODEL_NAME: ${{ inputs.model }}
+        KIMI_MODEL_API_KEY: ${{ inputs.api_key }}
+        KIMI_MODEL_MAX_CONTEXT_SIZE: ${{ inputs.max_context_size }}
+        KIMI_MODEL_PROVIDER_TYPE: ${{ inputs.provider_type }}
+        KIMI_DISABLE_TELEMETRY: "1"
+        KIMI_CODE_NO_AUTO_UPDATE: "1"
+        CI: "1"
+        GITHUB_TOKEN: ""
+        GH_TOKEN: ""
+        AUTOFIX_GITHUB_TOKEN: ""
+        INPUT_BASE_URL: ${{ inputs.base_url }}
+        CONTEXT_PATH: ${{ inputs.fix_context_path }}
+        TRIVY_JSON: ${{ inputs.trivy_json_path }}
+        OUTPUT_PATH: ${{ inputs.output_path }}
+      run: |
+        [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Kimi SCA engine: missing or empty fix context at $CONTEXT_PATH"; exit 1; }
+        [[ -s "$TRIVY_JSON" ]] || { echo "❌ Kimi SCA engine: missing or empty Trivy JSON at $TRIVY_JSON"; exit 1; }
+
+        BASE_URL="${INPUT_BASE_URL%/}"
+        [[ "$BASE_URL" == */v1 ]] || BASE_URL="${BASE_URL}/v1"
+        export KIMI_MODEL_BASE_URL="$BASE_URL"
+        echo "🔧 Kimi SCA engine | model=$KIMI_MODEL_NAME | base_url=$BASE_URL"
+
+        cat > /tmp/sca_prompt.txt <<'EOF'
+        REPO: ${{ inputs.repository }}
+
+        Read ${{ inputs.fix_context_path }} and follow it exactly. It contains
+        the playbook, repo metadata, package manager, and Trivy flags. Then read
+        ${{ inputs.trivy_json_path }}. You have no shell tool.
+
+        HOW THIS TASK IS DELIVERED: your chat reply is discarded. Write
+        ${{ inputs.output_path }} with the Write tool (what changed, CVEs
+        addressed, CVEs left unfixed) AND edit only package.json /
+        package-lock.json / yarn.lock / pnpm-lock.yaml.
+        EOF
+
+        dump_kimi_log() {
+          set +e +o pipefail
+          bytes_of() { wc -c < "$1" 2>/dev/null | tr -d '[:space:]' || echo '?'; }
+          echo "ℹ️  Kimi SCA engine config: model=$KIMI_MODEL_NAME base_url=$KIMI_MODEL_BASE_URL provider_type=$KIMI_MODEL_PROVIDER_TYPE"
+          echo "ℹ️  input bytes: context=$(bytes_of "$CONTEXT_PATH") trivy=$(bytes_of "$TRIVY_JSON")"
+          if [[ -s "$OUTPUT_PATH" ]]; then
+            echo "ℹ️  result file: PRESENT ($(bytes_of "$OUTPUT_PATH") bytes)"
+          else
+            echo "ℹ️  result file: ABSENT"
+          fi
+          KIMI_LOGS=$(find "$HOME" /tmp -maxdepth 5 -type f -name '*.log' 2>/dev/null | grep -i kimi | head -3 || true)
+          if [[ -n "$KIMI_LOGS" ]]; then
+            while IFS= read -r log; do
+              echo "::group::$log (last 200 lines)"
+              tail -n 200 "$log"
+              echo "::endgroup::"
+            done <<< "$KIMI_LOGS"
+          fi
+        }
+
+        rm -f "$OUTPUT_PATH"
+        BEFORE=$(git status --porcelain)
+        REVIEW_PROMPT="$(cat /tmp/sca_prompt.txt)"
+
+        for attempt in 1 2; do
+          kimi -p "$REVIEW_PROMPT" && KIMI_STATUS=0 || KIMI_STATUS=$?
+          AFTER=$(git status --porcelain)
+          if [[ -s "$OUTPUT_PATH" ]]; then
+            if [[ "$KIMI_STATUS" -ne 0 ]]; then
+              echo "⚠️  Kimi SCA engine: CLI exited $KIMI_STATUS AFTER writing the result — keeping it."
+              ( dump_kimi_log ) || true
+            fi
+            break
+          fi
+          if [[ -n "$AFTER" && "$AFTER" != "$BEFORE" ]]; then
+            echo "❌ Kimi SCA engine: worktree changed but $OUTPUT_PATH is empty — not retrying a partial edit"
+            ( dump_kimi_log ) || true
+            exit 1
+          fi
+          if [[ "$attempt" -eq 1 ]]; then
+            echo "⚠️  Kimi SCA engine: CLI exited $KIMI_STATUS with no result and no worktree change — retrying once."
+            ( dump_kimi_log ) || true
+          fi
+        done
+
+        if [[ ! -s "$OUTPUT_PATH" ]]; then
+          echo "❌ Kimi SCA engine: no result written to $OUTPUT_PATH after 2 attempts (last CLI exit: $KIMI_STATUS)"
+          ( dump_kimi_log ) || true
+          exit 1
+        fi
+        echo "✅ Kimi SCA engine: result written ($(wc -c < "$OUTPUT_PATH") bytes)"
+        echo "output_path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"
