@@ -468,6 +468,8 @@ jobs:
           git config --local --unset-all http.proxy || true
           git config --local --unset-all https.proxy || true
           git config --local --unset-all http.https://github.com/.extraheader || true
+          git config --local --unset-all credential.helper || true
+          git config --local --unset-all credential.https://github.com.helper || true
           while IFS= read -r line; do
             key="${line%% *}"
             [[ -z "$key" ]] && continue
