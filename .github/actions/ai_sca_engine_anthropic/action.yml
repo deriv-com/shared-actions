@@ -1,0 +1,117 @@
+name: ai_sca_engine_anthropic
+description: >
+  Trivy SCA fix engine — Claude Code Action. Reads pre-built fix context and a
+  Trivy JSON report, edits JS dependency files with Write, writes
+  /tmp/autofix_result.md. No Bash. No github_token input. The caller owns git
+  and the PR. Write is unscoped at the CLI because a path-scoped Write made
+  the tool unavailable on the review engine; the workflow allowlist is the gate.
+
+inputs:
+  fix_context_path:
+    description: Path to caller-built fix context markdown
+    required: false
+    default: "/tmp/fix_context.md"
+  trivy_json_path:
+    description: Path to Trivy JSON report
+    required: false
+    default: "/tmp/trivy.json"
+  output_path:
+    description: Path this engine MUST write the result markdown to
+    required: false
+    default: "/tmp/autofix_result.md"
+  repository:
+    description: owner/repo (prompt preamble only)
+    required: true
+  model:
+    description: Claude model ID, e.g. claude-sonnet-5
+    required: false
+    default: "claude-sonnet-5"
+  base_url:
+    description: LLM API base URL; trailing /v1 is stripped
+    required: false
+    default: "https://litellmsa.deriv.ai/v1"
+  api_key:
+    description: API key for base_url. Composite actions cannot read the secrets context, so the caller must pass this explicitly.
+    required: true
+
+outputs:
+  output_path:
+    description: Path the result markdown was written to
+    value: ${{ steps.verify.outputs.output_path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Strip repo-supplied agent config (Claude Code)
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        find . -name .git -prune -o -type f \
+          \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' -o -name '.mcp.json' \) \
+          -print0 | xargs -0 -r rm -f
+        find . -name .git -prune -o -type d \
+          \( -name '.claude' -o -name '.claude-plugin' \) \
+          -print0 | xargs -0 -r rm -rf
+        rm -rf "$HOME/.claude"
+        rm -f "$HOME/.claude.json"
+        echo "✅ Anthropic SCA engine: stripped agent config (recursive)"
+
+    - name: Resolve base URL and verify inputs
+      id: resolve
+      shell: bash
+      env:
+        INPUT_BASE_URL: ${{ inputs.base_url }}
+        CONTEXT_PATH: ${{ inputs.fix_context_path }}
+        TRIVY_JSON: ${{ inputs.trivy_json_path }}
+        GITHUB_TOKEN: ""
+        GH_TOKEN: ""
+        AUTOFIX_GITHUB_TOKEN: ""
+      run: |
+        [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Anthropic SCA engine: missing or empty fix context at $CONTEXT_PATH"; exit 1; }
+        [[ -s "$TRIVY_JSON" ]] || { echo "❌ Anthropic SCA engine: missing or empty Trivy JSON at $TRIVY_JSON"; exit 1; }
+        BASE_URL="${INPUT_BASE_URL%/}"
+        BASE_URL="${BASE_URL%/v1}"
+        echo "base_url=$BASE_URL" >> "$GITHUB_OUTPUT"
+        echo "🔧 Anthropic SCA engine | model=${{ inputs.model }} | base_url=$BASE_URL"
+
+    - name: Claude Code SCA fix
+      env:
+        ANTHROPIC_BASE_URL: ${{ steps.resolve.outputs.base_url }}
+        ANTHROPIC_AUTH_TOKEN: ${{ inputs.api_key }}
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+        CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+        DISABLE_NON_ESSENTIAL_MODEL_CALLS: "1"
+        GITHUB_TOKEN: ""
+        GH_TOKEN: ""
+        AUTOFIX_GITHUB_TOKEN: ""
+      uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
+      with:
+        anthropic_api_key: ${{ inputs.api_key }}
+        show_full_output: true
+        prompt: |
+          REPO: ${{ inputs.repository }}
+
+          Read ${{ inputs.fix_context_path }} and follow it exactly. Then read
+          ${{ inputs.trivy_json_path }}. You have no shell tool.
+
+          HOW THIS TASK IS DELIVERED: your chat reply is discarded. The ONLY
+          outputs that count are edits to package.json / package-lock.json /
+          yarn.lock / pnpm-lock.yaml and the file ${{ inputs.output_path }}
+          written with the Write tool. Do not post comments or use GitHub tools.
+        claude_args: |
+          --model ${{ inputs.model }}
+          --allowedTools "Read,Write,Grep,Glob"
+          --disallowedTools "Bash,WebFetch,WebSearch,mcp__github_comment,mcp__github_inline_comment,mcp__github_file_ops,mcp__github"
+
+    - name: Verify SCA output
+      id: verify
+      shell: bash
+      env:
+        OUTPUT_PATH: ${{ inputs.output_path }}
+      run: |
+        if [[ ! -s "$OUTPUT_PATH" ]]; then
+          echo "❌ Anthropic SCA engine: claude-code-action finished but wrote no result to $OUTPUT_PATH"
+          exit 1
+        fi
+        echo "✅ Anthropic SCA engine: result written ($(wc -c < "$OUTPUT_PATH") bytes)"
+        echo "output_path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"

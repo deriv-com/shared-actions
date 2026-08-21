@@ -45,6 +45,19 @@ if [[ -f "$KIMI" ]]; then
   check 'grep -q "Kimi SCA engine" "$KIMI"' "kimi SCA failures are engine-named"
 fi
 
+ANTH="$ROOT/.github/actions/ai_sca_engine_anthropic/action.yml"
+check '[[ -f "$ANTH" ]]' "ai_sca_engine_anthropic/action.yml exists"
+if [[ -f "$ANTH" ]]; then
+  check '! grep -nE "timeout-minutes:" "$ANTH"' "anthropic SCA has no timeout-minutes"
+  check '! grep -nE "secrets\\." "$ANTH"' "anthropic SCA does not mention secrets."
+  check '! grep -nE "\\$\\{\\{[[:space:]]*\\}\\}" "$ANTH"' "anthropic SCA has no empty expression pair"
+  check '! grep -nE "github_token:" "$ANTH"' "anthropic SCA does not pass github_token"
+  check 'grep -q "disallowedTools" "$ANTH"' "anthropic SCA sets disallowedTools"
+  check 'grep -q "Bash" "$ANTH"' "anthropic SCA mentions Bash in denylist"
+  check 'grep -q "Anthropic SCA engine" "$ANTH"' "anthropic SCA failures are engine-named"
+  check 'grep -q "fefa07e9c665b7320f08c3b525980457f22f58aa" "$ANTH"' "anthropic SCA pins the same claude-code-action SHA as review"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "contract checks failed"
   exit 1
