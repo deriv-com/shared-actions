@@ -111,6 +111,10 @@ if [[ -f "$WF" ]]; then
   check 'grep -q "/usr/bin/git" "$WF"' "commit step pins /usr/bin/git"
   check 'grep -q "/usr/bin/gh" "$WF"' "commit step pins /usr/bin/gh"
   check 'grep -q "unset.*GH_HOST" "$WF"' "commit step unsets GH_HOST"
+  check 'grep -q "GIT_CONFIG_PARAMETERS" "$WF"' "commit step unsets GIT_CONFIG_PARAMETERS"
+  check 'grep -q "env -i" "$WF"' "commit step runs PAT git/gh under env -i"
+  check 'grep -q "GH_HOST=github.com" "$WF"' "env -i child sets GH_HOST=github.com"
+  check 'grep -q "GH_CONFIG_DIR" "$WF"' "env -i child uses isolated GH_CONFIG_DIR"
   check 'grep -q "credential.https://github.com.helper" "$WF"' "commit step sets local gh credential helper"
 fi
 

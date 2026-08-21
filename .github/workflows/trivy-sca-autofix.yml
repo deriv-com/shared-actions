@@ -449,7 +449,7 @@ jobs:
         run: |
           command -v /usr/bin/git >/dev/null || { echo "❌ /usr/bin/git not found"; exit 1; }
           command -v /usr/bin/gh >/dev/null || { echo "❌ /usr/bin/gh not found"; exit 1; }
-          unset GIT_CONFIG_COUNT
+          unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
           while IFS= read -r name; do unset "$name"; done < <(compgen -v | grep -E '^GIT_CONFIG_(KEY|VALUE)_' || true)
           unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy GH_HOST
           /usr/bin/git config user.name "github-actions[bot]"
@@ -479,12 +479,24 @@ jobs:
           	fetch = +refs/heads/*:refs/remotes/origin/*
           EOF
           /usr/bin/git remote set-url origin "https://github.com/${REPO}.git"
-          export GIT_CONFIG_NOSYSTEM=1
-          export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_GLOBAL="$(mktemp)"
+          GIT_CONFIG_GLOBAL_FILE="$(mktemp)"
+          GH_CONFIG_DIR="$(mktemp -d)"
           /usr/bin/git config --local credential.https://github.com.helper '!/usr/bin/gh auth git-credential'
-          /usr/bin/git -c core.hooksPath=/dev/null push --force --no-verify origin "HEAD:refs/heads/${AUTOFIX_BRANCH}"
-          EXISTING="$(/usr/bin/gh pr list --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" --state open --json number --jq '.[0].number // empty')"
+          run_pat() {
+            env -i \
+              HOME="$HOME" \
+              PATH=/usr/bin:/bin \
+              GH_TOKEN="$GH_TOKEN" \
+              GH_HOST=github.com \
+              GH_CONFIG_DIR="$GH_CONFIG_DIR" \
+              GIT_CONFIG_NOSYSTEM=1 \
+              GIT_CONFIG_SYSTEM=/dev/null \
+              GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL_FILE" \
+              TERM=dumb \
+              "$@"
+          }
+          run_pat /usr/bin/git -c core.hooksPath=/dev/null push --force --no-verify origin "HEAD:refs/heads/${AUTOFIX_BRANCH}"
+          EXISTING="$(run_pat /usr/bin/gh pr list --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" --state open --json number --jq '.[0].number // empty')"
           BODY_FILE=/tmp/pr_body.md
           {
             echo "## Trivy SCA autofix"
@@ -509,16 +521,16 @@ jobs:
             exit 1
           fi
           if [[ -z "$EXISTING" ]]; then
-            /usr/bin/gh pr create --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" \
+            run_pat /usr/bin/gh pr create --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" \
               --title "chore: fix Trivy SCA findings" \
               --body-file "$BODY_FILE"
-            EXISTING="$(/usr/bin/gh pr list --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" --state open --json number --jq '.[0].number')"
-            /usr/bin/gh pr edit "$EXISTING" --add-label trivy-autofix --add-label security || true
+            EXISTING="$(run_pat /usr/bin/gh pr list --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" --state open --json number --jq '.[0].number')"
+            run_pat /usr/bin/gh pr edit "$EXISTING" --add-label trivy-autofix --add-label security || true
           else
-            /usr/bin/gh pr edit "$EXISTING" --body-file "$BODY_FILE"
-            /usr/bin/gh pr edit "$EXISTING" --add-label trivy-autofix --add-label security || true
+            run_pat /usr/bin/gh pr edit "$EXISTING" --body-file "$BODY_FILE"
+            run_pat /usr/bin/gh pr edit "$EXISTING" --add-label trivy-autofix --add-label security || true
           fi
-          URL="$(/usr/bin/gh pr view "$EXISTING" --json url --jq .url)"
+          URL="$(run_pat /usr/bin/gh pr view "$EXISTING" --json url --jq .url)"
           printf '%s\n' "PR opened/updated: $URL (engine \`$ENGINE\` / \`$MODEL\`, cleared $BEFORE findings)" > "$SLACK_MESSAGE_FILE"
           echo "✅ $URL"
 
