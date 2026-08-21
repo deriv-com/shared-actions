@@ -464,17 +464,16 @@ jobs:
             printf '%s\n' "could not fix (invalid repository name)" > "$SLACK_MESSAGE_FILE"
             exit 1
           fi
+          cat > .git/config <<EOF
+          [core]
+          	repositoryformatversion = 0
+          	bare = false
+          	logallrefupdates = true
+          [remote "origin"]
+          	url = https://github.com/${REPO}.git
+          	fetch = +refs/heads/*:refs/remotes/origin/*
+          EOF
           git remote set-url origin "https://github.com/${REPO}.git"
-          git config --local --unset-all http.proxy || true
-          git config --local --unset-all https.proxy || true
-          git config --local --unset-all http.https://github.com/.extraheader || true
-          git config --local --unset-all credential.helper || true
-          git config --local --unset-all credential.https://github.com.helper || true
-          while IFS= read -r line; do
-            key="${line%% *}"
-            [[ -z "$key" ]] && continue
-            git config --local --unset-all "$key" || true
-          done < <(git config --local --get-regexp '^url\.' 2>/dev/null || true)
           gh auth setup-git
           git -c core.hooksPath=/dev/null push --force --no-verify origin "HEAD:refs/heads/${AUTOFIX_BRANCH}"
           EXISTING="$(gh pr list --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" --state open --json number --jq '.[0].number // empty')"

@@ -103,8 +103,9 @@ if [[ -f "$WF" ]]; then
   check 'grep -q "corepack enable" "$WF"' "corepack enabled after setup-node"
   check 'grep -q "remote set-url origin" "$WF"' "commit step resets remote.origin before PAT push"
   check 'grep -q "REPO:" "$WF" && grep -q "github.repository" "$WF"' "commit step passes github.repository via env"
-  check 'grep -q "get-regexp" "$WF"' "commit step clears url.insteadOf keys"
-  check 'grep -q "credential.helper" "$WF"' "commit step clears credential.helper"
+  check 'grep -q "\.git/config" "$WF"' "commit step rewrites .git/config before PAT push"
+  check 'grep -q "https://github.com/\${REPO}.git" "$WF"' "commit step sets origin to github.com REPO"
+  check 'grep -q "gh auth setup-git" "$WF"' "commit step runs gh auth setup-git before push"
 fi
 
 DOC="$ROOT/.github/workflows/TRIVY_SCA_AUTOFIX_README.md"
