@@ -56,6 +56,7 @@ if [[ -f "$ANTH" ]]; then
   check 'grep -q "Bash" "$ANTH"' "anthropic SCA mentions Bash in denylist"
   check 'grep -q "Anthropic SCA engine" "$ANTH"' "anthropic SCA failures are engine-named"
   check 'grep -q "fefa07e9c665b7320f08c3b525980457f22f58aa" "$ANTH"' "anthropic SCA pins the same claude-code-action SHA as review"
+  check 'grep -q "show_full_output: false" "$ANTH"' "anthropic SCA disables show_full_output"
 fi
 
 GROK="$ROOT/.github/actions/ai_sca_engine_grok/action.yml"
@@ -89,6 +90,17 @@ if [[ -f "$WF" ]]; then
   check 'grep -q "AUTOFIX_GITHUB_TOKEN" "$WF"' "PAT secret declared"
   check '! grep -nE "ref:.*pull_request.head" "$WF"' "does not checkout PR head"
   check 'grep -q "GITHUB_TOKEN:" "$WF"' "engine dispatch mentions GITHUB_TOKEN (cleared to empty)"
+  check 'grep -q "cache-dir: /tmp/trivy-cache" "$WF"' "trivy cache-dir is /tmp/trivy-cache"
+  check 'grep -c "cache-dir: /tmp/trivy-cache" "$WF" | grep -qx 2' "both trivy steps use /tmp/trivy-cache"
+  check 'grep -q "cache: \"false\"" "$WF"' "trivy cache disabled"
+  check 'grep -q "persist-credentials: false" "$WF"' "checkout does not persist PAT"
+  check '! grep -q "git add -A" "$WF"' "commit step does not git add -A"
+  check 'grep -q "core.hooksPath=/dev/null" "$WF"' "commit/push bypass consumer hooks"
+  check 'grep -q "commit --no-verify" "$WF"' "commit uses --no-verify"
+  check '! grep -A5 "gh pr create" "$WF" | grep -q "\-\-label"' "gh pr create does not pass --label"
+  check 'grep -q "contents: read" "$WF"' "job contents permission is read"
+  check 'grep -q "install_dir" "$WF"' "detect package manager outputs install_dir"
+  check 'grep -q "corepack enable" "$WF"' "corepack enabled after setup-node"
 fi
 
 DOC="$ROOT/.github/workflows/TRIVY_SCA_AUTOFIX_README.md"
@@ -100,6 +112,12 @@ if [[ -f "$DOC" ]]; then
   check 'grep -q "engine:" "$DOC"' "docs show engine switch"
   check 'grep -q "nothing to do" "$DOC"' "docs include the clean-master case"
   check 'grep -q "chore/trivy-sca-autofix" "$DOC"' "docs name the singleton branch"
+fi
+
+LINT="$ROOT/.github/workflows/lint-actions.yml"
+if [[ -f "$LINT" ]]; then
+  check 'grep -q "trivy-sca-autofix-contract.sh" "$LINT"' "lint-actions runs contract script"
+  check 'grep -q "tests/trivy-sca-autofix-contract.sh" "$LINT"' "lint-actions paths include contract script"
 fi
 
 if [[ "$fail" -ne 0 ]]; then

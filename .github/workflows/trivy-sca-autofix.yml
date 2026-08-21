@@ -80,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
-      contents: write
+      contents: read
       pull-requests: write
     concurrency:
       group: trivy-sca-autofix-${{ github.repository }}
@@ -168,6 +168,11 @@ jobs:
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
           token: ${{ secrets.AUTOFIX_GITHUB_TOKEN }}
+          persist-credentials: false
+
+      - name: Strip checkout extraheader
+        if: steps.skip.outputs.skip != 'true'
+        run: git config --unset-all http.https://github.com/.extraheader || true
 
       - name: Copy autofix playbook
         if: steps.skip.outputs.skip != 'true'
@@ -179,15 +184,14 @@ jobs:
         with:
           node-version: ${{ inputs.node_version }}
 
+      - name: Enable Corepack
+        if: steps.skip.outputs.skip != 'true'
+        run: corepack enable
+
       - name: Detect package manager
         id: pkg
         if: steps.skip.outputs.skip != 'true'
         run: |
-          if [[ -f .yarnrc.yml ]]; then
-            echo "❌ Yarn Berry is not supported in v1 (would run lifecycle scripts)"
-            printf '%s\n' "could not fix (Yarn Berry unsupported)" > "$SLACK_MESSAGE_FILE"
-            exit 1
-          fi
           detect_in() {
             local d="$1"
             if [[ -f "$d/pnpm-lock.yaml" ]]; then echo pnpm; return; fi
@@ -195,12 +199,13 @@ jobs:
             if [[ -f "$d/package-lock.json" ]]; then echo npm; return; fi
             echo ""
           }
+          INSTALL_DIR="."
           PM="$(detect_in .)"
           if [[ -z "$PM" ]]; then
             FOUND="$(find . -name .git -prune -o -type f \( -name pnpm-lock.yaml -o -name yarn.lock -o -name package-lock.json \) -print | head -1 || true)"
             if [[ -n "$FOUND" ]]; then
-              DIR="$(dirname "$FOUND")"
-              PM="$(detect_in "$DIR")"
+              INSTALL_DIR="$(dirname "$FOUND")"
+              PM="$(detect_in "$INSTALL_DIR")"
             fi
           fi
           if [[ -z "$PM" ]]; then
@@ -212,8 +217,14 @@ jobs:
             printf '%s\n' "could not fix (no JS lockfile)" > "$SLACK_MESSAGE_FILE"
             exit 1
           fi
+          if [[ -f "$INSTALL_DIR/.yarnrc.yml" ]]; then
+            echo "❌ Yarn Berry is not supported in v1 (would run lifecycle scripts)"
+            printf '%s\n' "could not fix (Yarn Berry unsupported)" > "$SLACK_MESSAGE_FILE"
+            exit 1
+          fi
           echo "package_manager=$PM" >> "$GITHUB_OUTPUT"
-          echo "✅ Package manager: $PM"
+          echo "install_dir=$INSTALL_DIR" >> "$GITHUB_OUTPUT"
+          echo "✅ Package manager: $PM (install dir: $INSTALL_DIR)"
 
       - name: Trivy SCA (before)
         if: steps.skip.outputs.skip != 'true'
@@ -227,6 +238,8 @@ jobs:
           scanners: ${{ inputs.trivy_scanners }}
           skip-dirs: ${{ inputs.trivy_skip_dirs }}
           exit-code: "0"
+          cache: "false"
+          cache-dir: /tmp/trivy-cache
 
       - name: Count findings and skip if clean
         id: findings
@@ -332,6 +345,7 @@ jobs:
         if: steps.skip.outputs.skip != 'true' && steps.findings.outputs.clean != 'true'
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          AUTOFIX_GITHUB_TOKEN: ${{ secrets.AUTOFIX_GITHUB_TOKEN }}
         run: |
           if [[ ! -s "$AUTOFIX_RESULT" ]]; then
             echo "❌ Result file missing"
@@ -340,13 +354,15 @@ jobs:
           fi
           leak=0
           if [[ -n "$LLM_API_KEY" ]] && grep -qF -- "$LLM_API_KEY" "$AUTOFIX_RESULT"; then leak=1; fi
+          if [[ -n "$AUTOFIX_GITHUB_TOKEN" ]] && grep -qF -- "$AUTOFIX_GITHUB_TOKEN" "$AUTOFIX_RESULT"; then leak=1; fi
           while IFS= read -r f; do
             [[ -z "$f" ]] && continue
             if [[ -n "$LLM_API_KEY" && -f "$f" ]] && grep -qF -- "$LLM_API_KEY" "$f"; then leak=1; fi
+            if [[ -n "$AUTOFIX_GITHUB_TOKEN" && -f "$f" ]] && grep -qF -- "$AUTOFIX_GITHUB_TOKEN" "$f"; then leak=1; fi
           done < <(git diff --name-only; git ls-files --others --exclude-standard)
           if [[ "$leak" -eq 1 ]]; then
-            echo "❌ Output contains the LLM API key — refusing to open a PR. Rotate the key."
-            printf '%s\n' "secret leak, rotate the LLM API key" > "$SLACK_MESSAGE_FILE"
+            echo "❌ Output contains a secret — refusing to open a PR. Rotate the leaked credential."
+            printf '%s\n' "secret leak, rotate the leaked credential" > "$SLACK_MESSAGE_FILE"
             exit 1
           fi
 
@@ -354,7 +370,9 @@ jobs:
         if: steps.skip.outputs.skip != 'true' && steps.findings.outputs.clean != 'true'
         env:
           PM: ${{ steps.pkg.outputs.package_manager }}
+          INSTALL_DIR: ${{ steps.pkg.outputs.install_dir }}
         run: |
+          cd "$INSTALL_DIR"
           case "$PM" in
             npm) npm install --ignore-scripts ;;
             yarn) yarn install --ignore-scripts ;;
@@ -404,6 +422,8 @@ jobs:
           scanners: ${{ inputs.trivy_scanners }}
           skip-dirs: ${{ inputs.trivy_skip_dirs }}
           exit-code: "0"
+          cache: "false"
+          cache-dir: /tmp/trivy-cache
 
       - name: Require clean Trivy after fix
         if: steps.skip.outputs.skip != 'true' && steps.findings.outputs.clean != 'true'
@@ -421,16 +441,25 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.AUTOFIX_GITHUB_TOKEN }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          AUTOFIX_GITHUB_TOKEN: ${{ secrets.AUTOFIX_GITHUB_TOKEN }}
           ENGINE: ${{ steps.engine.outputs.engine }}
           MODEL: ${{ steps.engine.outputs.model }}
           BEFORE: ${{ steps.findings.outputs.count }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
+          allowed='^(package\.json|package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$'
+          while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            base="$(basename "$f")"
+            if [[ "$base" =~ $allowed ]]; then
+              git add -- "$f"
+            fi
+          done < <( { git diff --name-only; git ls-files --others --exclude-standard; } | sort -u )
           git diff --cached --quiet && { echo "❌ Nothing to commit"; printf '%s\n' "could not fix (nothing to commit)" > "$SLACK_MESSAGE_FILE"; exit 1; }
-          git commit -m "chore: fix Trivy SCA findings"
-          git push --force origin "HEAD:refs/heads/${AUTOFIX_BRANCH}"
+          git -c core.hooksPath=/dev/null commit --no-verify -m "chore: fix Trivy SCA findings"
+          gh auth setup-git
+          git -c core.hooksPath=/dev/null push --force --no-verify origin "HEAD:refs/heads/${AUTOFIX_BRANCH}"
           EXISTING="$(gh pr list --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" --state open --json number --jq '.[0].number // empty')"
           BODY_FILE=/tmp/pr_body.md
           {
@@ -450,12 +479,17 @@ jobs:
             printf '%s\n' "secret leak, rotate the LLM API key" > "$SLACK_MESSAGE_FILE"
             exit 1
           fi
+          if [[ -n "$AUTOFIX_GITHUB_TOKEN" ]] && grep -qF -- "$AUTOFIX_GITHUB_TOKEN" "$BODY_FILE"; then
+            echo "❌ PR body contains the autofix PAT"
+            printf '%s\n' "secret leak, rotate the autofix PAT" > "$SLACK_MESSAGE_FILE"
+            exit 1
+          fi
           if [[ -z "$EXISTING" ]]; then
             gh pr create --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" \
               --title "chore: fix Trivy SCA findings" \
-              --body-file "$BODY_FILE" \
-              --label trivy-autofix --label security
+              --body-file "$BODY_FILE"
             EXISTING="$(gh pr list --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" --state open --json number --jq '.[0].number')"
+            gh pr edit "$EXISTING" --add-label trivy-autofix --add-label security || true
           else
             gh pr edit "$EXISTING" --body-file "$BODY_FILE"
             gh pr edit "$EXISTING" --add-label trivy-autofix --add-label security || true

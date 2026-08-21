@@ -21,6 +21,7 @@ on:
     paths:
       - '.github/workflows/**'
       - '.github/actions/**'
+      - 'tests/trivy-sca-autofix-contract.sh'
   workflow_dispatch:
 
 permissions:
@@ -108,3 +109,6 @@ jobs:
             exit 1
           fi
           echo "✅ ${#actions[@]} composite action(s) passed"
+
+      - name: Trivy SCA autofix contract
+        run: bash tests/trivy-sca-autofix-contract.sh

@@ -87,7 +87,8 @@ runs:
       uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
       with:
         anthropic_api_key: ${{ inputs.api_key }}
-        show_full_output: true
+        show_full_output: false
+        classify_inline_comments: false
         prompt: |
           REPO: ${{ inputs.repository }}
 

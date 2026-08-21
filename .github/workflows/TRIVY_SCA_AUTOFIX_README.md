@@ -12,7 +12,7 @@ autofix:
   if: failure()
   uses: deriv-com/shared-actions/.github/workflows/trivy-sca-autofix.yml@master
   permissions:
-    contents: write
+    contents: read
     pull-requests: write
   with:
     engine: kimi          # or: anthropic | grok
@@ -31,7 +31,7 @@ Every consumer in this org pins `@master`, so that is the documented policy — 
 | Engine | Runtime | Default model | Notes |
 |--------|---------|---------------|-------|
 | `kimi` | Kimi Code CLI `0.34.0` (npm, pinned) | `kimi-k3` | Default engine |
-| `anthropic` | `anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa` (same SHA as PR review) | `claude-sonnet-5` | Bash denied via `disallowedTools` |
+| `anthropic` | `anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa` (same SHA as PR review) | `claude-sonnet-5` | Bash denied via `disallowedTools`; `show_full_output: false` |
 | `grok` | Grok Build CLI `1.0.5` (npm, pinned) | `grok-4.6` | `workspace-write` sandbox; Bash denied |
 
 Switching engines is one input: `engine:`. To add a new engine, create `.github/actions/ai_sca_engine_<name>/action.yml`, add a `case` arm in the resolve step, and an `if:`-gated `uses:` dispatch step.
@@ -60,7 +60,7 @@ Switching engines is one input: `engine:`. To add a new engine, create `.github/
 | Secret | Description | Required |
 |--------|-------------|----------|
 | `LLM_API_KEY` | LiteLLM virtual key for the selected engine | ✅ |
-| `AUTOFIX_GITHUB_TOKEN` | GitHub PAT with `contents:write` and `pull-requests:write` that **triggers workflows** on the new PR — `GITHUB_TOKEN` would not | ✅ |
+| `AUTOFIX_GITHUB_TOKEN` | GitHub PAT with `contents:write` and `pull-requests:write` that **triggers workflows** on the new PR — `GITHUB_TOKEN` would not. The job token only needs `contents: read`; push and PR creation use this PAT via `GH_TOKEN`. | ✅ |
 | `SLACK_WEBHOOK_URL` | Slack incoming webhook for all outcomes | ✅ |
 
 ## Behaviour
@@ -68,9 +68,13 @@ Switching engines is one input: `engine:`. To add a new engine, create `.github/
 - **Loop skip** — If the run is on branch `chore/trivy-sca-autofix`, head ref `chore/trivy-sca-autofix`, or the PR has label `trivy-autofix`, the job exits early (prevents infinite loops when Trivy fails on the autofix PR itself).
 - **Clean master** — When Trivy finds zero findings at the configured severity on `base_branch`, Slack reports `nothing to do` (`master` already clean) and no PR is opened.
 - **Singleton branch** — All fixes land on `chore/trivy-sca-autofix`. A second failure while that PR is open force-pushes the same branch and updates the existing PR.
-- **JS only** — npm, Yarn Classic, or pnpm lockfiles. Yarn Berry (`.yarnrc.yml`) is rejected. No lockfile generation.
-- **Safe install** — Lockfile refresh runs with `--ignore-scripts`.
-- **Allowlist** — Only `package.json`, `package-lock.json`, `yarn.lock`, and `pnpm-lock.yaml` may change.
+- **JS only** — npm, Yarn Classic, or pnpm lockfiles. Yarn Berry (`.yarnrc.yml` in the install directory) is rejected. No lockfile generation. Nested lockfiles install from their directory, not always repo root.
+- **Safe install** — Lockfile refresh runs with `--ignore-scripts` in the detected install directory (`corepack enable` ensures yarn/pnpm are on PATH).
+- **Allowlist** — Only `package.json`, `package-lock.json`, `yarn.lock`, and `pnpm-lock.yaml` may change. Commit stages only those paths (never `git add -A`).
+- **Trivy cache** — Scans disable Trivy action caching and use `/tmp/trivy-cache` so cache files are not mistaken for extra repo changes.
+- **PAT isolation** — Checkout uses `persist-credentials: false`; the PAT is not written to `.git/config`. `gh auth setup-git` re-authenticates immediately before push.
+- **Hook bypass** — Commit and push use `core.hooksPath=/dev/null` and `--no-verify` so consumer `.git/hooks` cannot run with secrets in env.
+- **Labels best-effort** — PRs are created without `--label`; `trivy-autofix` and `security` are added afterward with `|| true` so missing repo labels do not fail after a force-push.
 - **Fail closed** — A second Trivy scan must pass before a PR is opened. If findings remain, the job fails and Slack reports the count.
 - **No auto-merge** — The workflow opens or updates a PR only; it never merges.
 - **Slack** — Every outcome (skip, clean master, PR opened/updated, failure) posts to the webhook via `if: always()`.
@@ -78,7 +82,7 @@ Switching engines is one input: `engine:`. To add a new engine, create `.github/
 ## Manual test plan
 
 1. **Feature PR Trivy red, `master` clean** — Trigger autofix; expect Slack `nothing to do`, no PR.
-2. **Feature PR Trivy red, `master` dirty** — Expect one PR to `master` on `chore/trivy-sca-autofix` with labels `trivy-autofix` and `security`; CI runs on the new PR (PAT must trigger workflows).
+2. **Feature PR Trivy red, `master` dirty** — Expect one PR to `master` on `chore/trivy-sca-autofix`; labels `trivy-autofix` and `security` are added when they exist; CI runs on the new PR (PAT must trigger workflows).
 3. **Second failure while that PR is open** — Same PR updated (force-push + body edit), not a second PR.
 4. **Trivy failure on the autofix PR** — Loop skip; no new remediation PR.
 5. **Repeat the dirty-master case with `engine: anthropic` and `engine: grok`** — Same PR shape; engine and model appear in the PR body.
