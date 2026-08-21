@@ -447,18 +447,23 @@ jobs:
           BEFORE: ${{ steps.findings.outputs.count }}
           REPO: ${{ github.repository }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          command -v /usr/bin/git >/dev/null || { echo "❌ /usr/bin/git not found"; exit 1; }
+          command -v /usr/bin/gh >/dev/null || { echo "❌ /usr/bin/gh not found"; exit 1; }
+          unset GIT_CONFIG_COUNT
+          while IFS= read -r name; do unset "$name"; done < <(compgen -v | grep -E '^GIT_CONFIG_(KEY|VALUE)_' || true)
+          unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy GH_HOST
+          /usr/bin/git config user.name "github-actions[bot]"
+          /usr/bin/git config user.email "github-actions[bot]@users.noreply.github.com"
           allowed='^(package\.json|package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$'
           while IFS= read -r f; do
             [[ -z "$f" ]] && continue
             base="$(basename "$f")"
             if [[ "$base" =~ $allowed ]]; then
-              git add -- "$f"
+              /usr/bin/git add -- "$f"
             fi
-          done < <( { git diff --name-only; git ls-files --others --exclude-standard; } | sort -u )
-          git diff --cached --quiet && { echo "❌ Nothing to commit"; printf '%s\n' "could not fix (nothing to commit)" > "$SLACK_MESSAGE_FILE"; exit 1; }
-          git -c core.hooksPath=/dev/null commit --no-verify -m "chore: fix Trivy SCA findings"
+          done < <( { /usr/bin/git diff --name-only; /usr/bin/git ls-files --others --exclude-standard; } | sort -u )
+          /usr/bin/git diff --cached --quiet && { echo "❌ Nothing to commit"; printf '%s\n' "could not fix (nothing to commit)" > "$SLACK_MESSAGE_FILE"; exit 1; }
+          /usr/bin/git -c core.hooksPath=/dev/null commit --no-verify -m "chore: fix Trivy SCA findings"
           if ! [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
             echo "❌ Invalid repository name: '$REPO'"
             printf '%s\n' "could not fix (invalid repository name)" > "$SLACK_MESSAGE_FILE"
@@ -473,13 +478,13 @@ jobs:
           	url = https://github.com/${REPO}.git
           	fetch = +refs/heads/*:refs/remotes/origin/*
           EOF
-          git remote set-url origin "https://github.com/${REPO}.git"
+          /usr/bin/git remote set-url origin "https://github.com/${REPO}.git"
           export GIT_CONFIG_NOSYSTEM=1
           export GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_CONFIG_GLOBAL=/dev/null
-          gh auth setup-git
-          git -c core.hooksPath=/dev/null push --force --no-verify origin "HEAD:refs/heads/${AUTOFIX_BRANCH}"
-          EXISTING="$(gh pr list --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" --state open --json number --jq '.[0].number // empty')"
+          export GIT_CONFIG_GLOBAL="$(mktemp)"
+          /usr/bin/git config --local credential.https://github.com.helper '!/usr/bin/gh auth git-credential'
+          /usr/bin/git -c core.hooksPath=/dev/null push --force --no-verify origin "HEAD:refs/heads/${AUTOFIX_BRANCH}"
+          EXISTING="$(/usr/bin/gh pr list --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" --state open --json number --jq '.[0].number // empty')"
           BODY_FILE=/tmp/pr_body.md
           {
             echo "## Trivy SCA autofix"
@@ -504,16 +509,16 @@ jobs:
             exit 1
           fi
           if [[ -z "$EXISTING" ]]; then
-            gh pr create --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" \
+            /usr/bin/gh pr create --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" \
               --title "chore: fix Trivy SCA findings" \
               --body-file "$BODY_FILE"
-            EXISTING="$(gh pr list --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" --state open --json number --jq '.[0].number')"
-            gh pr edit "$EXISTING" --add-label trivy-autofix --add-label security || true
+            EXISTING="$(/usr/bin/gh pr list --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" --state open --json number --jq '.[0].number')"
+            /usr/bin/gh pr edit "$EXISTING" --add-label trivy-autofix --add-label security || true
           else
-            gh pr edit "$EXISTING" --body-file "$BODY_FILE"
-            gh pr edit "$EXISTING" --add-label trivy-autofix --add-label security || true
+            /usr/bin/gh pr edit "$EXISTING" --body-file "$BODY_FILE"
+            /usr/bin/gh pr edit "$EXISTING" --add-label trivy-autofix --add-label security || true
           fi
-          URL="$(gh pr view "$EXISTING" --json url --jq .url)"
+          URL="$(/usr/bin/gh pr view "$EXISTING" --json url --jq .url)"
           printf '%s\n' "PR opened/updated: $URL (engine \`$ENGINE\` / \`$MODEL\`, cleared $BEFORE findings)" > "$SLACK_MESSAGE_FILE"
           echo "✅ $URL"
 

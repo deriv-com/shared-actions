@@ -105,8 +105,13 @@ if [[ -f "$WF" ]]; then
   check 'grep -q "REPO:" "$WF" && grep -q "github.repository" "$WF"' "commit step passes github.repository via env"
   check 'grep -q "\.git/config" "$WF"' "commit step rewrites .git/config before PAT push"
   check 'grep -q "https://github.com/\${REPO}.git" "$WF"' "commit step sets origin to github.com REPO"
-  check 'grep -q "gh auth setup-git" "$WF"' "commit step runs gh auth setup-git before push"
   check 'grep -q "GIT_CONFIG_GLOBAL" "$WF"' "commit step ignores global gitconfig on PAT push"
+  check '! grep -q "GIT_CONFIG_GLOBAL=/dev/null" "$WF"' "global gitconfig is writable (not /dev/null)"
+  check 'grep -q "mktemp" "$WF"' "commit step uses mktemp for global gitconfig"
+  check 'grep -q "/usr/bin/git" "$WF"' "commit step pins /usr/bin/git"
+  check 'grep -q "/usr/bin/gh" "$WF"' "commit step pins /usr/bin/gh"
+  check 'grep -q "unset.*GH_HOST" "$WF"' "commit step unsets GH_HOST"
+  check 'grep -q "credential.https://github.com.helper" "$WF"' "commit step sets local gh credential helper"
 fi
 
 DOC="$ROOT/.github/workflows/TRIVY_SCA_AUTOFIX_README.md"
