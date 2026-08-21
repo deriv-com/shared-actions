@@ -101,6 +101,9 @@ if [[ -f "$WF" ]]; then
   check 'grep -q "contents: read" "$WF"' "job contents permission is read"
   check 'grep -q "install_dir" "$WF"' "detect package manager outputs install_dir"
   check 'grep -q "corepack enable" "$WF"' "corepack enabled after setup-node"
+  check 'grep -q "remote set-url origin" "$WF"' "commit step resets remote.origin before PAT push"
+  check 'grep -q "REPO:" "$WF" && grep -q "github.repository" "$WF"' "commit step passes github.repository via env"
+  check 'grep -q "get-regexp" "$WF"' "commit step clears url.insteadOf keys"
 fi
 
 DOC="$ROOT/.github/workflows/TRIVY_SCA_AUTOFIX_README.md"

@@ -445,6 +445,7 @@ jobs:
           ENGINE: ${{ steps.engine.outputs.engine }}
           MODEL: ${{ steps.engine.outputs.model }}
           BEFORE: ${{ steps.findings.outputs.count }}
+          REPO: ${{ github.repository }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -458,6 +459,20 @@ jobs:
           done < <( { git diff --name-only; git ls-files --others --exclude-standard; } | sort -u )
           git diff --cached --quiet && { echo "❌ Nothing to commit"; printf '%s\n' "could not fix (nothing to commit)" > "$SLACK_MESSAGE_FILE"; exit 1; }
           git -c core.hooksPath=/dev/null commit --no-verify -m "chore: fix Trivy SCA findings"
+          if ! [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+            echo "❌ Invalid repository name: '$REPO'"
+            printf '%s\n' "could not fix (invalid repository name)" > "$SLACK_MESSAGE_FILE"
+            exit 1
+          fi
+          git remote set-url origin "https://github.com/${REPO}.git"
+          git config --local --unset-all http.proxy || true
+          git config --local --unset-all https.proxy || true
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          while IFS= read -r line; do
+            key="${line%% *}"
+            [[ -z "$key" ]] && continue
+            git config --local --unset-all "$key" || true
+          done < <(git config --local --get-regexp '^url\.' 2>/dev/null || true)
           gh auth setup-git
           git -c core.hooksPath=/dev/null push --force --no-verify origin "HEAD:refs/heads/${AUTOFIX_BRANCH}"
           EXISTING="$(gh pr list --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" --state open --json number --jq '.[0].number // empty')"
