@@ -71,6 +71,26 @@ if [[ -f "$GROK" ]]; then
   check 'grep -q "deny Bash" "$GROK" || grep -q "--deny Bash" "$GROK"' "grok SCA denies Bash"
 fi
 
+WF="$ROOT/.github/workflows/trivy-sca-autofix.yml"
+check '[[ -f "$WF" ]]' "trivy-sca-autofix.yml exists"
+if [[ -f "$WF" ]]; then
+  check 'grep -q "workflow_call:" "$WF"' "workflow is reusable"
+  check 'grep -q "engine:" "$WF"' "workflow has engine input"
+  check 'python3 -c "import pathlib,sys; t=pathlib.Path(\"$WF\").read_text(); sys.exit(0 if all(x in t for x in [\"kimi)\", \"anthropic)\", \"grok)\"]) else 1)"' "resolve case has kimi, anthropic, grok"
+  check 'grep -q "ai_sca_engine_kimi@master" "$WF"' "kimi dispatch pinned at master"
+  check 'grep -q "ai_sca_engine_anthropic@master" "$WF"' "anthropic dispatch pinned at master"
+  check 'grep -q "ai_sca_engine_grok@master" "$WF"' "grok dispatch pinned at master"
+  check 'grep -q "trivy_sca_autofix_prompt@master" "$WF"' "prompt composite pinned at master"
+  check 'grep -q "send_slack_notification@master" "$WF"' "slack action pinned at master"
+  check 'grep -q "ed142fd0673e97e23eac54620cfb913e5ce36c25" "$WF"' "trivy-action SHA pinned"
+  check 'grep -q "d23441a48e516b6c34aea4fa41551a30e30af803" "$WF"' "checkout SHA pinned"
+  check 'grep -q "chore/trivy-sca-autofix" "$WF"' "singleton branch name"
+  check 'grep -q "ignore-scripts" "$WF"' "install uses ignore-scripts"
+  check 'grep -q "AUTOFIX_GITHUB_TOKEN" "$WF"' "PAT secret declared"
+  check '! grep -nE "ref:.*pull_request.head" "$WF"' "does not checkout PR head"
+  check 'grep -q "GITHUB_TOKEN:" "$WF"' "engine dispatch mentions GITHUB_TOKEN (cleared to empty)"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "contract checks failed"
   exit 1
