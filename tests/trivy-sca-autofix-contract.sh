@@ -106,6 +106,7 @@ if [[ -f "$WF" ]]; then
   check 'grep -q "\.git/config" "$WF"' "commit step rewrites .git/config before PAT push"
   check 'grep -q "https://github.com/\${REPO}.git" "$WF"' "commit step sets origin to github.com REPO"
   check 'grep -q "gh auth setup-git" "$WF"' "commit step runs gh auth setup-git before push"
+  check 'grep -q "GIT_CONFIG_GLOBAL" "$WF"' "commit step ignores global gitconfig on PAT push"
 fi
 
 DOC="$ROOT/.github/workflows/TRIVY_SCA_AUTOFIX_README.md"

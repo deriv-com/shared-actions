@@ -474,6 +474,9 @@ jobs:
           	fetch = +refs/heads/*:refs/remotes/origin/*
           EOF
           git remote set-url origin "https://github.com/${REPO}.git"
+          export GIT_CONFIG_NOSYSTEM=1
+          export GIT_CONFIG_SYSTEM=/dev/null
+          export GIT_CONFIG_GLOBAL=/dev/null
           gh auth setup-git
           git -c core.hooksPath=/dev/null push --force --no-verify origin "HEAD:refs/heads/${AUTOFIX_BRANCH}"
           EXISTING="$(gh pr list --base "$BASE_BRANCH" --head "$AUTOFIX_BRANCH" --state open --json number --jq '.[0].number // empty')"
