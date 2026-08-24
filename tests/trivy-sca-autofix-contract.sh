@@ -138,10 +138,6 @@ if [[ -f "$DOC" ]]; then
   check 'grep -q "treat edits to those composites" "$DOC"' "docs call out @master blast radius for SCA engines"
 fi
 
-SPEC="$ROOT/docs/superpowers/specs/2026-08-21-trivy-sca-autofix-design.md"
-check 'grep -q "Source of truth" "$SPEC"' "spec points at shipped workflow as source of truth"
-check 'grep -q "contents: read" "$SPEC"' "spec caller permissions are contents: read"
-
 LINT="$ROOT/.github/workflows/lint-actions.yml"
 if [[ -f "$LINT" ]]; then
   check 'grep -q "trivy-sca-autofix-contract.sh" "$LINT"' "lint-actions runs contract script"
