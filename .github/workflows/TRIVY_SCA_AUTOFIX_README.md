@@ -70,9 +70,9 @@ Switching engines is one input: `engine:`. To add a new engine, create `.github/
 - **Singleton branch** — All fixes land on `chore/trivy-sca-autofix`. A second failure while that PR is open force-pushes the same branch and updates the existing PR.
 - **JS only** — npm, Yarn Classic, or pnpm lockfiles. Yarn Berry (`.yarnrc.yml` in the install directory) is rejected. No lockfile generation. Nested lockfiles install from their directory, not always repo root.
 - **Safe install** — Lockfile refresh runs with `--ignore-scripts` in the detected install directory (`corepack enable` ensures yarn/pnpm are on PATH).
-- **Allowlist** — Only `package.json`, `package-lock.json`, `yarn.lock`, and `pnpm-lock.yaml` may change. Commit stages only those paths (never `git add -A`).
+- **Allowlist** — Only `package.json`, `package-lock.json`, `yarn.lock`, and `pnpm-lock.yaml` may change. Tracked files the engine stripped (for example `AGENTS.md`) are restored before the gate. Commit stages only allowlisted paths (never `git add -A`).
 - **Trivy cache** — Scans disable Trivy action caching and use `/tmp/trivy-cache` so cache files are not mistaken for extra repo changes.
-- **PAT isolation** — Checkout uses `persist-credentials: false`; the PAT is not written to `.git/config`. `gh auth setup-git` re-authenticates immediately before push.
+- **PAT isolation** — Checkout uses the job `GITHUB_TOKEN` with `persist-credentials: false` (no write PAT on fetch). Push and `gh` run under `env -i` with `/usr/bin/git` / `/usr/bin/gh` and a local `gh` credential helper.
 - **Hook bypass** — Commit and push use `core.hooksPath=/dev/null` and `--no-verify` so consumer `.git/hooks` cannot run with secrets in env.
 - **Labels best-effort** — PRs are created without `--label`; `trivy-autofix` and `security` are added afterward with `|| true` so missing repo labels do not fail after a force-push.
 - **Fail closed** — A second Trivy scan must pass before a PR is opened. If findings remain, the job fails and Slack reports the count.

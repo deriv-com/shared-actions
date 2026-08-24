@@ -231,6 +231,7 @@ runs:
         rm -f "$OUTPUT_PATH"
         BEFORE=$(git status --porcelain)
         REVIEW_PROMPT="$(cat /tmp/sca_prompt.txt)"
+        OUT_DIR="$(dirname "$OUTPUT_PATH")"
         for attempt in 1 2; do
           grok --no-alt-screen \
             --permission-mode dontAsk \
@@ -242,8 +243,8 @@ runs:
             --disallowed-tools Bash,WebFetch,WebSearch \
             --allow Read \
             --allow Grep \
-            --allow "Write(/tmp/*)" \
-            --allow "Edit(/tmp/*)" \
+            --allow "Write(${OUT_DIR}/*)" \
+            --allow "Edit(${OUT_DIR}/*)" \
             --allow "Write(package.json)" \
             --allow "Write(**/package.json)" \
             --allow "Write(package-lock.json)" \

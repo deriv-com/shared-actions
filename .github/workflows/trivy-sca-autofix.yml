@@ -167,7 +167,6 @@ jobs:
         with:
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
-          token: ${{ secrets.AUTOFIX_GITHUB_TOKEN }}
           persist-credentials: false
 
       - name: Strip checkout extraheader
@@ -388,6 +387,16 @@ jobs:
         if: steps.skip.outputs.skip != 'true' && steps.findings.outputs.clean != 'true'
         run: |
           allowed='^(package\.json|package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$'
+          # Engines delete tracked agent-config files (AGENTS.md, CLAUDE.md, …)
+          # so those deletions do not trip this gate or land in the PR.
+          while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            base="$(basename "$f")"
+            if [[ ! "$base" =~ $allowed ]]; then
+              git checkout -- "$f" 2>/dev/null || true
+            fi
+          done < <(git diff --name-only)
+          echo "✅ Restored non-allowlisted tracked paths"
           extra=0
           while IFS= read -r f; do
             [[ -z "$f" ]] && continue

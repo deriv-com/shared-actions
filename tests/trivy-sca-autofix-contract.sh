@@ -70,6 +70,8 @@ if [[ -f "$GROK" ]]; then
   check '! grep -q "GROK_SANDBOX: read-only" "$GROK"' "grok SCA does not use read-only sandbox"
   check 'grep -q "Grok SCA engine" "$GROK"' "grok SCA failures are engine-named"
   check 'grep -q "deny Bash" "$GROK" || grep -q "--deny Bash" "$GROK"' "grok SCA denies Bash"
+  check 'grep -qF '\''Write(${OUT_DIR}/*)'\'' "$GROK"' "grok SCA Write allow matches output_path dir"
+  check 'grep -qF '\''Edit(${OUT_DIR}/*)'\'' "$GROK"' "grok SCA Edit allow matches output_path dir"
 fi
 
 WF="$ROOT/.github/workflows/trivy-sca-autofix.yml"
@@ -94,6 +96,8 @@ if [[ -f "$WF" ]]; then
   check 'grep -c "cache-dir: /tmp/trivy-cache" "$WF" | grep -qx 2' "both trivy steps use /tmp/trivy-cache"
   check 'grep -q "cache: \"false\"" "$WF"' "trivy cache disabled"
   check 'grep -q "persist-credentials: false" "$WF"' "checkout does not persist PAT"
+  check '! grep -q "token: \${{ secrets.AUTOFIX_GITHUB_TOKEN }}" "$WF"' "checkout does not pass the write PAT"
+  check 'grep -q "Restored non-allowlisted tracked paths" "$WF"' "allowlist restores engine-stripped tracked files"
   check '! grep -q "git add -A" "$WF"' "commit step does not git add -A"
   check 'grep -q "core.hooksPath=/dev/null" "$WF"' "commit/push bypass consumer hooks"
   check 'grep -q "commit --no-verify" "$WF"' "commit uses --no-verify"
@@ -127,6 +131,7 @@ if [[ -f "$DOC" ]]; then
   check 'grep -q "engine:" "$DOC"' "docs show engine switch"
   check 'grep -q "nothing to do" "$DOC"' "docs include the clean-master case"
   check 'grep -q "chore/trivy-sca-autofix" "$DOC"' "docs name the singleton branch"
+  check '! grep -q "gh auth setup-git" "$DOC"' "docs do not mention gh auth setup-git"
 fi
 
 LINT="$ROOT/.github/workflows/lint-actions.yml"
