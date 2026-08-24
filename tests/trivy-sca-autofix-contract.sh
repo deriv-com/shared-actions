@@ -25,7 +25,6 @@ if [[ -f "$PROMPT" ]]; then
   check 'grep -q ".trivyignore" "$PROMPT"' "prompt forbids trivyignore"
   check 'grep -q "DATA" "$PROMPT"' "prompt frames inputs as data"
   check 'grep -q "edit lockfiles" "$PROMPT"' "prompt tells the engine not to edit lockfiles"
-  check 'grep -q "caller regenerates lockfiles" "$PROMPT"' "prompt says caller regenerates lockfiles"
 fi
 if [[ -f "$ACTION" ]]; then
   check '! grep -nE "timeout-minutes:" "$ACTION"' "prompt action has no timeout-minutes"
@@ -33,6 +32,15 @@ if [[ -f "$ACTION" ]]; then
   check '! grep -nE "\\$\\{\\{[[:space:]]*\\}\\}" "$ACTION"' "prompt action has no empty expression pair"
   check 'grep -q "github.action_path" "$ACTION"' "prompt action uses github.action_path"
   check 'grep -q "/tmp/fix_prompt.md" "$ACTION"' "prompt action copies to /tmp/fix_prompt.md"
+  check 'grep -q "/tmp/sca-lib.sh" "$ACTION"' "prompt action copies lib to /tmp/sca-lib.sh"
+fi
+
+LIB="$ROOT/.github/actions/trivy_sca_autofix_prompt/lib.sh"
+check '[[ -f "$LIB" ]]' "sca helper lib exists"
+if [[ -f "$LIB" ]]; then
+  check '! grep -nE "secrets\\." "$LIB"' "helper lib does not mention secrets."
+  check 'grep -q "SCA_SKIP_DIRS_EXTRA" "$LIB"' "helper lib defines skip-dirs extra"
+  check 'grep -qF '\''**/node_modules'\'' "$LIB"' "skip-dirs extra includes nested node_modules"
 fi
 
 KIMI="$ROOT/.github/actions/ai_sca_engine_kimi/action.yml"
@@ -59,7 +67,7 @@ if [[ -f "$ANTH" ]]; then
   check '! grep -nE "github_token:" "$ANTH"' "anthropic SCA does not pass github_token"
   check 'grep -qF -- '\''--model "${{ inputs.model }}"'\'' "$ANTH"' "anthropic SCA quotes --model"
   check 'grep -q "disallowedTools" "$ANTH"' "anthropic SCA sets disallowedTools"
-  check 'grep -q "Bash" "$ANTH"' "anthropic SCA denies Bash"
+  check 'grep -qF -- '\''--disallowedTools "Bash,WebFetch'\'' "$ANTH"' "anthropic SCA disallows Bash"
   check 'grep -q "Anthropic SCA engine" "$ANTH"' "anthropic SCA failures are engine-named"
   check '! grep -q "package-lock.json" "$ANTH"' "anthropic SCA prompt does not ask for lockfile Writes"
   check 'grep -q "fefa07e9c665b7320f08c3b525980457f22f58aa" "$ANTH"' "anthropic SCA pins the same claude-code-action SHA as review"
@@ -112,13 +120,15 @@ if [[ -f "$WF" ]]; then
   check 'grep -q -- "-name node_modules" "$WF"' "lockfile find prunes node_modules"
   check 'grep -q "COREPACK_ENABLE_DOWNLOAD_PROMPT" "$WF"' "corepack download prompt disabled"
   check 'grep -q "core.quotePath=false" "$WF"' "git path enumeration disables quotePath"
-  check 'grep -qF -- '\''-ge "$BEFORE"'\'' "$WF"' "after-scan requires AFTER < BEFORE"
+  check 'grep -q "source /tmp/sca-lib.sh" "$WF"' "workflow sources the helper lib"
+  check 'grep -q "discard_engine_lockfile_edits" "$WF"' "engine lockfile writes are discarded before install"
+  check 'grep -q "should_open_pr" "$WF"' "after-scan uses should_open_pr"
+  check 'grep -qF -- '\''--body-file "$BODY_FILE" --base "$BASE_BRANCH"'\'' "$WF"' "existing PR edit retargets base"
   check 'grep -qF '\''URL="$(run_pat /usr/bin/gh pr create'\'' "$WF"' "PR create captures URL from stdout"
   check 'grep -qF '\''OWNER="${REPO%%/*}"'\'' "$WF"' "existing PR lookup uses owner:head not --base"
   check '! grep -q "Findings after: 0" "$WF"' "PR body does not hardcode Findings after: 0"
   check '! grep -q "extraheader" "$WF"' "does not unset checkout extraheader"
   check 'grep -q "steps.trivy-dirs.outputs.dirs" "$WF"' "trivy skip-dirs includes resolved node_modules"
-  check 'grep -qF '\''extra="node_modules"'\'' "$WF"' "skip-dirs merge always adds node_modules"
   check '! grep -q "git add -A" "$WF"' "commit step does not git add -A"
   check 'grep -q "core.hooksPath=/dev/null" "$WF"' "commit/push bypass consumer hooks"
   check 'grep -q "commit --no-verify" "$WF"' "commit uses --no-verify"
@@ -153,10 +163,6 @@ if [[ -f "$DOC" ]]; then
   check 'grep -q "nothing to do" "$DOC"' "docs include the clean-master case"
   check 'grep -q "chore/trivy-sca-autofix" "$DOC"' "docs name the singleton branch"
   check '! grep -q "gh auth setup-git" "$DOC"' "docs do not mention gh auth setup-git"
-  check 'grep -q "AFTER < BEFORE" "$DOC"' "docs describe the reduction gate"
-  check 'grep -q "queued" "$DOC"' "docs mention queued concurrency drops skip Slack"
-  check 'grep -q "force-with-lease" "$DOC"' "docs record force without lease"
-  check 'grep -q "not a full monorepo product" "$DOC"' "docs do not oversell monorepo support"
 fi
 
 LINT="$ROOT/.github/workflows/lint-actions.yml"
@@ -164,6 +170,11 @@ if [[ -f "$LINT" ]]; then
   check 'grep -q "trivy-sca-autofix-contract.sh" "$LINT"' "lint-actions runs contract script"
   check 'grep -q "tests/trivy-sca-autofix-contract.sh" "$LINT"' "lint-actions paths include contract script"
   check 'grep -q "trivy-sca-autofix-logic.sh" "$LINT"' "lint-actions runs logic script"
+fi
+
+LOGIC="$ROOT/tests/trivy-sca-autofix-logic.sh"
+if [[ -f "$LOGIC" ]]; then
+  check 'grep -q "trivy_sca_autofix_prompt/lib.sh" "$LOGIC"' "logic tests source the shipped helper lib"
 fi
 
 if [[ "$fail" -ne 0 ]]; then

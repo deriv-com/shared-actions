@@ -96,6 +96,9 @@ jobs:
       - name: Initialise Slack message
         run: printf '%s\n' "could not fix (job failed)" > "$SLACK_MESSAGE_FILE"
 
+      - name: Copy autofix playbook
+        uses: deriv-com/shared-actions/.github/actions/trivy_sca_autofix_prompt@master
+
       - name: Loop skip
         id: skip
         env:
@@ -103,7 +106,8 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: |
-          if [[ "$REF" == "refs/heads/${AUTOFIX_BRANCH}" || "$HEAD_REF" == "$AUTOFIX_BRANCH" || ",${PR_LABELS}," == *",trivy-autofix,"* ]]; then
+          source /tmp/sca-lib.sh
+          if should_loop_skip "$REF" "${HEAD_REF:-}" "${PR_LABELS:-}" "$AUTOFIX_BRANCH"; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             printf '%s\n' "skipped (autofix PR)" > "$SLACK_MESSAGE_FILE"
             echo "⏭️ Loop skip — this is the autofix branch/PR"
@@ -122,7 +126,13 @@ jobs:
           CLI_VERSION_INPUT: ${{ inputs.cli_version }}
           PROVIDER_TYPE_INPUT: ${{ inputs.provider_type }}
         run: |
-          ENGINE="${ENGINE_INPUT:-kimi}"
+          source /tmp/sca-lib.sh
+          ENGINE="$(normalize_engine "${ENGINE_INPUT:-}")" || {
+            echo "❌ Unknown engine: '${ENGINE_INPUT:-}'"
+            echo "   Supported values for the engine input: kimi, anthropic, grok"
+            printf '%s\n' "could not fix (bad input: unknown engine)" > "$SLACK_MESSAGE_FILE"
+            exit 1
+          }
           case "$ENGINE" in
             kimi)
               DEFAULT_MODEL="kimi-k3"
@@ -169,10 +179,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Copy autofix playbook
-        if: steps.skip.outputs.skip != 'true'
-        uses: deriv-com/shared-actions/.github/actions/trivy_sca_autofix_prompt@master
-
       - name: Set up Node.js
         if: steps.skip.outputs.skip != 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -190,25 +196,9 @@ jobs:
         if: steps.skip.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          detect_in() {
-            local d="$1"
-            if [[ -f "$d/pnpm-lock.yaml" ]]; then echo pnpm; return; fi
-            if [[ -f "$d/yarn.lock" ]]; then echo yarn; return; fi
-            if [[ -f "$d/package-lock.json" ]]; then echo npm; return; fi
-            echo ""
-          }
+          source /tmp/sca-lib.sh
           LOCK_DIRS_FILE="$(mktemp)"
-          find . \( -name .git -o -name node_modules \) -prune -o -type f \
-            \( -name pnpm-lock.yaml -o -name yarn.lock -o -name package-lock.json \) -print |
-            sed 's|^\./||' |
-            awk 'NF { n=split($0, a, "/"); printf "%d\t%s\n", n, $0 }' |
-            sort -n -k1,1 -k2,2 |
-            cut -f2- |
-            while IFS= read -r f; do
-              [[ -z "$f" ]] && continue
-              dirname -- "$f"
-            done |
-            awk 'NF && !seen[$0]++' > "$LOCK_DIRS_FILE"
+          collect_lockfile_dirs > "$LOCK_DIRS_FILE"
           if [[ ! -s "$LOCK_DIRS_FILE" ]]; then
             if [[ -f package.json ]]; then
               echo "❌ package.json present but no lockfile — v1 will not generate one"
@@ -250,12 +240,8 @@ jobs:
         env:
           USER_SKIP: ${{ inputs.trivy_skip_dirs }}
         run: |
-          extra="node_modules"
-          if [[ -n "$USER_SKIP" ]]; then
-            echo "dirs=${USER_SKIP},${extra}" >> "$GITHUB_OUTPUT"
-          else
-            echo "dirs=${extra}" >> "$GITHUB_OUTPUT"
-          fi
+          source /tmp/sca-lib.sh
+          echo "dirs=$(merge_trivy_skip_dirs "${USER_SKIP:-}")" >> "$GITHUB_OUTPUT"
 
       - name: Trivy SCA (before)
         if: steps.skip.outputs.skip != 'true'
@@ -410,19 +396,19 @@ jobs:
             exit 1
           fi
 
+      - name: Discard engine lockfile edits
+        if: steps.skip.outputs.skip != 'true' && steps.findings.outputs.clean != 'true'
+        run: |
+          source /tmp/sca-lib.sh
+          discard_engine_lockfile_edits
+
       - name: Trusted lockfile refresh
         if: steps.skip.outputs.skip != 'true' && steps.findings.outputs.clean != 'true'
         env:
           INSTALL_DIRS: ${{ steps.pkg.outputs.install_dirs }}
         run: |
           set -euo pipefail
-          detect_in() {
-            local d="$1"
-            if [[ -f "$d/pnpm-lock.yaml" ]]; then echo pnpm; return; fi
-            if [[ -f "$d/yarn.lock" ]]; then echo yarn; return; fi
-            if [[ -f "$d/package-lock.json" ]]; then echo npm; return; fi
-            echo ""
-          }
+          source /tmp/sca-lib.sh
           while IFS= read -r d; do
             [[ -z "$d" ]] && continue
             PM="$(detect_in "$d")"
@@ -457,18 +443,13 @@ jobs:
       - name: Allowlist changed files
         if: steps.skip.outputs.skip != 'true' && steps.findings.outputs.clean != 'true'
         run: |
-          allowed='^(package\.json|package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$'
-          under_node_modules() {
-            local f="$1"
-            [[ "$f" == node_modules || "$f" == node_modules/* || "$f" == */node_modules || "$f" == */node_modules/* ]]
-          }
+          source /tmp/sca-lib.sh
           # Engines delete tracked agent-config files (AGENTS.md, CLAUDE.md, …)
           # so those deletions do not trip this gate or land in the PR.
           while IFS= read -r f; do
             [[ -z "$f" ]] && continue
             under_node_modules "$f" && continue
-            base="$(basename "$f")"
-            if [[ ! "$base" =~ $allowed ]]; then
+            if ! is_allowlisted "$f"; then
               git -c core.quotePath=false checkout -- "$f" 2>/dev/null || true
             fi
           done < <(git -c core.quotePath=false diff --name-only)
@@ -476,8 +457,7 @@ jobs:
           while IFS= read -r f; do
             [[ -z "$f" ]] && continue
             under_node_modules "$f" && continue
-            base="$(basename "$f")"
-            if [[ ! "$base" =~ $allowed ]]; then
+            if ! is_allowlisted "$f"; then
               echo "❌ Extra file: $f"
               extra=1
             fi
@@ -518,15 +498,11 @@ jobs:
         env:
           BEFORE: ${{ steps.findings.outputs.count }}
         run: |
+          source /tmp/sca-lib.sh
           AFTER="$(jq '[.Results[]? | .Vulnerabilities[]?] | length' /tmp/trivy-after.json)"
           echo "count=$AFTER" >> "$GITHUB_OUTPUT"
           echo "📊 Trivy findings after fix: $AFTER (was $BEFORE)"
-          if ! [[ "$AFTER" =~ ^[0-9]+$ ]] || ! [[ "$BEFORE" =~ ^[0-9]+$ ]]; then
-            echo "❌ Could not parse finding counts"
-            printf '%s\n' "could not fix (invalid finding count)" > "$SLACK_MESSAGE_FILE"
-            exit 1
-          fi
-          if [[ "$AFTER" -ge "$BEFORE" ]]; then
+          if ! should_open_pr "$BEFORE" "$AFTER"; then
             echo "❌ Gate not reduced — not opening a PR"
             printf '%s\n' "could not clear gate ($AFTER remain, was $BEFORE)" > "$SLACK_MESSAGE_FILE"
             exit 1
@@ -551,16 +527,11 @@ jobs:
           unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy GH_HOST
           /usr/bin/git config user.name "github-actions[bot]"
           /usr/bin/git config user.email "github-actions[bot]@users.noreply.github.com"
-          allowed='^(package\.json|package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$'
-          under_node_modules() {
-            local f="$1"
-            [[ "$f" == node_modules || "$f" == node_modules/* || "$f" == */node_modules || "$f" == */node_modules/* ]]
-          }
+          source /tmp/sca-lib.sh
           while IFS= read -r f; do
             [[ -z "$f" ]] && continue
             under_node_modules "$f" && continue
-            base="$(basename "$f")"
-            if [[ "$base" =~ $allowed ]]; then
+            if is_allowlisted "$f"; then
               /usr/bin/git -c core.quotePath=false add -- "$f"
             fi
           done < <( { /usr/bin/git -c core.quotePath=false diff --name-only; /usr/bin/git -c core.quotePath=false ls-files --others --exclude-standard; } | sort -u )
@@ -641,7 +612,7 @@ jobs:
             fi
             run_pat /usr/bin/gh pr edit "$EXISTING" --add-label trivy-autofix --add-label security || true
           else
-            run_pat /usr/bin/gh pr edit "$EXISTING" --title "$TITLE" --body-file "$BODY_FILE"
+            run_pat /usr/bin/gh pr edit "$EXISTING" --title "$TITLE" --body-file "$BODY_FILE" --base "$BASE_BRANCH"
             run_pat /usr/bin/gh pr edit "$EXISTING" --add-label trivy-autofix --add-label security || true
             URL="$(run_pat /usr/bin/gh pr view "$EXISTING" --json url --jq .url)"
           fi
