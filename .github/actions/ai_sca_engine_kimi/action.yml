@@ -1,9 +1,9 @@
 name: ai_sca_engine_kimi
 description: >
   Trivy SCA fix engine — Kimi Code CLI. Reads pre-built fix context and a
-  Trivy JSON report, edits JS manifests/lockfiles with the Write tool, and
-  writes /tmp/autofix_result.md. No shell tool. No GitHub token. The caller
-  owns lockfile refresh, git, and PR creation.
+  Trivy JSON report, edits package.json with the Write tool, and writes
+  /tmp/autofix_result.md. No shell tool. No GitHub token. The caller owns
+  lockfile refresh, git, and PR creation.
 
 inputs:
   fix_context_path:
@@ -105,31 +105,7 @@ runs:
 
         [[permission.rules]]
         decision = "allow"
-        pattern = "Write(package-lock.json)"
-
-        [[permission.rules]]
-        decision = "allow"
-        pattern = "Write(yarn.lock)"
-
-        [[permission.rules]]
-        decision = "allow"
-        pattern = "Write(pnpm-lock.yaml)"
-
-        [[permission.rules]]
-        decision = "allow"
         pattern = "Write(**/package.json)"
-
-        [[permission.rules]]
-        decision = "allow"
-        pattern = "Write(**/package-lock.json)"
-
-        [[permission.rules]]
-        decision = "allow"
-        pattern = "Write(**/yarn.lock)"
-
-        [[permission.rules]]
-        decision = "allow"
-        pattern = "Write(**/pnpm-lock.yaml)"
 
         [[permission.rules]]
         decision = "deny"
@@ -160,6 +136,7 @@ runs:
         CONTEXT_PATH: ${{ inputs.fix_context_path }}
         TRIVY_JSON: ${{ inputs.trivy_json_path }}
         OUTPUT_PATH: ${{ inputs.output_path }}
+        REPO: ${{ inputs.repository }}
       run: |
         [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Kimi SCA engine: missing or empty fix context at $CONTEXT_PATH"; exit 1; }
         [[ -s "$TRIVY_JSON" ]] || { echo "❌ Kimi SCA engine: missing or empty Trivy JSON at $TRIVY_JSON"; exit 1; }
@@ -169,17 +146,16 @@ runs:
         export KIMI_MODEL_BASE_URL="$BASE_URL"
         echo "🔧 Kimi SCA engine | model=$KIMI_MODEL_NAME | base_url=$BASE_URL"
 
-        cat > /tmp/sca_prompt.txt <<'EOF'
-        REPO: ${{ inputs.repository }}
+        cat > /tmp/sca_prompt.txt <<EOF
+        REPO: ${REPO}
 
-        Read ${{ inputs.fix_context_path }} and follow it exactly. It contains
+        Read ${CONTEXT_PATH} and follow it exactly. It contains
         the playbook, repo metadata, package manager, and Trivy flags. Then read
-        ${{ inputs.trivy_json_path }}. You have no shell tool.
+        ${TRIVY_JSON}. You have no shell tool.
 
         HOW THIS TASK IS DELIVERED: your chat reply is discarded. Write
-        ${{ inputs.output_path }} with the Write tool (what changed, CVEs
-        addressed, CVEs left unfixed) AND edit only package.json /
-        package-lock.json / yarn.lock / pnpm-lock.yaml.
+        ${OUTPUT_PATH} with the Write tool (what changed, CVEs
+        addressed, CVEs left unfixed) AND edit only package.json files.
         EOF
 
         dump_kimi_log() {

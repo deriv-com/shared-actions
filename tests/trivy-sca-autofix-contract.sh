@@ -24,6 +24,8 @@ if [[ -f "$PROMPT" ]]; then
   check 'grep -q "do not invent" "$PROMPT"' "prompt forbids invented versions"
   check 'grep -q ".trivyignore" "$PROMPT"' "prompt forbids trivyignore"
   check 'grep -q "DATA" "$PROMPT"' "prompt frames inputs as data"
+  check 'grep -q "edit lockfiles" "$PROMPT"' "prompt tells the engine not to edit lockfiles"
+  check 'grep -q "caller regenerates lockfiles" "$PROMPT"' "prompt says caller regenerates lockfiles"
 fi
 if [[ -f "$ACTION" ]]; then
   check '! grep -nE "timeout-minutes:" "$ACTION"' "prompt action has no timeout-minutes"
@@ -43,6 +45,9 @@ if [[ -f "$KIMI" ]]; then
   check 'grep -q "decision = \"deny\"" "$KIMI" || grep -q "pattern = \"Bash\"" "$KIMI"' "kimi SCA denies Bash"
   check 'grep -q "autofix_result.md" "$KIMI"' "kimi SCA writes autofix_result.md"
   check 'grep -q "Kimi SCA engine" "$KIMI"' "kimi SCA failures are engine-named"
+  check 'grep -q "Write(package.json)" "$KIMI"' "kimi SCA allows package.json Write"
+  check '! grep -q "Write(package-lock.json)" "$KIMI"' "kimi SCA does not allow lockfile Write"
+  check 'grep -qF '\''REPO: ${REPO}'\'' "$KIMI"' "kimi SCA prompt interpolates REPO from env"
 fi
 
 ANTH="$ROOT/.github/actions/ai_sca_engine_anthropic/action.yml"
@@ -52,11 +57,11 @@ if [[ -f "$ANTH" ]]; then
   check '! grep -nE "secrets\\." "$ANTH"' "anthropic SCA does not mention secrets."
   check '! grep -nE "\\$\\{\\{[[:space:]]*\\}\\}" "$ANTH"' "anthropic SCA has no empty expression pair"
   check '! grep -nE "github_token:" "$ANTH"' "anthropic SCA does not pass github_token"
-  check 'grep -q "github_token is optional" "$ANTH"' "anthropic SCA records github_token SHA verification"
   check 'grep -qF -- '\''--model "${{ inputs.model }}"'\'' "$ANTH"' "anthropic SCA quotes --model"
   check 'grep -q "disallowedTools" "$ANTH"' "anthropic SCA sets disallowedTools"
-  check 'grep -q "Bash" "$ANTH"' "anthropic SCA mentions Bash in denylist"
+  check 'grep -q "Bash" "$ANTH"' "anthropic SCA denies Bash"
   check 'grep -q "Anthropic SCA engine" "$ANTH"' "anthropic SCA failures are engine-named"
+  check '! grep -q "package-lock.json" "$ANTH"' "anthropic SCA prompt does not ask for lockfile Writes"
   check 'grep -q "fefa07e9c665b7320f08c3b525980457f22f58aa" "$ANTH"' "anthropic SCA pins the same claude-code-action SHA as review"
   check 'grep -q "show_full_output: false" "$ANTH"' "anthropic SCA disables show_full_output"
 fi
@@ -74,6 +79,8 @@ if [[ -f "$GROK" ]]; then
   check 'grep -q "deny Bash" "$GROK" || grep -q "--deny Bash" "$GROK"' "grok SCA denies Bash"
   check 'grep -qF '\''Write(${OUT_DIR}/*)'\'' "$GROK"' "grok SCA Write allow matches output_path dir"
   check 'grep -qF '\''Edit(${OUT_DIR}/*)'\'' "$GROK"' "grok SCA Edit allow matches output_path dir"
+  check '! grep -q "Write(package-lock.json)" "$GROK"' "grok SCA does not allow lockfile Write"
+  check 'grep -qF '\''REPO: ${REPO}'\'' "$GROK"' "grok SCA prompt interpolates REPO from env"
 fi
 
 WF="$ROOT/.github/workflows/trivy-sca-autofix.yml"
@@ -95,12 +102,23 @@ if [[ -f "$WF" ]]; then
   check '! grep -nE "ref:.*pull_request.head" "$WF"' "does not checkout PR head"
   check 'grep -q "GITHUB_TOKEN:" "$WF"' "engine dispatch mentions GITHUB_TOKEN (cleared to empty)"
   check 'grep -q "cache-dir: /tmp/trivy-cache" "$WF"' "trivy cache-dir is /tmp/trivy-cache"
-  check 'grep -q "Real input on aquasecurity/trivy-action" "$WF"' "trivy cache-dir documented as a real input at the pin"
   check 'grep -c "cache-dir: /tmp/trivy-cache" "$WF" | grep -qx 2' "both trivy steps use /tmp/trivy-cache"
   check 'grep -q "cache: \"false\"" "$WF"' "trivy cache disabled"
   check 'grep -q "persist-credentials: false" "$WF"' "checkout does not persist PAT"
   check '! grep -q "token: \${{ secrets.AUTOFIX_GITHUB_TOKEN }}" "$WF"' "checkout does not pass the write PAT"
-  check 'grep -q "Restored non-allowlisted tracked paths" "$WF"' "allowlist restores engine-stripped tracked files"
+  check 'grep -q "git checkout --" "$WF"' "allowlist restores engine-stripped tracked files"
+  check 'grep -q -- "--no-frozen-lockfile" "$WF"' "pnpm install disables frozen lockfile"
+  check 'grep -q "install_dirs" "$WF"' "detect outputs install_dirs"
+  check 'grep -q -- "-name node_modules" "$WF"' "lockfile find prunes node_modules"
+  check 'grep -q "COREPACK_ENABLE_DOWNLOAD_PROMPT" "$WF"' "corepack download prompt disabled"
+  check 'grep -q "core.quotePath=false" "$WF"' "git path enumeration disables quotePath"
+  check 'grep -qF -- '\''-ge "$BEFORE"'\'' "$WF"' "after-scan requires AFTER < BEFORE"
+  check 'grep -qF '\''URL="$(run_pat /usr/bin/gh pr create'\'' "$WF"' "PR create captures URL from stdout"
+  check 'grep -qF '\''OWNER="${REPO%%/*}"'\'' "$WF"' "existing PR lookup uses owner:head not --base"
+  check '! grep -q "Findings after: 0" "$WF"' "PR body does not hardcode Findings after: 0"
+  check '! grep -q "extraheader" "$WF"' "does not unset checkout extraheader"
+  check 'grep -q "steps.trivy-dirs.outputs.dirs" "$WF"' "trivy skip-dirs includes resolved node_modules"
+  check 'grep -qF '\''extra="node_modules"'\'' "$WF"' "skip-dirs merge always adds node_modules"
   check '! grep -q "git add -A" "$WF"' "commit step does not git add -A"
   check 'grep -q "core.hooksPath=/dev/null" "$WF"' "commit/push bypass consumer hooks"
   check 'grep -q "commit --no-verify" "$WF"' "commit uses --no-verify"
@@ -135,13 +153,17 @@ if [[ -f "$DOC" ]]; then
   check 'grep -q "nothing to do" "$DOC"' "docs include the clean-master case"
   check 'grep -q "chore/trivy-sca-autofix" "$DOC"' "docs name the singleton branch"
   check '! grep -q "gh auth setup-git" "$DOC"' "docs do not mention gh auth setup-git"
-  check 'grep -q "treat edits to those composites" "$DOC"' "docs call out @master blast radius for SCA engines"
+  check 'grep -q "AFTER < BEFORE" "$DOC"' "docs describe the reduction gate"
+  check 'grep -q "queued" "$DOC"' "docs mention queued concurrency drops skip Slack"
+  check 'grep -q "force-with-lease" "$DOC"' "docs record force without lease"
+  check 'grep -q "not a full monorepo product" "$DOC"' "docs do not oversell monorepo support"
 fi
 
 LINT="$ROOT/.github/workflows/lint-actions.yml"
 if [[ -f "$LINT" ]]; then
   check 'grep -q "trivy-sca-autofix-contract.sh" "$LINT"' "lint-actions runs contract script"
   check 'grep -q "tests/trivy-sca-autofix-contract.sh" "$LINT"' "lint-actions paths include contract script"
+  check 'grep -q "trivy-sca-autofix-logic.sh" "$LINT"' "lint-actions runs logic script"
 fi
 
 if [[ "$fail" -ne 0 ]]; then

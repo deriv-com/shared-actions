@@ -102,9 +102,9 @@ runs:
           ${{ inputs.trivy_json_path }}. You have no shell tool.
 
           HOW THIS TASK IS DELIVERED: your chat reply is discarded. The ONLY
-          outputs that count are edits to package.json / package-lock.json /
-          yarn.lock / pnpm-lock.yaml and the file ${{ inputs.output_path }}
-          written with the Write tool. Do not post comments or use GitHub tools.
+          outputs that count are edits to package.json files and the file
+          ${{ inputs.output_path }} written with the Write tool. Do not post
+          comments or use GitHub tools. Do not edit lockfiles.
         claude_args: |
           --model "${{ inputs.model }}"
           --allowedTools "Read,Write,Grep,Glob"

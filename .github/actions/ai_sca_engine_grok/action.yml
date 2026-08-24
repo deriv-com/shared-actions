@@ -1,7 +1,7 @@
 name: ai_sca_engine_grok
 description: >
   Trivy SCA fix engine — Grok Build CLI. Reads pre-built fix context and a
-  Trivy JSON report, edits JS dependency files, writes /tmp/autofix_result.md.
+  Trivy JSON report, edits package.json files, writes /tmp/autofix_result.md.
   No shell tool. No GitHub token. Sandbox is workspace-write (read-only cannot
   write package.json in the checkout).
 
@@ -198,18 +198,18 @@ runs:
         TRIVY_JSON: ${{ inputs.trivy_json_path }}
         OUTPUT_PATH: ${{ inputs.output_path }}
         MODEL: ${{ inputs.model }}
+        REPO: ${{ inputs.repository }}
       run: |
         [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Grok SCA engine: missing or empty fix context at $CONTEXT_PATH"; exit 1; }
         [[ -s "$TRIVY_JSON" ]] || { echo "❌ Grok SCA engine: missing or empty Trivy JSON at $TRIVY_JSON"; exit 1; }
-        cat > /tmp/sca_prompt.txt <<'EOF'
-        REPO: ${{ inputs.repository }}
+        cat > /tmp/sca_prompt.txt <<EOF
+        REPO: ${REPO}
 
-        Read ${{ inputs.fix_context_path }} and follow it exactly. Then read
-        ${{ inputs.trivy_json_path }}. You have no shell tool.
+        Read ${CONTEXT_PATH} and follow it exactly. Then read
+        ${TRIVY_JSON}. You have no shell tool.
 
         HOW THIS TASK IS DELIVERED: your chat reply is discarded. Write
-        ${{ inputs.output_path }} with the Write tool and edit only
-        package.json / package-lock.json / yarn.lock / pnpm-lock.yaml.
+        ${OUTPUT_PATH} with the Write tool and edit only package.json files.
         EOF
         dump_grok_log() {
           set +e +o pipefail
@@ -247,20 +247,8 @@ runs:
             --allow "Edit(${OUT_DIR}/*)" \
             --allow "Write(package.json)" \
             --allow "Write(**/package.json)" \
-            --allow "Write(package-lock.json)" \
-            --allow "Write(**/package-lock.json)" \
-            --allow "Write(yarn.lock)" \
-            --allow "Write(**/yarn.lock)" \
-            --allow "Write(pnpm-lock.yaml)" \
-            --allow "Write(**/pnpm-lock.yaml)" \
             --allow "Edit(package.json)" \
             --allow "Edit(**/package.json)" \
-            --allow "Edit(package-lock.json)" \
-            --allow "Edit(**/package-lock.json)" \
-            --allow "Edit(yarn.lock)" \
-            --allow "Edit(**/yarn.lock)" \
-            --allow "Edit(pnpm-lock.yaml)" \
-            --allow "Edit(**/pnpm-lock.yaml)" \
             --deny Bash \
             --deny WebFetch \
             --deny WebSearch \

@@ -22,6 +22,7 @@ on:
       - '.github/workflows/**'
       - '.github/actions/**'
       - 'tests/trivy-sca-autofix-contract.sh'
+      - 'tests/trivy-sca-autofix-logic.sh'
   workflow_dispatch:
 
 permissions:
@@ -110,5 +111,7 @@ jobs:
           fi
           echo "✅ ${#actions[@]} composite action(s) passed"
 
-      - name: Trivy SCA autofix contract
-        run: bash tests/trivy-sca-autofix-contract.sh
+      - name: Trivy SCA autofix tests
+        run: |
+          bash tests/trivy-sca-autofix-contract.sh
+          bash tests/trivy-sca-autofix-logic.sh

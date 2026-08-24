@@ -17,10 +17,10 @@ in the result file.
 
 ## Goal
 
-Clear the same severity gate as `/tmp/fix_context.md` with the smallest safe
-JavaScript dependency changes. The caller will regenerate the lockfile; you must
-still edit `package.json` (and may edit a lockfile, but a correct lockfile is
-not required).
+Reduce the same severity findings as `/tmp/fix_context.md` with the smallest safe
+JavaScript dependency changes. The caller regenerates lockfiles after you finish;
+edit `package.json` only. Leave unfixable CVEs unfixed and list them in the
+result file. A partial reduction still ships.
 
 ## Hard rules
 
@@ -29,10 +29,10 @@ not required).
    do not invent a version and do not query the registry (you have no shell).
    Record that CVE as unfixed in `/tmp/autofix_result.md`.
 2. Do not bump major unless no fix exists on the current major.
-3. Edit only files whose basename is `package.json`, `package-lock.json`,
-   `yarn.lock`, or `pnpm-lock.yaml` (any directory). Direct deps go in
-   `package.json`. Transitive-only findings use `overrides` /
-   `resolutions` / `pnpm.overrides` in `package.json` when needed.
+3. Edit only files whose basename is `package.json` (any directory). Direct
+   deps go in `package.json`. Transitive-only findings use `overrides` /
+   `resolutions` / `pnpm.overrides` in `package.json` when needed. Do not
+   edit lockfiles.
 4. Never commit. Never call `gh`. You have no shell tool.
 5. HOW THIS TASK IS DELIVERED: your chat reply is discarded. The file
    `/tmp/autofix_result.md` MUST be written with the Write tool, listing:
