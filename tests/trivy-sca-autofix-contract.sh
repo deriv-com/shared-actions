@@ -52,6 +52,8 @@ if [[ -f "$ANTH" ]]; then
   check '! grep -nE "secrets\\." "$ANTH"' "anthropic SCA does not mention secrets."
   check '! grep -nE "\\$\\{\\{[[:space:]]*\\}\\}" "$ANTH"' "anthropic SCA has no empty expression pair"
   check '! grep -nE "github_token:" "$ANTH"' "anthropic SCA does not pass github_token"
+  check 'grep -q "github_token is optional" "$ANTH"' "anthropic SCA records github_token SHA verification"
+  check 'grep -qF -- '\''--model "${{ inputs.model }}"'\'' "$ANTH"' "anthropic SCA quotes --model"
   check 'grep -q "disallowedTools" "$ANTH"' "anthropic SCA sets disallowedTools"
   check 'grep -q "Bash" "$ANTH"' "anthropic SCA mentions Bash in denylist"
   check 'grep -q "Anthropic SCA engine" "$ANTH"' "anthropic SCA failures are engine-named"
@@ -93,6 +95,7 @@ if [[ -f "$WF" ]]; then
   check '! grep -nE "ref:.*pull_request.head" "$WF"' "does not checkout PR head"
   check 'grep -q "GITHUB_TOKEN:" "$WF"' "engine dispatch mentions GITHUB_TOKEN (cleared to empty)"
   check 'grep -q "cache-dir: /tmp/trivy-cache" "$WF"' "trivy cache-dir is /tmp/trivy-cache"
+  check 'grep -q "Real input on aquasecurity/trivy-action" "$WF"' "trivy cache-dir documented as a real input at the pin"
   check 'grep -c "cache-dir: /tmp/trivy-cache" "$WF" | grep -qx 2' "both trivy steps use /tmp/trivy-cache"
   check 'grep -q "cache: \"false\"" "$WF"' "trivy cache disabled"
   check 'grep -q "persist-credentials: false" "$WF"' "checkout does not persist PAT"
@@ -132,7 +135,12 @@ if [[ -f "$DOC" ]]; then
   check 'grep -q "nothing to do" "$DOC"' "docs include the clean-master case"
   check 'grep -q "chore/trivy-sca-autofix" "$DOC"' "docs name the singleton branch"
   check '! grep -q "gh auth setup-git" "$DOC"' "docs do not mention gh auth setup-git"
+  check 'grep -q "treat edits to those composites" "$DOC"' "docs call out @master blast radius for SCA engines"
 fi
+
+SPEC="$ROOT/docs/superpowers/specs/2026-08-21-trivy-sca-autofix-design.md"
+check 'grep -q "Source of truth" "$SPEC"' "spec points at shipped workflow as source of truth"
+check 'grep -q "contents: read" "$SPEC"' "spec caller permissions are contents: read"
 
 LINT="$ROOT/.github/workflows/lint-actions.yml"
 if [[ -f "$LINT" ]]; then

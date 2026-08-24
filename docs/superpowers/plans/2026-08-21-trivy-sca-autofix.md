@@ -1,5 +1,7 @@
 # Trivy SCA Autofix Implementation Plan
 
+> **Historical.** Task YAML snapshots below predate post-review hardening (allowlist restore, PAT-free checkout, `env -i` push, Grok `OUT_DIR` allows, `contents: read`). Do not copy them forward. Source of truth: `.github/workflows/trivy-sca-autofix.yml`, `.github/actions/ai_sca_engine_*/action.yml`, `.github/workflows/TRIVY_SCA_AUTOFIX_README.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship a reusable workflow that, when a consumer’s Trivy job fails, re-scans `master`, runs a pluggable SCA engine (`kimi` | `anthropic` | `grok`), and opens one human-merged PR into `master` with Slack on every outcome.

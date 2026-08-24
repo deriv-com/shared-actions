@@ -87,6 +87,12 @@ runs:
       uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
       with:
         anthropic_api_key: ${{ inputs.api_key }}
+        # github_token is optional at this SHA (action.yml: required: false).
+        # Omitting it does not fail startup. The action still binds
+        # github.token internally (bun install fallback, DEFAULT_WORKFLOW_TOKEN).
+        # We do not pass the input: classify_inline_comments is false so the
+        # post-buffered-comments step is skipped; GitHub MCP tools are denied
+        # below. Job token is contents:read. Same SHA as ai_review_engine_anthropic.
         show_full_output: false
         classify_inline_comments: false
         prompt: |
@@ -100,7 +106,7 @@ runs:
           yarn.lock / pnpm-lock.yaml and the file ${{ inputs.output_path }}
           written with the Write tool. Do not post comments or use GitHub tools.
         claude_args: |
-          --model ${{ inputs.model }}
+          --model "${{ inputs.model }}"
           --allowedTools "Read,Write,Grep,Glob"
           --disallowedTools "Bash,WebFetch,WebSearch,mcp__github_comment,mcp__github_inline_comment,mcp__github_file_ops,mcp__github"
 

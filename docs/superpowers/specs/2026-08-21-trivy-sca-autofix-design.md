@@ -1,8 +1,10 @@
 # Trivy SCA Autofix — Design
 
 Date: 2026-08-21  
-Status: approved for spec review (not yet implemented)  
+Status: implemented on `feat/trivy-sca-autofix`  
 Repo: `deriv-com/shared-actions`
+
+> **Source of truth:** `.github/workflows/trivy-sca-autofix.yml` and `.github/workflows/TRIVY_SCA_AUTOFIX_README.md`. Embedded YAML below is the original design snapshot and may lag hardening (allowlist restore, PAT-free checkout, `contents: read`, labels after create).
 
 ## Goal
 
@@ -51,7 +53,7 @@ autofix:
   if: failure()
   uses: deriv-com/shared-actions/.github/workflows/trivy-sca-autofix.yml@master
   permissions:
-    contents: write
+    contents: read
     pull-requests: write
   with:
     engine: kimi                 # optional; default kimi
@@ -170,7 +172,7 @@ Fail **closed**: no PR unless post-fix Trivy is green and the allowlist holds.
 | Output contains `LLM_API_KEY` | failure | secret leak, rotate | none |
 | Empty diff after engine + install | failure | could not fix | none |
 | Trivy still red after | failure | could not clear gate | none |
-| `gh` / push fails | failure | GitHub error | none |
+| `gh` / push fails | failure | could not fix (job failed) | none |
 | Missing required secret | failure at start | none if Slack secret missing | none |
 | Grok bwrap/user-namespace failure | failure (Grok-named) | could not fix | none |
 

@@ -24,7 +24,7 @@ autofix:
     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 ```
 
-Every consumer in this org pins `@master`, so that is the documented policy — changes are live on merge.
+Every consumer in this org pins `@master`, so that is the documented policy — changes are live on merge. The SCA engines and `send_slack_notification` run with the LLM key in scope, and the same job later uses `AUTOFIX_GITHUB_TOKEN` for push/PR creation — treat edits to those composites like edits to this workflow.
 
 ## Engines
 

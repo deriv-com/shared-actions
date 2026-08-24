@@ -238,6 +238,8 @@ jobs:
           skip-dirs: ${{ inputs.trivy_skip_dirs }}
           exit-code: "0"
           cache: "false"
+          # Real input on aquasecurity/trivy-action@ed142fd (v0.36.0).
+          # Default is github.workspace/.cache/trivy (inside the checkout).
           cache-dir: /tmp/trivy-cache
 
       - name: Count findings and skip if clean
@@ -432,6 +434,8 @@ jobs:
           skip-dirs: ${{ inputs.trivy_skip_dirs }}
           exit-code: "0"
           cache: "false"
+          # Real input on aquasecurity/trivy-action@ed142fd (v0.36.0).
+          # Default is github.workspace/.cache/trivy (inside the checkout).
           cache-dir: /tmp/trivy-cache
 
       - name: Require clean Trivy after fix
