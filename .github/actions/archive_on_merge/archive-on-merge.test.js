@@ -11,6 +11,7 @@ const {
   isTasksComplete,
   isValidPrNumber,
   isValidRepo,
+  isRetryableResponse,
   fetchWithRetry,
   fetchPullRequestFiles,
   FILES_PER_PAGE,
@@ -28,7 +29,13 @@ async function stubApi(t, handler) {
     const result = handler(url, req);
     const status = Array.isArray(result) ? 200 : result.status;
     const body = Array.isArray(result) ? result : (result.body ?? []);
-    res.writeHead(status, { "content-type": "application/json" });
+    if (result && result.hang) {
+      return; // socket accepted, no response — exercises the request timeout
+    }
+    res.writeHead(status, {
+      "content-type": "application/json",
+      ...(Array.isArray(result) ? {} : (result.headers ?? {})),
+    });
     res.end(typeof body === "string" ? body : JSON.stringify(body));
   });
   await new Promise((resolve) => server.listen(0, resolve));
@@ -270,5 +277,134 @@ test("fetchWithRetry retries a network error", async () => {
   await assert.rejects(
     fetchWithRetry("http://127.0.0.1:1/x", {}, { attempts: 2, baseDelayMs: 0 }),
     /request failed/
+  );
+});
+
+// --- response classification -------------------------------------------------
+
+const stubResponse = (status, headers = {}) => ({
+  status,
+  headers: { get: (k) => headers[k.toLowerCase()] ?? null },
+});
+
+test("isRetryableResponse retries 5xx and 429", () => {
+  for (const status of [500, 502, 503, 504, 429]) {
+    assert.strictEqual(
+      isRetryableResponse(stubResponse(status)),
+      true,
+      `${status} is transient`
+    );
+  }
+});
+
+test("isRetryableResponse does not retry a plain 4xx", () => {
+  for (const status of [200, 301, 400, 404, 422]) {
+    assert.strictEqual(
+      isRetryableResponse(stubResponse(status)),
+      false,
+      `${status} is a real answer`
+    );
+  }
+});
+
+test("isRetryableResponse retries a rate-limit 403 but not a permissions 403", () => {
+  // GitHub uses 403 for both primary and secondary rate limits. Losing the
+  // call permanently loses the archive, so these must be retried.
+  assert.strictEqual(
+    isRetryableResponse(stubResponse(403, { "x-ratelimit-remaining": "0" })),
+    true,
+    "primary rate limit"
+  );
+  assert.strictEqual(
+    isRetryableResponse(stubResponse(403, { "retry-after": "60" })),
+    true,
+    "secondary rate limit"
+  );
+  // A token without pull-requests:read is also a 403. Retrying it three times
+  // would bury the real cause.
+  assert.strictEqual(
+    isRetryableResponse(stubResponse(403, { "x-ratelimit-remaining": "4999" })),
+    false,
+    "permissions failure"
+  );
+  assert.strictEqual(
+    isRetryableResponse(stubResponse(403)),
+    false,
+    "bare 403 without rate-limit headers"
+  );
+});
+
+test("fetchWithRetry retries a rate-limit 403 and then succeeds", async (t) => {
+  let calls = 0;
+  const apiUrl = await stubApi(t, () => {
+    calls += 1;
+    return calls < 3
+      ? { status: 403, body: {}, headers: { "x-ratelimit-remaining": "0" } }
+      : [];
+  });
+  const res = await fetchWithRetry(
+    `${apiUrl}/repos/o/r/pulls/7/files`,
+    {},
+    { baseDelayMs: 0 }
+  );
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(calls, 3);
+});
+
+test("fetchWithRetry does not retry a permissions 403", async (t) => {
+  let calls = 0;
+  const apiUrl = await stubApi(t, () => {
+    calls += 1;
+    return { status: 403, body: {} };
+  });
+  const res = await fetchWithRetry(
+    `${apiUrl}/repos/o/r/pulls/7/files`,
+    {},
+    { baseDelayMs: 0 }
+  );
+  assert.strictEqual(res.status, 403);
+  assert.strictEqual(calls, 1, "a permissions 403 is a real answer");
+});
+
+// --- request timeout ---------------------------------------------------------
+
+test("a stalled request times out per attempt and is retried", async (t) => {
+  let calls = 0;
+  const apiUrl = await stubApi(t, () => {
+    calls += 1;
+    return calls < 2 ? { hang: true } : [];
+  });
+  const res = await fetchWithRetry(
+    `${apiUrl}/repos/o/r/pulls/7/files`,
+    {},
+    { baseDelayMs: 0, timeoutMs: 150 }
+  );
+  // Without a per-attempt signal the first call would sit on undici's 300s
+  // default headers timeout and outlast the job.
+  assert.strictEqual(res.status, 200, "recovered on the retry");
+  assert.strictEqual(calls, 2);
+});
+
+test("a permanently stalled request fails with a timeout message, not a hang", async (t) => {
+  const apiUrl = await stubApi(t, () => ({ hang: true }));
+  await assert.rejects(
+    fetchWithRetry(
+      `${apiUrl}/repos/o/r/pulls/7/files`,
+      {},
+      { attempts: 2, baseDelayMs: 0, timeoutMs: 150 }
+    ),
+    /request timed out after 150ms/
+  );
+});
+
+test("a caller-supplied signal is respected over the default timeout", async (t) => {
+  const apiUrl = await stubApi(t, () => ({ hang: true }));
+  await assert.rejects(
+    fetchWithRetry(
+      `${apiUrl}/repos/o/r/pulls/7/files`,
+      { signal: AbortSignal.timeout(120) },
+      { attempts: 1, baseDelayMs: 0, timeoutMs: 60_000 }
+    ),
+    /request (timed out|failed)/
   );
 });

@@ -131,6 +131,17 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_BRANCH: ${{ inputs.base_branch }}
         run: |
+          # The branch name is built from CHANGES, so an empty list would make
+          # it "archive-on-merge/" and fail at `git checkout -b` with git's own
+          # opaque "not a valid branch name". `archived=true` with no usable
+          # name is reachable: the script derives `archived` from how many
+          # changes openspec reported, but `changes` from those names filtered
+          # through the kebab-case allowlist. Fail here, naming the cause.
+          if [ -z "$CHANGES" ]; then
+            echo "::error::archive reported success but produced no usable change name; refusing to build a branch name from an empty list."
+            exit 1
+          fi
+
           # Name the branch after the change(s) archived, never after the PR
           # that triggered the run: two runs archiving the same change then
           # land on the same branch, so the second one finds the first one's

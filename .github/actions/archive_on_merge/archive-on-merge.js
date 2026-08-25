@@ -43,10 +43,16 @@ const CHANGE_NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
 const FILES_PER_PAGE = 100;
 const MAX_FILE_PAGES = 30;
 
-// Retry only what a retry can fix: 5xx and 429. A 404 or 403 is a real answer
-// and failing immediately on it keeps the log readable.
+// Retry only what a retry can fix: 5xx, 429, and the rate-limit flavour of 403
+// (see isRetryableResponse). A 404, or a 403 about permissions, is a real
+// answer and failing immediately on it keeps the log readable.
 const MAX_ATTEMPTS = 3;
 const RETRY_BASE_MS = 1000;
+// Per-attempt ceiling. Node's fetch does not hang forever without one, but its
+// default headers timeout is 300s, so three attempts of that would outlast the
+// calling job's timeout-minutes and surface as an opaque job kill rather than a
+// failed request.
+const REQUEST_TIMEOUT_MS = 30_000;
 
 /** True when `value` is a positive integer PR number. Pure function. */
 function isValidPrNumber(value) {
@@ -95,28 +101,64 @@ function isTasksComplete(tasksMdContent) {
 }
 
 /**
- * `fetch` with bounded retries on transient failures (network error, 5xx,
- * 429). Detection used to be an offline `git diff`; over the network a single
- * blip would otherwise fail the job, and `pull_request: closed` never fires
- * again for that merge.
+ * True when a response is worth retrying. Pure function.
+ *
+ * GitHub signals both primary and secondary rate limits with 403, and losing a
+ * call permanently loses the archive — `pull_request: closed` never fires again
+ * for that merge. But 403 is also how a token missing `pull-requests: read` is
+ * refused, and retrying that three times buries the real cause. The rate-limit
+ * headers separate the two.
+ */
+function isRetryableResponse(response) {
+  if (response.status >= 500 || response.status === 429) {
+    return true;
+  }
+  if (response.status !== 403) {
+    return false;
+  }
+  return (
+    response.headers.get("retry-after") !== null ||
+    response.headers.get("x-ratelimit-remaining") === "0"
+  );
+}
+
+/**
+ * `fetch` with a per-attempt timeout and bounded retries on transient failures
+ * (network error, timeout, 5xx, 429, rate-limit 403). Detection used to be an
+ * offline `git diff`; over the network a single blip would otherwise fail the
+ * job, and `pull_request: closed` never fires again for that merge.
  */
 async function fetchWithRetry(
   url,
   options,
-  { attempts = MAX_ATTEMPTS, baseDelayMs = RETRY_BASE_MS } = {}
+  {
+    attempts = MAX_ATTEMPTS,
+    baseDelayMs = RETRY_BASE_MS,
+    timeoutMs = REQUEST_TIMEOUT_MS,
+  } = {}
 ) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      const response = await fetch(url, options);
-      if (response.status < 500 && response.status !== 429) {
+      // A fresh signal per attempt: AbortSignal.timeout starts counting from
+      // creation, so one hoisted out of the loop would abort every retry after
+      // the first budget elapsed.
+      const response = await fetch(url, {
+        ...options,
+        signal: options.signal ?? AbortSignal.timeout(timeoutMs),
+      });
+      if (!isRetryableResponse(response)) {
         return response;
       }
       lastError = new Error(
         `GitHub API returned ${response.status} ${response.statusText}`
       );
     } catch (err) {
-      lastError = new Error(`request failed: ${err.message}`);
+      lastError = new Error(
+        err.name === "TimeoutError"
+          ? `request timed out after ${timeoutMs}ms`
+          : `request failed: ${err.message}`
+      );
     }
     if (attempt < attempts) {
       const delay = baseDelayMs * 2 ** (attempt - 1);
@@ -349,6 +391,7 @@ module.exports = {
   isTasksComplete,
   isValidPrNumber,
   isValidRepo,
+  isRetryableResponse,
   fetchWithRetry,
   fetchPullRequestFiles,
   runOpenspecArchive,

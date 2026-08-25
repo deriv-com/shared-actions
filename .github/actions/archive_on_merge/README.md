@@ -47,6 +47,16 @@ the API is exact and works the same for merge, squash, and rebase merges.
 Change names come back sorted, so the branch slug the caller derives from them
 is the same whatever order the API listed the files in.
 
+### Failure handling
+
+`pull_request: closed` never fires twice for the same merge, so a request lost
+to a blip loses that archive for good. Each attempt is therefore capped at 30s
+and retried up to 3 times with exponential backoff on network errors, timeouts,
+5xx, 429, and the rate-limit flavour of 403 (identified by `retry-after` or
+`x-ratelimit-remaining: 0`). A 403 without those headers is a permissions
+failure — a real answer — and fails immediately rather than retrying three
+times and burying the cause.
+
 ## Tests
 
 ```bash
