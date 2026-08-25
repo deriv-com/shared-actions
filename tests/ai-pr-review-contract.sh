@@ -31,7 +31,16 @@ check 'grep -qE "^    name: .*inputs\\.review_title" "$WF"' "job name uses revie
 check 'grep -q "REVIEW_TITLE=\"\$REVIEW_TITLE_INPUT\"" "$WF" || grep -q "REVIEW_TITLE=\"\${REVIEW_TITLE_INPUT}\"" "$WF"' "non-empty review_title overrides engine default"
 check 'grep -qF "$HEADER_STRIP" "$WF"' "follow-up strip matches any * PR Review Complete heading"
 check '! grep -qF "(AI|Claude|Kimi|Grok) PR Review Complete" "$WF"' "follow-up strip is not hardcoded to engine names"
-check 'grep -qF '\''\ PR\ Review$'\'' "$WF"' "review_title validation requires a PR Review suffix"
+check 'grep -q "review_title_re=" "$WF"' "validation holds the regex in a variable"
+
+TITLE_RE="$(sed -n "s/.*review_title_re='\([^']*\)'.*/\1/p" "$WF" | head -1)"
+check '[[ -n "$TITLE_RE" ]]' "review_title_re assignment is parseable"
+check '[[ "GLM PR Review" =~ $TITLE_RE ]]' "accepts GLM PR Review"
+check '[[ "Kimi PR Review" =~ $TITLE_RE ]]' "accepts Kimi PR Review"
+check '[[ ! "GLM Code Audit" =~ $TITLE_RE ]]' "rejects GLM Code Audit"
+check '[[ ! "GLM PR Review/" =~ $TITLE_RE ]]' "rejects trailing junk"
+bs='foo\bar PR Review'
+check '[[ ! "$bs" =~ $TITLE_RE ]]' "rejects a backslash in the title"
 
 got=$(printf '%s\n' '## 🤖 GLM PR Review Complete' 'body' | sed -E -e "$HEADER_STRIP")
 check '[[ "$got" == "body" ]]' "header strip drops GLM PR Review Complete"
@@ -46,6 +55,7 @@ check 'grep -q "is a replacement label" "$README"' "README says review_title is 
 check 'grep -q "group is keyed only by" "$README"' "README documents same-engine concurrency cancellation"
 
 check 'grep -q "tests/ai-pr-review-contract.sh" "$LINT"' "lint-actions runs this contract script"
+check 'grep -q "test-scripts:" "$LINT"' "lint-actions keeps master's test-scripts job"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "contract checks failed"

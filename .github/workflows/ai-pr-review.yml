@@ -245,7 +245,12 @@ jobs:
           esac
 
           if [[ -n "${REVIEW_TITLE_INPUT:-}" ]]; then
-            if [[ ${#REVIEW_TITLE_INPUT} -gt 79 ]] || [[ ! "$REVIEW_TITLE_INPUT" =~ ^[A-Za-z0-9][A-Za-z0-9 ._-]*\ PR\ Review$ ]]; then
+            # Quoted pattern in a variable: an unquoted `=~` with a literal
+            # space is a bash 3.2 parse error and would fail the whole step
+            # even when review_title is empty. Runners are bash 5, but this
+            # stays portable and rejects backslashes in the title.
+            review_title_re='^[A-Za-z0-9][A-Za-z0-9 ._-]* PR Review$'
+            if [[ ${#REVIEW_TITLE_INPUT} -gt 79 ]] || [[ ! "$REVIEW_TITLE_INPUT" =~ $review_title_re ]]; then
               echo "❌ Invalid review_title '$REVIEW_TITLE_INPUT'"
               echo "   Use 1-79 characters ending in ' PR Review' (letters, numbers, spaces, '.', '_' or '-')."
               echo "   Example: GLM PR Review"
