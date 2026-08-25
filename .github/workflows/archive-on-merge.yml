@@ -54,7 +54,12 @@ on:
 
 jobs:
   archive:
-    if: github.event.pull_request.merged == true
+    # Skip archive PRs themselves: merging one deletes the change directory it
+    # archived, which would otherwise re-enter this workflow as a "touched"
+    # change on every archive.
+    if: >-
+      github.event.pull_request.merged == true &&
+      !startsWith(github.event.pull_request.head.ref, 'archive-on-merge/')
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -62,6 +67,10 @@ jobs:
       contents: write
       pull-requests: write
 
+    # Keyed per PR, deliberately not per repository: a repo-wide group would
+    # queue concurrent merges, and GitHub drops an already-pending run when a
+    # newer one arrives — silently losing that merge's archive. Two runs
+    # racing on the same branch instead fail loudly at `gh pr create`.
     concurrency:
       group: archive-on-merge-${{ github.repository }}-${{ github.event.pull_request.number }}
       cancel-in-progress: false
@@ -100,8 +109,8 @@ jobs:
       - name: Detect + archive completed changes
         id: archive
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # openspec telemetry auto-disables when CI=true; set DO_NOT_TRACK too
           # as defense-in-depth and for local runs outside CI.
           DO_NOT_TRACK: "1"
@@ -119,7 +128,17 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_BRANCH: ${{ inputs.base_branch }}
         run: |
-          BRANCH="archive-on-merge/$PR_NUMBER"
+          # Name the branch after the change(s) archived, never after the PR
+          # that triggered the run: two runs archiving the same change then
+          # land on the same branch, so the second one finds the first one's
+          # PR already open instead of opening a duplicate.
+          SLUG=$(printf '%s' "$CHANGES" | tr ',' '_')
+          if [ "${#SLUG}" -gt 60 ]; then
+            DIGEST=$(printf '%s' "$CHANGES" | sha256sum | cut -c1-8)
+            SLUG="$(printf '%s' "$SLUG" | cut -c1-51 | sed 's/[-_]*$//')-$DIGEST"
+          fi
+          BRANCH="archive-on-merge/$SLUG"
+          echo "Archive branch: $BRANCH"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -134,11 +153,6 @@ jobs:
             exit 0
           fi
 
-          # No open PR uses this branch — drop any stale remote left from a
-          # closed-without-merge archive PR so re-runs are not blocked by a
-          # non-fast-forward push.
-          git push origin --delete "$BRANCH" 2>/dev/null || true
-
           git checkout -b "$BRANCH"
           git add openspec/
 
@@ -151,8 +165,17 @@ jobs:
           fi
 
           git commit -m "docs(openspec): archive completed change(s) - $CHANGES"
-          git push -u origin "$BRANCH"
 
+          # Force-push: no PR is open for this branch, so anything already at
+          # that ref is a leftover from a closed-without-merge archive PR and
+          # would otherwise block the push as a non-fast-forward. The content
+          # is regenerated from the base branch on every run, so there is
+          # nothing here to preserve.
+          git push --force origin "HEAD:refs/heads/$BRANCH"
+
+          # If two runs raced past the check above, the loser fails here
+          # ("a pull request for branch ... already exists") rather than
+          # opening a second PR for the same change.
           gh pr create \
             --title "docs(openspec): archive completed change(s) - $CHANGES" \
             --body "Automated archive triggered by the merge of #${PR_NUMBER}. Moves ${CHANGES} to \`openspec/changes/archive/\` and syncs specs, per \`openspec archive --yes\`." \

@@ -3,10 +3,18 @@
 // Shared across repos via deriv-com/shared-actions (composite action +
 // reusable workflow).
 //
-// Detects which change(s) a merge touched from the diff, verifies every task
-// in that change's tasks.md is checked, then runs `openspec archive --yes
-// --json` (non-interactive). The calling workflow opens a follow-up PR with
-// the result — it never pushes directly to a protected branch.
+// Detects which change(s) the merged PR itself touched, verifies every task in
+// that change's tasks.md is checked, then runs `openspec archive --yes --json`
+// (non-interactive). The calling workflow opens a follow-up PR with the result
+// — it never pushes directly to a protected branch.
+//
+// The touched-file list comes from the GitHub API rather than a local `git
+// diff`. A diff of `base.sha..merge_commit_sha` is NOT the PR's own diff: for
+// a PR opened against an older master it also contains every commit merged in
+// between, so an unrelated PR merged after some other PR completed a change
+// would "touch" that change too and archive it a second time. Asking the API
+// for the PR's files is exact and, unlike any local range, is independent of
+// whether the PR was merged, squashed, or rebased.
 const { execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
@@ -18,7 +26,7 @@ const ROOT =
   process.env.GITHUB_WORKSPACE || path.join(__dirname, "..", "..", "..");
 
 /**
- * Given a list of changed file paths (e.g. from `git diff --name-only`),
+ * Given a list of changed file paths (e.g. the filenames of a PR's files),
  * return the distinct openspec change names touched, excluding the archive
  * directory itself. Pure function — no I/O.
  */
@@ -27,14 +35,19 @@ const ROOT =
 // as a change name below, since it can never match this pattern.
 const CHANGE_NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
 
-// Full 40-char hex git SHA. GitHub always provides base/head SHAs in this
-// shape for a pull_request event, but validating the shape here is cheap
-// defense-in-depth before shelling out to `git diff` with them.
-const SHA_RE = /^[0-9a-f]{40}$/i;
+// GitHub returns at most 100 files per page and caps the endpoint at 3000
+// files, so 30 pages is a complete read and also a runaway-loop backstop.
+const FILES_PER_PAGE = 100;
+const MAX_FILE_PAGES = 30;
 
-/** True when `value` is a well-formed 40-char hex git SHA. Pure function. */
-function isValidSha(value) {
-  return typeof value === "string" && SHA_RE.test(value);
+/** True when `value` is a positive integer PR number. Pure function. */
+function isValidPrNumber(value) {
+  return /^[1-9][0-9]*$/.test(String(value ?? ""));
+}
+
+/** True when `value` is an `owner/repo` slug. Pure function. */
+function isValidRepo(value) {
+  return /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(String(value ?? ""));
 }
 
 function extractChangeNames(files) {
@@ -63,12 +76,49 @@ function isTasksComplete(tasksMdContent) {
   return !/^\s*-\s\[\s\]/m.test(tasksMdContent);
 }
 
-function gitDiffNames(base, head) {
-  const raw = execFileSync("git", ["diff", "--name-only", `${base}..${head}`], {
-    encoding: "utf8",
-    cwd: ROOT,
-  });
-  return raw.split("\n").filter(Boolean);
+/**
+ * Every path the pull request itself changed, via the GitHub API. Renames
+ * report both their new and previous path, so a file moved out of a change
+ * directory still counts as touching that change.
+ */
+async function fetchPullRequestFiles({ apiUrl, repo, prNumber, token }) {
+  const files = [];
+  for (let page = 1; page <= MAX_FILE_PAGES; page += 1) {
+    const url =
+      `${apiUrl}/repos/${repo}/pulls/${prNumber}/files` +
+      `?per_page=${FILES_PER_PAGE}&page=${page}`;
+    const response = await fetch(url, {
+      headers: {
+        accept: "application/vnd.github+json",
+        authorization: `Bearer ${token}`,
+        "x-github-api-version": "2022-11-28",
+        "user-agent": "deriv-com/shared-actions archive_on_merge",
+      },
+    });
+    if (!response.ok) {
+      throw new Error(
+        `GitHub API returned ${response.status} ${response.statusText} for ${repo} PR #${prNumber} files.`
+      );
+    }
+    const batch = await response.json();
+    if (!Array.isArray(batch)) {
+      throw new Error(
+        `Expected an array of files from the GitHub API, got ${typeof batch}.`
+      );
+    }
+    for (const file of batch) {
+      if (file && typeof file.filename === "string") {
+        files.push(file.filename);
+      }
+      if (file && typeof file.previous_filename === "string") {
+        files.push(file.previous_filename);
+      }
+    }
+    if (batch.length < FILES_PER_PAGE) {
+      return files;
+    }
+  }
+  return files;
 }
 
 function runOpenspecArchive(changeName) {
@@ -115,26 +165,38 @@ function writeOutputs(archived) {
   );
 }
 
-function main() {
-  const base = process.env.BASE_SHA;
-  const head = process.env.HEAD_SHA;
-  if (!base || !head) {
-    console.error("BASE_SHA and HEAD_SHA env vars are required.");
+async function main() {
+  const prNumber = process.env.PR_NUMBER;
+  const repo = process.env.GITHUB_REPOSITORY;
+  const token = process.env.GITHUB_TOKEN;
+  const apiUrl = process.env.GITHUB_API_URL || "https://api.github.com";
+
+  if (!isValidPrNumber(prNumber)) {
+    console.error(`PR_NUMBER must be a positive integer (got '${prNumber}').`);
     process.exit(1);
   }
-  if (!isValidSha(base) || !isValidSha(head)) {
+  if (!isValidRepo(repo)) {
     console.error(
-      `BASE_SHA and HEAD_SHA must be 40-char hex SHAs (got '${base}', '${head}').`
+      `GITHUB_REPOSITORY must be an 'owner/repo' slug (got '${repo}').`
     );
     process.exit(1);
   }
+  if (!token) {
+    console.error("GITHUB_TOKEN env var is required to read the PR's files.");
+    process.exit(1);
+  }
 
-  const changedFiles = gitDiffNames(base, head);
+  const changedFiles = await fetchPullRequestFiles({
+    apiUrl,
+    repo,
+    prNumber,
+    token,
+  });
   const candidates = extractChangeNames(changedFiles);
 
   if (candidates.length === 0) {
     console.log(
-      "No openspec change directories touched by this merge. Nothing to archive."
+      `PR #${prNumber} touched no openspec change directories. Nothing to archive.`
     );
     writeOutputs([]);
     return;
@@ -204,18 +266,17 @@ function main() {
 module.exports = {
   extractChangeNames,
   isTasksComplete,
-  isValidSha,
-  gitDiffNames,
+  isValidPrNumber,
+  isValidRepo,
+  fetchPullRequestFiles,
   runOpenspecArchive,
   writeOutputs,
   main,
 };
 
 if (require.main === module) {
-  try {
-    main();
-  } catch (err) {
+  main().catch((err) => {
     console.error(err.message);
     process.exit(1);
-  }
+  });
 }
