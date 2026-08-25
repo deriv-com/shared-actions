@@ -1,0 +1,29 @@
+name: trivy_sca_autofix_prompt
+description: >
+  Copy the Trivy SCA autofix playbook and helper lib from this action's
+  directory to /tmp. A reusable workflow cannot read sibling files from
+  shared-actions; github.action_path is how they reach the runner.
+
+outputs:
+  prompt_path:
+    description: Path the playbook was copied to
+    value: ${{ steps.copy.outputs.prompt_path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Copy autofix playbook
+      id: copy
+      shell: bash
+      run: |
+        SRC="${{ github.action_path }}/prompt.md"
+        LIB="${{ github.action_path }}/lib.sh"
+        DEST="/tmp/fix_prompt.md"
+        LIB_DEST="/tmp/sca-lib.sh"
+        [[ -s "$SRC" ]] || { echo "❌ trivy_sca_autofix_prompt: missing $SRC"; exit 1; }
+        [[ -s "$LIB" ]] || { echo "❌ trivy_sca_autofix_prompt: missing $LIB"; exit 1; }
+        cp "$SRC" "$DEST"
+        cp "$LIB" "$LIB_DEST"
+        echo "✅ Playbook copied to $DEST ($(wc -c < "$DEST") bytes)"
+        echo "✅ Lib copied to $LIB_DEST"
+        echo "prompt_path=$DEST" >> "$GITHUB_OUTPUT"

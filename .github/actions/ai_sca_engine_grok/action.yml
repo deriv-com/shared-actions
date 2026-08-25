@@ -1,0 +1,280 @@
+name: ai_sca_engine_grok
+description: >
+  Trivy SCA fix engine — Grok Build CLI. Reads pre-built fix context and a
+  Trivy JSON report, edits package.json files, writes /tmp/autofix_result.md.
+  No shell tool. No GitHub token. Sandbox is workspace-write (read-only cannot
+  write package.json in the checkout).
+
+inputs:
+  fix_context_path:
+    description: Path to caller-built fix context markdown
+    required: false
+    default: "/tmp/fix_context.md"
+  trivy_json_path:
+    description: Path to Trivy JSON report
+    required: false
+    default: "/tmp/trivy.json"
+  output_path:
+    description: Path this engine MUST write the result markdown to (must be under /tmp)
+    required: false
+    default: "/tmp/autofix_result.md"
+  repository:
+    description: owner/repo (prompt preamble only)
+    required: true
+  model:
+    description: LiteLLM alias, e.g. grok-4.6
+    required: false
+    default: "grok-4.6"
+  base_url:
+    description: LLM API base URL; /v1 appended when absent
+    required: false
+    default: "https://litellmsa.deriv.ai/v1"
+  api_key:
+    description: API key for base_url. Composite actions cannot read the secrets context, so the caller must pass this explicitly.
+    required: true
+  max_context_size:
+    description: Context window in tokens
+    required: false
+    default: "500000"
+  cli_version:
+    description: Exact @xai-official/grok version
+    required: false
+    default: "1.0.5"
+  node_version:
+    description: Node.js version to install the CLI
+    required: false
+    default: "22"
+
+outputs:
+  output_path:
+    description: Path the result markdown was written to
+    value: ${{ steps.run.outputs.output_path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Strip repo-supplied agent config (Grok Build)
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        find . -name .git -prune -o -type f \
+          \( -iname 'agents.md' -o -iname 'agent.md' \
+             -o -iname 'claude.md' -o -iname 'claude.local.md' \
+             -o -iname 'kimi.md' -o -iname '.mcp.json' -o -iname '.cursorrules' \) \
+          -print0 | xargs -0 -r rm -f
+        find . -name .git -prune -o -type d \
+          \( -iname '.grok' -o -iname '.claude' -o -iname '.claude-plugin' -o -iname '.agents' \) \
+          -print0 | xargs -0 -r rm -rf
+        find . -name .git -prune -o -type d -ipath '*/.cursor/rules' \
+          -print0 | xargs -0 -r rm -rf
+        echo "✅ Grok SCA engine: stripped agent config (recursive)"
+
+    - name: Set up Node.js
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: ${{ inputs.node_version }}
+
+    - name: Install SCA CLI (Grok Build)
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli_version }}
+        GROK_HOME: /tmp/grok-engine-home
+      run: |
+        rm -rf "$GROK_HOME" "$HOME/.grok" "$HOME/.agents" "$HOME/.claude"
+        mkdir -p "$GROK_HOME"
+        npm install -g "@xai-official/grok@${CLI_VERSION}"
+        grok --version
+        if ! command -v bwrap >/dev/null 2>&1; then
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap apparmor-profiles
+        fi
+        if [[ -f /usr/share/apparmor/extra-profiles/bwrap-userns-restrict ]]; then
+          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+            /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+        elif [[ ! -f /etc/apparmor.d/bwrap ]]; then
+          printf '%s\n' \
+            'abi <abi/4.0>,' \
+            'include <tunables/global>' \
+            '' \
+            'profile bwrap /usr/bin/bwrap flags=(unconfined) {' \
+            '  userns,' \
+            '  include if exists <local/bwrap>' \
+            '}' \
+            | sudo tee /etc/apparmor.d/bwrap >/dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+        fi
+        if ! bwrap --unshare-user --die-with-parent --ro-bind / / --dev /dev true; then
+          echo "❌ Grok SCA engine: bubblewrap cannot create a user namespace on this runner (uid map denied)."
+          exit 1
+        fi
+        echo "✅ Grok SCA engine: CLI ${CLI_VERSION} installed"
+
+    - name: Configure SCA CLI (Grok Build)
+      shell: bash
+      env:
+        GROK_HOME: /tmp/grok-engine-home
+        OUTPUT_PATH: ${{ inputs.output_path }}
+        MODEL: ${{ inputs.model }}
+        INPUT_BASE_URL: ${{ inputs.base_url }}
+        MAX_CONTEXT: ${{ inputs.max_context_size }}
+        GROK_CURSOR_SKILLS_ENABLED: "0"
+        GROK_CURSOR_RULES_ENABLED: "0"
+        GROK_CURSOR_AGENTS_ENABLED: "0"
+        GROK_CURSOR_MCPS_ENABLED: "0"
+        GROK_CURSOR_HOOKS_ENABLED: "0"
+        GROK_CLAUDE_SKILLS_ENABLED: "0"
+        GROK_CLAUDE_RULES_ENABLED: "0"
+        GROK_CLAUDE_AGENTS_ENABLED: "0"
+        GROK_CLAUDE_MCPS_ENABLED: "0"
+        GROK_CLAUDE_HOOKS_ENABLED: "0"
+      run: |
+        case "$OUTPUT_PATH" in
+          /tmp/*|/var/tmp/*) ;;
+          *)
+            echo "❌ Grok SCA engine: output_path must be under temp: $OUTPUT_PATH"
+            exit 1
+            ;;
+        esac
+        [[ "$MAX_CONTEXT" =~ ^[1-9][0-9]*$ ]] || {
+          echo "❌ Grok SCA engine: max_context_size must be a positive integer, got '$MAX_CONTEXT'"
+          exit 1
+        }
+        BASE_URL="${INPUT_BASE_URL%/}"
+        [[ "$BASE_URL" == */v1 ]] || BASE_URL="${BASE_URL}/v1"
+        mkdir -p "$GROK_HOME"
+        cat > "$GROK_HOME/config.toml" <<EOF
+        [models]
+        default = "review"
+
+        [model.review]
+        model = "${MODEL}"
+        base_url = "${BASE_URL}"
+        env_key = "XAI_API_KEY"
+        api_backend = "chat_completions"
+        context_window = ${MAX_CONTEXT}
+
+        [sandbox]
+        profile = "workspace-write"
+
+        [permission]
+        rules = [
+          { action = "allow", tool = "read" },
+          { action = "allow", tool = "grep" },
+          { action = "deny", tool = "bash" },
+          { action = "deny", tool = "webfetch" },
+          { action = "deny", tool = "websearch" },
+          { action = "deny", tool = "mcp" },
+        ]
+        EOF
+        echo "🔧 Grok SCA engine | model=$MODEL | base_url=$BASE_URL"
+        grok inspect
+        echo "✅ Grok SCA engine: config written"
+
+    - name: Run Trivy SCA fix (Grok Build)
+      id: run
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        GROK_HOME: /tmp/grok-engine-home
+        XAI_API_KEY: ${{ inputs.api_key }}
+        GROK_DISABLE_AUTOUPDATER: "1"
+        GROK_SANDBOX: workspace-write
+        CI: "1"
+        GITHUB_TOKEN: ""
+        GH_TOKEN: ""
+        AUTOFIX_GITHUB_TOKEN: ""
+        GROK_CURSOR_SKILLS_ENABLED: "0"
+        GROK_CURSOR_RULES_ENABLED: "0"
+        GROK_CURSOR_AGENTS_ENABLED: "0"
+        GROK_CURSOR_MCPS_ENABLED: "0"
+        GROK_CURSOR_HOOKS_ENABLED: "0"
+        GROK_CLAUDE_SKILLS_ENABLED: "0"
+        GROK_CLAUDE_RULES_ENABLED: "0"
+        GROK_CLAUDE_AGENTS_ENABLED: "0"
+        GROK_CLAUDE_MCPS_ENABLED: "0"
+        GROK_CLAUDE_HOOKS_ENABLED: "0"
+        CONTEXT_PATH: ${{ inputs.fix_context_path }}
+        TRIVY_JSON: ${{ inputs.trivy_json_path }}
+        OUTPUT_PATH: ${{ inputs.output_path }}
+        MODEL: ${{ inputs.model }}
+        REPO: ${{ inputs.repository }}
+      run: |
+        [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Grok SCA engine: missing or empty fix context at $CONTEXT_PATH"; exit 1; }
+        [[ -s "$TRIVY_JSON" ]] || { echo "❌ Grok SCA engine: missing or empty Trivy JSON at $TRIVY_JSON"; exit 1; }
+        cat > /tmp/sca_prompt.txt <<EOF
+        REPO: ${REPO}
+
+        Read ${CONTEXT_PATH} and follow it exactly. Then read
+        ${TRIVY_JSON}. You have no shell tool.
+
+        HOW THIS TASK IS DELIVERED: your chat reply is discarded. Write
+        ${OUTPUT_PATH} with the Write tool and edit only package.json files.
+        EOF
+        dump_grok_log() {
+          set +e +o pipefail
+          echo "ℹ️  Grok SCA engine config: model=$MODEL grok_home=$GROK_HOME"
+          if [[ -s "$OUTPUT_PATH" ]]; then
+            echo "ℹ️  result file: PRESENT"
+          else
+            echo "ℹ️  result file: ABSENT"
+          fi
+          GROK_LOGS=$(find "$GROK_HOME" /tmp -maxdepth 5 -type f \( -name '*.log' -o -name '*.jsonl' \) 2>/dev/null | grep -i grok | head -3 || true)
+          if [[ -n "$GROK_LOGS" ]]; then
+            while IFS= read -r log; do
+              echo "::group::$log (last 200 lines)"
+              tail -n 200 "$log"
+              echo "::endgroup::"
+            done <<< "$GROK_LOGS"
+          fi
+        }
+        rm -f "$OUTPUT_PATH"
+        BEFORE=$(git status --porcelain)
+        REVIEW_PROMPT="$(cat /tmp/sca_prompt.txt)"
+        OUT_DIR="$(dirname "$OUTPUT_PATH")"
+        for attempt in 1 2; do
+          grok --no-alt-screen \
+            --permission-mode dontAsk \
+            --sandbox workspace-write \
+            --disable-web-search \
+            --no-subagents \
+            --no-plan \
+            --tools Read,Grep,Write,Edit \
+            --disallowed-tools Bash,WebFetch,WebSearch \
+            --allow Read \
+            --allow Grep \
+            --allow "Write(${OUT_DIR}/*)" \
+            --allow "Edit(${OUT_DIR}/*)" \
+            --allow "Write(package.json)" \
+            --allow "Write(**/package.json)" \
+            --allow "Edit(package.json)" \
+            --allow "Edit(**/package.json)" \
+            --deny Bash \
+            --deny WebFetch \
+            --deny WebSearch \
+            -p "$REVIEW_PROMPT" && GROK_STATUS=0 || GROK_STATUS=$?
+          AFTER=$(git status --porcelain)
+          if [[ -s "$OUTPUT_PATH" ]]; then
+            if [[ "$GROK_STATUS" -ne 0 ]]; then
+              echo "⚠️  Grok SCA engine: CLI exited $GROK_STATUS AFTER writing the result — keeping it."
+              ( dump_grok_log ) || true
+            fi
+            break
+          fi
+          if [[ -n "$AFTER" && "$AFTER" != "$BEFORE" ]]; then
+            echo "❌ Grok SCA engine: worktree changed but $OUTPUT_PATH is empty — not retrying a partial edit"
+            ( dump_grok_log ) || true
+            exit 1
+          fi
+          if [[ "$attempt" -eq 1 ]]; then
+            echo "⚠️  Grok SCA engine: CLI exited $GROK_STATUS with no result — retrying once."
+            ( dump_grok_log ) || true
+          fi
+        done
+        if [[ ! -s "$OUTPUT_PATH" ]]; then
+          echo "❌ Grok SCA engine: no result written to $OUTPUT_PATH after 2 attempts (last CLI exit: $GROK_STATUS)"
+          ( dump_grok_log ) || true
+          exit 1
+        fi
+        echo "✅ Grok SCA engine: result written ($(wc -c < "$OUTPUT_PATH") bytes)"
+        echo "output_path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"

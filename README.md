@@ -17,6 +17,7 @@ Everything here is consumed at `@master`, so **changes are live for every consum
 | [`claude-pr-review.yml`](.github/workflows/claude-pr-review.yml) | Claude PR review | — | ⚠️ **deprecated** → use `ai-pr-review.yml` with `engine: anthropic` |
 | [`docsync-ai.yml`](.github/workflows/docsync-ai.yml) | Keeps docs in sync with code; scheduled + comment-triggered | — | ✅ active |
 | [`dependonme-bot.yml`](.github/workflows/dependonme-bot.yml) | Auto-fixes Dependabot security alerts | [DEPENDONME_BOT_README.md](.github/workflows/DEPENDONME_BOT_README.md) | ✅ active |
+| [`trivy-sca-autofix.yml`](.github/workflows/trivy-sca-autofix.yml) | When a consumer Trivy SCA job fails, re-scan `master` and open one JS-deps fix PR; engine selectable (`kimi` \| `anthropic` \| `grok`) | [TRIVY_SCA_AUTOFIX_README.md](.github/workflows/TRIVY_SCA_AUTOFIX_README.md) | ✅ active |
 | [`qa-checklist.yml`](.github/workflows/qa-checklist.yml) | Generates a QA checklist for a PR | — | ✅ active |
 
 ### Deprecations
