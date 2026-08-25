@@ -6,10 +6,10 @@ name: Kimi PR Review
 # regression in ai-pr-review.yml or ai_review_engine_* shows up on our own PRs
 # before it reaches the 14 consumer repos.
 #
-# Runs ALONGSIDE claude.yml on purpose, so Kimi K3 and Claude review the same PRs
-# and can be compared. Every PR gets two review comments, told apart by header:
-#   "## 🤖 Kimi PR Review Complete"   <- this workflow (Kimi K3)
-#   "## 🤖 Claude PR Review Complete" <- claude.yml (claude-sonnet-5)
+# This is now the ONLY review on this repo's PRs. claude.yml — which ran
+# claude-sonnet-5 through the deprecated claude-pr-review.yml so the two engines
+# could be compared on the same PRs — has been removed, so a PR gets exactly one
+# review comment, headed "## 🤖 Kimi PR Review Complete".
 #
 # TWO SELF-REFERENCE CAVEATS, both worth knowing before trusting a green run here:
 #
@@ -32,15 +32,15 @@ on:
 
 jobs:
   ai-review:
-    # Absolute path at @master rather than a local `./` path, matching claude.yml
-    # and docsync-ai.yml. It also keeps this caller identical in shape to the
+    # Absolute path at @master rather than a local `./` path, matching
+    # docsync-ai.yml. It also keeps this caller identical in shape to the
     # consumer repos', so dogfooding exercises the same resolution path they use.
     uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@master
 
     # Exactly what the shared workflow declares. `actions: write` and
     # `id-token: write` were dropped from it (nothing calls the Actions API, no
-    # step mints an OIDC token), so they are not needed here either — unlike
-    # claude.yml, which still grants both for the older workflow.
+    # step mints an OIDC token), so they are not needed here either — unlike the
+    # deprecated claude-pr-review.yml, which still requires both from its callers.
     permissions:
       contents: read
       pull-requests: write
@@ -59,13 +59,11 @@ jobs:
       # platform and the proxy rejects it, even with a correct model and key.
       provider_type: openai
 
-      # REQUIRED while claude.yml also runs. The shared workflow defaults this to
-      # "Claude PR Review Complete" so a repo migrating OFF claude-pr-review.yml
-      # cleans up its leftovers; left at that default here, this run would delete
-      # the Claude review it is being compared against on every push. Emptying it
-      # leaves Claude's comments alone — each workflow reaps only its own.
-      # Restore the default when claude.yml is removed.
-      legacy_markers: ""
+      # `legacy_markers` is deliberately NOT set, so it keeps the shared default
+      # ("Claude PR Review Complete"). It had to be emptied while claude.yml also
+      # ran, or every Kimi run deleted the Claude review it was being compared
+      # against. With claude.yml gone the default is what we want: a run also
+      # reaps the stale Claude comment on any PR left open across the switch.
 
     secrets:
       # LiteLLM virtual key, authorised for `kimi-k3` on litellmsa.deriv.ai.

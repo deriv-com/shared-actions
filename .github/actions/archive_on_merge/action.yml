@@ -5,12 +5,16 @@ description: >
   a follow-up step/workflow that opens the archive PR (never pushes to a
   protected branch).
 inputs:
-  base_sha:
-    description: Base SHA of the merged PR (40-char hex)
+  pr_number:
+    description: Number of the merged pull request whose files are inspected
     required: true
-  head_sha:
-    description: Merge commit SHA of the merged PR (40-char hex)
+  github_token:
+    description: Token used to read the merged PR's file list (needs pull-requests read)
     required: true
+  repository:
+    description: "'owner/repo' the pull request belongs to"
+    required: false
+    default: ${{ github.repository }}
 outputs:
   archived:
     description: "'true' when at least one change was archived, otherwise 'false'"
@@ -25,8 +29,12 @@ runs:
       id: archive
       shell: bash
       env:
-        BASE_SHA: ${{ inputs.base_sha }}
-        HEAD_SHA: ${{ inputs.head_sha }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        # Not GITHUB_REPOSITORY: the GITHUB_ prefix is reserved, and
+        # reassigning a default runner variable here is undocumented. The
+        # script falls back to GITHUB_REPOSITORY when this is unset.
+        TARGET_REPOSITORY: ${{ inputs.repository }}
         # openspec telemetry auto-disables when CI=true; set DO_NOT_TRACK too
         # as defense-in-depth and for local runs outside CI.
         DO_NOT_TRACK: "1"
