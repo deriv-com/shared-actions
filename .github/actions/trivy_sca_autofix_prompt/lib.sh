@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# WARNING: shipped to consumers at @master via trivy_sca_autofix_prompt.
+# Changes here are live for every consumer on merge and alter the security
+# gate (allowlist, loop-skip, reduction gate). Treat as workflow code.
+#
 # Shared SCA autofix helpers. Copied to /tmp/sca-lib.sh via github.action_path
 # (reusable workflows check out the caller, so this cannot live at a path in
 # the consumer repo). Sourced by trivy-sca-autofix.yml and the logic tests.

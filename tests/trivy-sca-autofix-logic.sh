@@ -75,6 +75,8 @@ assert_ok should_open_pr 1 0
 assert_fail should_open_pr 5 5
 assert_fail should_open_pr 5 6
 assert_fail should_open_pr 0 0
+assert_fail should_open_pr "" 3
+assert_fail should_open_pr 12 "not-a-number"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

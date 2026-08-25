@@ -24,7 +24,7 @@ autofix:
     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 ```
 
-Every consumer in this org pins `@master`, so that is the documented policy — changes are live on merge. The SCA engines and `send_slack_notification` run with the LLM key in scope, and the same job later uses `AUTOFIX_GITHUB_TOKEN` for push/PR creation.
+Every consumer in this org pins `@master`, so that is the documented policy — changes are live on merge. The SCA engines and `send_slack_notification` run with the LLM key in scope, and the same job later uses `AUTOFIX_GITHUB_TOKEN` for push/PR creation. `trivy_sca_autofix_prompt/lib.sh` carries the allowlist, loop-skip and reduction-gate logic for every consumer — treat edits to it like edits to this workflow.
 
 ## Engines
 
@@ -90,4 +90,4 @@ Switching engines is one input: `engine:`. To add a new engine, create `.github/
 
 ## Dogfood note
 
-Composite action refs inside this workflow resolve `@master` even when the reusable workflow is called from a feature branch. To pilot a new engine before merge, temporarily point the dispatch `uses:` steps in `trivy-sca-autofix.yml` at `@<branch>` and revert before merging to `master`.
+Composite action refs inside this workflow resolve `@master` even when the reusable workflow is called from a feature branch. `@master` does not yet have `trivy_sca_autofix_prompt/lib.sh`, so a branch pilot that only retargets the engine `uses:` steps dies at `Copy autofix playbook` / `Loop skip`. Point `trivy_sca_autofix_prompt` at `@<branch>` first, then the SCA engine dispatch steps, and revert all of those pins before merging to `master`.
