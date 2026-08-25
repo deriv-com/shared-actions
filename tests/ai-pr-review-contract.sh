@@ -53,6 +53,7 @@ check 'grep -q "| \`review_title\`" "$README"' "README documents review_title"
 check 'grep -q "GLM PR Review" "$README"' "README shows GLM PR Review as the caller example"
 check 'grep -q "is a replacement label" "$README"' "README says review_title is a replacement label"
 check 'grep -q "group is keyed only by" "$README"' "README documents same-engine concurrency cancellation"
+check 'grep -q "not authoritative until the run succeeds" "$README"' "README notes invalid review_title still appears in Checks"
 
 check 'grep -q "tests/ai-pr-review-contract.sh" "$LINT"' "lint-actions runs this contract script"
 check 'grep -q "test-scripts:" "$LINT"' "lint-actions keeps master's test-scripts job"

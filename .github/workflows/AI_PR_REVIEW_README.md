@@ -187,6 +187,10 @@ engine if you need a bake-off.
 | `legacy_markers` | Newline-separated markers from superseded workflows to also delete | ❌ | `Claude PR Review Complete` |
 | `prompt_gist_url` | Review prompt template | ❌ | DerivFE gist, **pinned to a revision** |
 
+An invalid `review_title` still renders verbatim in the Check name at
+workflow-parse time; the run then fails in "Resolve and validate engine".
+The job name is not authoritative until the run succeeds.
+
 Inputs marked **[kimi]** / **[kimi, grok]** are ignored by engines that do not
 use them. Every input except
 `engine` and `legacy_markers` declares `default: ""` and is resolved to the

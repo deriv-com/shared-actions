@@ -33,7 +33,7 @@ on:
         default: "kimi"
         type: string
       review_title:
-        description: "Visible Checks name and comment heading (the post step appends ' Complete'). Empty keeps the engine default (Kimi PR Review / Claude PR Review / Grok PR Review). Must end in ' PR Review' so follow-up header strip stays in lockstep. Replacement label for one engine+model, not a second concurrent engine — e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review. Hidden HTML markers stay per-engine."
+        description: "Visible Checks name and comment heading (the post step appends ' Complete'). Empty keeps the engine default (Kimi PR Review / Claude PR Review / Grok PR Review). Must end in ' PR Review' so follow-up header strip stays in lockstep. Replacement label for one engine+model, not a second concurrent engine — e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review. Hidden HTML markers stay per-engine. An invalid value still appears in the Check name at parse time; the job name is not authoritative until the run succeeds."
         required: false
         default: ""
         type: string
