@@ -33,7 +33,7 @@ on:
         default: "kimi"
         type: string
       review_title:
-        description: "Visible Checks name and comment heading (the post step appends ' Complete'). Empty keeps the engine default (Kimi PR Review / Claude PR Review / Grok PR Review). For a model swap on an existing engine, pass this rather than adding a new engine — e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review. Not a comment marker; hidden HTML markers stay per-engine."
+        description: "Visible Checks name and comment heading (the post step appends ' Complete'). Empty keeps the engine default (Kimi PR Review / Claude PR Review / Grok PR Review). Must end in ' PR Review' so follow-up header strip stays in lockstep. Replacement label for one engine+model, not a second concurrent engine — e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review. Hidden HTML markers stay per-engine."
         required: false
         default: ""
         type: string
@@ -245,9 +245,9 @@ jobs:
           esac
 
           if [[ -n "${REVIEW_TITLE_INPUT:-}" ]]; then
-            if [[ ! "$REVIEW_TITLE_INPUT" =~ ^[A-Za-z0-9][A-Za-z0-9\ ._-]{0,78}$ ]]; then
+            if [[ ${#REVIEW_TITLE_INPUT} -gt 79 ]] || [[ ! "$REVIEW_TITLE_INPUT" =~ ^[A-Za-z0-9][A-Za-z0-9 ._-]*\ PR\ Review$ ]]; then
               echo "❌ Invalid review_title '$REVIEW_TITLE_INPUT'"
-              echo "   Use 1-79 characters: letters, numbers, spaces, '.', '_' or '-'."
+              echo "   Use 1-79 characters ending in ' PR Review' (letters, numbers, spaces, '.', '_' or '-')."
               echo "   Example: GLM PR Review"
               exit 1
             fi
@@ -593,9 +593,12 @@ jobs:
               # Strips this workflow's own header AND any superseded workflow's,
               # so a follow-up review does not re-feed a stale header back to the
               # agent (which may echo it and break the next run's parsing).
-              # `Review generated via .*` collapses the historical variants.
+              # The Complete heading is `.+ PR Review Complete`, not a hardcoded
+              # engine list, so a review_title like GLM PR Review is stripped too.
+              # Titles must end in ` PR Review` (validated in Resolve) for this
+              # to match. `Review generated via .*` collapses the historical variants.
               sed -E \
-                -e '/^## 🤖 (AI|Claude|Kimi|Grok) PR Review Complete$/d' \
+                -e '/^## 🤖 .+ PR Review Complete$/d' \
                 -e '/^## 🤖 .+ PR Review$/d' \
                 -e '/^\*\*Model:\*\*/d' \
                 -e '/^\*\*Review Type:\*\*/d' \

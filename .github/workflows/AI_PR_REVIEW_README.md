@@ -23,7 +23,7 @@ engine is pluggable: pick `kimi`, `anthropic`, or `grok` with one input.
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
 - 📊 Emits events to the OneAboveAll metrics dashboard, and always to the job summary
 - ⏳ Posts a caller-owned "working on it" comment (model at the top) before the engine runs, then edits that same comment into the review; the CLI never gets a GitHub token
-- 🏷️ The reusable job is named after the engine (`Grok PR Review` / `Kimi PR Review` / `Claude PR Review`), or after `review_title` when that input is set, so Checks can tell concurrent engines (and model swaps) apart
+- 🏷️ The reusable job is named after the engine (`Grok PR Review` / `Kimi PR Review` / `Claude PR Review`), or after `review_title` when that input is set. `review_title` relabels one engine+model; it does not make two same-engine callers concurrent
 
 ## Usage
 
@@ -164,18 +164,21 @@ proxy fronts can be reached by setting `model` (and `max_context_size` on Kimi
 or Grok). Replacing an engine's *CLI* means writing a new composite action,
 because each CLI has its own config format, sandbox model, tool names and
 entrypoint. Grok 4.6 as a *model* on the Kimi CLI is a model swap; Grok Build
-as the *agent* is this engine. A model swap does not rename Checks or the
-comment heading: those stay `Claude PR Review` / `Kimi PR Review` /
-`Grok PR Review` unless the caller also sets `review_title`. Hidden HTML
-markers stay per-`engine`, so two anthropic callers with different titles
-would still reap each other.
+as the *agent* is this engine. `review_title` is a replacement label for a
+repo that has already chosen one engine+model (for example GLM on
+`engine: anthropic`). It does not make two same-engine callers coexist:
+hidden HTML markers and `METRICS_AGENT` stay per-engine, and the
+`concurrency` group is keyed only by `engine`, so a second anthropic run
+(Claude + GLM) cancels the first (`cancel-in-progress: true`) and would
+reap the same comment. Run one anthropic caller per repo, or add a real
+engine if you need a bake-off.
 
 ## Inputs
 
 | Input | Description | Required | Default (resolved when empty) |
 |-------|-------------|----------|---------|
 | `engine` | `kimi`, `anthropic`, or `grok` | ❌ | `kimi` |
-| `review_title` | Visible Checks name and comment heading (` Complete` is appended). Empty keeps the engine default. Model swap example: `engine: anthropic`, `model: glm-5.3`, `review_title: GLM PR Review` | ❌ | engine name (`Kimi PR Review` / `Claude PR Review` / `Grok PR Review`) |
+| `review_title` | Visible Checks name and comment heading (` Complete` is appended). Empty keeps the engine default. Must end in ` PR Review`. Replacement label, not a second concurrent engine. Example: `engine: anthropic`, `model: glm-5.3`, `review_title: GLM PR Review` | ❌ | engine name (`Kimi PR Review` / `Claude PR Review` / `Grok PR Review`) |
 | `model` | Model ID; resolved per engine when empty | ❌ | per engine |
 | `base_url` | LLM API endpoint; `/v1` added or stripped per engine | ❌ | `https://litellmsa.deriv.ai/v1` |
 | `max_context_size` | **[kimi, grok]** Context window in tokens. Must match the model, or the CLI over-packs and the API rejects the request | ❌ | per engine (`1048576` kimi, `500000` grok) |
@@ -328,9 +331,10 @@ Keep the caller's filename, `name:` and job id — they determine the left
 half of the status-check name (`{caller job} / {reusable job}`), and
 changing one can block merges on a repo with branch protection. The
 reusable job is named after `engine` (`Kimi PR Review`, `Grok PR Review`,
-`Claude PR Review`) so two engines on one PR are distinguishable in
-Checks. Override that heading with `review_title` for a model swap on the
-same engine (for example `review_title: GLM PR Review`). After adopting this, update any required check that still names
+`Claude PR Review`) so two *engines* on one PR are distinguishable in
+Checks. Override that heading with `review_title` when replacing the model
+on the same engine (for example `review_title: GLM PR Review`) — that is
+not a second concurrent anthropic job. After adopting this, update any required check that still names
 `ai-review / ai-review`. Do other cosmetic renames separately.
 
 Switching that repo to Kimi afterwards is a separate decision: set
