@@ -76,9 +76,12 @@ jobs:
       cancel-in-progress: false
 
     steps:
+      # Shallow is enough: detection reads the PR's files from the API and
+      # nothing walks a local commit range. The archive branch is cut from
+      # this single commit and pushes fine without history.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           ref: ${{ inputs.base_branch }}
 
       # Fetch the archive script from shared-actions at the caller-supplied

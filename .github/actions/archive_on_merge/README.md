@@ -9,9 +9,15 @@ Prefer the reusable workflow for the full flow (detect + open archive PR):
 
 ## Composite action usage
 
-Requires the `openspec` CLI on `PATH` (install `@fission-ai/openspec` first)
-and a checkout of the consumer repo at the base branch, already containing the
-merge.
+Requires:
+
+- **Node.js 18 or newer** — the script reads the PR's files over HTTP and uses
+  global `fetch`. The reusable workflow's `node_version` input defaults to `22`;
+  if you lower it below 18 the run fails with a message saying so. A shallow
+  checkout is fine — nothing walks a local commit range.
+- The `openspec` CLI on `PATH` (install `@fission-ai/openspec` first).
+- A checkout of the consumer repo at the base branch, already containing the
+  merge.
 
 ```yaml
 - uses: deriv-com/shared-actions/.github/actions/archive_on_merge@master
@@ -37,6 +43,19 @@ diff — for a PR opened against an older base it also contains every commit
 merged in between, so an unrelated PR merged afterwards would appear to touch a
 change some earlier PR had completed and would archive it a second time. Asking
 the API is exact and works the same for merge, squash, and rebase merges.
+
+Change names come back sorted, so the branch slug the caller derives from them
+is the same whatever order the API listed the files in.
+
+## Tests
+
+```bash
+node --test .github/actions/archive_on_merge/archive-on-merge.test.js
+```
+
+No dependencies and no `package.json` — the tests use the runner built into
+Node 18+ and a stub HTTP server. CI runs them via
+[`lint-actions.yml`](../../workflows/lint-actions.yml).
 
 ### Outputs
 

@@ -108,3 +108,29 @@ jobs:
             exit 1
           fi
           echo "✅ ${#actions[@]} composite action(s) passed"
+
+  # Node scripts that composite actions execute. These carry real logic, so
+  # linting the manifest around them is not enough.
+  test-scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
+      - name: Run action script tests
+        run: |
+          # No package.json anywhere: this repo ships workflows, not a Node
+          # package, so tests use the runner built into Node 18+ and have no
+          # dependencies to install.
+          shopt -s nullglob globstar
+          tests=(.github/actions/**/*.test.js)
+          if [[ ${#tests[@]} -eq 0 ]]; then
+            echo "::error::no action script tests found — has the layout changed?"
+            exit 1
+          fi
+          printf 'Running %d test file(s)\n' "${#tests[@]}"
+          node --test "${tests[@]}"

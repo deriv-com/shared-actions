@@ -15,9 +15,12 @@
 // would "touch" that change too and archive it a second time. Asking the API
 // for the PR's files is exact and, unlike any local range, is independent of
 // whether the PR was merged, squashed, or rebased.
+//
+// Requires Node.js 18 or newer for global `fetch`.
 const { execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { setTimeout: sleep } = require("timers/promises");
 
 // Prefer GITHUB_WORKSPACE so this script works when shipped as a composite
 // action (action files live under github.action_path, not the consumer repo).
@@ -40,6 +43,11 @@ const CHANGE_NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
 const FILES_PER_PAGE = 100;
 const MAX_FILE_PAGES = 30;
 
+// Retry only what a retry can fix: 5xx and 429. A 404 or 403 is a real answer
+// and failing immediately on it keeps the log readable.
+const MAX_ATTEMPTS = 3;
+const RETRY_BASE_MS = 1000;
+
 /** True when `value` is a positive integer PR number. Pure function. */
 function isValidPrNumber(value) {
   return /^[1-9][0-9]*$/.test(String(value ?? ""));
@@ -47,7 +55,14 @@ function isValidPrNumber(value) {
 
 /** True when `value` is an `owner/repo` slug. Pure function. */
 function isValidRepo(value) {
-  return /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(String(value ?? ""));
+  const slug = String(value ?? "");
+  if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(slug)) {
+    return false;
+  }
+  // The character class above still admits "." and ".." as whole segments,
+  // which `fetch` would resolve away and silently retarget the request at a
+  // different API path.
+  return slug.split("/").every((segment) => segment !== "." && segment !== "..");
 }
 
 function extractChangeNames(files) {
@@ -64,7 +79,10 @@ function extractChangeNames(files) {
       names.push(name);
     }
   }
-  return names;
+  // Sorted so the caller's branch slug is canonical: the same set of changes
+  // must produce the same branch name whatever order the API listed the files
+  // in, or the open-PR dedupe silently misses.
+  return names.sort();
 }
 
 /**
@@ -77,24 +95,69 @@ function isTasksComplete(tasksMdContent) {
 }
 
 /**
+ * `fetch` with bounded retries on transient failures (network error, 5xx,
+ * 429). Detection used to be an offline `git diff`; over the network a single
+ * blip would otherwise fail the job, and `pull_request: closed` never fires
+ * again for that merge.
+ */
+async function fetchWithRetry(
+  url,
+  options,
+  { attempts = MAX_ATTEMPTS, baseDelayMs = RETRY_BASE_MS } = {}
+) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await fetch(url, options);
+      if (response.status < 500 && response.status !== 429) {
+        return response;
+      }
+      lastError = new Error(
+        `GitHub API returned ${response.status} ${response.statusText}`
+      );
+    } catch (err) {
+      lastError = new Error(`request failed: ${err.message}`);
+    }
+    if (attempt < attempts) {
+      const delay = baseDelayMs * 2 ** (attempt - 1);
+      console.log(
+        `Attempt ${attempt}/${attempts} failed (${lastError.message}) — retrying in ${delay}ms.`
+      );
+      await sleep(delay);
+    }
+  }
+  throw lastError;
+}
+
+/**
  * Every path the pull request itself changed, via the GitHub API. Renames
  * report both their new and previous path, so a file moved out of a change
  * directory still counts as touching that change.
  */
-async function fetchPullRequestFiles({ apiUrl, repo, prNumber, token }) {
+async function fetchPullRequestFiles({
+  apiUrl,
+  repo,
+  prNumber,
+  token,
+  retry = {},
+}) {
   const files = [];
   for (let page = 1; page <= MAX_FILE_PAGES; page += 1) {
     const url =
       `${apiUrl}/repos/${repo}/pulls/${prNumber}/files` +
       `?per_page=${FILES_PER_PAGE}&page=${page}`;
-    const response = await fetch(url, {
-      headers: {
-        accept: "application/vnd.github+json",
-        authorization: `Bearer ${token}`,
-        "x-github-api-version": "2022-11-28",
-        "user-agent": "deriv-com/shared-actions archive_on_merge",
+    const response = await fetchWithRetry(
+      url,
+      {
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `Bearer ${token}`,
+          "x-github-api-version": "2022-11-28",
+          "user-agent": "deriv-com/shared-actions archive_on_merge",
+        },
       },
-    });
+      retry
+    );
     if (!response.ok) {
       throw new Error(
         `GitHub API returned ${response.status} ${response.statusText} for ${repo} PR #${prNumber} files.`
@@ -118,6 +181,14 @@ async function fetchPullRequestFiles({ apiUrl, repo, prNumber, token }) {
       return files;
     }
   }
+  // Hitting the endpoint's own 3000-file ceiling. Say so rather than treating
+  // a truncated list as the whole PR — an openspec directory could be missing
+  // from it, and the run would report "nothing to archive" with no clue why.
+  console.log(
+    `::warning::PR #${prNumber} has more files than the GitHub API will list ` +
+      `(${MAX_FILE_PAGES * FILES_PER_PAGE}); the file list is truncated and a ` +
+      `completed openspec change may not be detected.`
+  );
   return files;
 }
 
@@ -167,17 +238,27 @@ function writeOutputs(archived) {
 
 async function main() {
   const prNumber = process.env.PR_NUMBER;
-  const repo = process.env.GITHUB_REPOSITORY;
+  // TARGET_REPOSITORY rather than overriding GITHUB_REPOSITORY: the GITHUB_
+  // prefix is reserved, and reassigning a default runner variable from a
+  // step's `env:` is not documented as supported.
+  const repo = process.env.TARGET_REPOSITORY || process.env.GITHUB_REPOSITORY;
   const token = process.env.GITHUB_TOKEN;
   const apiUrl = process.env.GITHUB_API_URL || "https://api.github.com";
 
+  if (typeof fetch !== "function") {
+    console.error(
+      "Global fetch is unavailable — this action requires Node.js 18 or newer. " +
+        `Running on ${process.version}; raise the workflow's node_version input.`
+    );
+    process.exit(1);
+  }
   if (!isValidPrNumber(prNumber)) {
     console.error(`PR_NUMBER must be a positive integer (got '${prNumber}').`);
     process.exit(1);
   }
   if (!isValidRepo(repo)) {
     console.error(
-      `GITHUB_REPOSITORY must be an 'owner/repo' slug (got '${repo}').`
+      `Repository must be an 'owner/repo' slug (got '${repo}'). Set TARGET_REPOSITORY or run inside Actions.`
     );
     process.exit(1);
   }
@@ -268,10 +349,13 @@ module.exports = {
   isTasksComplete,
   isValidPrNumber,
   isValidRepo,
+  fetchWithRetry,
   fetchPullRequestFiles,
   runOpenspecArchive,
   writeOutputs,
   main,
+  MAX_FILE_PAGES,
+  FILES_PER_PAGE,
 };
 
 if (require.main === module) {
