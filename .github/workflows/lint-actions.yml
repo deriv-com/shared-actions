@@ -21,6 +21,7 @@ on:
     paths:
       - '.github/workflows/**'
       - '.github/actions/**'
+      - 'tests/ai-pr-review-contract.sh'
   workflow_dispatch:
 
 permissions:
@@ -108,6 +109,9 @@ jobs:
             exit 1
           fi
           echo "✅ ${#actions[@]} composite action(s) passed"
+
+      - name: AI PR review contract tests
+        run: bash tests/ai-pr-review-contract.sh
 
   # Node scripts that composite actions execute. These carry real logic, so
   # linting the manifest around them is not enough.

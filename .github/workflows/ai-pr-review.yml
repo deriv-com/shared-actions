@@ -4,7 +4,9 @@ name: AI PR Review
 # Full docs: .github/workflows/AI_PR_REVIEW_README.md
 #
 #   Model swap — set `model` (and `max_context_size` on the Kimi/Grok engines). Any
-#   model the LiteLLM proxy fronts works; the proxy normalises the API.
+#   model the LiteLLM proxy fronts works; the proxy normalises the API. The Checks
+#   name and comment heading stay the engine default unless `review_title` is set
+#   (e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review).
 #
 #   Engine swap — set `engine`. Each engine is a composite action under
 #   .github/actions/ai_review_engine_<engine>/ owning its own CLI, sandbox model,
@@ -29,6 +31,11 @@ on:
         description: "Review engine: `kimi` (Kimi Code CLI), `anthropic` (Claude Code Action), or `grok` (Grok Build CLI). Each is a composite action under .github/actions/ai_review_engine_<engine>/. Set this explicitly — the default is `kimi`, so an omitted value on a repo migrating from claude-pr-review.yml would switch LLM vendor."
         required: false
         default: "kimi"
+        type: string
+      review_title:
+        description: "Visible Checks name and comment heading (the post step appends ' Complete'). Empty keeps the engine default (Kimi PR Review / Claude PR Review / Grok PR Review). Must end in ' PR Review' so follow-up header strip stays in lockstep. Replacement label for one engine+model, not a second concurrent engine — e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review. Hidden HTML markers stay per-engine. An invalid value still appears in the Check name at parse time; the job name is not authoritative until the run succeeds."
+        required: false
+        default: ""
         type: string
       model:
         description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5, grok -> grok-4.6). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
@@ -78,7 +85,7 @@ on:
 
 jobs:
   ai-review:
-    name: ${{ inputs.engine == 'grok' && 'Grok PR Review' || (inputs.engine == 'anthropic' && 'Claude PR Review' || 'Kimi PR Review') }}
+    name: ${{ inputs.review_title != '' && inputs.review_title || (inputs.engine == 'grok' && 'Grok PR Review' || (inputs.engine == 'anthropic' && 'Claude PR Review' || 'Kimi PR Review')) }}
     runs-on:
       group: github_claude_code_reviewer
     # Bot actors are skipped, not failed: dependabot and friends are not org
@@ -174,6 +181,7 @@ jobs:
         id: engine
         env:
           ENGINE_INPUT: ${{ inputs.engine }}
+          REVIEW_TITLE_INPUT: ${{ inputs.review_title }}
           MODEL_INPUT: ${{ inputs.model }}
           BASE_URL_INPUT: ${{ inputs.base_url }}
           MAX_CONTEXT_INPUT: ${{ inputs.max_context_size }}
@@ -235,6 +243,21 @@ jobs:
               exit 1
               ;;
           esac
+
+          if [[ -n "${REVIEW_TITLE_INPUT:-}" ]]; then
+            # Quoted pattern in a variable: an unquoted `=~` with a literal
+            # space is a bash 3.2 parse error and would fail the whole step
+            # even when review_title is empty. Runners are bash 5, but this
+            # stays portable and rejects backslashes in the title.
+            review_title_re='^[A-Za-z0-9][A-Za-z0-9 ._-]* PR Review$'
+            if [[ ${#REVIEW_TITLE_INPUT} -gt 79 ]] || [[ ! "$REVIEW_TITLE_INPUT" =~ $review_title_re ]]; then
+              echo "❌ Invalid review_title '$REVIEW_TITLE_INPUT'"
+              echo "   Use 1-79 characters ending in ' PR Review' (letters, numbers, spaces, '.', '_' or '-')."
+              echo "   Example: GLM PR Review"
+              exit 1
+            fi
+            REVIEW_TITLE="$REVIEW_TITLE_INPUT"
+          fi
 
           MODEL="${MODEL_INPUT:-$DEFAULT_MODEL}"
 
@@ -575,9 +598,12 @@ jobs:
               # Strips this workflow's own header AND any superseded workflow's,
               # so a follow-up review does not re-feed a stale header back to the
               # agent (which may echo it and break the next run's parsing).
-              # `Review generated via .*` collapses the historical variants.
+              # The Complete heading is `.+ PR Review Complete`, not a hardcoded
+              # engine list, so a review_title like GLM PR Review is stripped too.
+              # Titles must end in ` PR Review` (validated in Resolve) for this
+              # to match. `Review generated via .*` collapses the historical variants.
               sed -E \
-                -e '/^## 🤖 (AI|Claude|Kimi|Grok) PR Review Complete$/d' \
+                -e '/^## 🤖 .+ PR Review Complete$/d' \
                 -e '/^## 🤖 .+ PR Review$/d' \
                 -e '/^\*\*Model:\*\*/d' \
                 -e '/^\*\*Review Type:\*\*/d' \
