@@ -22,6 +22,7 @@ on:
       - '.github/workflows/**'
       - '.github/actions/**'
       - 'tests/ai-pr-review-contract.sh'
+      - 'tests/forge-contract.sh'
   workflow_dispatch:
 
 permissions:
@@ -112,6 +113,9 @@ jobs:
 
       - name: AI PR review contract tests
         run: bash tests/ai-pr-review-contract.sh
+
+      - name: Forge contract tests
+        run: bash tests/forge-contract.sh
 
   # Node scripts that composite actions execute. These carry real logic, so
   # linting the manifest around them is not enough.
