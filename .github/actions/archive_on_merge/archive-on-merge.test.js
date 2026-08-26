@@ -8,7 +8,17 @@ const http = require("node:http");
 
 const {
   extractChangeNames,
+  parseTasks,
+  truncate,
   isTasksComplete,
+  groupBySection,
+  postMergeTasks,
+  postMergeNoteText,
+  repoSlugFromRemote,
+  formatIncompleteReport,
+  formatIncompleteSummary,
+  formatSkipNotice,
+  writeStepSummary,
   isValidPrNumber,
   isValidRepo,
   isRetryableResponse,
@@ -406,5 +416,383 @@ test("a caller-supplied signal is respected over the default timeout", async (t)
       { attempts: 1, baseDelayMs: 0, timeoutMs: 60_000 }
     ),
     /request (timed out|failed)/
+  );
+});
+
+// --- tasks.md census ---------------------------------------------------------
+
+// Shaped after the real file that prompted this: a change whose remaining work
+// is split between pre-merge verification and a section that by its own title
+// cannot be done before the merge.
+const TASKS_FIXTURE = [
+  "## 1. Build it",
+  "",
+  "- [x] 1.1 First thing",
+  "  - [x] 1.2 Nested and done",
+  "",
+  "## 5. Verify",
+  "",
+  "- [ ] 5.1 Run the test suite",
+  "- [X] 5.2 Uppercase X counts as checked",
+  "",
+  "## 6. Post-merge acceptance (cannot be run before merge)",
+  "",
+  "- [ ] 6.1 Dispatch from master",
+  "- [ ] 6.2 Confirm the next real merge",
+].join("\n");
+
+test("parseTasks counts checked and unchecked, including nested and uppercase", () => {
+  const census = parseTasks(TASKS_FIXTURE);
+  assert.strictEqual(census.total, 6);
+  assert.strictEqual(census.checked, 3);
+  assert.strictEqual(census.incomplete.length, 3);
+});
+
+test("parseTasks records the line and nearest section for each remaining task", () => {
+  const { incomplete } = parseTasks(TASKS_FIXTURE);
+  assert.deepStrictEqual(
+    incomplete.map((t) => [t.line, t.section, t.text]),
+    [
+      [8, "5. Verify", "5.1 Run the test suite"],
+      [13, "6. Post-merge acceptance (cannot be run before merge)", "6.1 Dispatch from master"],
+      [14, "6. Post-merge acceptance (cannot be run before merge)", "6.2 Confirm the next real merge"],
+    ]
+  );
+});
+
+test("parseTasks handles a body with no checkboxes at all", () => {
+  const census = parseTasks("# Notes\n\nNothing actionable here.\n");
+  assert.deepStrictEqual(census, { total: 0, checked: 0, incomplete: [] });
+});
+
+test("parseTasks tolerates empty and missing input", () => {
+  for (const input of ["", null, undefined]) {
+    assert.strictEqual(parseTasks(input).total, 0, `handles ${input}`);
+  }
+});
+
+test("parseTasks truncates a very long task rather than reflowing the log", () => {
+  const long = "x".repeat(300);
+  const [task] = parseTasks(`- [ ] ${long}`).incomplete;
+  assert.ok(task.text.length <= 100, `got ${task.text.length}`);
+  assert.ok(task.text.endsWith("…"), "marks the truncation");
+});
+
+test("isTasksComplete stays consistent with parseTasks", () => {
+  // They must not drift: isTasksComplete delegates, so any body where one says
+  // "complete" and the other reports remaining work is a bug.
+  const bodies = [
+    TASKS_FIXTURE,
+    "- [x] done\n",
+    "- [ ] not done\n",
+    "  - [ ] nested only\n",
+    "# no tasks\n",
+    "",
+  ];
+  for (const body of bodies) {
+    assert.strictEqual(
+      isTasksComplete(body),
+      parseTasks(body).incomplete.length === 0,
+      `disagreement on: ${JSON.stringify(body)}`
+    );
+  }
+});
+
+test("groupBySection preserves file order and merges consecutive runs", () => {
+  const groups = groupBySection([
+    { line: 1, section: "A", text: "a1" },
+    { line: 2, section: "A", text: "a2" },
+    { line: 3, section: "B", text: "b1" },
+    { line: 4, section: "A", text: "a3" },
+  ]);
+  assert.deepStrictEqual(
+    groups.map((g) => [g.section, g.tasks.length]),
+    [["A", 2], ["B", 1], ["A", 1]]
+  );
+});
+
+test("groupBySection labels tasks that precede any heading", () => {
+  const [group] = groupBySection([{ line: 1, section: null, text: "orphan" }]);
+  assert.strictEqual(group.section, "(no section)");
+});
+
+// --- reporting ---------------------------------------------------------------
+
+test("the log report names the counts, the sections and the line numbers", () => {
+  const report = formatIncompleteReport("my-change", parseTasks(TASKS_FIXTURE));
+  assert.match(report, /'my-change' is not complete: 3\/6 tasks checked, 3 remaining\./);
+  assert.match(report, /^ {2}5\. Verify$/m);
+  assert.match(report, /5\.1 Run the test suite {2}\(tasks\.md:8\)/);
+  // URLs belong in the job summary: change names run to ~90 characters, so a
+  // blob URL per row buries the task text it annotates.
+  assert.ok(!report.includes("https://"), "log lines stay URL-free");
+});
+
+test("the report calls out remaining tasks a merge can never see checked", () => {
+  const report = formatIncompleteReport("my-change", parseTasks(TASKS_FIXTURE));
+  assert.match(report, /2 of the 3 remaining task\(s\) sit in a section marked post-merge/);
+});
+
+test("the post-merge note stays quiet when no section is post-merge", () => {
+  const report = formatIncompleteReport(
+    "my-change",
+    parseTasks("## 5. Verify\n\n- [ ] 5.1 Run the suite\n")
+  );
+  assert.ok(!report.includes("post-merge"), "no spurious note");
+});
+
+test("the job summary renders a table and links each line when a URL is known", () => {
+  const md = formatIncompleteSummary("my-change", parseTasks(TASKS_FIXTURE), {
+    tasksUrl: "https://example.test/blob/sha/tasks.md",
+  });
+  assert.match(md, /### Not archived: `my-change`/);
+  assert.match(md, /\*\*3 of 6\*\* tasks checked/);
+  assert.match(md, /\| Section \| Remaining task \| Line \|/);
+  // ?plain=1 matters: GitHub ignores an #L anchor on a rendered .md blob.
+  assert.match(
+    md,
+    /\[8\]\(https:\/\/example\.test\/blob\/sha\/tasks\.md\?plain=1#L8\)/
+  );
+  assert.match(md, /> 2 of the 3 remaining task\(s\) sit in a section marked post-merge/);
+});
+
+test("the job summary degrades to bare line numbers with no URL", () => {
+  const md = formatIncompleteSummary("my-change", parseTasks(TASKS_FIXTURE));
+  assert.ok(!md.includes("]("), "no half-built links");
+  assert.match(md, /\| 8 \|/);
+});
+
+test("a pipe in a task cannot break out of the summary table", () => {
+  const md = formatIncompleteSummary(
+    "my-change",
+    parseTasks("## S\n\n- [ ] run `a | b` then stop\n")
+  );
+  const row = md.split("\n").find((l) => l.includes("run `a"));
+  assert.ok(row.includes("\\|"), "the pipe is escaped");
+  assert.strictEqual(row.split(/(?<!\\)\|/).length - 1, 4, "row keeps 3 cells");
+});
+
+// --- line endings ------------------------------------------------------------
+
+test("parseTasks reads CRLF, CR and U+2028 files, not just LF", () => {
+  // Regression: TASK_RE ends in `$`, which (no `m` flag) only matches
+  // end-of-string, and `.` never matches `\r`. Splitting on "\n" alone left a
+  // trailing "\r" on every line, so a CRLF file full of unchecked boxes parsed
+  // as ZERO tasks and read as complete — archiving an unfinished change.
+  for (const [label, eol] of [
+    ["CRLF", "\r\n"],
+    ["CR", "\r"],
+    ["LS", "\u2028"],
+    ["PS", "\u2029"],
+    ["LF", "\n"],
+  ]) {
+    const body = ["## S", "", "- [x] done", "- [ ] NOT done"].join(eol);
+    const census = parseTasks(body);
+    assert.strictEqual(census.total, 2, `${label}: counts both tasks`);
+    assert.strictEqual(census.checked, 1, `${label}: counts the checked one`);
+    assert.strictEqual(
+      isTasksComplete(body),
+      false,
+      `${label}: must NOT read as complete`
+    );
+    assert.strictEqual(
+      census.incomplete[0].section,
+      "S",
+      `${label}: heading parsed`
+    );
+  }
+});
+
+test("a CRLF task keeps no carriage return in its reported text", () => {
+  const [task] = parseTasks("- [ ] trailing CR must go\r\n").incomplete;
+  assert.strictEqual(task.text, "trailing CR must go");
+});
+
+// --- fenced blocks -----------------------------------------------------------
+
+const FENCED = [
+  "## 1. Real section",
+  "",
+  "- [x] 1.1 done",
+  "",
+  "```bash",
+  "# after merging, run the smoke test",
+  "- [ ] not a real task",
+  "```",
+  "",
+  "- [ ] 1.2 ordinary pre-merge work",
+].join("\n");
+
+test("parseTasks ignores checkboxes and headings inside fenced blocks", () => {
+  const census = parseTasks(FENCED);
+  assert.strictEqual(census.total, 2, "the sample row in the fence is not a task");
+  assert.deepStrictEqual(
+    census.incomplete.map((t) => t.text),
+    ["1.2 ordinary pre-merge work"]
+  );
+});
+
+test("a comment inside a fence cannot become the attributed section", () => {
+  // `# after merging, ...` matches HEADING_RE and matched the post-merge
+  // heuristic, so ordinary work was reported as never-archivable.
+  const census = parseTasks(FENCED);
+  assert.strictEqual(census.incomplete[0].section, "1. Real section");
+  assert.ok(
+    !formatIncompleteReport("c", census).includes("post-merge"),
+    "no phantom post-merge note"
+  );
+});
+
+test("parseTasks handles tilde fences too", () => {
+  const census = parseTasks("~~~\n- [ ] sample\n~~~\n\n- [ ] real\n");
+  assert.strictEqual(census.total, 1);
+});
+
+// --- post-merge classification ----------------------------------------------
+
+test("post-merge classification matches the section's subject, not any mention", () => {
+  const classify = (section) =>
+    postMergeTasks([{ line: 1, section, text: "t" }]).length === 1;
+
+  for (const heading of [
+    "6. Post-merge acceptance (cannot be run before merge)",
+    "Post-release acceptance",
+    "After deployment",
+    "After the merge",
+    "Once merged",
+    "Verify [post-merge]", // explicit opt-in marker
+  ]) {
+    assert.strictEqual(classify(heading), true, `post-merge: ${heading}`);
+  }
+
+  for (const heading of [
+    // The phrase appears, but the section is pre-merge work. Unanchored, this
+    // told the author the exact opposite of the truth.
+    "Pre-merge checks (do these before, not after merging)",
+    "Compost-merge cleanup",
+    "5. Verify",
+    "Post",
+  ]) {
+    assert.strictEqual(classify(heading), false, `not post-merge: ${heading}`);
+  }
+});
+
+test("both renderers embed the identical post-merge note", () => {
+  // One wording, one classification: a future edit cannot land in the log and
+  // not the job summary.
+  const census = parseTasks("## 6. Post-merge acceptance\n\n- [ ] a\n- [ ] b\n");
+  const note = postMergeNoteText(census.incomplete);
+  assert.ok(note, "note applies");
+  assert.ok(formatIncompleteReport("c", census).includes(note), "log");
+  assert.ok(formatIncompleteSummary("c", census).includes(note), "summary");
+});
+
+test("postMergeNoteText is null when nothing is post-merge", () => {
+  assert.strictEqual(
+    postMergeNoteText(parseTasks("## 5. Verify\n\n- [ ] a\n").incomplete),
+    null
+  );
+});
+
+// --- truncation --------------------------------------------------------------
+
+test("truncate never splits a surrogate pair", () => {
+  // slice() cuts at UTF-16 code units, so an emoji straddling the limit left a
+  // lone high surrogate that rendered as U+FFFD.
+  for (const pad of [97, 98, 99, 100]) {
+    const text = truncate("x".repeat(pad) + "\u{1F600}" + "y".repeat(60));
+    assert.ok(
+      !/[\uD800-\uDBFF]$/.test(text.replace(/…$/, "")),
+      `pad=${pad}: no lone high surrogate`
+    );
+    assert.ok(!text.includes("�"), `pad=${pad}: no replacement char`);
+  }
+});
+
+test("truncate leaves short text and whole emoji alone", () => {
+  assert.strictEqual(truncate("short"), "short");
+  assert.strictEqual(truncate("ok \u{1F600}"), "ok \u{1F600}");
+});
+
+// --- table escaping ----------------------------------------------------------
+
+test("neither a pipe nor an already-escaped pipe can add a table cell", () => {
+  // Escaping only the pipe turned an author's `\|` into `\\|`, which GFM reads
+  // as an escaped backslash plus a LIVE delimiter.
+  for (const [text, label] of [
+    ["a | b", "bare pipe"],
+    ["a \\| b", "already-escaped pipe"],
+    ["a \\\\| b", "double backslash then pipe"],
+  ]) {
+    const md = formatIncompleteSummary(
+      "c",
+      parseTasks(`## S\n\n- [ ] ${text}\n`)
+    );
+    const row = md.split("\n").find((l) => l.includes("a "));
+    const live = row.replace(/\\\\/g, "").replace(/\\\|/g, "").match(/\|/g);
+    assert.strictEqual(live.length, 4, `${label}: row keeps 3 cells :: ${row}`);
+  }
+});
+
+// --- blob URL ----------------------------------------------------------------
+
+test("repoSlugFromRemote reads https and ssh remotes", () => {
+  for (const [url, expected] of [
+    ["https://github.com/deriv-com/shared-actions.git", "deriv-com/shared-actions"],
+    ["git@github.com:deriv-com/shared-actions.git", "deriv-com/shared-actions"],
+    ["https://github.com/o/r", "o/r"],
+    ["ssh://git@github.com/o/r.git", "o/r"],
+  ]) {
+    assert.strictEqual(repoSlugFromRemote(url), expected, url);
+  }
+  for (const bad of ["", null, undefined, "not-a-url"]) {
+    assert.strictEqual(repoSlugFromRemote(bad), null, `rejects ${bad}`);
+  }
+});
+
+// --- the annotation ----------------------------------------------------------
+
+test("the skip notice is a well-formed workflow command", () => {
+  const notice = formatSkipNotice("my-change", parseTasks(TASKS_FIXTURE));
+  // A stray `,` or `:` in the property list stops the runner recognising the
+  // command, and the annotation vanishes from a green run with nothing failing.
+  assert.match(notice, /^::notice title=[^,:]+::/);
+  assert.strictEqual(notice.split("::").length - 1, 2, "exactly two `::` markers");
+  assert.ok(
+    !/[\r\n]/.test(notice),
+    "single line — a newline would truncate the command"
+  );
+  assert.ok(notice.includes("'my-change' has 3 of 6 tasks unchecked"));
+});
+
+test("the skip notice counts agree with the census it was built from", () => {
+  for (const body of [
+    TASKS_FIXTURE,
+    "## S\n\n- [ ] only one\n",
+    "## S\n\n- [x] a\n- [x] b\n- [ ] c\n",
+  ]) {
+    const census = parseTasks(body);
+    assert.ok(
+      formatSkipNotice("c", census).includes(
+        `${census.incomplete.length} of ${census.total} tasks unchecked`
+      ),
+      `counts match for: ${JSON.stringify(body)}`
+    );
+  }
+});
+
+test("a failed job-summary write is annotated, not just logged", (t) => {
+  // The write is the thing that failed, so the report must not depend on it.
+  const logs = [];
+  t.mock.method(console, "log", (msg) => logs.push(String(msg)));
+  process.env.GITHUB_STEP_SUMMARY = "/nonexistent-dir/summary.md";
+  t.after(() => delete process.env.GITHUB_STEP_SUMMARY);
+
+  // Must not throw: a summary is reporting, not the job's purpose.
+  writeStepSummary(formatIncompleteSummary("c", parseTasks(TASKS_FIXTURE)));
+
+  assert.ok(
+    logs.some((l) => l.startsWith("::warning::") && l.includes("job summary")),
+    `expected a ::warning:: annotation, got: ${JSON.stringify(logs)}`
   );
 });

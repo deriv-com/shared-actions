@@ -47,6 +47,44 @@ the API is exact and works the same for merge, squash, and rebase merges.
 Change names come back sorted, so the branch slug the caller derives from them
 is the same whatever order the API listed the files in.
 
+### What a declined archive reports
+
+A change with unchecked tasks is not archived, and the run stays green — that is
+correct (an unfinished change is not a failure), but it means nobody looks. So
+the skip is reported three ways instead of one log line:
+
+- **Log** — every remaining task, grouped by its `tasks.md` section, cited as
+  `tasks.md:<line>`.
+- **Annotation** — a `::notice::` with the count, so it appears on the run
+  summary page without opening the log.
+- **Job summary** — a table of the remaining tasks, each line number linked to
+  the checked-out commit, so the line numbers match what the run actually read.
+
+#### Marking a post-merge section
+
+Tasks that can only be done *after* the merge can never be checked before the
+merge that would trigger the archive, so a change holding them will never
+archive automatically. The report calls this out — without it, the run just
+repeats "still has incomplete tasks" on every future merge.
+
+Mark such a section either way:
+
+- **Explicitly** — put `[post-merge]` anywhere in the heading. Unambiguous, and
+  the recommended form.
+- **By phrasing** — a heading that *starts* with `Post-merge`, `Post-release`,
+  `Post-deployment`, `After the merge`, `After merging`, `After deployment`, or
+  `Once merged` (an optional `6.` style number may precede it).
+
+The phrase check is anchored to the start of the heading on purpose, so the
+phrase has to be the section's subject. `Pre-merge checks (do these before, not
+after merging)` is *not* treated as post-merge — an unanchored match there would
+tell the author the opposite of the truth. If a heading does not fit the list
+above, use the `[post-merge]` marker rather than relying on the wording.
+
+Checkboxes and headings inside fenced code blocks are ignored, so a `#` comment
+or a sample `- [ ]` row in a shell snippet is not mistaken for a real section or
+task. Files with CRLF, CR, or U+2028 line endings parse the same as LF.
+
 ### Failure handling
 
 `pull_request: closed` never fires twice for the same merge, so a request lost
