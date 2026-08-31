@@ -8,10 +8,24 @@ on:
         required: false
         default: "claude-sonnet-5"
         type: string
+      anthropic_base_url:
+        description: >-
+          Gateway base URL for Claude, supplied by the calling repo (e.g.
+          https://litellmsa.deriv.ai). Leave unset to call the public
+          Anthropic API directly.
+        required: false
+        default: ""
+        type: string
     secrets:
       ANTHROPIC_API_KEY:
         description: "Anthropic API key for Claude"
         required: true
+      ANTHROPIC_AUTH_TOKEN:
+        description: >-
+          Bearer token for the gateway named by anthropic_base_url, supplied
+          by the calling repo. Falls back to ANTHROPIC_API_KEY when unset, so
+          callers already passing only that keep working.
+        required: false
 
 jobs:
   generate-checklist:
@@ -164,6 +178,9 @@ jobs:
       - name: Generate QA Checklist
         uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
         timeout-minutes: 60
+        env:
+          ANTHROPIC_BASE_URL: ${{ inputs.anthropic_base_url }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN || secrets.ANTHROPIC_API_KEY }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
