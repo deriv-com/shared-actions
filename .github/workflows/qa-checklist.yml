@@ -2,6 +2,12 @@ name: QA Checklist Generator
 
 on:
   workflow_call:
+    inputs:
+      claude_model:
+        description: "Claude model to use for checklist generation"
+        required: false
+        default: "claude-sonnet-5"
+        type: string
     secrets:
       ANTHROPIC_API_KEY:
         description: "Anthropic API key for Claude"
@@ -24,6 +30,9 @@ jobs:
     concurrency:
       group: qa-checklist-pr-${{ github.event.issue.number }}
       cancel-in-progress: true
+
+    env:
+      CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-sonnet-5' }}
 
     steps:
       - name: Security Check - Validate User Access
@@ -158,6 +167,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_args: "--model ${{ env.CLAUDE_MODEL }}"
           track_progress: true
           prompt: |
             REPO: ${{ github.repository }}
