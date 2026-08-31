@@ -175,7 +175,21 @@ jobs:
         env:
           ANTHROPIC_BASE_URL: ${{ inputs.anthropic_base_url }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          # Claude Code also makes background calls with a small/fast model the
+          # gateway may not front. forge.yml and claude-pr-review set these same
+          # three flags against this same gateway for that reason.
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          DISABLE_NON_ESSENTIAL_MODEL_CALLS: "1"
         with:
+          # The action's validate-env refuses to start unless ANTHROPIC_API_KEY
+          # or CLAUDE_CODE_OAUTH_TOKEN is set — it does not accept
+          # ANTHROPIC_AUTH_TOKEN and does not look at ANTHROPIC_BASE_URL, so a
+          # gateway-only config fails before Claude ever runs. The gateway
+          # bearer is passed here to satisfy that gate; ANTHROPIC_BASE_URL still
+          # decides the route, which is how claude-pr-review runs against this
+          # same gateway.
+          anthropic_api_key: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: "--model ${{ env.CLAUDE_MODEL }}"
           track_progress: true
