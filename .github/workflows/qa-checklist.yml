@@ -9,7 +9,8 @@ on:
 
 jobs:
   generate-checklist:
-    runs-on: ubuntu-latest
+    runs-on:
+      group: github_claude_code_reviewer
     timeout-minutes: 60
 
     permissions:
