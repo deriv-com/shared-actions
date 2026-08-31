@@ -162,7 +162,7 @@ jobs:
           git log -1 --oneline
 
       - name: Generate QA Checklist
-        uses: anthropics/claude-code-action@8a1c4371755898f67cd97006ba7c97702d5fc4bf
+        uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
         timeout-minutes: 60
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
