@@ -11,21 +11,15 @@ on:
       anthropic_base_url:
         description: >-
           Gateway base URL for Claude, supplied by the calling repo (e.g.
-          https://litellmsa.deriv.ai). Leave unset to call the public
-          Anthropic API directly.
-        required: false
-        default: ""
+          https://litellmsa.deriv.ai).
+        required: true
         type: string
     secrets:
-      ANTHROPIC_API_KEY:
-        description: "Anthropic API key for Claude"
-        required: true
       ANTHROPIC_AUTH_TOKEN:
         description: >-
           Bearer token for the gateway named by anthropic_base_url, supplied
-          by the calling repo. Falls back to ANTHROPIC_API_KEY when unset, so
-          callers already passing only that keep working.
-        required: false
+          by the calling repo.
+        required: true
 
 jobs:
   generate-checklist:
@@ -180,9 +174,8 @@ jobs:
         timeout-minutes: 60
         env:
           ANTHROPIC_BASE_URL: ${{ inputs.anthropic_base_url }}
-          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN || secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: "--model ${{ env.CLAUDE_MODEL }}"
           track_progress: true
