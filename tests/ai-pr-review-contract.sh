@@ -56,6 +56,23 @@ MARKER_FORMAT="format(':{0}', inputs.review_title)"
 check 'grep -qF "$CONCURRENCY_FORMAT" "$WF"' "concurrency group appends review_title when set"
 check 'grep -qF "$MARKER_FORMAT" "$WF"' "canonical marker appends :review_title when set"
 check 'grep -q "REVIEW_SLOT_SUFFIX" "$WF"' "resolve step exports REVIEW_SLOT_SUFFIX for append + progress"
+
+# Match-side (job-level Actions expression on inputs.review_title) and
+# append-side (bash on the validated REVIEW_TITLE) are two implementations.
+# Extract the prefix each uses before {0} / ${REVIEW_TITLE}; if they drift,
+# capture never sees the marker the post step just appended.
+MARKER_LINE=$(grep -F 'deriv-pr-review-${{ inputs.engine }}' "$WF" | head -1)
+YAML_PREFIX=$(printf '%s\n' "$MARKER_LINE" | sed -n "s/.*format('\([^']*\){0}'.*/\1/p")
+BASH_PREFIX=$(sed -n 's/.*REVIEW_SLOT_SUFFIX="\(.*\)\${REVIEW_TITLE}".*/\1/p' "$WF" | head -1)
+check '[[ -n "$YAML_PREFIX" ]]' "REVIEW_MARKERS format() prefix is parseable"
+check '[[ -n "$BASH_PREFIX" ]]' "REVIEW_SLOT_SUFFIX assignment prefix is parseable"
+check '[[ "$YAML_PREFIX" == "$BASH_PREFIX" ]]' "match-side format prefix equals append-side REVIEW_SLOT_SUFFIX prefix"
+engine="anthropic"
+title="GLM PR Review"
+detect_side="<!-- deriv-pr-review-${engine}${YAML_PREFIX}${title} -->"
+append_side="<!-- deriv-pr-review-${engine}${BASH_PREFIX}${title} -->"
+check '[[ "$detect_side" == "$append_side" ]]' "rendered GLM markers agree"
+check 'grep -q "printf .<!-- deriv-pr-review-%s%s -->" "$WF"' "post step appends via REVIEW_ENGINE + REVIEW_SLOT_SUFFIX"
 check 'grep -q "deriv-pr-review-progress-\${REVIEW_ENGINE}\${REVIEW_SLOT_SUFFIX:-}" "$WF"' "progress marker is title-scoped"
 KIMI_EMPTY_GATE="inputs.review_title == '' && inputs.engine == 'kimi'"
 ANTHROPIC_EMPTY_GATE="inputs.review_title == '' && inputs.engine == 'anthropic'"
