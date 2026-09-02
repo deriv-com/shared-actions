@@ -23,7 +23,7 @@ engine is pluggable: pick `kimi`, `anthropic`, or `grok` with one input.
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
 - 📊 Emits events to the OneAboveAll metrics dashboard, and always to the job summary
 - ⏳ Posts a caller-owned "working on it" comment (model at the top) before the engine runs, then edits that same comment into the review; the CLI never gets a GitHub token
-- 🏷️ The reusable job is named after the engine (`Grok PR Review` / `Kimi PR Review` / `Claude PR Review`), or after `review_title` when that input is set. `review_title` relabels one engine+model; it does not make two same-engine callers concurrent
+- 🏷️ The reusable job is named after the engine (`Grok PR Review` / `Kimi PR Review` / `Claude PR Review`), or after `review_title` when that input is set. empty title = one slot per engine; set title = concurrent slot on that engine (concurrency, HTML marker, and progress marker include the title)
 
 ## Usage
 
@@ -164,21 +164,22 @@ proxy fronts can be reached by setting `model` (and `max_context_size` on Kimi
 or Grok). Replacing an engine's *CLI* means writing a new composite action,
 because each CLI has its own config format, sandbox model, tool names and
 entrypoint. Grok 4.6 as a *model* on the Kimi CLI is a model swap; Grok Build
-as the *agent* is this engine. `review_title` is a replacement label for a
-repo that has already chosen one engine+model (for example GLM on
-`engine: anthropic`). It does not make two same-engine callers coexist:
-hidden HTML markers and `METRICS_AGENT` stay per-engine, and the
-`concurrency` group is keyed only by `engine`, so a second anthropic run
-(Claude + GLM) cancels the first (`cancel-in-progress: true`) and would
-reap the same comment. Run one anthropic caller per repo, or add a real
-engine if you need a bake-off.
+as the *agent* is this engine. `review_title` is a replacement label for the
+visible Checks name and comment heading. empty title = one slot per engine
+(Kimi today). set title = concurrent slot on that engine: concurrency,
+the canonical HTML marker, and the progress marker include the title, so
+GLM (`review_title: GLM PR Review`) and DeepSeek can share `engine: anthropic`
+without cancelling or reaping each other. `METRICS_AGENT` and the artifact
+prefix stay per-engine. A title-scoped marker change means open PRs lose
+follow-up once for that caller (fresh initial review on the next push).
+That is not a new engine.
 
 ## Inputs
 
 | Input | Description | Required | Default (resolved when empty) |
 |-------|-------------|----------|---------|
 | `engine` | `kimi`, `anthropic`, or `grok` | ❌ | `kimi` |
-| `review_title` | Visible Checks name and comment heading (` Complete` is appended). Empty keeps the engine default. Must end in ` PR Review`. Replacement label, not a second concurrent engine. Example: `engine: anthropic`, `model: glm-5.3`, `review_title: GLM PR Review` | ❌ | engine name (`Kimi PR Review` / `Claude PR Review` / `Grok PR Review`) |
+| `review_title` | Visible Checks name and comment heading (` Complete` is appended). Empty keeps the engine default and one slot per engine. Set title = concurrent slot on that engine. Must end in ` PR Review`. Example: `engine: anthropic`, `model: glm-5.3`, `review_title: GLM PR Review` | ❌ | engine name (`Kimi PR Review` / `Claude PR Review` / `Grok PR Review`) |
 | `model` | Model ID; resolved per engine when empty | ❌ | per engine |
 | `base_url` | LLM API endpoint; `/v1` added or stripped per engine | ❌ | `https://litellmsa.deriv.ai/v1` |
 | `max_context_size` | **[kimi, grok]** Context window in tokens. Must match the model, or the CLI over-packs and the API rejects the request | ❌ | per engine (`1048576` kimi, `500000` grok) |
@@ -265,17 +266,24 @@ the start of the run, which meant every engine failure or cancel-in-progress
 in the up-to-an-hour gap destroyed the previous review and its reviewed-commit
 SHA.)
 Detection uses a canonical hidden marker, `<!-- deriv-pr-review-<engine> -->`
-(for example `<!-- deriv-pr-review-grok -->`), which the **post step appends**
-as its own unindented line — it is not something the model is asked to emit.
-Capture and reap match that **exact line** in the last 20 lines of the
-comment, not a substring anywhere in the body. Visible titles such as
-`Grok PR Review Complete` are not markers: a follow-up that quotes this
-workflow's YAML would otherwise be deleted by the other engine. The marker
-is per-engine so a Kimi run and a Grok run on the same PR keep both
-comments. `engine: kimi` and `engine: anthropic` also match the older
-shared line `<!-- deriv-pr-review -->` so comments posted before the
-split stay in follow-up mode. Grok does **not** match that old tag, or a
-Grok run would reap Kimi during a bake-off.
+when `review_title` is empty (for example `<!-- deriv-pr-review-grok -->`),
+or `<!-- deriv-pr-review-<engine>:<review_title> -->` when it is set (for
+example `<!-- deriv-pr-review-anthropic:GLM PR Review -->`). The **post
+step appends** it as its own unindented line — it is not something the
+model is asked to emit. Capture and reap match that **exact line** in the
+last 20 lines of the comment, not a substring anywhere in the body.
+Visible titles such as `Grok PR Review Complete` are not markers: a
+follow-up that quotes this workflow's YAML would otherwise be deleted by
+the other engine. empty title = one slot per engine, so a Kimi run and a
+Grok run on the same PR keep both comments. set title = concurrent slot,
+so GLM and DeepSeek on `engine: anthropic` keep both comments. Title-scoped
+jobs do **not** also match the bare `<!-- deriv-pr-review-<engine> -->` line
+or a DeepSeek run would reap GLM. `engine: kimi` and `engine: anthropic`
+with an empty title also match the older shared line
+`<!-- deriv-pr-review -->` so comments posted before the split stay in
+follow-up mode. Grok does **not** match that old tag, or a Grok run would
+reap Kimi during a bake-off. Changing a caller from empty title to a set
+title changes its marker; open PRs lose follow-up once for that caller.
 
 `legacy_markers` exists purely for migrations: a run also deletes comments
 matching those strings, so a PR that has been through more than one review
@@ -337,8 +345,9 @@ changing one can block merges on a repo with branch protection. The
 reusable job is named after `engine` (`Kimi PR Review`, `Grok PR Review`,
 `Claude PR Review`) so two *engines* on one PR are distinguishable in
 Checks. Override that heading with `review_title` when replacing the model
-on the same engine (for example `review_title: GLM PR Review`) — that is
-not a second concurrent anthropic job. After adopting this, update any required check that still names
+on the same engine (for example `review_title: GLM PR Review`). set title =
+concurrent slot — two anthropic callers with distinct titles keep both
+comments. After adopting this, update any required check that still names
 `ai-review / ai-review`. Do other cosmetic renames separately.
 
 Switching that repo to Kimi afterwards is a separate decision: set

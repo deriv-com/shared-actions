@@ -6,7 +6,11 @@ name: AI PR Review
 #   Model swap — set `model` (and `max_context_size` on the Kimi/Grok engines). Any
 #   model the LiteLLM proxy fronts works; the proxy normalises the API. The Checks
 #   name and comment heading stay the engine default unless `review_title` is set
-#   (e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review).
+#   (e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review). A
+#   set `review_title` is also a concurrent slot: concurrency, the canonical
+#   HTML marker, and the progress marker include it so two anthropic callers
+#   (GLM + DeepSeek) do not cancel or reap each other. Empty title keeps one
+#   slot per engine.
 #
 #   Engine swap — set `engine`. Each engine is a composite action under
 #   .github/actions/ai_review_engine_<engine>/ owning its own CLI, sandbox model,
@@ -33,7 +37,7 @@ on:
         default: "kimi"
         type: string
       review_title:
-        description: "Visible Checks name and comment heading (the post step appends ' Complete'). Empty keeps the engine default (Kimi PR Review / Claude PR Review / Grok PR Review). Must end in ' PR Review' so follow-up header strip stays in lockstep. Replacement label for one engine+model, not a second concurrent engine — e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review. Hidden HTML markers stay per-engine. An invalid value still appears in the Check name at parse time; the job name is not authoritative until the run succeeds."
+        description: "Visible Checks name and comment heading (the post step appends ' Complete'). Empty keeps the engine default (Kimi PR Review / Claude PR Review / Grok PR Review) and one slot per engine. Set this to run a second caller on the same engine as a concurrent slot — e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review. Must end in ' PR Review' so follow-up header strip stays in lockstep. Concurrency, the canonical HTML marker, and the progress marker include the title when set. An invalid value still appears in the Check name at parse time; the job name is not authoritative until the run succeeds."
         required: false
         default: ""
         type: string
@@ -119,9 +123,11 @@ jobs:
       issues: write
 
     concurrency:
-      # Include engine so a temporary kimi+grok bake-off does not cancel itself.
-      # One engine per PR still cancels in-progress runs of that same engine.
-      group: ai-pr-review-${{ github.event.pull_request.number }}-${{ inputs.engine }}
+      # Include engine so a kimi+grok bake-off does not cancel itself. Append
+      # review_title when set so two anthropic callers (GLM vs DeepSeek) are
+      # separate slots. Empty title keeps the historical `-{engine}` group, so
+      # Kimi and other single-engine consumers do not change identity.
+      group: ai-pr-review-${{ github.event.pull_request.number }}-${{ inputs.engine }}${{ inputs.review_title != '' && format('-{0}', inputs.review_title) || '' }}
       cancel-in-progress: true
 
     env:
@@ -145,18 +151,21 @@ jobs:
 
       # Comment markers identifying a review comment as ours. Canonical marker
       # is engine-specific so a Kimi run and a Grok run on the same PR do not
-      # reap each other. Detection never depends on the model reproducing a
-      # visible header — the post step appends the HTML comment as its own
-      # unindented line. Visible titles are NOT markers: a follow-up that
-      # quotes "Grok PR Review Complete" from this repo's YAML would otherwise
-      # be deleted by the Grok reap. kimi/anthropic also match the pre-split
-      # `<!-- deriv-pr-review -->` line so existing comments stay in follow-up
-      # mode after merge. Grok must not, or it would reap Kimi during a bake-off.
+      # reap each other, and title-scoped when review_title is set so two
+      # anthropic callers do not reap each other. Detection never depends on
+      # the model reproducing a visible header — the post step appends the HTML
+      # comment as its own unindented line. Visible titles are NOT markers: a
+      # follow-up that quotes "Grok PR Review Complete" from this repo's YAML
+      # would otherwise be deleted by the Grok reap. Empty-title kimi/anthropic
+      # also match the pre-split `<!-- deriv-pr-review -->` line so existing
+      # comments stay in follow-up mode. Title-scoped jobs must not match the
+      # bare engine marker or the pre-split line, or DeepSeek would reap GLM.
+      # Grok must not match the pre-split tag, or it would reap Kimi.
       # legacy_markers is the only substring list (Claude migration leftovers).
       REVIEW_MARKERS: |
-        <!-- deriv-pr-review-${{ inputs.engine }} -->
-        ${{ inputs.engine == 'kimi' && '<!-- deriv-pr-review -->' || '' }}
-        ${{ inputs.engine == 'anthropic' && '<!-- deriv-pr-review -->' || '' }}
+        <!-- deriv-pr-review-${{ inputs.engine }}${{ inputs.review_title != '' && format(':{0}', inputs.review_title) || '' }} -->
+        ${{ inputs.review_title == '' && inputs.engine == 'kimi' && '<!-- deriv-pr-review -->' || '' }}
+        ${{ inputs.review_title == '' && inputs.engine == 'anthropic' && '<!-- deriv-pr-review -->' || '' }}
       LEGACY_MARKERS: ${{ inputs.legacy_markers }}
 
     steps:
@@ -291,11 +300,22 @@ jobs:
           # Consumed by later `run:` scripts (review header, metrics payload,
           # step summary) rather than by `if:`, so $GITHUB_ENV is fine here.
           # Dispatch gates read steps.engine.outputs.engine instead.
+          #
+          # REVIEW_SLOT_SUFFIX is empty when review_title was omitted, so the
+          # appended marker stays `<!-- deriv-pr-review-{engine} -->` (Kimi).
+          # When the caller set a title it is `:{title}`, matching REVIEW_MARKERS
+          # and isolating GLM from DeepSeek on the same anthropic engine.
+          if [[ -n "${REVIEW_TITLE_INPUT:-}" ]]; then
+            REVIEW_SLOT_SUFFIX=":${REVIEW_TITLE}"
+          else
+            REVIEW_SLOT_SUFFIX=""
+          fi
           {
             echo "REVIEW_MODEL=$MODEL"
             echo "REVIEW_ENGINE=$ENGINE"
             echo "REVIEW_TITLE=$REVIEW_TITLE"
             echo "METRICS_AGENT=$METRICS_AGENT"
+            echo "REVIEW_SLOT_SUFFIX=$REVIEW_SLOT_SUFFIX"
           } >> "$GITHUB_ENV"
 
           echo "✅ Engine: $ENGINE | Model: $MODEL | Metrics agent: $METRICS_AGENT"
@@ -314,7 +334,7 @@ jobs:
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
           REPO="${{ github.repository }}"
-          PROGRESS_MARKER="<!-- deriv-pr-review-progress-${REVIEW_ENGINE} -->"
+          PROGRESS_MARKER="<!-- deriv-pr-review-progress-${REVIEW_ENGINE}${REVIEW_SLOT_SUFFIX:-} -->"
 
           # Progress is UX: a transient list/DELETE failure must not abort the
           # review. Worst case of skipping the sweep is one extra stale
@@ -880,7 +900,7 @@ jobs:
           {
             printf '\n'
             printf '<!-- reviewed-commit: %s -->\n' "$CURRENT_SHA"
-            printf '<!-- deriv-pr-review-%s -->\n' "$REVIEW_ENGINE"
+            printf '<!-- deriv-pr-review-%s%s -->\n' "$REVIEW_ENGINE" "${REVIEW_SLOT_SUFFIX:-}"
           } >> "$REVIEW_OUTPUT_FILE"
 
           # Reap-list for prior reviews, captured BEFORE posting — the new
@@ -933,7 +953,7 @@ jobs:
             printf '## 🤖 %s\n\n' "$REVIEW_TITLE"
             printf '%s did not finish this review.\n\n' "${REVIEW_TITLE%% PR Review}"
             printf 'See the [job log](%s) for details. The previous review comment, if any, is unchanged.\n\n' "$RUN_URL"
-            printf '%s\n' "${PROGRESS_MARKER:-<!-- deriv-pr-review-progress-${REVIEW_ENGINE} -->}"
+            printf '%s\n' "${PROGRESS_MARKER:-<!-- deriv-pr-review-progress-${REVIEW_ENGINE}${REVIEW_SLOT_SUFFIX:-} -->}"
           } > /tmp/progress_failed.md
           jq -n --arg body "$(cat /tmp/progress_failed.md)" '{body: $body}' \
             | gh api "repos/${{ github.repository }}/issues/comments/${PROGRESS_COMMENT_ID}" --method PATCH --input -

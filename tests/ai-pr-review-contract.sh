@@ -37,6 +37,8 @@ TITLE_RE="$(sed -n "s/.*review_title_re='\([^']*\)'.*/\1/p" "$WF" | head -1)"
 check '[[ -n "$TITLE_RE" ]]' "review_title_re assignment is parseable"
 check '[[ "GLM PR Review" =~ $TITLE_RE ]]' "accepts GLM PR Review"
 check '[[ "Kimi PR Review" =~ $TITLE_RE ]]' "accepts Kimi PR Review"
+check '[[ "DeepSeek V4 Pro PR Review" =~ $TITLE_RE ]]' "accepts DeepSeek V4 Pro PR Review"
+check '[[ "DeepSeek V4 Flash PR Review" =~ $TITLE_RE ]]' "accepts DeepSeek V4 Flash PR Review"
 check '[[ ! "GLM Code Audit" =~ $TITLE_RE ]]' "rejects GLM Code Audit"
 check '[[ ! "GLM PR Review/" =~ $TITLE_RE ]]' "rejects trailing junk"
 bs='foo\bar PR Review'
@@ -49,10 +51,18 @@ check '[[ "$got" == "body" ]]' "header strip still drops Kimi PR Review Complete
 kept=$(printf '%s\n' '## 🤖 GLM Code Audit Complete' 'body' | sed -E -e "$HEADER_STRIP")
 check '[[ "$kept" == *$'\''GLM Code Audit Complete'\''* ]]' "header strip leaves headings that are not * PR Review Complete"
 
+CONCURRENCY_FORMAT="format('-{0}', inputs.review_title)"
+MARKER_FORMAT="format(':{0}', inputs.review_title)"
+check 'grep -qF "$CONCURRENCY_FORMAT" "$WF"' "concurrency group appends review_title when set"
+check 'grep -qF "$MARKER_FORMAT" "$WF"' "canonical marker appends :review_title when set"
+check 'grep -q "REVIEW_SLOT_SUFFIX" "$WF"' "resolve step exports REVIEW_SLOT_SUFFIX for append + progress"
+check 'grep -q "deriv-pr-review-progress-\${REVIEW_ENGINE}\${REVIEW_SLOT_SUFFIX" "$WF" || grep -q "deriv-pr-review-progress-\${REVIEW_ENGINE}\${REVIEW_SLOT_SUFFIX:-}" "$WF"' "progress marker is title-scoped"
+
 check 'grep -q "| \`review_title\`" "$README"' "README documents review_title"
 check 'grep -q "GLM PR Review" "$README"' "README shows GLM PR Review as the caller example"
-check 'grep -q "is a replacement label" "$README"' "README says review_title is a replacement label"
-check 'grep -q "group is keyed only by" "$README"' "README documents same-engine concurrency cancellation"
+check 'grep -q "empty title = one slot per engine" "$README"' "README documents empty-title per-engine slots"
+check 'grep -q "set title = concurrent slot" "$README"' "README documents title-scoped concurrent slots"
+check '! grep -q "group is keyed only by" "$README"' "README no longer says concurrency is engine-only"
 check 'grep -q "not authoritative until the run succeeds" "$README"' "README notes invalid review_title still appears in Checks"
 
 check 'grep -q "tests/ai-pr-review-contract.sh" "$LINT"' "lint-actions runs this contract script"
