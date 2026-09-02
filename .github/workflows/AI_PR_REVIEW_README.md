@@ -171,8 +171,13 @@ the canonical HTML marker, and the progress marker include the title, so
 GLM (`review_title: GLM PR Review`) and DeepSeek can share `engine: anthropic`
 without cancelling or reaping each other. `METRICS_AGENT` and the artifact
 prefix stay per-engine. A title-scoped marker change means open PRs lose
-follow-up once for that caller (fresh initial review on the next push).
-That is not a new engine.
+follow-up once for that caller: the next push posts a fresh initial review
+and does **not** delete the old bare-marker comment. Remove that leftover
+by hand, or leave it until the PR closes. Do not put the bare HTML marker
+in `legacy_markers` — that is a substring match on the whole body, so a
+review that quotes a caller YAML containing that string would be reaped
+(the same trap as listing a visible `Complete` heading). That is not a
+new engine.
 
 ## Inputs
 
@@ -284,6 +289,12 @@ with an empty title also match the older shared line
 follow-up mode. Grok does **not** match that old tag, or a Grok run would
 reap Kimi during a bake-off. Changing a caller from empty title to a set
 title changes its marker; open PRs lose follow-up once for that caller.
+The old bare-marker comment is never captured and never reaped — it stays
+as a duplicate next to the new review until someone deletes it by hand or
+the PR closes. Putting `<!-- deriv-pr-review-<engine> -->` in
+`legacy_markers` would substring-match any comment that quotes a workflow
+containing that exact line (seen with visible titles on deriv-api-v2#725).
+Do not use `legacy_markers` for that cleanup.
 
 `legacy_markers` exists purely for migrations: a run also deletes comments
 matching those strings, so a PR that has been through more than one review
