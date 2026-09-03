@@ -85,6 +85,7 @@ check 'grep -q "empty title = one slot per engine" "$README"' "README documents 
 check 'grep -q "set title = concurrent slot" "$README"' "README documents title-scoped concurrent slots"
 check '! grep -q "group is keyed only by" "$README"' "README no longer says concurrency is engine-only"
 check 'grep -q "not authoritative until the run succeeds" "$README"' "README notes invalid review_title still appears in Checks"
+check 'grep -q "stale progress" "$README"' "README documents orphaned progress comments after a title-slot change"
 
 check 'grep -q "tests/ai-pr-review-contract.sh" "$LINT"' "lint-actions runs this contract script"
 check 'grep -q "test-scripts:" "$LINT"' "lint-actions keeps master's test-scripts job"

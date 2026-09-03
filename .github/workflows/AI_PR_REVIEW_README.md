@@ -176,8 +176,8 @@ and does **not** delete the old bare-marker comment. Remove that leftover
 by hand, or leave it until the PR closes. Do not put the bare HTML marker
 in `legacy_markers` — that is a substring match on the whole body, so a
 review that quotes a caller YAML containing that string would be reaped
-(the same trap as listing a visible `Complete` heading). That is not a
-new engine.
+(the same trap as listing a visible `Complete` heading). A titled slot is
+still the same engine, not a new one.
 
 ## Inputs
 
@@ -291,7 +291,11 @@ reap Kimi during a bake-off. Changing a caller from empty title to a set
 title changes its marker; open PRs lose follow-up once for that caller.
 The old bare-marker comment is never captured and never reaped — it stays
 as a duplicate next to the new review until someone deletes it by hand or
-the PR closes. Putting `<!-- deriv-pr-review-<engine> -->` in
+the PR closes. The same one-time orphaning applies to a stale progress
+comment (`<!-- deriv-pr-review-progress-<engine> -->` left by a pre-change
+failed or cancelled run): title-scoped jobs never match that bare progress
+marker either, so it also lingers until manual deletion or PR close.
+Putting `<!-- deriv-pr-review-<engine> -->` in
 `legacy_markers` would substring-match any comment that quotes a workflow
 containing that exact line (seen with visible titles on deriv-api-v2#725).
 Do not use `legacy_markers` for that cleanup.
