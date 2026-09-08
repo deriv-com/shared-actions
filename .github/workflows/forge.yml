@@ -100,9 +100,12 @@ on:
         description: >-
           deriv-com/spec-to-pr commit SHA to run. Immutable on purpose: this job
           runs the engine with a write token in scope, so tracking a branch would
-          let any push to that repo execute here.
+          let any push to that repo execute here. A SHA and not the tag name for
+          the same reason — a tag can be moved, a commit cannot.
         required: false
-        default: "a20b48e13b1eab31e2e4a07683d31a4d11ee91fe"
+        # v0.6.1 — annotated tag 7537bb5 dereferences to this commit.
+        # Previous pin: a20b48e (v0.2.0).
+        default: "26484fc22df1bc02106ed05c86527c8d05aa12e4"
         type: string
       timeout_minutes:
         description: >-
