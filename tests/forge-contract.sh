@@ -35,12 +35,20 @@ check '! grep -qE "^  (issues|pull_request|push|schedule):" "$WF"' \
 # --- inputs callers pass by name ------------------------------------------
 for input in issue_number slack_channel slack_thread_ts requested_by \
              node_version install_command model runner_group engine_ref \
-             timeout_minutes; do
+             fast_lane timeout_minutes; do
   check "grep -q '^      ${input}:' \"\$WF\"" "input '${input}' is declared"
 done
 
 check 'awk "/^      issue_number:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: true"' \
   "issue_number stays required"
+
+# The lane decides whether a run fits inside timeout_minutes, so it must stay a
+# caller decision. Hardcoding --fast onto the command line would silently strip
+# the planner and reviewer from a caller that asked for the full pipeline.
+check '! grep -qE "auto .*--fast" "$WF"' \
+  "--fast is not hardcoded onto the auto invocation"
+check 'grep -q "ARGS+=(--fast)" "$WF"' \
+  "--fast is appended conditionally, from the fast_lane input"
 
 # --- secrets callers must forward -----------------------------------------
 for secret in CLIENT_ID_GHAPP_WRITE PRIVATE_KEY_GHAPP_WRITE \
