@@ -107,6 +107,24 @@ on:
         # Previous pin: a20b48e (v0.2.0).
         default: "26484fc22df1bc02106ed05c86527c8d05aa12e4"
         type: string
+      fast_lane:
+        description: >-
+          Pass --fast: ONE agent takes the change from analysis to a verified
+          diff, with no planner/reviewer stage and no OpenSpec files.
+
+          Default true because the alternative is not "the full pipeline", it is
+          "an LLM guesses which pipeline". Without --fast the engine makes a
+          separate classification call per issue and anything ambiguous falls
+          back to the full pipeline, which does not fit inside timeout_minutes —
+          derivatives-trader runs were cancelled at the 55-minute cap twice, and
+          the same issue was classified differently locally and in CI. Forcing
+          the lane makes the run time predictable and skips that call entirely.
+
+          Set false for a large or cross-cutting change that genuinely needs the
+          planner and reviewer — and raise timeout_minutes with it.
+        required: false
+        default: true
+        type: boolean
       timeout_minutes:
         description: >-
           Job timeout. App installation tokens expire after 1 hour, so stay
@@ -404,14 +422,25 @@ jobs:
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.FORGE_API_KEY }}
           GH_TOKEN: ${{ steps.repo-token.outputs.token }}
           GITHUB_TOKEN: ${{ steps.repo-token.outputs.token }}
+          FAST_LANE: ${{ inputs.fast_lane }}
         run: |
           set -o pipefail
           git config --global user.name  "forge[bot]"
           git config --global user.email "forge@users.noreply.github.com"
 
+          # Built as an array so the optional flag can't word-split, and so the
+          # exact command is echoed in the log — the lane is the single biggest
+          # factor in whether a run finishes inside the timeout, so it should be
+          # readable at the top of the step rather than inferred from behaviour.
+          ARGS=(auto "$ISSUE_URL" --cwd . --unattended --json)
+          if [ "$FAST_LANE" = "true" ]; then
+            ARGS+=(--fast)
+          fi
+          echo "Running: dstp ${ARGS[*]}"
+
           # `|| STATUS=$?` keeps the default `bash -e` from aborting before we
           # can salvage the result line and surface the log.
-          node "$FORGE_CLI" auto "$ISSUE_URL" --cwd . --unattended --json 2>&1 | tee /tmp/forge.log || STATUS=$?
+          node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || STATUS=$?
           STATUS=${STATUS:-0}
 
           # --json writes the result as a single JSON line on stdout.
