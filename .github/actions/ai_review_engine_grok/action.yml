@@ -93,10 +93,10 @@ runs:
              -o -iname 'claude.md' -o -iname 'claude.local.md' \
              -o -iname 'kimi.md' -o -iname '.mcp.json' -o -iname '.cursorrules' \) \
           -print0 | xargs -0 -r rm -f
-        find . -name .git -prune -o -type d \
+        find . -name .git -prune -o \( -type d -o -type l \) \
           \( -iname '.grok' -o -iname '.claude' -o -iname '.claude-plugin' -o -iname '.agents' \) \
           -print0 | xargs -0 -r rm -rf
-        find . -name .git -prune -o -type d -ipath '*/.cursor/rules' \
+        find . -name .git -prune -o \( -type d -o -type l \) -ipath '*/.cursor/rules' \
           -print0 | xargs -0 -r rm -rf
         echo "✅ Stripped PR-supplied agent config (recursive)"
 

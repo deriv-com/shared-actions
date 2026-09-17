@@ -92,7 +92,7 @@ runs:
         find . -name .git -prune -o \( -type f -o -type l \) \
           \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' -o -name '.mcp.json' \) \
           -print0 | xargs -0 -r rm -f
-        find . -name .git -prune -o -type d \
+        find . -name .git -prune -o \( -type d -o -type l \) \
           \( -name '.claude' -o -name '.claude-plugin' \) \
           -print0 | xargs -0 -r rm -rf
         echo "✅ Stripped PR-supplied agent config (recursive)"
@@ -100,6 +100,71 @@ runs:
         # Persistent self-hosted runner: clear cross-run agent state too.
         rm -rf "$HOME/.claude"
         rm -f "$HOME/.claude.json"
+
+    - name: Set up Node.js
+      # For the PreToolUse path guard below, which is a Node script (JSON and
+      # path handling is what goes wrong in shell). Claude Code itself is a
+      # native binary and does not need this; the runner is not assumed to have
+      # node on PATH. Pinned to a commit SHA, same as the Kimi engine.
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: "22"
+
+    - name: Install path guard and detach the origin remote (Claude Code)
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        # This composite action's own files on the runner (the
+        # deriv-com/shared-actions checkout under _actions), not the PR checkout.
+        ACTION_PATH: ${{ github.action_path }}
+        GUARD_DIR: ${{ runner.temp }}/ai-review-path-guard
+      run: |
+        # 1. Path guard. Claude Code's `--allowedTools` has no path scope for
+        #    Read, so without this the model can open anything on the runner —
+        #    including /proc/self/environ of its own CLI process, which
+        #    claude-code-action spawns with the job's GitHub token in its
+        #    environment (GITHUB_TOKEN, GH_TOKEN, OVERRIDE_GITHUB_TOKEN and
+        #    DEFAULT_WORKFLOW_TOKEN, verified in base-action/src/parse-sdk-
+        #    options.ts at the pinned SHA: `env: { ...process.env }`). The guard
+        #    is the same script the Kimi engine uses (../ai_review_path_guard,
+        #    unit-tested in lint-actions.yml); Claude Code's Read/Write pass the
+        #    path as `file_path`, which it accepts. It is registered through the
+        #    action's `settings` input below and confines Read/Grep/Glob to the
+        #    PR checkout minus .git/ plus the caller's context, diff and output
+        #    files, Write to the output file alone, and denies every other tool.
+        #    Copied OUTSIDE the PR checkout (the PR controls the checkout) into
+        #    a directory wiped first, so a persistent runner cannot carry a
+        #    stale copy or a stale decision log into this run. Syntax-checked
+        #    here so a broken copy fails this step, not every tool call.
+        rm -rf "$GUARD_DIR"
+        mkdir -p "$GUARD_DIR"
+        cp "$ACTION_PATH/../ai_review_path_guard/path-guard.js" "$GUARD_DIR/path-guard.js"
+        node --check "$GUARD_DIR/path-guard.js"
+
+        # 2. No origin remote. claude-code-action's agent mode
+        #    (prepareAgentMode in src/modes/agent/index.ts at the pinned SHA)
+        #    calls configureGitAuth, whose default branch runs
+        #      git remote set-url origin https://x-access-token:<job token>@github.com/<owner>/<repo>.git
+        #    That puts the caller's write-scoped GitHub token, in plaintext,
+        #    into .git/config — undoing the caller's persist-credentials: false
+        #    and handing the token to any Read of .git/config. The call sits in
+        #    a try/catch that logs and continues, so with no origin remote the
+        #    set-url fails and .git/config stays token-free. Nothing after the
+        #    checkout needs the remote: the diff is pre-fetched, comments go
+        #    through the caller's gh, and this engine pushes nothing.
+        #    This relies on that catch at the pinned SHA. The verify step after
+        #    the review re-reads .git/config and fails the job if a token got in
+        #    anyway, so a SHA bump that changes the behaviour fails closed
+        #    rather than leaking. (HackerOne #4037167)
+        if git remote get-url origin >/dev/null 2>&1; then
+          git remote remove origin
+        fi
+        if git remote | grep -q .; then
+          echo "❌ Anthropic engine: unexpected git remotes remain after detaching origin:"
+          git remote
+          exit 1
+        fi
+        echo "✅ Anthropic engine: path guard installed at $GUARD_DIR; no git remote for claude-code-action to write a token into"
 
     - name: Resolve base URL and verify inputs
       id: resolve
@@ -131,8 +196,48 @@ runs:
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
         CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
         DISABLE_NON_ESSENTIAL_MODEL_CALLS: "1"
+        # Read by the path guard (hooks inherit the CLI's environment, and the
+        # action spawns the CLI with this step's env). GITHUB_WORKSPACE is set by
+        # the runner. PATH_GUARD_LOG receives one line per decision and is
+        # checked by the verify step: a review with an empty log means the hook
+        # never fired. The directory is wiped by the install step above, so no
+        # stale log survives on a persistent runner.
+        OUTPUT_PATH: ${{ inputs.output_path }}
+        CONTEXT_PATH: ${{ inputs.review_context_path }}
+        DIFF_PATH: ${{ inputs.pr_diff_path }}
+        PATH_GUARD_LOG: ${{ runner.temp }}/ai-review-path-guard/decisions.log
       with:
         anthropic_api_key: ${{ inputs.api_key }}
+        # PreToolUse hook = the path guard installed above. The action merges
+        # this JSON into $HOME/.claude/settings.json (base-action/src/
+        # setup-claude-code-settings.ts) and the SDK loads that file because
+        # settingSources defaults to user+project+local (parse-sdk-options.ts);
+        # `--setting-sources user` in claude_args narrows it to that one file so
+        # nothing in the PR checkout is read as settings even if the strip step
+        # missed a path. Claude Code hook contract: JSON on stdin with tool_name
+        # and tool_input; exit 2 blocks the call and shows stderr to the model;
+        # any OTHER non-zero exit does not block, hence `|| exit 2` — a guard
+        # that cannot start must deny, not wave through. Matcher is match-all
+        # (a call the matcher does not fire for is allowed without a decision;
+        # the guard denies unknown tools itself). Timeout is seconds; a hook
+        # that exceeds it is treated as allow, and the script needs milliseconds.
+        settings: |
+          {
+            "hooks": {
+              "PreToolUse": [
+                {
+                  "matcher": ".*",
+                  "hooks": [
+                    {
+                      "type": "command",
+                      "command": "node '${{ runner.temp }}/ai-review-path-guard/path-guard.js' || exit 2",
+                      "timeout": 30
+                    }
+                  ]
+                }
+              ]
+            }
+          }
         # The action needs a token for its own actor/permission checks.
         #
         # What the model can actually reach here — verified against the action's
@@ -186,31 +291,57 @@ runs:
         # the review input is attacker-influenced PR content. The action's docs
         # confirm Bash is off unless explicitly allowed, so this one is airtight.
         #
-        # `Write` is granted unscoped, unlike the Kimi engine which confines it to
-        # the output directory. Path-scoped patterns are only documented here for
-        # Bash (`Bash(npm install)`), and the workflow this replaced carried an
-        # explicit note that a scoped `Write(/path)` made the tool unavailable
-        # altogether. Since an unavailable Write means the engine silently reviews
-        # and writes nothing, tightening this needs a real run to verify, not a
-        # guess — tracked in the PR test plan. Until then the asymmetry is real
-        # and documented rather than papered over.
+        # `Write` and `Read` are granted unscoped HERE, on purpose: path-scoped
+        # permission patterns are only documented for Bash (`Bash(npm install)`),
+        # and the workflow this replaced recorded that a scoped `Write(/path)`
+        # made the tool unavailable altogether, which means an engine that
+        # silently reviews and writes nothing. Path confinement is done by the
+        # PreToolUse hook in `settings` above instead — Write to the single
+        # output file, Read/Grep/Glob to the checkout minus .git/ plus the
+        # caller's input files — the same guard, same rules, same tests as the
+        # Kimi engine.
         #
         # --disallowedTools is the belt for the agent-mode analysis on
         # github_token above: server-level MCP names deny every tool of those
         # servers, and disallowing a tool that is not mounted is a no-op — this
         # only matters if a future SHA bump mounts them again. Disallowed takes
         # precedence over allowed in the CLI, so it cannot mask Read/Write.
+        #
+        # --setting-sources user: only $HOME/.claude/settings.json (which the
+        # action writes from `settings` above) is loaded; project and local
+        # settings inside the PR checkout are not, whatever the strip step did.
         claude_args: |
           --model ${{ inputs.model }}
           --allowedTools "Read,Write"
           --disallowedTools "Bash,WebFetch,WebSearch,mcp__github_comment,mcp__github_inline_comment,mcp__github_file_ops,mcp__github"
+          --setting-sources user
 
-    - name: Verify review output
+    - name: Verify the sandbox held and the review was written
       id: verify
       shell: bash
+      working-directory: ${{ github.workspace }}
       env:
         OUTPUT_PATH: ${{ inputs.output_path }}
+        PATH_GUARD_LOG: ${{ runner.temp }}/ai-review-path-guard/decisions.log
       run: |
+        # 1. The job token must not have reached .git/config. The install step
+        #    removed the origin remote so claude-code-action's
+        #    `git remote set-url origin https://x-access-token:...` had nothing
+        #    to write to; this re-reads the file the model could have opened and
+        #    fails if any remote URL carries credentials or any credential
+        #    plumbing (a checkout-style extraheader / includeIf, or a token
+        #    shape) is present. Raw file, not `git config --list`, so an include
+        #    pointing elsewhere is itself visible. A hit here means the pinned
+        #    action's behaviour changed: treat the job token as exposed to the
+        #    model, rotate/inspect, and do not merge the SHA bump that did it.
+        if [[ -f .git/config ]] && { git config --local --get-regexp '^remote\..*\.url$' 2>/dev/null | grep -q '@' \
+             || grep -qiE 'x-access-token|extraheader|includeif|credential\.helper|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}' .git/config; }; then
+          echo "❌ Anthropic engine: .git/config carries credentials after the review step. The model's Read could have opened it — treat the job token as exposed. (HackerOne #4037167)"
+          echo "   claude-code-action at the pinned SHA writes the token into the origin remote URL when one exists; the install step removed origin so this should be impossible. Check what changed."
+          exit 1
+        fi
+
+        # 2. The review exists?
         # Fail here, named, rather than letting the caller report a generic
         # "review file missing" — all steps in a composite action share one log
         # group, so an engine-attributed error is what makes this locatable.
@@ -218,5 +349,21 @@ runs:
           echo "❌ Anthropic engine: claude-code-action finished but wrote no review to $OUTPUT_PATH"
           exit 1
         fi
+
+        # 3. The path guard actually ran. A review exists, so the model made at
+        #    least one tool call (the Write that produced it), so the match-all
+        #    PreToolUse hook must have logged at least one decision. An empty or
+        #    missing log means the hook never fired — the `settings` plumbing or
+        #    the hook contract changed under a SHA bump — and this review was
+        #    produced with no path confinement at all, with the job token in
+        #    the CLI's environment. It is not handed to the caller. Fail closed;
+        #    do not downgrade this to a warning.
+        if [[ ! -s "$PATH_GUARD_LOG" ]]; then
+          echo "❌ Anthropic engine: the review was written but the path guard never ran (no decisions logged at $PATH_GUARD_LOG)."
+          echo "   The PreToolUse hook is the only path control in this engine; without it the model could read anything on the runner, including its own process environment."
+          echo "   Refusing to hand this review to the caller. Check the \`settings\` hook against this claude-code-action SHA. (HackerOne #4037167)"
+          exit 1
+        fi
+        echo "✅ Anthropic engine: path guard handled $(wc -l < "$PATH_GUARD_LOG" | tr -d ' ') tool call(s), $(grep -c '^deny' "$PATH_GUARD_LOG" || true) denied; .git/config is credential-free"
         echo "✅ Anthropic engine: review written ($(wc -c < "$OUTPUT_PATH") bytes)"
         echo "output_path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"
