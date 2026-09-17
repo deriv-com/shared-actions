@@ -166,7 +166,8 @@ runs:
         # script's own directory, never into the checkout below it. A hostile
         # package.json / node_modules / .npmrc in the PR was tested and changes
         # nothing. Keep it that way: no npm packages, no reading repo files.
-        # No `${{ }}` in here — Actions scans the whole run: string for them.
+        # No Actions expression pairs (dollar + double braces) in here: Actions
+        # scans the whole run: string for them, comments and heredocs included.
         cat > "$HOME/.kimi-code/path-guard.js" <<'JS'
         'use strict';
         const fs = require('node:fs');
