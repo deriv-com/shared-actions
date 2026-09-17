@@ -18,7 +18,7 @@ engine is pluggable: pick `kimi`, `anthropic`, or `grok` with one input.
 - 🔄 Follow-up mode — on re-push, feeds the previous review plus an incremental diff so fixed items are not re-reported
 - 🧹 Exactly one review comment per engine per PR — a "working on it" comment is posted first, then **edited** into the finished review (same comment URL). The previous review is deleted only after that edit, so a failed or cancelled run never leaves the PR without its last completed review
 - 🔌 Pluggable engine (`kimi` | `anthropic` | `grok`), each a composite action with its own CLI and sandbox
-- 🔒 The model gets **no shell tool** and no comment tool, and PR-supplied agent config is stripped before it starts. Only same-repo PRs are reviewed (the job is skipped for forks), the checkout keeps no git credentials on disk (`persist-credentials: false`, and the Anthropic engine removes the `origin` remote so claude-code-action cannot write the token back into `.git/config`), and a PR that adds or retargets a symlink is refused before any engine runs
+- 🔒 The model gets **no shell tool** and no comment tool, and PR-supplied agent config is stripped before it starts. Only same-repo PRs are reviewed (the job is skipped for forks), the checkout keeps no git credentials on disk (`persist-credentials: false`, and the Anthropic engine runs claude-code-action in the one mode that does not write the token back into `.git/config`, then re-checks the file), and a PR that adds or retargets a symlink is refused before any engine runs
 - 🧱 The Kimi and Anthropic engines confine the model's `Read`/`Grep`/`Glob` to the PR checkout and its `Write` to the single output file with a shared, unit-tested **PreToolUse path guard** (match-all, fail-closed, unknown tools denied), and fail the job if a review was produced while the guard never ran
 - 🛡️ The post step refuses to publish a review containing the LLM API key, the job's GitHub token, anything shaped like a GitHub token, or the on-disk shapes of git credential plumbing (comment bodies are not covered by Actions secret masking; the failure message names the exact pattern that hit), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
@@ -69,12 +69,13 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 | Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) | `@xai-official/grok` CLI — Grok Build (npm, pinned) |
 | Default model | `kimi-k3` | `claude-sonnet-5` | `grok-4.6` |
 | `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** | proxy origin **+ `/v1`** |
-| Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (+ Claude Code's permission-free `Grep`/`Glob`; agent mode mounts **no** GitHub MCP servers — see below) | `Read`, `Grep`, `Write`/`Edit` **output dir only** |
+| Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (+ Claude Code's permission-free `Grep`/`Glob`; the only GitHub MCP server agent mode mounts here is `github_file_ops`, denied by name and by the guard — see below) | `Read`, `Grep`, `Write`/`Edit` **output dir only** |
 | Shell | none (absent from `[tools] enabled`; the deny rule is intent only, and the path guard denies it too) | none (`--allowedTools` omits Bash, `--disallowedTools` re-denies it, the path guard denies it too) | none (`dontAsk` + `--tools` allowlist + `--deny Bash`) |
 | `Read` scope | PR checkout minus `.git/`, plus the context/diff/output files (**PreToolUse path guard**) | same guard, same scope (registered via the action's `settings` input) | **unscoped** (`--sandbox read-only` limits writes, not reads) |
 | `Write` scope | exactly the output file (path guard) | exactly the output file (path guard) | output directory only (`dontAsk`; Grok deny-wins, so no catch-all deny) |
 | GitHub token in the CLI process | none | **yes** — claude-code-action spawns the CLI with `GITHUB_TOKEN`/`GH_TOKEN` in its env for its own MCP servers; the path guard's `/proc` denial and the post-step scan are what stand between that and the PR | none |
-| `.git/config` after the run | untouched (`persist-credentials: false`) | `origin` remote removed **before** the action (it would otherwise write the token into the remote URL); re-checked **after** | untouched |
+| `.git/config` after the run | untouched (`persist-credentials: false`) | untouched: `use_commit_signing: true` keeps the action off the path that rewrites the `origin` URL with the token, its base-branch fetch authenticates from env-only git config, and the file is asserted clean **before** and re-checked **after** | untouched |
+| Base-branch config restored | no | **yes** — the action fetches the PR's base branch and restores `.claude/`, `.mcp.json`, `CLAUDE.md`, `.gitmodules`, `.husky`, … from it after the strip step removed the PR's copies (maintainer-merged versions, never the PR's); `.claude/settings.json` from there is still not loaded (`--setting-sources user`) | no |
 | Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `.mcp.json` / `.cursorrules`; dirs `.grok/`, `.claude/`, `.claude-plugin/`, `.agents/`, `.cursor/rules/` |
 | Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type` | all except `max_context_size`, `cli_version`, `provider_type` | all except `provider_type` |
 | `agent` reported | `ai_review` | `claude_review` | `grok_review` |
@@ -155,23 +156,38 @@ assuming parity:
   The docs' *"base GitHub tools are always included"* describes **tag mode**;
   passing `prompt:` selects **agent mode**, and the action's source at the
   pinned SHA mounts the `github_comment` MCP server only when `--allowedTools`
-  requests its tools, file-ops only with commit signing, inline comments only
-  when requested. Ours requests `Read,Write`, so **no GitHub MCP server is
-  mounted at all** — the model holds no comment tool, matching the Kimi
-  guarantee. Because that rests on source behavior at one SHA, the engine also
-  passes `--disallowedTools` denying those servers plus Bash/WebFetch/WebSearch,
-  so a future SHA bump that changes agent-mode defaults fails safe.
+  requests its tools, inline comments only when requested, and file-ops only
+  with commit signing. Ours requests `Read,Write` and sets `use_commit_signing`
+  (see below), so **the only GitHub MCP server mounted is `github_file_ops`**,
+  denied by name in `--disallowedTools` and by the path guard — the model holds
+  no comment tool and no commit tool, matching the Kimi guarantee. Because that
+  rests on source behavior at one SHA, `--disallowedTools` also denies the
+  other servers plus Bash/WebFetch/WebSearch, so a future SHA bump that changes
+  agent-mode defaults fails safe.
   Two things the action does with the job token, both verified in its source at
-  the pinned SHA and both handled: (1) agent mode calls `configureGitAuth`,
-  which runs `git remote set-url origin` with the token embedded in the URL —
-  plaintext, in `.git/config`, undoing the caller's `persist-credentials:
-  false`. The engine runs `git remote remove origin` **before** the action (the
-  call sits in a try/catch and the action continues; nothing after checkout
-  needs the remote) and re-reads `.git/config` **after** the model ran, failing
-  the job if any credential got in. (2) The CLI is spawned with the token in
-  its environment (`GITHUB_TOKEN`, `GH_TOKEN`, `OVERRIDE_GITHUB_TOKEN`,
-  `DEFAULT_WORKFLOW_TOKEN`), so an unconfined `Read` of `/proc/self/environ`
-  would hand it to the model. The path guard is what confines `Read`; it is
+  the pinned SHA and both handled: (1) outside commit-signing mode, agent mode
+  calls `configureGitAuth`, which runs `git remote set-url origin` with the
+  token embedded in the URL — plaintext, in `.git/config`, undoing the caller's
+  `persist-credentials: false` and within reach of a `Grep` over the checkout
+  (the guard scopes Grep's `path`, not what ripgrep finds under it). The engine
+  passes `use_commit_signing: true`, the one prepare branch that skips that
+  call. It does **not** remove the `origin` remote — an earlier revision did,
+  and that fails the action outright: on every PR event `run.ts` calls
+  `restoreConfigFromBase`, which runs `git fetch origin <base> --depth=1` with
+  no try/catch and then restores `.claude/`, `.mcp.json`, `CLAUDE.md`,
+  `.gitmodules`, `.husky`, … from `origin/<base>` (verified in the source and
+  in production logs of deriv-api-v2's GLM and DeepSeek reviews). That fetch
+  needs credentials for a private repo, so the engine hands git a credential
+  helper through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` in
+  the step env — it reads the token the action already placed in its process
+  environment, and nothing is written to `.git/config`. The install step asserts
+  `.git/config` is credential-free going in and the verify step re-reads it
+  **after** the model ran, failing the job if any credential got in. (2) The
+  CLI is spawned with the token in its environment (`GITHUB_TOKEN`, `GH_TOKEN`,
+  `OVERRIDE_GITHUB_TOKEN`, `DEFAULT_WORKFLOW_TOKEN`) and, with commit signing,
+  in its argv (the file-ops server's config), so an unconfined `Read` of
+  `/proc/self/environ` or `/proc/self/cmdline` would hand it to the model. The
+  path guard is what confines `Read`; it is
   registered through the action's `settings` input (merged into
   `$HOME/.claude/settings.json`, which the SDK loads because `settingSources`
   defaults to user+project+local), with `--setting-sources user` so nothing in
@@ -529,7 +545,7 @@ asserts all of it.
     token shapes, and the exact on-disk shapes of git credential plumbing —
     actions/checkout's `includeIf`/`extraheader`/credentials-file/base64 forms
     and the plaintext `x-access-token:<token>@` remote URL claude-code-action
-    writes (refuse if found, naming the pattern). Those last patterns are
+    writes outside commit-signing mode (refuse if found, naming the pattern). Those last patterns are
     anchored to what the tools write — not bare words like `includeIf` — so a
     review that *discusses* git config still posts; the contract test holds
     that line with fixtures on both sides. Then truncate over

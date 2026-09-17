@@ -154,11 +154,18 @@ check 'grep -q "kimi doctor config" "$KIMI" && grep -q "salvageConfigData" "$KIM
 check 'grep -q "not applied in \`-p\` mode\|not apply \`\[\[permission.rules\]\]\`\|are not applied" "$KIMI" || grep -qi "permission.rules.*not" "$KIMI"' "Kimi action documents that permission.rules are not enforcement"
 check 'step_body "Run AI PR review (Kimi Code)" "$KIMI" | grep -q "PATH_GUARD_LOG: \${{ runner.temp }}/" && step_body "Run AI PR review (Kimi Code)" "$KIMI" | grep -q "\[\[ ! -s \"\$PATH_GUARD_LOG\" \]\]"' "Kimi run step fails if a review was written without the guard ever running"
 # Anthropic wiring
-check 'awk '\''/- name: Install path guard and detach the origin remote/{i=NR} /uses: anthropics\/claude-code-action@/{a=NR} /- name: Verify the sandbox held/{v=NR} END{exit !(i && a && v && i<a && a<v)}'\'' "$ANTH"' "Anthropic: guard install + origin removal run before claude-code-action, sandbox verification after"
-ANTH_INSTALL="$(step_body "Install path guard and detach the origin remote (Claude Code)" "$ANTH")"
-check 'grep -q "git remote remove origin" <<< "$ANTH_INSTALL"' "Anthropic: origin remote is removed so configureGitAuth cannot write the token into .git/config"
+check 'awk '\''/- name: Install path guard \(Claude Code\)/{i=NR} /uses: anthropics\/claude-code-action@/{a=NR} /- name: Verify the sandbox held/{v=NR} END{exit !(i && a && v && i<a && a<v)}'\'' "$ANTH"' "Anthropic: guard install runs before claude-code-action, sandbox verification after"
+ANTH_INSTALL="$(step_body "Install path guard (Claude Code)" "$ANTH")"
 check 'grep -q "cp \"\$ACTION_PATH/../ai_review_path_guard/path-guard.js\"" <<< "$ANTH_INSTALL" && grep -q "node --check" <<< "$ANTH_INSTALL"' "Anthropic: installs and syntax-checks the shared guard outside the checkout"
+# The pinned action's restoreConfigFromBase runs `git fetch origin <base>` on
+# every PR event with no try/catch; removing the remote fails the run before
+# the model starts (it took out every engine: anthropic review in a consumer).
+check '! grep -q "git remote remove origin" "$ANTH" && ! grep -q "git remote rm origin" "$ANTH"' "Anthropic: the origin remote is NOT removed (the action's base-branch restore fetches through it)"
+check 'grep -q "git remote get-url origin" <<< "$ANTH_INSTALL" && grep -q "x-access-token" <<< "$ANTH_INSTALL"' "Anthropic: install step asserts origin exists and .git/config is credential-free going in"
 ANTH_RUN="$(step_body "Claude Code PR review" "$ANTH")"
+check 'grep -q "^        use_commit_signing: true" <<< "$ANTH_RUN"' "Anthropic: commit-signing mode, the one prepare branch that never rewrites origin with the token"
+check 'grep -q "^        GIT_CONFIG_COUNT: \"1\"" <<< "$ANTH_RUN" && grep -q "^        GIT_CONFIG_KEY_0: credential.helper" <<< "$ANTH_RUN" && grep -q "^        GIT_CONFIG_VALUE_0: .*GITHUB_TOKEN" <<< "$ANTH_RUN"' "Anthropic: the action's base-branch fetch authenticates from env-only git config, never .git/config"
+check 'grep -q "mcp__github_file_ops" <<< "$ANTH_RUN"' "Anthropic: the file-ops MCP server that commit-signing mode mounts is denied by name"
 check 'grep -q "\"PreToolUse\"" <<< "$ANTH_RUN" && grep -q "\"matcher\": \".\*\"" <<< "$ANTH_RUN"' "Anthropic: settings registers a match-all PreToolUse hook"
 check 'grep -qF "/ai-review-path-guard/path-guard.js'\'' || exit 2\"" <<< "$ANTH_RUN"' "Anthropic: hook command maps any failure onto the deny code"
 check 'grep -q "^        OUTPUT_PATH: \${{ inputs.output_path }}" <<< "$ANTH_RUN" && grep -q "^        PATH_GUARD_LOG: \${{ runner.temp }}/ai-review-path-guard/decisions.log" <<< "$ANTH_RUN"' "Anthropic: guard receives OUTPUT_PATH and the decision log path through the step env"
@@ -220,7 +227,7 @@ check 'grep -q "ai_review_path_guard/path-guard.js" "$README"' "README names the
 check 'grep -q "type l" "$README"' "README explains why the scrubs match symlinks"
 check 'grep -q "persist-credentials: false" "$README"' "README documents the credential-free checkout"
 check 'grep -qi "fork" "$README"' "README documents the fork skip"
-check 'grep -q "git remote remove origin" "$README"' "README documents why the Anthropic engine removes the origin remote"
+check 'grep -q "use_commit_signing" "$README" && grep -q "restoreConfigFromBase" "$README"' "README documents why the Anthropic engine keeps origin and uses commit-signing mode instead"
 check 'grep -q "REVIEW_MARKER_FILTER" "$README"' "README documents why the reap filter is env, not a file"
 check 'grep -q "120000" "$README"' "README documents the tree-based symlink check"
 

@@ -110,7 +110,7 @@ runs:
       with:
         node-version: "22"
 
-    - name: Install path guard and detach the origin remote (Claude Code)
+    - name: Install path guard (Claude Code)
       shell: bash
       working-directory: ${{ github.workspace }}
       env:
@@ -141,30 +141,36 @@ runs:
         cp "$ACTION_PATH/../ai_review_path_guard/path-guard.js" "$GUARD_DIR/path-guard.js"
         node --check "$GUARD_DIR/path-guard.js"
 
-        # 2. No origin remote. claude-code-action's agent mode
-        #    (prepareAgentMode in src/modes/agent/index.ts at the pinned SHA)
-        #    calls configureGitAuth, whose default branch runs
-        #      git remote set-url origin https://x-access-token:<job token>@github.com/<owner>/<repo>.git
-        #    That puts the caller's write-scoped GitHub token, in plaintext,
-        #    into .git/config — undoing the caller's persist-credentials: false
-        #    and handing the token to any Read of .git/config. The call sits in
-        #    a try/catch that logs and continues, so with no origin remote the
-        #    set-url fails and .git/config stays token-free. Nothing after the
-        #    checkout needs the remote: the diff is pre-fetched, comments go
-        #    through the caller's gh, and this engine pushes nothing.
-        #    This relies on that catch at the pinned SHA. The verify step after
-        #    the review re-reads .git/config and fails the job if a token got in
-        #    anyway, so a SHA bump that changes the behaviour fails closed
-        #    rather than leaking. (HackerOne #4037167)
-        if git remote get-url origin >/dev/null 2>&1; then
-          git remote remove origin
-        fi
-        if git remote | grep -q .; then
-          echo "❌ Anthropic engine: unexpected git remotes remain after detaching origin:"
-          git remote
+        # 2. Baseline for the verify step: the checkout must arrive with an
+        #    origin remote and a credential-free .git/config.
+        #
+        #    The remote is KEPT on purpose. An earlier revision of this fix
+        #    removed it so that claude-code-action's `git remote set-url origin
+        #    https://x-access-token:<job token>@...` would have nothing to write
+        #    to. That breaks the action: on every PR event, run.ts at the pinned
+        #    SHA calls restoreConfigFromBase (src/github/operations/
+        #    restore-config.ts), which runs
+        #      git fetch origin <base branch> --depth=1 --no-recurse-submodules
+        #    with no try/catch around it, then restores .claude/, .mcp.json,
+        #    CLAUDE.md, .gitmodules, .husky, ... from origin/<base> — the
+        #    maintainer-merged versions, replacing whatever the PR shipped. With
+        #    no origin that fetch throws, the action fails before the model
+        #    starts, and the caller gets no review at all. Verified against the
+        #    source and against production logs of deriv-api-v2's GLM and
+        #    DeepSeek reviews (both `engine: anthropic`), which show that fetch
+        #    running on every PR. How the token is kept out of .git/config
+        #    anyway is explained on the action step below (use_commit_signing
+        #    plus env-only fetch credentials). (HackerOne #4037167)
+        if ! git remote get-url origin >/dev/null 2>&1; then
+          echo "❌ Anthropic engine: the checkout has no origin remote; claude-code-action's base-branch restore fetches through it"
           exit 1
         fi
-        echo "✅ Anthropic engine: path guard installed at $GUARD_DIR; no git remote for claude-code-action to write a token into"
+        if git config --local --get-regexp '^remote\..*\.url$' | grep -q '@' \
+           || grep -qiE 'x-access-token|extraheader|includeif|credential\.helper' .git/config; then
+          echo "❌ Anthropic engine: .git/config carries credentials before the review step — the caller's checkout must use persist-credentials: false"
+          exit 1
+        fi
+        echo "✅ Anthropic engine: path guard installed at $GUARD_DIR; .git/config is credential-free going in"
 
     - name: Resolve base URL and verify inputs
       id: resolve
@@ -206,8 +212,41 @@ runs:
         CONTEXT_PATH: ${{ inputs.review_context_path }}
         DIFF_PATH: ${{ inputs.pr_diff_path }}
         PATH_GUARD_LOG: ${{ runner.temp }}/ai-review-path-guard/decisions.log
+        # Credentials for the action's own `git fetch origin <base>` (the
+        # base-branch restore described on the install step), handed to git
+        # through its environment-config mechanism (GIT_CONFIG_COUNT/KEY/VALUE,
+        # git >= 2.31) so they exist in this step's process environment only
+        # and are never written to .git/config. The helper reads the token the
+        # action itself places in its process env before that fetch (run.ts:
+        # GITHUB_TOKEN/GH_TOKEN from the github_token input); OVERRIDE_GITHUB_TOKEN
+        # is the action's own env name for the same input, kept as a fallback.
+        # This adds no secret the CLI's environment does not already hold, and
+        # the model cannot run git (no Bash) or read /proc (path guard). Without
+        # it the fetch of a private repo fails and, that call having no
+        # try/catch, the action exits before the model runs. The verify step
+        # below fails the job if anything credential-shaped shows up in
+        # .git/config anyway.
+        GIT_CONFIG_COUNT: "1"
+        GIT_CONFIG_KEY_0: credential.helper
+        GIT_CONFIG_VALUE_0: '!f() { cat >/dev/null; echo username=x-access-token; echo "password=${GITHUB_TOKEN:-$OVERRIDE_GITHUB_TOKEN}"; }; f'
       with:
         anthropic_api_key: ${{ inputs.api_key }}
+        # The one branch of agent mode's prepare (src/modes/agent/index.ts at
+        # the pinned SHA) that does NOT call configureGitAuth — the function
+        # that runs
+        #   git remote set-url origin https://x-access-token:<job token>@github.com/<owner>/<repo>.git
+        # and so writes the caller's write-scoped token, in plaintext, into
+        # .git/config, undoing persist-credentials: false and putting it within
+        # reach of any Read or Grep over the checkout. Removing the origin remote
+        # instead is not an option (see the install step). Nothing is signed or
+        # committed here: the model has no commit tool. The one side effect is
+        # that the action mounts its github_file_ops MCP server
+        # (src/mcp/install-mcp-server.ts), whose config — job token included, for
+        # that server's env — travels in the CLI's argv; it is denied by name in
+        # --disallowedTools below and by the path guard, which allows only
+        # Read/Write/Grep/Glob, and argv, like the environment, is reachable only
+        # through /proc, which the guard denies. (HackerOne #4037167)
+        use_commit_signing: true
         # PreToolUse hook = the path guard installed above. The action merges
         # this JSON into $HOME/.claude/settings.json (base-action/src/
         # setup-claude-code-settings.ts) and the SDK loads that file because
@@ -238,21 +277,24 @@ runs:
               ]
             }
           }
-        # The action needs a token for its own actor/permission checks.
+        # The action needs a token for its own actor/permission checks and for
+        # the base-branch fetch above.
         #
         # What the model can actually reach here — verified against the action's
         # SOURCE at the pinned SHA, not its docs (the docs' "base GitHub tools
         # are always included" describes tag mode): passing `prompt:` puts the
         # action in AGENT mode, and in agent mode src/mcp/install-mcp-server.ts
         # mounts the github_comment MCP server only when --allowedTools requests
-        # mcp__github_comment__* tools, the file-ops server only with commit
-        # signing, and the inline-comment server only when requested. Ours asks
-        # for "Read,Write", so NO GitHub MCP server is mounted at all — the
-        # model holds no comment tool, same guarantee as the Kimi engine.
+        # mcp__github_comment__* tools, the inline-comment server only when
+        # requested, and the file-ops server only with commit signing. Ours asks
+        # for "Read,Write", so the ONLY GitHub MCP server mounted is file-ops (a
+        # consequence of use_commit_signing above), and its tools are denied by
+        # name below and by the path guard — the model holds no comment tool and
+        # no commit tool, same guarantee as the Kimi engine.
         #
         # Because that rests on source behavior at one SHA rather than a
-        # documented contract, --disallowedTools below re-denies those servers
-        # (plus Bash/WebFetch/WebSearch) as a belt — so a future SHA bump that
+        # documented contract, --disallowedTools below denies all of those
+        # servers (plus Bash/WebFetch/WebSearch) — so a future SHA bump that
         # changes agent-mode defaults fails safe instead of silently widening
         # the surface. The caller's delete-before-post remains the final layer.
         github_token: ${{ github.token }}
@@ -303,9 +345,11 @@ runs:
         #
         # --disallowedTools is the belt for the agent-mode analysis on
         # github_token above: server-level MCP names deny every tool of those
-        # servers, and disallowing a tool that is not mounted is a no-op — this
-        # only matters if a future SHA bump mounts them again. Disallowed takes
-        # precedence over allowed in the CLI, so it cannot mask Read/Write.
+        # servers. mcp__github_file_ops IS mounted (use_commit_signing) and this
+        # is its deny; the others are not mounted today, and disallowing a tool
+        # that is not mounted is a no-op that starts mattering the day a SHA bump
+        # mounts them. Disallowed takes precedence over allowed in the CLI, so it
+        # cannot mask Read/Write.
         #
         # --setting-sources user: only $HOME/.claude/settings.json (which the
         # action writes from `settings` above) is loaded; project and local
@@ -324,20 +368,24 @@ runs:
         OUTPUT_PATH: ${{ inputs.output_path }}
         PATH_GUARD_LOG: ${{ runner.temp }}/ai-review-path-guard/decisions.log
       run: |
-        # 1. The job token must not have reached .git/config. The install step
-        #    removed the origin remote so claude-code-action's
-        #    `git remote set-url origin https://x-access-token:...` had nothing
-        #    to write to; this re-reads the file the model could have opened and
-        #    fails if any remote URL carries credentials or any credential
-        #    plumbing (a checkout-style extraheader / includeIf, or a token
-        #    shape) is present. Raw file, not `git config --list`, so an include
-        #    pointing elsewhere is itself visible. A hit here means the pinned
-        #    action's behaviour changed: treat the job token as exposed to the
-        #    model, rotate/inspect, and do not merge the SHA bump that did it.
+        # 1. The job token must not have reached .git/config. use_commit_signing
+        #    keeps claude-code-action off the code path that runs
+        #    `git remote set-url origin https://x-access-token:...`, and the
+        #    action's base-branch fetch authenticated from env-only git config;
+        #    so the file should be exactly as the caller's persist-credentials:
+        #    false checkout left it (the install step asserted that baseline).
+        #    This re-reads the file the model's Read or Grep could have reached
+        #    and fails if any remote URL carries credentials or any credential
+        #    plumbing (a checkout-style extraheader / includeIf, a credential
+        #    helper, or a token shape) is present. Raw file, not `git config
+        #    --list`, so an include pointing elsewhere is itself visible. A hit
+        #    here means the pinned action's behaviour changed: treat the job
+        #    token as exposed to the model, rotate/inspect, and do not merge the
+        #    SHA bump that did it.
         if [[ -f .git/config ]] && { git config --local --get-regexp '^remote\..*\.url$' 2>/dev/null | grep -q '@' \
              || grep -qiE 'x-access-token|extraheader|includeif|credential\.helper|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}' .git/config; }; then
-          echo "❌ Anthropic engine: .git/config carries credentials after the review step. The model's Read could have opened it — treat the job token as exposed. (HackerOne #4037167)"
-          echo "   claude-code-action at the pinned SHA writes the token into the origin remote URL when one exists; the install step removed origin so this should be impossible. Check what changed."
+          echo "❌ Anthropic engine: .git/config carries credentials after the review step. The model's Read or Grep could have reached it — treat the job token as exposed. (HackerOne #4037167)"
+          echo "   claude-code-action at the pinned SHA only rewrites the origin URL with the token outside commit-signing mode, and this engine sets use_commit_signing: true. Check what changed."
           exit 1
         fi
 
