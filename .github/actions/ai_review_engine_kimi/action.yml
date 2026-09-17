@@ -94,7 +94,7 @@ runs:
         # it to traverse into dependencies — so a nested packages/foo/CLAUDE.md
         # would reach the model as trusted instructions even with the root file
         # deleted. .git is pruned so the sweep cannot corrupt the checkout.
-        find . -name .git -prune -o -type f \
+        find . -name .git -prune -o \( -type f -o -type l \) \
           \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' -o -name 'KIMI.md' \) \
           -print0 | xargs -0 -r rm -f
         find . -name .git -prune -o -type d -name '.kimi-code' \
@@ -124,14 +124,19 @@ runs:
       run: |
         # Model and credentials are supplied entirely through the KIMI_MODEL_*
         # env channel on the run step — nothing sensitive is written to disk.
-        # This file only restricts the tool surface: Read, Write (output dir
-        # only), Grep, Glob. No Bash. The diff is pre-fetched, so the agent has
-        # no reason to run commands.
+        # This step only restricts the tool surface: Read, Grep, Glob confined
+        # to the PR checkout; Write confined to the output directory; no Bash.
+        # The diff is pre-fetched, so the agent has no reason to run commands.
         #
-        # Rules are first-match-wins and evaluated before the mode default, so
-        # each `allow` must precede its `deny` catch-all. Bash is absent from
-        # `enabled` AND denied by rule, so neither control has to be correct on
-        # its own.
+        # Two controls, and they do not overlap:
+        #   1. `[tools] enabled` is what removes Bash.
+        #   2. The PreToolUse hook is what confines paths. It is the ONLY thing
+        #      that does: in kimi-code 0.34.0 the `[[permission.rules]]` below
+        #      are not applied in `-p` mode at all — a config with a bare
+        #      `deny Read` still read files and `deny Write` still wrote into the
+        #      checkout (verified against a mock model endpoint while fixing
+        #      HackerOne #4037167). They stay as a statement of intent, and for
+        #      the version that honours them; never treat them as enforcement.
         #
         # $HOME/.kimi-code is recreated rather than merged: on a persistent
         # self-hosted runner a previous run's config could otherwise survive
@@ -140,11 +145,135 @@ runs:
         rm -rf "$HOME/.kimi-code"
         mkdir -p "$HOME/.kimi-code"
 
+        # Path guard. The CLI runs it before every Read/Grep/Glob/Write call with
+        # the call's JSON on stdin; exit 2 denies the call and hands stderr to
+        # the model as the reason. Allow-list, not deny-list: Read/Grep/Glob may
+        # touch the PR checkout (minus .git/) and Read may also open the two input
+        # files the caller prepared and the output file; Write may only land in
+        # the output directory.
+        # $RUNNER_TEMP (where actions/checkout parks a token), $HOME, /proc, ~,
+        # and everything else fall outside that by construction. Symlinks are
+        # resolved first so a link inside the checkout cannot alias a file
+        # outside it. Any internal error also exits 2: the guard fails closed.
+        # Node, not bash+jq: node is guaranteed present because the CLI runs on
+        # it, and JSON/path handling is what goes wrong in shell.
+        #
+        # Self-contained on purpose, because the CLI treats a hook that times
+        # out as ALLOW and the attacker controls the checkout the hook runs in
+        # (its cwd). The script lives under $HOME/.kimi-code, which is wiped and
+        # recreated above; it requires only `node:` builtins, which never touch
+        # node_modules; and Node's package.json scope lookup walks UP from the
+        # script's own directory, never into the checkout below it. A hostile
+        # package.json / node_modules / .npmrc in the PR was tested and changes
+        # nothing. Keep it that way: no npm packages, no reading repo files.
+        # No `${{ }}` in here — Actions scans the whole run: string for them.
+        cat > "$HOME/.kimi-code/path-guard.js" <<'JS'
+        'use strict';
+        const fs = require('node:fs');
+        const os = require('node:os');
+        const path = require('node:path');
+
+        function deny(reason) {
+          process.stderr.write(reason + '\n');
+          process.exit(2);
+        }
+        process.on('uncaughtException', function (err) {
+          deny('path guard: internal error: ' + (err && err.message ? err.message : String(err)));
+        });
+
+        // realpath of the longest existing prefix: resolves symlinks anywhere
+        // in the path, and still works for an output file that does not exist yet.
+        function canonical(p) {
+          let head = path.resolve(p);
+          const tail = [];
+          for (;;) {
+            try {
+              return path.join(fs.realpathSync.native(head), ...tail);
+            } catch (e) {
+              const parent = path.dirname(head);
+              if (parent === head) return path.join(head, ...tail);
+              tail.unshift(path.basename(head));
+              head = parent;
+            }
+          }
+        }
+        function within(child, parent) {
+          const rel = path.relative(parent, child);
+          return rel === '' || (!path.isAbsolute(rel) && rel.split(path.sep)[0] !== '..');
+        }
+        function hasGitSegment(rel) {
+          return rel.split(path.sep).some(function (seg) { return seg.toLowerCase() === '.git'; });
+        }
+        // ripgrep matches these relative to the search root, so neither shape is
+        // ever needed for a legitimate search; refuse them rather than reason
+        // about ripgrep's anchoring rules.
+        function unsafeGlob(g) {
+          return typeof g === 'string' && (path.isAbsolute(g) || g.split(/[\\/]/).indexOf('..') !== -1);
+        }
+
+        const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+        const tool = String(input.tool_name || '');
+        const args = input.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
+
+        const wsRaw = process.env.GITHUB_WORKSPACE;
+        const outRaw = process.env.OUTPUT_PATH;
+        if (!wsRaw || !outRaw) deny('path guard: GITHUB_WORKSPACE or OUTPUT_PATH is not set');
+        const ws = canonical(wsRaw);
+        const outDir = canonical(path.dirname(path.resolve(outRaw)));
+        // Files the caller prepared for the model, plus its own output so it can
+        // re-read what it wrote.
+        const readableFiles = [process.env.CONTEXT_PATH, process.env.DIFF_PATH, outRaw]
+          .filter(function (p) { return typeof p === 'string' && p.length > 0; })
+          .map(canonical);
+
+        if ((tool === 'Glob' && unsafeGlob(args.pattern)) || (tool === 'Grep' && unsafeGlob(args.glob))) {
+          deny(tool + ' denied: glob patterns must be relative to the search path and must not contain "..".');
+        }
+
+        const raw = args.path;
+        if (raw === undefined || raw === null) {
+          // Grep/Glob search the workspace when path is omitted; Read/Write
+          // without a path are rejected by the tool itself.
+          process.exit(0);
+        }
+        if (typeof raw !== 'string') deny(tool + ' denied: path must be a string.');
+        let expanded = raw;
+        if (expanded === '~' || expanded.startsWith('~/')) expanded = path.join(os.homedir(), expanded.slice(1));
+        // The CLI resolves relative paths against its cwd, which the run step
+        // pins to the workspace.
+        const target = canonical(path.resolve(wsRaw, expanded));
+
+        if (tool === 'Write') {
+          if (within(target, outDir)) process.exit(0);
+          deny('Write denied: ' + raw + '. This review may only write its output file under ' + outDir + '.');
+        }
+        if (tool === 'Read' && readableFiles.indexOf(target) !== -1) process.exit(0);
+        if (within(target, ws)) {
+          if (hasGitSegment(path.relative(ws, target))) {
+            deny(tool + ' denied: ' + raw + ' is inside .git/, which is not part of the code under review.');
+          }
+          process.exit(0);
+        }
+        deny(tool + ' denied: ' + raw + ' resolves outside the PR checkout (' + ws + '). Only the checked-out repository, the review context and the pre-fetched diff may be read.');
+        JS
+
         cat > "$HOME/.kimi-code/config.toml" <<EOF
         default_permission_mode = "auto"
 
         [tools]
         enabled = ["Read", "Write", "Grep", "Glob"]
+
+        # \`|| exit 2\` is load-bearing: the CLI treats a hook it cannot start
+        # (node missing, script missing, exit 1) as ALLOW. This maps every
+        # non-zero exit onto the deny code so breaking the guard cannot bypass it.
+        # timeout is the schema maximum. A hook that exceeds it is treated as
+        # ALLOW, so the window is made as small as the CLI permits: the script
+        # needs milliseconds, and nothing the PR contains can slow it down.
+        [[hooks]]
+        event = "PreToolUse"
+        matcher = "^(Read|Grep|Glob|Write)$"
+        command = "node '${HOME}/.kimi-code/path-guard.js' || exit 2"
+        timeout = 600
 
         [[permission.rules]]
         decision = "allow"
@@ -160,6 +289,10 @@ runs:
         EOF
 
         kimi doctor config
+        # The guard must exist and parse before the run step starts, or the hook
+        # would deny every tool call and the review would fail with no output.
+        node --check "$HOME/.kimi-code/path-guard.js"
+        echo "✅ Kimi engine: tool surface configured (path guard installed)"
 
     - name: Run AI PR review (Kimi Code)
       id: run

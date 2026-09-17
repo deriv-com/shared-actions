@@ -18,8 +18,8 @@ engine is pluggable: pick `kimi`, `anthropic`, or `grok` with one input.
 - 🔄 Follow-up mode — on re-push, feeds the previous review plus an incremental diff so fixed items are not re-reported
 - 🧹 Exactly one review comment per engine per PR — a "working on it" comment is posted first, then **edited** into the finished review (same comment URL). The previous review is deleted only after that edit, so a failed or cancelled run never leaves the PR without its last completed review
 - 🔌 Pluggable engine (`kimi` | `anthropic` | `grok`), each a composite action with its own CLI and sandbox
-- 🔒 The model gets **no shell tool** and no GitHub token — it cannot comment, and PR-supplied agent config is stripped before it starts
-- 🛡️ The post step refuses to publish a review containing the LLM API key (comment bodies are not covered by Actions secret masking), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
+- 🔒 The model gets **no shell tool** and no GitHub token — it cannot comment, and PR-supplied agent config is stripped before it starts. Only same-repo PRs are reviewed (the job is skipped for forks), the checkout keeps no git credentials on disk, and a PR that adds or touches a symlink is refused before any engine runs
+- 🛡️ The post step refuses to publish a review containing the LLM API key, the job's GitHub token, anything shaped like a GitHub token, or git credential-helper vocabulary (comment bodies are not covered by Actions secret masking; the failure message names the exact pattern that hit), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
 - 📊 Emits events to the OneAboveAll metrics dashboard, and always to the job summary
 - ⏳ Posts a caller-owned "working on it" comment (model at the top) before the engine runs, then edits that same comment into the review; the CLI never gets a GitHub token
@@ -115,12 +115,17 @@ input value mean two different things.
 **How each engine's sandbox actually holds.** Be precise about this rather than
 assuming parity:
 
-- **Kimi** — the tool surface *is* the guarantee. Bash is absent from `enabled`
-  and denied by rule; `Write` is confined to the output directory by an allow rule
-  plus a catch-all deny; no GitHub token reaches the step at all. The agent
-  cannot comment because it has no means to. Its `Read` is unscoped, though —
-  which is why the caller's post step scans the review for the API key before
-  publishing (see below).
+- **Kimi** — two controls that do not overlap. Bash is absent from `[tools]
+  enabled`, which is what removes it. Paths are confined by a **PreToolUse hook**
+  (`$HOME/.kimi-code/path-guard.js`, written by the configure step): `Read`,
+  `Grep` and `Glob` may touch the PR checkout minus `.git/` plus the caller's
+  context, diff and output files; `Write` only the output directory; symlinks
+  are resolved first. The `[[permission.rules]]` in the same config are **not
+  enforcement**: kimi-code 0.34.0 ignores them in `-p` mode (a bare `deny Read`
+  still read files — verified against a mock model while fixing HackerOne
+  #4037167). Do not remove the hook because "the rules already cover it"; they
+  do not. No GitHub token reaches the step at all, and the caller's post step
+  still scans the review before publishing (see below).
 - **Anthropic** — stronger than the action's docs suggest. The docs' *"base
   GitHub tools are always included"* describes **tag mode**; passing `prompt:`
   selects **agent mode**, and the action's source at the pinned SHA mounts the
@@ -399,7 +404,12 @@ The stripping step is a **security boundary, and its paths are engine-specific**
 — `.claude/settings.json` can declare hooks that execute arbitrary commands and
 `.kimi-code/mcp.json` can declare MCP servers, neither gated by a tool allowlist,
 and both PR-controlled. Never inherit another engine's list; work out what your
-CLI reads.
+CLI reads. The `find` must match symlinks as well as regular files
+(`\( -type f -o -type l \)`): a PR can add `AGENTS.md` as a link to any other
+file it ships, and a scrub that only deletes regular files leaves that link in
+place for the CLI to follow. The workflow additionally rejects PRs that add or
+modify symlinks before any engine runs, so this is defence in depth, not the
+only line.
 
 ### Gotchas that will bite you
 
@@ -422,8 +432,11 @@ CLI reads.
 
 ## How It Works
 
-0. **Bot skip** — the job does not run at all for `*[bot]` actors (they cannot
-   pass the gate, and a red run on every dependabot PR reads like a regression).
+0. **Bot and fork skip** — the job does not run at all for `*[bot]` actors (they
+   cannot pass the gate, and a red run on every dependabot PR reads like a
+   regression) or for PRs whose head repo is not the base repo: callers use
+   `pull_request_target`, which runs with the base repo's secrets and a
+   write-scoped token even for forks.
 1. **Access gate** — actor must be a `deriv-com` member or a repo collaborator.
 2. **Resolve engine** — validate `engine`, resolve per-engine and engine-neutral
    defaults (the single place every default value lives).
@@ -432,7 +445,11 @@ CLI reads.
    the comment that later becomes the review (same id). The CLI never
    receives `GITHUB_TOKEN`.
 4. **Checkout** the event's `head.sha` — not the branch, which could have moved
-   past what the gate validated — at depth 20, for the incremental diff.
+   past what the gate validated — at depth 20, for the incremental diff, with
+   `persist-credentials: false` so the token is never written under
+   `$RUNNER_TEMP` or referenced from `.git/config`. Then **reject symlinks**:
+   any file the PR adds or touches that is a symlink in the checkout fails the
+   job here (symlinks already in the base branch are ignored).
 5. **Fetch prompt** template from the pinned gist revision; inject the Click2Fix URL.
 6. **Capture** the newest prior review comment (canonical + legacy markers,
    paginated) as `PREVIOUS_REVIEW` and extract its `reviewed-commit` SHA.
@@ -448,7 +465,9 @@ CLI reads.
    engine needs no shell), filtered for build noise only — lockfiles and
    generated output, never test or doc files, which the review must see.
 10. **Dispatch to the engine** — it writes `/tmp/ai_review_output.txt`.
-11. **Post**: scan the review for the API key (refuse if found), truncate over
+11. **Post**: scan the review for the API key, the job's GitHub token, GitHub
+    token shapes and git credential-helper vocabulary (refuse if found, naming
+    the pattern), truncate over
     GitHub's comment limit, prepend the model and engine title, append
     detection markers, **PATCH the progress comment** into that body (or
     `gh pr comment` if progress never posted), **then** delete the prior

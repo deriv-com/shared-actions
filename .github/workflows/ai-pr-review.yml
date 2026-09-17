@@ -97,7 +97,16 @@ jobs:
     # every bot PR produces a red run that reads like a workflow regression.
     # Skipping also avoids spending LLM tokens on lockfile-bump PRs. A human
     # actor failing the gate still fails red, which is the correct signal.
-    if: github.event.pull_request.draft == false && !endsWith(github.actor, '[bot]')
+    #
+    # Same-repo PRs only. Callers trigger this workflow on pull_request_target,
+    # which runs with the BASE repository's secrets and a write-scoped
+    # GITHUB_TOKEN even when the PR comes from a fork — and the checkout step
+    # then fetches the fork's code for the engine to read. The org-member gate
+    # below validates the actor, not where the code came from, so this is the
+    # line that closes the fork path. Skipped, not failed: a fork PR from an
+    # org member is legitimate, just not eligible for the privileged review.
+    # (HackerOne #4037167)
+    if: github.event.pull_request.draft == false && !endsWith(github.actor, '[bot]') && github.event.pull_request.head.repo.full_name == github.repository
 
     permissions:
       # `actions:` is deliberately absent. Permissions can only be reduced, never
@@ -405,6 +414,45 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 20
           token: ${{ secrets.GITHUB_TOKEN }}
+          # The default (true) writes this token into a credential file under
+          # $RUNNER_TEMP and points .git/config at it via includeIf — both of
+          # which the review engine's Read/Grep tools could open. Nothing after
+          # this step talks to the remote with git (diff and comments go through
+          # `gh` with GH_TOKEN), so the token has no reason to be on disk.
+          # (HackerOne #4037167)
+          persist-credentials: false
+
+      - name: Reject symlinks introduced by the PR
+        # Each engine's instruction-file scrub deletes CLAUDE.md / AGENTS.md /
+        # KIMI.md etc. so a PR cannot hand the model trusted instructions. A
+        # symlink with one of those names, pointing at any other file in the
+        # PR, sidesteps a scrub that only matches regular files — and a symlink
+        # pointing outside the checkout lets a path-restricted Read follow it
+        # out. So any file this PR adds or touches that is a symlink in the
+        # checkout fails the job before an engine runs. Symlinks already in the
+        # base branch are left alone: they were reviewed when they landed.
+        # (HackerOne #4037167)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          # Fails closed under this step's `set -e`: an API error must not read
+          # as "no changed files".
+          gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" \
+            --jq '.[] | select(.status != "removed") | .filename' > /tmp/pr_changed_files.txt
+          LINKS=""
+          while IFS= read -r f; do
+            if [[ -n "$f" && -L "$f" ]]; then
+              LINKS+="   $f"$'\n'
+            fi
+          done < /tmp/pr_changed_files.txt
+          if [[ -n "$LINKS" ]]; then
+            echo "❌ This PR adds or modifies symlinks — refusing to run the review engine on it:"
+            printf '%s' "$LINKS"
+            exit 1
+          fi
+          echo "✅ No symlinks among the $(wc -l < /tmp/pr_changed_files.txt | tr -d ' ') changed files"
 
       - name: Fetch prompt template from Gist
         id: fetch-prompt
@@ -854,8 +902,40 @@ jobs:
           # this is the last point where posting them publicly can be stopped.
           # Everything up to the post below is deliberately fail-CLOSED: on any
           # failure in this step's checks, the previous review is untouched.
+          #
+          # Checked in order: the LLM API key and the job's GitHub token as
+          # literals; then GitHub token shapes (ghp_/gho_/ghu_/ghs_/ghr_,
+          # github_pat_) in case the model quoted one it found rather than the
+          # one in its own env; then the vocabulary of actions/checkout's
+          # credential plumbing (AUTHORIZATION: basic, extraheader,
+          # git-credentials, includeIf), which has no place in a code review and
+          # means the model was reading git config it should never see. That
+          # last set is case-insensitive because git config keys are. A review
+          # that legitimately discusses those git features trips this too — an
+          # accepted false positive, since the run log still has the text. If
+          # that becomes a nuisance, NARROW the two noisy words to their
+          # credential context (`extraheader.*basic`, `includeIf.*gitdir`)
+          # rather than dropping them. The message names the exact pattern
+          # that hit so nobody has to guess; token matches are printed
+          # prefix-only because the run log is readable by more people than
+          # the secret should be.
+          # (HackerOne #4037167)
+          LEAK=""
           if [[ -n "$LLM_API_KEY" ]] && grep -qF -- "$LLM_API_KEY" "$REVIEW_OUTPUT_FILE"; then
-            echo "❌ Review output contains the LLM API key — refusing to post. Rotate the key and inspect the run."
+            LEAK="the LLM API key (literal LLM_API_KEY value)"
+          elif [[ -n "${GITHUB_TOKEN:-}" ]] && grep -qF -- "$GITHUB_TOKEN" "$REVIEW_OUTPUT_FILE"; then
+            LEAK="the job's GitHub token (literal GITHUB_TOKEN value)"
+          elif [[ -n "${GH_TOKEN:-}" ]] && grep -qF -- "$GH_TOKEN" "$REVIEW_OUTPUT_FILE"; then
+            LEAK="the job's GitHub token (literal GH_TOKEN value)"
+          elif HIT=$(grep -oE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}' "$REVIEW_OUTPUT_FILE" | head -n1); [[ -n "$HIT" ]]; then
+            LEAK="a GitHub token shape (starts with '${HIT:0:4}…', matched regex gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"
+          elif HIT=$(grep -oiE 'authorization: *basic|extraheader|git-credentials|includeIf' "$REVIEW_OUTPUT_FILE" | head -n1); [[ -n "$HIT" ]]; then
+            LEAK="git credential-helper vocabulary (matched '$HIT'; regex authorization: *basic|extraheader|git-credentials|includeIf, case-insensitive)"
+          fi
+          if [[ -n "$LEAK" ]]; then
+            echo "❌ Review output contains $LEAK — refusing to post."
+            echo "   If a secret matched: rotate it and inspect this run. If only a word matched, this is the"
+            echo "   fail-closed exfiltration guard in the 'Post review' step; narrow the pattern, do not remove it."
             exit 1
           fi
 

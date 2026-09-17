@@ -89,7 +89,7 @@ runs:
         # can @import it, and other engines do read it.
         #
         # .git is pruned so the sweep cannot corrupt the checkout.
-        find . -name .git -prune -o -type f \
+        find . -name .git -prune -o \( -type f -o -type l \) \
           \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' -o -name '.mcp.json' \) \
           -print0 | xargs -0 -r rm -f
         find . -name .git -prune -o -type d \
