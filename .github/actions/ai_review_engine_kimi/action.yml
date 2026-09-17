@@ -94,10 +94,13 @@ runs:
         # it to traverse into dependencies — so a nested packages/foo/CLAUDE.md
         # would reach the model as trusted instructions even with the root file
         # deleted. .git is pruned so the sweep cannot corrupt the checkout.
-        find . -name .git -prune -o -type f \
+        # Both sweeps match symlinks too: a link named AGENTS.md or .kimi-code
+        # pointing at another file or directory in the PR would otherwise survive
+        # a sweep keyed on -type f / -type d. rm on a link removes the link only.
+        find . -name .git -prune -o \( -type f -o -type l \) \
           \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' -o -name 'KIMI.md' \) \
           -print0 | xargs -0 -r rm -f
-        find . -name .git -prune -o -type d -name '.kimi-code' \
+        find . -name .git -prune -o \( -type d -o -type l \) -name '.kimi-code' \
           -print0 | xargs -0 -r rm -rf
         echo "✅ Stripped PR-supplied agent config (recursive)"
 
@@ -121,17 +124,28 @@ runs:
       shell: bash
       env:
         OUTPUT_PATH: ${{ inputs.output_path }}
+        # Where this composite action's own files live on the runner (the
+        # deriv-com/shared-actions checkout under _actions), not the PR checkout.
+        ACTION_PATH: ${{ github.action_path }}
       run: |
         # Model and credentials are supplied entirely through the KIMI_MODEL_*
         # env channel on the run step — nothing sensitive is written to disk.
-        # This file only restricts the tool surface: Read, Write (output dir
-        # only), Grep, Glob. No Bash. The diff is pre-fetched, so the agent has
-        # no reason to run commands.
+        # This step only restricts the tool surface: Read, Grep, Glob confined
+        # to the PR checkout; Write confined to the output file; no Bash.
+        # The diff is pre-fetched, so the agent has no reason to run commands.
         #
-        # Rules are first-match-wins and evaluated before the mode default, so
-        # each `allow` must precede its `deny` catch-all. Bash is absent from
-        # `enabled` AND denied by rule, so neither control has to be correct on
-        # its own.
+        # Two controls:
+        #   1. `[tools] enabled` is what removes Bash (enforced by the CLI's
+        #      tool-call guard, verified in the 0.34.0 source).
+        #   2. The PreToolUse hook is what confines paths, and it independently
+        #      denies any tool other than Read/Grep/Glob/Write, so the tool
+        #      surface holds even if one of the two regresses. The hook is the
+        #      ONLY path control: in kimi-code 0.34.0 the `[[permission.rules]]`
+        #      below are not applied in `-p` mode at all — a config with a bare
+        #      `deny Read` still read files and `deny Write` still wrote into the
+        #      checkout (verified against a mock model endpoint while fixing
+        #      HackerOne #4037167). They stay as a statement of intent, and for
+        #      the version that honours them; never treat them as enforcement.
         #
         # $HOME/.kimi-code is recreated rather than merged: on a persistent
         # self-hosted runner a previous run's config could otherwise survive
@@ -140,11 +154,52 @@ runs:
         rm -rf "$HOME/.kimi-code"
         mkdir -p "$HOME/.kimi-code"
 
+        # Path guard. The CLI runs it before EVERY tool call (match-all matcher
+        # below) with the call's JSON on stdin; exit 2 denies the call and hands
+        # stderr to the model as the reason. Allow-list, not deny-list:
+        # Read/Grep/Glob may touch the PR checkout (minus .git/), Read may also
+        # open the caller's context and diff files and the output file, Write
+        # may only land on the single output file, and any other tool name is
+        # denied outright. $RUNNER_TEMP (where actions/checkout parks a token),
+        # $HOME, /proc, ~, and everything else fall outside that by
+        # construction. Symlinks are resolved first so a link inside the
+        # checkout cannot alias a file outside it. Any internal error exits 2
+        # as well: the guard fails closed.
+        #
+        # The script is a committed file shared with the Anthropic engine
+        # (../ai_review_path_guard/path-guard.js in this repository's checkout
+        # under _actions; tested by path-guard.test.js in lint-actions.yml) and
+        # is copied, not run in place, so config.toml can name a stable path.
+        # It stays self-contained on purpose, because the CLI treats a hook
+        # that times out as ALLOW and the attacker controls the checkout the
+        # hook runs in (its cwd): `node:` builtins only, no repo files, and
+        # Node's package.json scope lookup walks UP from $HOME/.kimi-code,
+        # never into the checkout below it. A hostile package.json /
+        # node_modules / .npmrc in the PR is covered by the tests and changes
+        # nothing.
+        cp "$ACTION_PATH/../ai_review_path_guard/path-guard.js" "$HOME/.kimi-code/path-guard.js"
+
         cat > "$HOME/.kimi-code/config.toml" <<EOF
         default_permission_mode = "auto"
 
         [tools]
         enabled = ["Read", "Write", "Grep", "Glob"]
+
+        # \`|| exit 2\` is load-bearing: the CLI treats a hook it cannot start
+        # (node missing, script missing, exit 1) as ALLOW. This maps every
+        # non-zero exit onto the deny code so breaking the guard cannot bypass it.
+        # timeout is the schema maximum. A hook that exceeds it is treated as
+        # ALLOW, so the window is made as small as the CLI permits: the script
+        # needs milliseconds, and nothing the PR contains can slow it down.
+        # matcher is match-all, not the four tool names: a call the matcher does
+        # not fire for is allowed without a decision, so a CLI bump that renamed
+        # a tool would silently remove the guard. The guard itself denies every
+        # tool other than Read/Grep/Glob/Write, independently of \`[tools]\`.
+        [[hooks]]
+        event = "PreToolUse"
+        matcher = ".*"
+        command = "node '${HOME}/.kimi-code/path-guard.js' || exit 2"
+        timeout = 600
 
         [[permission.rules]]
         decision = "allow"
@@ -159,7 +214,19 @@ runs:
         pattern = "Bash"
         EOF
 
+        # Load-bearing, not a smoke test. When a section of config.toml fails
+        # schema validation, the CLI's config loader (salvageConfigData in
+        # kimi-code 0.34.0) DROPS that whole section and carries on, so a
+        # `[[hooks]]` entry that stopped validating after a cli_version bump
+        # would remove the path guard with no error and the review would run
+        # unconfined. `kimi doctor config` validates the same file against the
+        # same schemas and exits 1 on any failing section, which fails this step
+        # before the run step can start. Keep it here, before the run.
         kimi doctor config
+        # The guard must be in place and parse before the run step starts, or the
+        # hook would deny every tool call and the review would fail with no output.
+        node --check "$HOME/.kimi-code/path-guard.js"
+        echo "✅ Kimi engine: tool surface configured (path guard installed)"
 
     - name: Run AI PR review (Kimi Code)
       id: run
@@ -177,9 +244,17 @@ runs:
         CONTEXT_PATH: ${{ inputs.review_context_path }}
         DIFF_PATH: ${{ inputs.pr_diff_path }}
         OUTPUT_PATH: ${{ inputs.output_path }}
+        # The path guard appends one line per decision here (outside the
+        # checkout; the guard itself denies the model this path). Checked after
+        # the run: a review written with an empty log means the hook never
+        # fired, i.e. the CLI's hook plumbing changed and the model ran
+        # unconfined. Env reaches the hook because the CLI spawns it with its
+        # own environment — the same way the guard receives OUTPUT_PATH.
+        PATH_GUARD_LOG: ${{ runner.temp }}/kimi-path-guard.log
       run: |
         [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Kimi engine: missing or empty review context at $CONTEXT_PATH"; exit 1; }
         [[ -s "$DIFF_PATH"    ]] || { echo "❌ Kimi engine: missing or empty PR diff at $DIFF_PATH"; exit 1; }
+        rm -f "$PATH_GUARD_LOG"
 
         # base_url is accepted with or without a trailing /v1 so one caller-facing
         # value works for every engine. The anthropic engine strips it instead.
@@ -339,5 +414,19 @@ runs:
           ( dump_kimi_log ) || true
           exit 1
         fi
+
+        # The review exists, so the model made at least one tool call (the Write
+        # that produced it), so the match-all PreToolUse hook must have logged at
+        # least one decision. An empty or missing log means the hook never ran:
+        # config.toml validated but the CLI no longer honours it the way 0.34.0
+        # does. That review was produced with no path confinement, so it is not
+        # posted. Fail closed; do not downgrade this to a warning.
+        if [[ ! -s "$PATH_GUARD_LOG" ]]; then
+          echo "❌ Kimi engine: the review was written but the path guard never ran (no decisions logged at $PATH_GUARD_LOG)."
+          echo "   The PreToolUse hook is the only path control in this engine; without it the model could read anything on the runner."
+          echo "   Refusing to hand this review to the caller. Check the hook configuration against this cli_version. (HackerOne #4037167)"
+          exit 1
+        fi
+        echo "✅ Kimi engine: path guard handled $(wc -l < "$PATH_GUARD_LOG" | tr -d ' ') tool call(s), $(grep -c '^deny' "$PATH_GUARD_LOG" || true) denied"
         echo "✅ Kimi engine: review written ($(wc -c < "$OUTPUT_PATH") bytes)"
         echo "output_path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"

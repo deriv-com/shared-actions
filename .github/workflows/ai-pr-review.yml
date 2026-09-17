@@ -97,7 +97,16 @@ jobs:
     # every bot PR produces a red run that reads like a workflow regression.
     # Skipping also avoids spending LLM tokens on lockfile-bump PRs. A human
     # actor failing the gate still fails red, which is the correct signal.
-    if: github.event.pull_request.draft == false && !endsWith(github.actor, '[bot]')
+    #
+    # Same-repo PRs only. Callers trigger this workflow on pull_request_target,
+    # which runs with the BASE repository's secrets and a write-scoped
+    # GITHUB_TOKEN even when the PR comes from a fork — and the checkout step
+    # then fetches the fork's code for the engine to read. The org-member gate
+    # below validates the actor, not where the code came from, so this is the
+    # line that closes the fork path. Skipped, not failed: a fork PR from an
+    # org member is legitimate, just not eligible for the privileged review.
+    # (HackerOne #4037167)
+    if: github.event.pull_request.draft == false && !endsWith(github.actor, '[bot]') && github.event.pull_request.head.repo.full_name == github.repository
 
     permissions:
       # `actions:` is deliberately absent. Permissions can only be reduced, never
@@ -167,6 +176,43 @@ jobs:
         ${{ inputs.review_title == '' && inputs.engine == 'kimi' && '<!-- deriv-pr-review -->' || '' }}
         ${{ inputs.review_title == '' && inputs.engine == 'anthropic' && '<!-- deriv-pr-review -->' || '' }}
       LEGACY_MARKERS: ${{ inputs.legacy_markers }}
+
+      # The jq program that decides which comments are "our review". Shared by
+      # the capture step (find the previous review) and the post step (build the
+      # reap list), so the two can never match different comment sets. It lives
+      # in job env and is passed to jq as a string, NOT written to a file: the
+      # post step runs AFTER the engine, and a file under /tmp is something an
+      # engine's Write tool could overwrite — a filter replaced with `.` would
+      # have the post step delete every comment on the PR. Nothing executed or
+      # trusted after the engine step may come from a path an engine can write.
+      # REVIEW_MARKERS and LEGACY_MARKERS are job env for the same reason
+      # ($ENV.* is read at jq run time).
+      #
+      # HTML markers: exact unindented line, and only in the last 20 lines
+      # (where the post step appends them). Substring contains() on the whole
+      # body would reap a Kimi follow-up that quoted this repo's YAML
+      # (`Grok PR Review Complete`, `<!-- deriv-pr-review-grok -->`). The marker
+      # MUST be captured with `. as $marker` before piping into `$body`. Writing
+      # contains(.) rebinds `.` to $body — always true — and would reap every
+      # github-actions[bot] comment (DocSync, QA, …).
+      #
+      # legacy_markers stay substring-matched: they are visible titles from
+      # superseded workflows (default `Claude PR Review Complete`), not HTML
+      # lines this workflow appends.
+      REVIEW_MARKER_FILTER: |
+        ($ENV.REVIEW_MARKERS | split("\n") | map(select(length > 0))) as $html
+        | ($ENV.LEGACY_MARKERS // "" | split("\n") | map(select(length > 0))) as $legacy
+        | map(select(
+            .user.login == "github-actions[bot]"
+            and (
+              (.body | split("\n") | .[-20:] | any(
+                . as $line | any($html[]; $line == .)
+              ))
+              or
+              (($legacy | length) > 0 and (.body as $body | any($legacy[]; . as $marker | $body | contains($marker))))
+            )
+          ))
+        | sort_by(.created_at)
 
     steps:
       - name: Security Check - Validate User Access
@@ -395,6 +441,11 @@ jobs:
         # pinned cli_version. Bump deliberately via PR.
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          # Always equal to github.repository: the job-level `if:` skips PRs
+          # whose head repo is not the base repo, so the write-scoped token and
+          # LLM key never run against a fork's tree. Kept explicit so the
+          # intent survives a refactor — do not "relax" the gate to make this
+          # field do work again.
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           # head.sha, NOT head.ref. This is pull_request_target: the access gate
           # above validated the actor of THIS event, and checking out the branch
@@ -405,6 +456,99 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 20
           token: ${{ secrets.GITHUB_TOKEN }}
+          # The default (true) writes this token into a credential file under
+          # $RUNNER_TEMP and points .git/config at it via includeIf — both of
+          # which the review engine's Read/Grep tools could open. Nothing after
+          # this step talks to the remote with git (diff and comments go through
+          # `gh` with GH_TOKEN), so the token has no reason to be on disk.
+          # (HackerOne #4037167)
+          persist-credentials: false
+
+      - name: Reject symlinks introduced by the PR
+        # Each engine's instruction-file scrub deletes CLAUDE.md / AGENTS.md /
+        # KIMI.md etc. so a PR cannot hand the model trusted instructions. A
+        # symlink with one of those names, pointing at any other file in the
+        # PR, sidesteps a scrub that only matches regular files — and a symlink
+        # pointing outside the checkout lets a path-restricted Read follow it
+        # out. So any symlink in the reviewed tree that is not already in the
+        # base branch, unchanged, fails the job before an engine runs. Symlinks
+        # already in the base were reviewed when they landed. (HackerOne #4037167)
+        #
+        # Both sides are pinned to the event's SHAs, exactly like the checkout.
+        # The PR files API is deliberately NOT used: it describes the PR's
+        # CURRENT head, which can move between the event and this step, so a
+        # symlink deleted at the new tip would read as absent while still
+        # sitting in the tree the engine reviews. Any API failure fails the
+        # step (set -e) or counts the link as new; nothing here can read as
+        # "no symlinks" without having proven it.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Head side: the tree of the commit actually checked out, from git.
+          # Complete by construction — no pagination, no 3000-entry cap — and
+          # -z is NUL-delimited, so a path containing a newline cannot split
+          # into two innocuous names. ls-tree lines are
+          # "<mode> <type> <sha>\t<path>"; mode 120000 is a symlink.
+          HEAD_LINKS=()
+          while IFS= read -r -d '' entry; do
+            [[ "${entry%% *}" == "120000" ]] || continue
+            rest="${entry#* * }"
+            HEAD_LINKS+=("${rest%%$'\t'*}"$'\t'"${rest#*$'\t'}")
+          done < <(git ls-tree -r -z HEAD)
+          if [[ ${#HEAD_LINKS[@]} -eq 0 ]]; then
+            echo "✅ No symlinks in the checked-out tree ($(git rev-parse --short HEAD))"
+            exit 0
+          fi
+
+          # Base side: walk the base commit's tree one directory at a time via
+          # the trees API (the endpoint accepts a commit SHA). Non-recursive
+          # listings are never truncated — the recursive form silently is above
+          # 7 MB — and the contents API is no use here, because for a symlink to
+          # a file in the repo it returns the target file, not the link. A
+          # symlink pre-exists only if the base has mode 120000 at the same path
+          # with the same blob, i.e. the same target: a retargeted link counts
+          # as new. The base is not in the checkout (depth-20 head only, and no
+          # token on disk to fetch it with), hence the API.
+          TREE_CACHE=$(mktemp -d)
+          list_tree() {  # $1 = tree or commit sha (hex from git/the API); prints the JSON listing, fetched once per sha
+            if [[ ! -f "$TREE_CACHE/$1.json" ]]; then
+              gh api "repos/$REPO/git/trees/$1" > "$TREE_CACHE/$1.json" || { rm -f "$TREE_CACHE/$1.json"; return 1; }
+            fi
+            cat "$TREE_CACHE/$1.json"
+          }
+          base_symlink_blob() {  # $1 = path; prints the blob sha of a symlink at that path in the base, or nothing
+            local rest="$1" tree="$BASE_SHA" listing seg
+            while :; do
+              listing=$(list_tree "$tree") || return 1
+              seg="${rest%%/*}"
+              if [[ "$rest" == */* ]]; then
+                tree=$(jq -r --arg s "$seg" '.tree[] | select(.path == $s and .type == "tree") | .sha' <<< "$listing")
+                [[ -n "$tree" ]] || return 1
+                rest="${rest#*/}"
+              else
+                jq -r --arg s "$seg" '.tree[] | select(.path == $s and .mode == "120000") | .sha' <<< "$listing"
+                return 0
+              fi
+            done
+          }
+          NEW_LINKS=""
+          for entry in "${HEAD_LINKS[@]}"; do
+            sha="${entry%%$'\t'*}"
+            file="${entry#*$'\t'}"
+            if blob=$(base_symlink_blob "$file"); then
+              [[ "$blob" == "$sha" ]] || NEW_LINKS+="   $file (new, or retargeted since the base)"$'\n'
+            else
+              NEW_LINKS+="   $file (not in the base branch, or the base lookup failed)"$'\n'
+            fi
+          done
+          if [[ -n "$NEW_LINKS" ]]; then
+            echo "❌ This PR adds or retargets symlinks — refusing to run the review engine on it:"
+            printf '%s' "$NEW_LINKS"
+            exit 1
+          fi
+          echo "✅ ${#HEAD_LINKS[@]} symlink(s) in the tree, all already in the base branch ($BASE_SHA) unchanged"
 
       - name: Fetch prompt template from Gist
         id: fetch-prompt
@@ -439,36 +583,9 @@ jobs:
           REPO="${{ github.repository }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
-          # Shared with the post step's delete, so capture and delete can never
-          # match different comment sets. REVIEW_MARKERS is job-level env for the
-          # same reason ($ENV.REVIEW_MARKERS reads it at jq run time).
-          #
-          # HTML markers: exact unindented line, and only in the last 20 lines
-          # (where the post step appends them). Substring contains() on the
-          # whole body would reap a Kimi follow-up that quoted this repo's
-          # YAML (`Grok PR Review Complete`, `<!-- deriv-pr-review-grok -->`).
-          # The marker MUST be captured with `. as $marker` before piping into
-          # `$body`. Writing contains(.) rebinds `.` to $body — always true —
-          # and would reap every github-actions[bot] comment (DocSync, QA, …).
-          #
-          # legacy_markers stay substring-matched: they are visible titles from
-          # superseded workflows (default `Claude PR Review Complete`), not
-          # HTML lines this workflow appends.
-          cat > /tmp/review_marker_filter.jq <<'JQ'
-          ($ENV.REVIEW_MARKERS | split("\n") | map(select(length > 0))) as $html
-          | ($ENV.LEGACY_MARKERS // "" | split("\n") | map(select(length > 0))) as $legacy
-          | map(select(
-              .user.login == "github-actions[bot]"
-              and (
-                (.body | split("\n") | .[-20:] | any(
-                  . as $line | any($html[]; $line == .)
-                ))
-                or
-                (($legacy | length) > 0 and (.body as $body | any($legacy[]; . as $marker | $body | contains($marker))))
-              )
-            ))
-          | sort_by(.created_at)
-          JQ
+          # The marker filter is $REVIEW_MARKER_FILTER (job env, documented
+          # there) — shared with the post step's delete, so capture and delete
+          # can never match different comment sets, and deliberately not a file.
 
           # --paginate: the default page size is 30, so the previous single-call
           # version silently missed review comments on busy PRs and left
@@ -484,7 +601,7 @@ jobs:
           # `last` — newest match only. A PR that crossed a migration legitimately
           # holds two matching comments; concatenating them produced a MULTI-LINE
           # last_reviewed_sha, which corrupts $GITHUB_OUTPUT.
-          jq -f /tmp/review_marker_filter.jq /tmp/all_comments.json \
+          jq "$REVIEW_MARKER_FILTER" /tmp/all_comments.json \
             | jq -r 'last | .body // empty' > /tmp/previous_review.txt
 
           if [ -s /tmp/previous_review.txt ]; then
@@ -854,8 +971,44 @@ jobs:
           # this is the last point where posting them publicly can be stopped.
           # Everything up to the post below is deliberately fail-CLOSED: on any
           # failure in this step's checks, the previous review is untouched.
+          #
+          # Checked in order: the LLM API key and the job's GitHub token as
+          # literals (GH_TOKEN in this step's env IS the job token —
+          # secrets.GITHUB_TOKEN — so one literal check covers it; do not add a
+          # second variable holding the same value); then GitHub token shapes
+          # (ghp_/gho_/ghu_/ghs_/ghr_, github_pat_) in case the model quoted one
+          # it found rather than the one in its own env; then the exact shapes
+          # git credential plumbing takes on disk: actions/checkout's
+          # (git-auth-helper.ts at the pinned SHA) includeIf section pointing
+          # .git/config at the credentials file, that file's name, its
+          # extraheader line carrying the basic-auth blob, the base64 of
+          # `x-access-token:` — the fixed prefix every encoded checkout token
+          # starts with, which the plain token regex above cannot see through —
+          # and the plaintext `x-access-token:<token>@` remote URL that
+          # claude-code-action writes when it can. Anchored to those shapes on
+          # purpose: a review that merely *discusses* includeIf or extraheader
+          # (a review of this very file, say) must still post — the Kimi review
+          # of PR #137 quoted both, and bare-word patterns would have refused
+          # it. Both regexes live in variables so tests/ai-pr-review-contract.sh
+          # can extract and exercise them against fixtures. Matches are printed
+          # prefix-only because the run log is readable by more people than the
+          # secret should be. (HackerOne #4037167)
+          token_shapes_re='gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}'
+          cred_shapes_re='authorization: *basic +[A-Za-z0-9+/=]{16,}|extraheader *= *authorization|includeif *"?gitdir:|git-credentials-[0-9a-f-]{8,}\.config|eC1hY2Nlc3MtdG9rZW46[A-Za-z0-9+/=]{10,}|x-access-token:[A-Za-z0-9_.-]{20,}@'
+          LEAK=""
           if [[ -n "$LLM_API_KEY" ]] && grep -qF -- "$LLM_API_KEY" "$REVIEW_OUTPUT_FILE"; then
-            echo "❌ Review output contains the LLM API key — refusing to post. Rotate the key and inspect the run."
+            LEAK="the LLM API key (literal LLM_API_KEY value)"
+          elif [[ -n "${GH_TOKEN:-}" ]] && grep -qF -- "$GH_TOKEN" "$REVIEW_OUTPUT_FILE"; then
+            LEAK="the job's GitHub token (literal GH_TOKEN value)"
+          elif HIT=$(grep -oE "$token_shapes_re" "$REVIEW_OUTPUT_FILE" | head -n1); [[ -n "$HIT" ]]; then
+            LEAK="a GitHub token shape (starts with '${HIT:0:4}…'; regex $token_shapes_re)"
+          elif HIT=$(grep -oiE "$cred_shapes_re" "$REVIEW_OUTPUT_FILE" | head -n1); [[ -n "$HIT" ]]; then
+            LEAK="actions/checkout credential plumbing (matched '${HIT:0:24}…'; one of the shapes in cred_shapes_re, case-insensitive)"
+          fi
+          if [[ -n "$LEAK" ]]; then
+            echo "❌ Review output contains $LEAK — refusing to post."
+            echo "   If a secret matched: rotate it and inspect this run. If only a word matched, this is the"
+            echo "   fail-closed exfiltration guard in the 'Post review' step; narrow the pattern, do not remove it."
             exit 1
           fi
 
@@ -906,8 +1059,14 @@ jobs:
           # Reap-list for prior reviews, captured BEFORE posting — the new
           # comment carries the markers too, so a fetch-after-post would match
           # (and delete) the comment it just created. Fresh fetch, since
-          # comments may have changed during the engine run; same filter file
-          # the capture step used, ALL matches including legacy.
+          # comments may have changed during the engine run; same filter the
+          # capture step used ($REVIEW_MARKER_FILTER, job env), ALL matches
+          # including legacy.
+          #
+          # This step runs AFTER the engine, so nothing it executes or trusts
+          # may come from a path an engine's Write tool could reach: the filter
+          # is job env, not a /tmp file, and every /tmp file below is written
+          # fresh with `>` before it is read. Keep it that way.
           #
           # Post FIRST, delete after. Deletion used to happen in the capture
           # step, an hour earlier — any failure in between left the PR with no
@@ -918,7 +1077,7 @@ jobs:
           # next run reaps, since its reap-list is built the same way.
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
             | jq -s 'add // []' > /tmp/comments_at_post.json
-          jq -f /tmp/review_marker_filter.jq /tmp/comments_at_post.json \
+          jq "$REVIEW_MARKER_FILTER" /tmp/comments_at_post.json \
             | jq -r --arg skip "${PROGRESS_COMMENT_ID:-}" \
               '.[] | select((.id | tostring) != $skip) | .id' > /tmp/reap_ids.txt
 
