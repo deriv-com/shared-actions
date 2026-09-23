@@ -306,8 +306,10 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          # Same Forge exception as ai_review_engine_anthropic. Default is no
-          # bots; `*` would allow Dependabot. The action strips `[bot]`.
+          # Kept in sync with ai_review_engine_anthropic for the shared pinned
+          # SHA. Inert here: this workflow's access gate has no
+          # gh-app-write[bot] exception, so Forge PRs fail at the gate before
+          # this step. Use ai-pr-review.yml for Forge. Do not set `*`.
           allowed_bots: gh-app-write
           track_progress: true
           show_full_output: true
