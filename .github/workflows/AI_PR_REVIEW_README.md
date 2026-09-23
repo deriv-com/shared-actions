@@ -493,12 +493,18 @@ asserts all of it.
 
 ## How It Works
 
-0. **Bot and fork skip** — the job does not run at all for `*[bot]` actors (they
-   cannot pass the gate, and a red run on every dependabot PR reads like a
-   regression) or for PRs whose head repo is not the base repo: callers use
+0. **Bot and fork skip** — the job does not run at all for `*[bot]` actors
+   except same-repo Forge (`gh-app-write[bot]`) (other bots cannot pass the
+   gate, and a red run on every dependabot PR reads like a regression) or
+   for PRs whose head repo is not the base repo: callers use
    `pull_request_target`, which runs with the base repo's secrets and a
-   write-scoped token even for forks.
+   write-scoped token even for forks. Forge PRs are still required to be
+   same-repo; Dependabot / Renovate / other bots stay skipped.
 1. **Access gate** — actor must be a `deriv-com` member or a repo collaborator.
+   Same-repo Forge (`gh-app-write[bot]`) is allowlisted here too: it is not
+   an org member, so without this the job `if:` would start the run and this
+   step would fail red. The same-repo `if:` already ran. Other bots and
+   forks never reach this step.
 2. **Resolve engine** — validate `engine`, resolve per-engine and engine-neutral
    defaults (the single place every default value lives).
 3. **Progress comment** — the caller (not the engine) posts a Claude-style

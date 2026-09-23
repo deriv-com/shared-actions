@@ -106,8 +106,18 @@ GUARD_TEST="$ROOT/.github/actions/ai_review_path_guard/path-guard.test.js"
 # contains X" checks that must not be satisfied by some other step.
 step_body() { awk -v name="- name: $1" 'index($0, name){f=1; next} f && /^ *- name: /{exit} f' "$2"; }
 
-# 1. Fork PRs never reach the privileged job.
+# 1. Fork PRs never reach the privileged job. Same-repo Forge
+#    (gh-app-write[bot]) is the only *[bot] exception: wrap the skip, do not
+#    delete it. A bare allow-all-bots if: is a regression. Presence greps
+#    alone would stay green if the wrap parentheses were dropped; the
+#    structure grep requires the exception inside that group and the
+#    same-repo clause &&-ed outside it.
 check 'grep -qE "^    if: .*github\.event\.pull_request\.head\.repo\.full_name == github\.repository" "$WF"' "job-level if: skips PRs whose head repo is not the base repo"
+check 'grep -qE "^    if: .*!endsWith\(github\.actor, .\[bot\].\)" "$WF"' "job-level if: still skips *[bot] actors (not a bare allow-all-bots)"
+check 'grep -qE "^    if: .*gh-app-write\[bot\]" "$WF"' "job-level if: allowlists gh-app-write[bot]"
+check 'grep -qE "^    if: .*\(!endsWith\(github\.actor, .\[bot\].\) *\|\| *github\.actor == .gh-app-write\[bot\].\).*&& *github\.event\.pull_request\.head\.repo\.full_name == github\.repository" "$WF"' "job-level if: scopes the gh-app-write[bot] exception inside the bot check, with the same-repo clause outside"
+GATE_BODY="$(step_body "Security Check - Validate User Access" "$WF")"
+check 'grep -F "gh-app-write[bot]" <<< "$GATE_BODY" | grep -q "exit 0"' "access gate allowlists gh-app-write[bot] on a line that exits 0"
 
 # 2. The checkout leaves no token on disk.
 check 'step_body "Checkout PR head" "$WF" | grep -q "persist-credentials: false"' "PR-head checkout sets persist-credentials: false"

@@ -97,6 +97,10 @@ jobs:
     # every bot PR produces a red run that reads like a workflow regression.
     # Skipping also avoids spending LLM tokens on lockfile-bump PRs. A human
     # actor failing the gate still fails red, which is the correct signal.
+    # Exception: wrap the *[bot] skip with gh-app-write[bot] (Forge). Forge
+    # opens same-repo PRs as that app, which is not an org member; a bare skip
+    # meant those PRs never got a review. Dependabot / Renovate /
+    # github-actions[bot] stay skipped. The same-repo clause is not waived.
     #
     # Same-repo PRs only. Callers trigger this workflow on pull_request_target,
     # which runs with the BASE repository's secrets and a write-scoped
@@ -106,7 +110,7 @@ jobs:
     # line that closes the fork path. Skipped, not failed: a fork PR from an
     # org member is legitimate, just not eligible for the privileged review.
     # (HackerOne #4037167)
-    if: github.event.pull_request.draft == false && !endsWith(github.actor, '[bot]') && github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event.pull_request.draft == false && (!endsWith(github.actor, '[bot]') || github.actor == 'gh-app-write[bot]') && github.event.pull_request.head.repo.full_name == github.repository
 
     permissions:
       # `actions:` is deliberately absent. Permissions can only be reduced, never
@@ -221,6 +225,11 @@ jobs:
         run: |
           ACTOR="${{ github.actor }}"
           echo "🔒 Validating access for user: $ACTOR"
+
+          # Forge is not an org member. The job-level if: already required a
+          # same-repo head (HackerOne #4037167) and allowlisted this actor;
+          # forks never reach this step. Exact match — do not glob *[bot].
+          [[ "$ACTOR" == "gh-app-write[bot]" ]] && echo "✅ Allowed Forge app (same-repo if: already ran)" && exit 0
 
           MEMBERSHIP=$(curl -s -H "Authorization: token $GH_TOKEN" \
             "https://api.github.com/orgs/deriv-com/members/$ACTOR" -w "%{http_code}" -o /dev/null)
