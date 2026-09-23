@@ -306,6 +306,9 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Same Forge exception as ai_review_engine_anthropic. Default is no
+          # bots; `*` would allow Dependabot. The action strips `[bot]`.
+          allowed_bots: gh-app-write
           track_progress: true
           show_full_output: true
           prompt: |
