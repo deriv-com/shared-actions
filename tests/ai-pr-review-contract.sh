@@ -173,6 +173,8 @@ check 'grep -q "cp \"\$ACTION_PATH/../ai_review_path_guard/path-guard.js\"" <<< 
 check '! grep -q "git remote remove origin" "$ANTH" && ! grep -q "git remote rm origin" "$ANTH"' "Anthropic: the origin remote is NOT removed (the action's base-branch restore fetches through it)"
 check 'grep -q "git remote get-url origin" <<< "$ANTH_INSTALL" && grep -q "x-access-token" <<< "$ANTH_INSTALL"' "Anthropic: install step asserts origin exists and .git/config is credential-free going in"
 ANTH_RUN="$(step_body "Claude Code PR review" "$ANTH")"
+check 'grep -qE "^        allowed_bots: gh-app-write[[:space:]]*$" <<< "$ANTH_RUN"' "Anthropic: claude-code-action allowlists gh-app-write (Forge); GLM/DeepSeek use this engine"
+check '! grep -qE "^        allowed_bots: ['\''\"]?\\*" <<< "$ANTH_RUN"' "Anthropic: allowed_bots is not a wildcard (Dependabot must stay out)"
 check 'grep -q "^        use_commit_signing: true" <<< "$ANTH_RUN"' "Anthropic: commit-signing mode, the one prepare branch that never rewrites origin with the token"
 check 'grep -q "^        GIT_CONFIG_COUNT: \"1\"" <<< "$ANTH_RUN" && grep -q "^        GIT_CONFIG_KEY_0: credential.helper" <<< "$ANTH_RUN" && grep -q "^        GIT_CONFIG_VALUE_0: .*GITHUB_TOKEN" <<< "$ANTH_RUN"' "Anthropic: the action's base-branch fetch authenticates from env-only git config, never .git/config"
 check 'grep -q "mcp__github_file_ops" <<< "$ANTH_RUN"' "Anthropic: the file-ops MCP server that commit-signing mode mounts is denied by name"

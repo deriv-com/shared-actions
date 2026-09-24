@@ -277,6 +277,15 @@ runs:
               ]
             }
           }
+        # Default is empty = no bots. That is why GLM/DeepSeek (this engine)
+        # failed red on Forge PRs after the job-level allowlist started them:
+        # "Workflow initiated by non-human actor: gh-app-write". Kimi and Grok
+        # do not use this action, so they already review those PRs. Exact app
+        # slug only — `*` would let Dependabot drive a job that holds the
+        # write-scoped token. The action strips a trailing `[bot]` on both
+        # sides (src/github/validation/actor.ts at this SHA), so
+        # `gh-app-write` matches `github.actor` `gh-app-write[bot]`.
+        allowed_bots: gh-app-write
         # The action needs a token for its own actor/permission checks and for
         # the base-branch fetch above.
         #

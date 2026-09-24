@@ -153,6 +153,12 @@ assuming parity:
   still scans the review before publishing (see below).
 - **Anthropic** — stronger than the action's docs suggest on comment tools,
   weaker than the Kimi engine on tokens, and the engine compensates for both.
+  `claude-code-action` also refuses bots unless `allowed_bots` is set (empty
+  default). This engine passes `allowed_bots: gh-app-write` so same-repo Forge
+  PRs that already passed the job `if:` and access gate are not failed in five
+  seconds with `Workflow initiated by non-human actor: gh-app-write`. Do not
+  set `*`: that would let Dependabot hold the write-scoped token. The action
+  strips a trailing `[bot]` when matching.
   The docs' *"base GitHub tools are always included"* describes **tag mode**;
   passing `prompt:` selects **agent mode**, and the action's source at the
   pinned SHA mounts the `github_comment` MCP server only when `--allowedTools`
@@ -504,7 +510,10 @@ asserts all of it.
    Same-repo Forge (`gh-app-write[bot]`) is allowlisted here too: it is not
    an org member, so without this the job `if:` would start the run and this
    step would fail red. The same-repo `if:` already ran. Other bots and
-   forks never reach this step.
+   forks never reach this step. The Anthropic engine has a second gate:
+   `claude-code-action` rejects non-human actors unless `allowed_bots` lists
+   `gh-app-write` (not `*`). Kimi and Grok do not use that action, so the
+   job-level allowlist is enough for them.
 2. **Resolve engine** — validate `engine`, resolve per-engine and engine-neutral
    defaults (the single place every default value lives).
 3. **Progress comment** — the caller (not the engine) posts a Claude-style
