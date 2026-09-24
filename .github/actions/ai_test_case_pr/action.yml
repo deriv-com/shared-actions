@@ -1,0 +1,635 @@
+name: AI Test Case PR
+description: Generate Jest/TypeScript test cases for frontend PRs using Claude AI and create a dedicated test PR
+
+inputs:
+  github_token:
+    description: "GitHub token for repository operations and PR creation"
+    required: true
+  anthropic_api_key:
+    description: "Anthropic API key for Claude AI"
+    required: true
+  repository:
+    description: "Repository name (owner/repo)"
+    required: true
+  pr_number:
+    description: "The PR number of the original PR"
+    required: true
+  head_branch:
+    description: "The head/source branch of the original PR (test PR targets this)"
+    required: true
+  claude_model:
+    description: "Claude model to use for test generation"
+    required: false
+    default: "claude-sonnet-4-5"
+
+outputs:
+  test_pr_created:
+    description: "Whether a test PR was created or updated"
+    value: ${{ steps.create-test-pr.outputs.test_pr_created }}
+  test_pr_number:
+    description: "Test PR number if created"
+    value: ${{ steps.create-test-pr.outputs.test_pr_number }}
+  test_pr_url:
+    description: "Test PR URL if created"
+    value: ${{ steps.create-test-pr.outputs.test_pr_url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch PR Diff and Analyze Test Coverage
+      id: fetch-diff
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO_NAME: ${{ inputs.repository }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+      run: |
+        set -e
+
+        echo "::add-mask::${GH_TOKEN}"
+
+        # Validate inputs
+        if ! [[ "$REPO_NAME" =~ ^[a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+$ ]]; then
+          echo "Invalid repository format: $REPO_NAME"
+          exit 1
+        fi
+        if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+          echo "Invalid PR number: $PR_NUMBER"
+          exit 1
+        fi
+
+        # Create secure temp directory
+        TEMP_DIR=$(mktemp -d -t gentests-XXXXXXXXXX)
+        echo "temp_dir=$TEMP_DIR" >> $GITHUB_OUTPUT
+
+        echo "## Diff Analysis" >> $GITHUB_STEP_SUMMARY
+        echo "Fetching diff for PR #$PR_NUMBER..." >> $GITHUB_STEP_SUMMARY
+
+        # Fetch PR diff
+        PR_DIFF=$(gh api \
+          -H "Accept: application/vnd.github.v3.diff" \
+          "/repos/$REPO_NAME/pulls/$PR_NUMBER" 2>/dev/null || echo "")
+
+        if [ -z "$PR_DIFF" ]; then
+          echo "Failed to fetch PR diff" >> $GITHUB_STEP_SUMMARY
+          echo "skip=true" >> $GITHUB_OUTPUT
+          rm -rf "$TEMP_DIR"
+          exit 0
+        fi
+
+        # Sanitize diff content
+        PR_DIFF=$(printf '%s' "$PR_DIFF" | tr -d '\000' | iconv -c -t UTF-8//IGNORE)
+
+        # Get list of changed files
+        CHANGED_FILES=$(gh api \
+          -H "Accept: application/vnd.github+json" \
+          "/repos/$REPO_NAME/pulls/$PR_NUMBER/files" \
+          --jq '.[].filename' 2>/dev/null || echo "")
+
+        echo "### All Changed Files:" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        printf '%s\n' "$CHANGED_FILES" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+        # Filter: keep only relevant frontend files (.tsx, .ts, .jsx, .js)
+        # Exclude: style files, test/spec files, lock files, workflow files, config files, barrel exports
+        RELEVANT_FILES=$(printf '%s\n' "$CHANGED_FILES" | grep -E '\.(tsx?|jsx?)$' \
+          | grep -vE '\.(spec|test)\.(tsx?|jsx?)$' \
+          | grep -vE '^\.github/' \
+          | grep -vE '(\.config\.|\.eslintrc|\.prettierrc|tsconfig|jest\.config)' \
+          | grep -vE '(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)' \
+          | grep -vE '/index\.(ts|js)$' \
+          || echo "")
+
+        if [ -z "$RELEVANT_FILES" ]; then
+          echo "No relevant frontend files changed -- skipping test generation" >> $GITHUB_STEP_SUMMARY
+          echo "skip=true" >> $GITHUB_OUTPUT
+          rm -rf "$TEMP_DIR"
+          exit 0
+        fi
+
+        RELEVANT_COUNT=$(printf '%s\n' "$RELEVANT_FILES" | grep -c '.' || echo "0")
+        echo "Found $RELEVANT_COUNT relevant frontend file(s)" >> $GITHUB_STEP_SUMMARY
+
+        # For each relevant file, detect existing tests and extract per-file diff
+        mkdir -p "$TEMP_DIR/file_contexts"
+        FILES_WITH_TESTS=0
+        FILES_WITHOUT_TESTS=0
+
+        while IFS= read -r SRC_FILE; do
+          [ -z "$SRC_FILE" ] && continue
+
+          SRC_DIR=$(dirname "$SRC_FILE")
+          SRC_BASENAME=$(basename "$SRC_FILE")
+          SRC_NAME="${SRC_BASENAME%.*}"
+
+          # Determine test directory (co-located __tests__ pattern)
+          TEST_DIR="${SRC_DIR}/__tests__"
+
+          # Check for existing spec/test files
+          EXISTING_SPEC=""
+          for PATTERN in "${SRC_NAME}.spec.tsx" "${SRC_NAME}.spec.ts" "${SRC_NAME}.test.tsx" "${SRC_NAME}.test.ts"; do
+            if [ -f "${TEST_DIR}/${PATTERN}" ]; then
+              EXISTING_SPEC="${TEST_DIR}/${PATTERN}"
+              break
+            fi
+          done
+
+          # Target is always a new .ai.spec.tsx file (never touches existing)
+          TARGET_SPEC="${TEST_DIR}/${SRC_NAME}.ai.spec.tsx"
+
+          if [ -n "$EXISTING_SPEC" ]; then
+            FILES_WITH_TESTS=$((FILES_WITH_TESTS + 1))
+          else
+            FILES_WITHOUT_TESTS=$((FILES_WITHOUT_TESTS + 1))
+          fi
+
+          # Use full path as unique key for temp files (replace / with _)
+          FILE_KEY=$(printf '%s' "$SRC_FILE" | tr '/' '_')
+
+          # Extract per-file diff
+          printf '%s' "$PR_DIFF" | awk -v target="b/${SRC_FILE}" '
+            /^diff --git/ {
+              n = split($0, parts, " ")
+              fname = parts[n]
+              printing = (fname == target)
+            }
+            printing { print }
+          ' > "$TEMP_DIR/file_contexts/${FILE_KEY}.diff"
+
+          # Save file metadata
+          jq -cn \
+            --arg src "$SRC_FILE" \
+            --arg target_spec "$TARGET_SPEC" \
+            --arg existing_spec "${EXISTING_SPEC:-}" \
+            --arg file_key "$FILE_KEY" \
+            '{
+              src: $src,
+              target_spec: $target_spec,
+              existing_spec: $existing_spec,
+              file_key: $file_key
+            }' >> "$TEMP_DIR/file_manifest.jsonl"
+
+        done <<< "$RELEVANT_FILES"
+
+        echo "### Test Coverage Analysis:" >> $GITHUB_STEP_SUMMARY
+        echo "- Files with existing specs (context-aware): $FILES_WITH_TESTS" >> $GITHUB_STEP_SUMMARY
+        echo "- Files without specs (new coverage): $FILES_WITHOUT_TESTS" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        echo "### Per-File Plan:" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        while IFS= read -r LINE; do
+          SRC=$(printf '%s' "$LINE" | jq -r '.src')
+          TARGET=$(printf '%s' "$LINE" | jq -r '.target_spec')
+          EXISTING=$(printf '%s' "$LINE" | jq -r '.existing_spec')
+          if [ -n "$EXISTING" ]; then
+            printf 'HAS SPEC: %s -> %s (context: %s)\n' "$SRC" "$TARGET" "$EXISTING" >> $GITHUB_STEP_SUMMARY
+          else
+            printf 'NO SPEC:  %s -> %s\n' "$SRC" "$TARGET" >> $GITHUB_STEP_SUMMARY
+          fi
+        done < "$TEMP_DIR/file_manifest.jsonl"
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+        echo "skip=false" >> $GITHUB_OUTPUT
+
+    - name: Generate Tests via Claude API
+      id: generate-test-code
+      if: steps.fetch-diff.outputs.skip != 'true'
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        TEMP_DIR: ${{ steps.fetch-diff.outputs.temp_dir }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        REPO_NAME: ${{ inputs.repository }}
+        CLAUDE_MODEL: ${{ inputs.claude_model }}
+      run: |
+        set -e
+        trap '[ $? -ne 0 ] && rm -rf "$TEMP_DIR" 2>/dev/null' EXIT
+
+        echo "::add-mask::${ANTHROPIC_API_KEY}"
+
+        echo "## Claude Test Generation" >> $GITHUB_STEP_SUMMARY
+        echo "Model: $CLAUDE_MODEL" >> $GITHUB_STEP_SUMMARY
+
+        # Build the prompt with per-file context
+        PROMPT_FILE="$TEMP_DIR/claude_prompt.txt"
+        cat > "$PROMPT_FILE" << 'PROMPT_HEADER'
+        You are a senior frontend test engineer working on a React + MobX + TypeScript codebase.
+        Generate complete Jest spec files (.ai.spec.tsx) for the changed source files below.
+
+        ## Rules
+
+        1. Use Jest + React Testing Library + TypeScript
+        2. Mock MobX stores where appropriate using jest.mock()
+        3. Test component rendering, user interactions, and state changes
+        4. Include edge cases for error states, loading states, and boundary conditions
+        5. Use descriptive test names that explain the expected behavior
+        6. Include all necessary imports at the top of each file
+        7. Use @testing-library/react for component tests
+        8. Use @testing-library/user-event for user interaction tests
+
+        ## Important
+
+        - You are creating spec files (*.ai.spec.tsx) that should provide COMPLETE test coverage
+        - Generate enough test cases to achieve above 80% code coverage for the changed file
+        - When an existing spec file is provided as context, use it to understand the project's
+          testing patterns, conventions, import style, and mock setup -- then apply those same
+          patterns in your generated spec
+        - Cover ALL functionality in the changed code, including anything already tested in
+          the existing spec -- these ai.spec files are intended to eventually replace the originals
+        - Focus on the changes shown in the diff
+
+        ## Output Format
+
+        For EACH file, output a marker line followed by the complete spec file content:
+
+        // @test-file: path/to/__tests__/filename.ai.spec.tsx
+        <complete file content here>
+
+        The marker line MUST start with exactly "// @test-file: " followed by the file path.
+        Do not wrap in markdown code blocks. Do not include explanations between files.
+        Output ONLY marker lines and spec code.
+
+        ## Files
+        PROMPT_HEADER
+
+        # Append per-file context
+        while IFS= read -r LINE; do
+          SRC=$(printf '%s' "$LINE" | jq -r '.src')
+          TARGET_SPEC=$(printf '%s' "$LINE" | jq -r '.target_spec')
+          EXISTING_SPEC=$(printf '%s' "$LINE" | jq -r '.existing_spec')
+          FILE_KEY=$(printf '%s' "$LINE" | jq -r '.file_key')
+
+          {
+            printf '\n---\n\n'
+            printf '### Source: %s\n' "$SRC"
+            printf 'Target spec file: %s\n\n' "$TARGET_SPEC"
+
+            # Include per-file diff
+            if [ -f "$TEMP_DIR/file_contexts/${FILE_KEY}.diff" ] && [ -s "$TEMP_DIR/file_contexts/${FILE_KEY}.diff" ]; then
+              printf '#### Diff\n```diff\n'
+              cat "$TEMP_DIR/file_contexts/${FILE_KEY}.diff"
+              printf '\n```\n\n'
+            fi
+
+            # Include existing spec as read-only context
+            if [ -n "$EXISTING_SPEC" ] && [ -f "$EXISTING_SPEC" ]; then
+              printf '#### Existing spec (reference for testing patterns and conventions)\n'
+              printf 'File: %s\n```tsx\n' "$EXISTING_SPEC"
+              cat "$EXISTING_SPEC"
+              printf '\n```\n'
+            else
+              printf '#### No existing spec -- generate full coverage\n'
+            fi
+          } >> "$PROMPT_FILE"
+
+        done < "$TEMP_DIR/file_manifest.jsonl"
+
+        chmod 600 "$PROMPT_FILE"
+
+        PROMPT_SIZE=$(wc -c < "$PROMPT_FILE" | tr -d ' ')
+        echo "Prompt size: $PROMPT_SIZE bytes" >> $GITHUB_STEP_SUMMARY
+
+        # Enforce max prompt size (600KB)
+        MAX_PROMPT_SIZE=614400
+        if [ "$PROMPT_SIZE" -gt "$MAX_PROMPT_SIZE" ]; then
+          echo "Prompt too large ($PROMPT_SIZE bytes) -- truncating" >> $GITHUB_STEP_SUMMARY
+          truncate -s "$MAX_PROMPT_SIZE" "$PROMPT_FILE"
+        fi
+
+        # Build API request with jq (safe variable expansion)
+        REQUEST_FILE="$TEMP_DIR/request.json"
+        jq -cn \
+          --arg model "$CLAUDE_MODEL" \
+          --argjson max_tokens 65536 \
+          --rawfile content "$PROMPT_FILE" \
+          '{
+            model: $model,
+            max_tokens: $max_tokens,
+            messages: [{
+              role: "user",
+              content: $content
+            }]
+          }' > "$REQUEST_FILE"
+
+        # Call Anthropic API
+        echo "Calling Claude API..." >> $GITHUB_STEP_SUMMARY
+        CALL_START=$(date +%s)
+
+        RESPONSE=$(curl -s -w "\n%{http_code}" https://api.anthropic.com/v1/messages \
+          -H "content-type: application/json" \
+          -H "x-api-key: $ANTHROPIC_API_KEY" \
+          -H "anthropic-version: 2023-06-01" \
+          --max-time 180 \
+          -d @"$REQUEST_FILE")
+
+        CALL_END=$(date +%s)
+        CALL_LATENCY=$((CALL_END - CALL_START))
+        echo "API call latency: ${CALL_LATENCY}s" >> $GITHUB_STEP_SUMMARY
+
+        # Parse response
+        HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -1)
+        RESPONSE_BODY=$(printf '%s' "$RESPONSE" | sed '$d')
+
+        if [[ "$HTTP_CODE" != "200" ]]; then
+          ERROR_TYPE=$(printf '%s' "$RESPONSE_BODY" | jq -r '.error.type // "unknown"' 2>/dev/null)
+          ERROR_MSG=$(printf '%s' "$RESPONSE_BODY" | jq -r '.error.message // "unknown"' 2>/dev/null)
+          echo "Claude API error (HTTP $HTTP_CODE): $ERROR_TYPE - $ERROR_MSG" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        if printf '%s' "$RESPONSE_BODY" | jq -e '.error' > /dev/null 2>&1; then
+          ERROR_TYPE=$(printf '%s' "$RESPONSE_BODY" | jq -r '.error.type // "unknown"')
+          echo "Claude API returned error: $ERROR_TYPE" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        # Extract generated test code
+        TEST_OUTPUT=$(printf '%s' "$RESPONSE_BODY" | jq -r '.content[0].text // empty')
+
+        if [ -z "$TEST_OUTPUT" ]; then
+          echo "Claude returned empty response" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        # Log token usage
+        TOKENS_IN=$(printf '%s' "$RESPONSE_BODY" | jq -r '.usage.input_tokens // 0')
+        TOKENS_OUT=$(printf '%s' "$RESPONSE_BODY" | jq -r '.usage.output_tokens // 0')
+        echo "Tokens: input=$TOKENS_IN, output=$TOKENS_OUT" >> $GITHUB_STEP_SUMMARY
+
+        # Strip markdown fences if the model wrapped the output
+        TEST_OUTPUT=$(printf '%s' "$TEST_OUTPUT" | sed '/^```\(typescript\|tsx\|ts\)\?$/d' | sed '/^```$/d')
+
+        # Save raw output
+        printf '%s\n' "$TEST_OUTPUT" > "$TEMP_DIR/raw_output.txt"
+        chmod 600 "$TEMP_DIR/raw_output.txt"
+
+        # Parse output into individual spec files using @test-file markers
+        mkdir -p "$TEMP_DIR/output_files"
+
+        awk '
+          /^\/\/ @test-file: / {
+            if (outfile) close(outfile)
+            path = substr($0, 17)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", path)
+            tmpname = path
+            gsub(/\//, "_", tmpname)
+            outfile = ENVIRON["TEMP_DIR"] "/output_files/" tmpname
+            print path > (ENVIRON["TEMP_DIR"] "/output_files/" tmpname ".path")
+            next
+          }
+          outfile { print > outfile }
+        ' "$TEMP_DIR/raw_output.txt"
+
+        # Count generated files
+        FILE_COUNT=0
+        for f in "$TEMP_DIR/output_files/"*.path; do
+          [ -f "$f" ] && FILE_COUNT=$((FILE_COUNT + 1))
+        done
+
+        echo "Generated $FILE_COUNT spec file(s)" >> $GITHUB_STEP_SUMMARY
+        echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+
+        if [ "$FILE_COUNT" -eq 0 ]; then
+          echo "No spec files parsed from Claude output" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        # Log test_generated event
+        EVENTS_FILE="/tmp/gentests_events_${GITHUB_RUN_ID}.jsonl"
+        [[ ! "$TOKENS_IN" =~ ^[0-9]+$ ]] && TOKENS_IN=0
+        [[ ! "$TOKENS_OUT" =~ ^[0-9]+$ ]] && TOKENS_OUT=0
+        [[ ! "$FILE_COUNT" =~ ^[0-9]+$ ]] && FILE_COUNT=0
+        [[ ! "$CALL_LATENCY" =~ ^[0-9]+$ ]] && CALL_LATENCY=0
+        OUTPUT_SIZE=$(wc -c < "$TEMP_DIR/raw_output.txt" | tr -d ' ')
+        [[ ! "$OUTPUT_SIZE" =~ ^[0-9]+$ ]] && OUTPUT_SIZE=0
+        jq -cn \
+          --arg run_id "$GITHUB_RUN_ID" \
+          --arg pr_number "$PR_NUMBER" \
+          --arg model "$CLAUDE_MODEL" \
+          --argjson tokens_in "$TOKENS_IN" \
+          --argjson tokens_out "$TOKENS_OUT" \
+          --argjson file_count "$FILE_COUNT" \
+          --argjson output_size_bytes "$OUTPUT_SIZE" \
+          --argjson latency_seconds "$CALL_LATENCY" \
+          '{
+            agent: "AI Test Case PR",
+            event_type: "tests_generated",
+            run_id: $run_id,
+            timestamp: (now | todate),
+            payload: {
+              pr_number: $pr_number,
+              model: $model,
+              tokens_in: $tokens_in,
+              tokens_out: $tokens_out,
+              file_count: $file_count,
+              output_size_bytes: $output_size_bytes,
+              latency_seconds: $latency_seconds
+            }
+          }' >> "$EVENTS_FILE" 2>/dev/null || true
+
+    - name: Create or Update Test Branch and PR
+      id: create-test-pr
+      if: steps.fetch-diff.outputs.skip != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO_NAME: ${{ inputs.repository }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        HEAD_BRANCH: ${{ inputs.head_branch }}
+        TEMP_DIR: ${{ steps.fetch-diff.outputs.temp_dir }}
+      run: |
+        set -e
+
+        echo "::add-mask::${GH_TOKEN}"
+
+        OUTPUT_DIR="$TEMP_DIR/output_files"
+
+        # Check that we have parsed spec files
+        PATH_COUNT=$(find "$OUTPUT_DIR" -name "*.path" 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$PATH_COUNT" -eq 0 ]; then
+          echo "No generated spec files found" >> $GITHUB_STEP_SUMMARY
+          echo "test_pr_created=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        TEST_BRANCH="auto-tests/pr-${PR_NUMBER}"
+
+        # Configure git (local only)
+        git config --local user.name "github-actions[bot]"
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+
+        CONFIGURED_NAME=$(git config --local user.name)
+        if [[ "$CONFIGURED_NAME" != "github-actions[bot]" ]]; then
+          echo "Failed to configure git user"
+          exit 1
+        fi
+
+        # Check if test branch already exists on remote
+        BRANCH_EXISTS=$(git ls-remote --heads origin "$TEST_BRANCH" | wc -l | tr -d ' ')
+
+        if [ "$BRANCH_EXISTS" -gt 0 ]; then
+          echo "Test branch exists -- updating" >> $GITHUB_STEP_SUMMARY
+          git fetch origin "$TEST_BRANCH"
+          git checkout "$TEST_BRANCH"
+          git reset --hard "origin/$HEAD_BRANCH"
+        else
+          echo "Creating new test branch: $TEST_BRANCH" >> $GITHUB_STEP_SUMMARY
+          git checkout -b "$TEST_BRANCH" "origin/$HEAD_BRANCH"
+        fi
+
+        # Write each generated spec file to its correct co-located path
+        FILES_WRITTEN=0
+        echo "### Spec Files Written:" >> $GITHUB_STEP_SUMMARY
+
+        for PATH_FILE in "$OUTPUT_DIR"/*.path; do
+          [ -f "$PATH_FILE" ] || continue
+
+          TARGET_PATH=$(cat "$PATH_FILE")
+          CONTENT_FILE="${PATH_FILE%.path}"
+
+          # Validate the path (no traversal, must be .ai.spec.tsx)
+          if [[ "$TARGET_PATH" == *".."* ]] || [[ "$TARGET_PATH" == /* ]]; then
+            echo "Skipping suspicious path: $TARGET_PATH" >> $GITHUB_STEP_SUMMARY
+            continue
+          fi
+
+          if [ ! -s "$CONTENT_FILE" ]; then
+            echo "Skipping empty file: $TARGET_PATH" >> $GITHUB_STEP_SUMMARY
+            continue
+          fi
+
+          # Create directory and write file
+          mkdir -p "$(dirname "$TARGET_PATH")"
+          cp "$CONTENT_FILE" "$TARGET_PATH"
+          git add "$TARGET_PATH"
+
+          FILES_WRITTEN=$((FILES_WRITTEN + 1))
+          echo "- \`$TARGET_PATH\`" >> $GITHUB_STEP_SUMMARY
+        done
+
+        if [ "$FILES_WRITTEN" -eq 0 ]; then
+          echo "No spec files written" >> $GITHUB_STEP_SUMMARY
+          echo "test_pr_created=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Check if there are changes to commit
+        if git diff --cached --quiet; then
+          echo "No changes to commit" >> $GITHUB_STEP_SUMMARY
+          echo "test_pr_created=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        git commit -m "test: auto-generated specs for PR #${PR_NUMBER}"
+        git push origin "$TEST_BRANCH" --force-with-lease --force-if-includes 2>/dev/null \
+          || git push origin "$TEST_BRANCH" --force
+
+        echo "Pushed $FILES_WRITTEN spec file(s) to branch: $TEST_BRANCH" >> $GITHUB_STEP_SUMMARY
+
+        # Check if a test PR already exists for this branch (open or merged)
+        EXISTING_PR=$(gh pr list \
+          --repo "$REPO_NAME" \
+          --head "$TEST_BRANCH" \
+          --state all \
+          --json number,url,state \
+          --jq '[.[] | select(.state == "OPEN" or .state == "MERGED")] | sort_by(.number) | last' \
+          2>/dev/null || echo "")
+
+        if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+          EXISTING_STATE=$(printf '%s' "$EXISTING_PR" | jq -r '.state')
+          TEST_PR_NUMBER=$(printf '%s' "$EXISTING_PR" | jq -r '.number')
+          TEST_PR_URL=$(printf '%s' "$EXISTING_PR" | jq -r '.url')
+
+          if [ "$EXISTING_STATE" = "MERGED" ]; then
+            echo "Test PR #$TEST_PR_NUMBER was already merged -- skipping" >> $GITHUB_STEP_SUMMARY
+            echo "test_pr_created=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Updated existing test PR #$TEST_PR_NUMBER" >> $GITHUB_STEP_SUMMARY
+        else
+          # Build file list for PR body
+          FILE_LIST=""
+          for PATH_FILE in "$OUTPUT_DIR"/*.path; do
+            [ -f "$PATH_FILE" ] || continue
+            TARGET_PATH=$(cat "$PATH_FILE")
+            FILE_LIST="$(printf '%s\n- `%s`' "$FILE_LIST" "$TARGET_PATH")"
+          done
+
+          PR_BODY_FILE="$TEMP_DIR/pr_body.md"
+          {
+            printf '## Auto-generated test coverage for PR #%s\n\n' "$PR_NUMBER"
+            printf 'This PR contains AI-generated spec files (`.ai.spec.tsx`) with complete test coverage for the changes in PR #%s.\n\n' "$PR_NUMBER"
+            printf '### Generated Files\n%s\n\n' "$FILE_LIST"
+            printf '### How it works\n'
+            printf -- '- Existing spec files are used as **context** so the AI matches your testing patterns and conventions\n'
+            printf -- '- New `.ai.spec.tsx` files are created alongside existing specs -- existing tests are never modified\n'
+            printf -- '- Review and adjust the generated specs as needed before merging\n\n'
+            printf -- '---\n*Auto-generated by AI Test Case PR*\n'
+          } > "$PR_BODY_FILE"
+
+          TEST_PR_URL=$(gh pr create \
+            --repo "$REPO_NAME" \
+            --title "test: generated specs for #${PR_NUMBER}" \
+            --body-file "$PR_BODY_FILE" \
+            --base "$HEAD_BRANCH" \
+            --head "$TEST_BRANCH")
+
+          TEST_PR_NUMBER=$(printf '%s' "$TEST_PR_URL" | grep -oE '[0-9]+$')
+          echo "Created test PR #$TEST_PR_NUMBER" >> $GITHUB_STEP_SUMMARY
+
+          LABEL="auto-generated"
+          if [[ "$LABEL" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            gh pr edit "$TEST_PR_NUMBER" --repo "$REPO_NAME" --add-label "$LABEL" 2>/dev/null || true
+          fi
+        fi
+
+        # Comment on original PR
+        COMMENT_BODY=$(printf 'Test PR created/updated: #%s\n\nAuto-generated specs are available for review (%s file(s)).' "$TEST_PR_NUMBER" "$FILES_WRITTEN")
+
+        EXISTING_COMMENT=$(gh api \
+          "repos/${REPO_NAME}/issues/${PR_NUMBER}/comments" \
+          --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("Auto-generated specs are available"))) | .id' \
+          2>/dev/null | head -1 || echo "")
+
+        if [ -n "$EXISTING_COMMENT" ]; then
+          gh api "repos/${REPO_NAME}/issues/comments/${EXISTING_COMMENT}" \
+            -X PATCH \
+            -f body="$COMMENT_BODY" 2>/dev/null || true
+        else
+          gh pr comment "$PR_NUMBER" --repo "$REPO_NAME" --body "$COMMENT_BODY"
+        fi
+
+        # Set outputs
+        echo "test_pr_created=true" >> $GITHUB_OUTPUT
+        echo "test_pr_number=$TEST_PR_NUMBER" >> $GITHUB_OUTPUT
+        echo "test_pr_url=$TEST_PR_URL" >> $GITHUB_OUTPUT
+
+        # Log test_pr_created event
+        EVENTS_FILE="/tmp/gentests_events_${GITHUB_RUN_ID}.jsonl"
+        [[ ! "$FILES_WRITTEN" =~ ^[0-9]+$ ]] && FILES_WRITTEN=0
+        jq -cn \
+          --arg run_id "$GITHUB_RUN_ID" \
+          --arg pr_number "$PR_NUMBER" \
+          --arg test_pr_number "$TEST_PR_NUMBER" \
+          --arg test_pr_url "$TEST_PR_URL" \
+          --arg test_branch "$TEST_BRANCH" \
+          --argjson files_written "$FILES_WRITTEN" \
+          '{
+            agent: "AI Test Case PR",
+            event_type: "test_pr_created",
+            run_id: $run_id,
+            timestamp: (now | todate),
+            payload: {
+              source_pr: $pr_number,
+              test_pr_number: $test_pr_number,
+              test_pr_url: $test_pr_url,
+              test_branch: $test_branch,
+              files_written: $files_written
+            }
+          }' >> "$EVENTS_FILE" 2>/dev/null || true
+
+        # Cleanup temp dir
+        rm -rf "$TEMP_DIR" 2>/dev/null || true
