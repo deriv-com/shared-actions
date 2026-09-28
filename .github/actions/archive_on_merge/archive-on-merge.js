@@ -1,20 +1,41 @@
 #!/usr/bin/env node
-// When the PR completing an openspec change is merged, archive that change.
-// Shared across repos via deriv-com/shared-actions (composite action +
-// reusable workflow).
+// When a PR merges, archive every openspec change on the base branch whose
+// tasks.md is fully checked. Shared across repos via deriv-com/shared-actions
+// (composite action + reusable workflow).
 //
-// Detects which change(s) the merged PR itself touched, verifies every task in
-// that change's tasks.md is checked, then runs `openspec archive --yes --json`
-// (non-interactive). The calling workflow opens a follow-up PR with the result
-// — it never pushes directly to a protected branch.
+// Detection is repo-wide, not limited to the change(s) the merged PR itself
+// touched, for two reasons:
 //
-// The touched-file list comes from the GitHub API rather than a local `git
-// diff`. A diff of `base.sha..merge_commit_sha` is NOT the PR's own diff: for
-// a PR opened against an older master it also contains every commit merged in
+//   1. The workflow serializes runs per repository so back-to-back merges
+//      cannot race. GitHub keeps only the NEWEST pending run in a concurrency
+//      group and silently drops an older one — with per-PR detection that
+//      would lose the dropped merge's archive. Repo-wide detection makes a
+//      dropped run harmless: the surviving run archives everything complete,
+//      including what the dropped run would have covered.
+//   2. A change whose post-merge tasks get checked in a later, unrelated
+//      commit would otherwise never archive — no later PR needs to touch its
+//      directory again.
+//
+// Duplicates are prevented before anything is archived
+// (deriv-com/shared-actions#141): a change an open archive-on-merge/* PR
+// already covers — its diff deletes openspec/changes/<name>/… — is skipped,
+// and the workflow names the archive branch after the change(s), so an
+// identical set lands on a branch whose open PR is found and skipped.
+//
+// Verifies every task in a change's tasks.md is checked, then runs
+// `openspec archive --yes --json` (non-interactive). The calling workflow
+// opens a follow-up PR with the result — it never pushes directly to a
+// protected branch.
+//
+// The merged PR's own file list still comes from the GitHub API rather than a
+// local `git diff`, and scopes which incomplete changes get a remaining-tasks
+// report (an unrelated merge stays quiet about changes it did not touch). A
+// diff of `base.sha..merge_commit_sha` is NOT the PR's own diff: for a PR
+// opened against an older master it also contains every commit merged in
 // between, so an unrelated PR merged after some other PR completed a change
-// would "touch" that change too and archive it a second time. Asking the API
-// for the PR's files is exact and, unlike any local range, is independent of
-// whether the PR was merged, squashed, or rebased.
+// would "touch" that change too. Asking the API for the PR's files is exact
+// and, unlike any local range, is independent of whether the PR was merged,
+// squashed, or rebased.
 //
 // Requires Node.js 18 or newer for global `fetch`.
 const { execFileSync } = require("child_process");
@@ -54,6 +75,16 @@ const RETRY_BASE_MS = 1000;
 // failed request.
 const REQUEST_TIMEOUT_MS = 30_000;
 
+// Branch prefix every archive PR is opened under. Both the "already covered"
+// check below and the workflow's own skip key on this prefix, so it must stay
+// in sync with the branch name built in archive-on-merge.yml.
+const ARCHIVE_BRANCH_PREFIX = "archive-on-merge/";
+
+// The open-PRs list pages at 100. Ten pages (1000 open PRs) is far past any
+// real consumer and, like MAX_FILE_PAGES, doubles as a runaway-loop backstop.
+const OPEN_PRS_PER_PAGE = 100;
+const MAX_OPEN_PR_PAGES = 10;
+
 /** True when `value` is a positive integer PR number. Pure function. */
 function isValidPrNumber(value) {
   return /^[1-9][0-9]*$/.test(String(value ?? ""));
@@ -88,6 +119,44 @@ function extractChangeNames(files) {
   // Sorted so the caller's branch slug is canonical: the same set of changes
   // must produce the same branch name whatever order the API listed the files
   // in, or the open-PR dedupe silently misses.
+  return names.sort();
+}
+
+/**
+ * Every change directory present under openspec/changes/ in the checkout,
+ * excluding the archive directory itself. This — not the merged PR's file
+ * list — is the archive candidate pool: see the header comment for why
+ * detection is repo-wide.
+ *
+ * Sorted for the same canonical-slug reason as extractChangeNames. Missing
+ * openspec/changes/ directory means the repo has no openspec setup — an empty
+ * result, not an error.
+ */
+function listRepoChangeNames(rootDir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(path.join(rootDir, "openspec", "changes"), {
+      withFileTypes: true,
+    });
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return [];
+    }
+    throw err;
+  }
+  const names = [];
+  for (const entry of entries) {
+    // The same kebab-case allowlist as extractChangeNames: a stray directory
+    // (".github", "Not_Kebab", a symlink) must never become a branch-name
+    // segment or reach `openspec archive` as an argument.
+    if (
+      entry.isDirectory() &&
+      entry.name !== "archive" &&
+      CHANGE_NAME_RE.test(entry.name)
+    ) {
+      names.push(entry.name);
+    }
+  }
   return names.sort();
 }
 
@@ -407,6 +476,101 @@ async function fetchPullRequestFiles({
   return files;
 }
 
+/**
+ * Every open PR whose head branch is an archive branch
+ * (`archive-on-merge/*`), as `{ number, headRef }` pairs. The list endpoint
+ * cannot filter by branch prefix, so this paginates the repo's open PRs and
+ * filters client-side.
+ */
+async function fetchOpenArchivePullRequests({
+  apiUrl,
+  repo,
+  token,
+  retry = {},
+}) {
+  const pulls = [];
+  for (let page = 1; page <= MAX_OPEN_PR_PAGES; page += 1) {
+    const url =
+      `${apiUrl}/repos/${repo}/pulls` +
+      `?state=open&per_page=${OPEN_PRS_PER_PAGE}&page=${page}`;
+    const response = await fetchWithRetry(
+      url,
+      {
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `Bearer ${token}`,
+          "x-github-api-version": "2022-11-28",
+          "user-agent": "deriv-com/shared-actions archive_on_merge",
+        },
+      },
+      retry
+    );
+    if (!response.ok) {
+      throw new Error(
+        `GitHub API returned ${response.status} ${response.statusText} listing open PRs for ${repo}.`
+      );
+    }
+    const batch = await response.json();
+    if (!Array.isArray(batch)) {
+      throw new Error(
+        `Expected an array of pull requests from the GitHub API, got ${typeof batch}.`
+      );
+    }
+    for (const pr of batch) {
+      const headRef =
+        pr && pr.head && typeof pr.head.ref === "string" ? pr.head.ref : null;
+      if (
+        headRef &&
+        headRef.startsWith(ARCHIVE_BRANCH_PREFIX) &&
+        Number.isInteger(pr.number)
+      ) {
+        pulls.push({ number: pr.number, headRef });
+      }
+    }
+    if (batch.length < OPEN_PRS_PER_PAGE) {
+      return pulls;
+    }
+  }
+  // Past the backstop: a missed archive PR means a possible duplicate, which
+  // is exactly what this listing exists to prevent. Say so loudly.
+  console.log(
+    `::warning::${repo} has more open PRs than were listed ` +
+      `(${MAX_OPEN_PR_PAGES * OPEN_PRS_PER_PAGE}); the list is truncated and ` +
+      `an open archive PR may be missed.`
+  );
+  return pulls;
+}
+
+/**
+ * Change names already covered by an open archive PR, as a Map of
+ * change name → covering PR number (for the skip log line).
+ *
+ * An archive PR's diff deletes openspec/changes/<name>/…, so the same
+ * extraction used on a merged PR's files recovers exactly what it covers.
+ */
+async function fetchCoveredChangeNames({ apiUrl, repo, token, retry = {} }) {
+  const openArchivePrs = await fetchOpenArchivePullRequests({
+    apiUrl,
+    repo,
+    token,
+    retry,
+  });
+  const covered = new Map();
+  for (const pr of openArchivePrs) {
+    const files = await fetchPullRequestFiles({
+      apiUrl,
+      repo,
+      prNumber: pr.number,
+      token,
+      retry,
+    });
+    for (const name of extractChangeNames(files)) {
+      covered.set(name, pr.number);
+    }
+  }
+  return covered;
+}
+
 /** owner/repo from an https or ssh git remote URL, or null. Pure function. */
 function repoSlugFromRemote(remoteUrl) {
   const match = String(remoteUrl ?? "")
@@ -632,53 +796,59 @@ async function main() {
     process.exit(1);
   }
 
+  // The candidate pool is every change on the base branch, not only what this
+  // PR touched — see the header comment. Checked first so a repo with no
+  // openspec setup skips the API calls entirely.
+  const repoChangeNames = listRepoChangeNames(ROOT);
+  if (repoChangeNames.length === 0) {
+    console.log("No openspec change directories found. Nothing to archive.");
+    writeOutputs([]);
+    return;
+  }
+
+  // The merged PR's own files, used only to scope the remaining-tasks report:
+  // an incomplete change the PR did not touch is nobody's news on this merge.
   const changedFiles = await fetchPullRequestFiles({
     apiUrl,
     repo,
     prNumber,
     token,
   });
-  const candidates = extractChangeNames(changedFiles);
+  const prTouched = extractChangeNames(changedFiles);
 
-  if (candidates.length === 0) {
-    console.log(
-      `PR #${prNumber} touched no openspec change directories. Nothing to archive.`
+  const complete = [];
+  for (const name of repoChangeNames) {
+    const tasksPath = path.join(
+      ROOT,
+      "openspec",
+      "changes",
+      name,
+      "tasks.md"
     );
-    writeOutputs([]);
-    return;
-  }
-
-  const archived = [];
-  let archiveFailures = 0;
-  for (const name of candidates) {
-    // Fault-isolated per candidate: an unexpected failure archiving one
-    // change (e.g. a merge that touches two changes at once) must not lose
-    // the result of another candidate that already succeeded in this run.
-    try {
-      const tasksPath = path.join(
-        ROOT,
-        "openspec",
-        "changes",
-        name,
-        "tasks.md"
-      );
-      if (!fs.existsSync(tasksPath)) {
+    if (!fs.existsSync(tasksPath)) {
+      // Logged only for a change this PR touched: a long-lived change without
+      // tasks.md would otherwise add the same line to every merge's log.
+      if (prTouched.includes(name)) {
         console.log(
           `'${name}' has no tasks.md — skipping (nothing to verify completion against).`
         );
-        continue;
       }
-      const content = fs.readFileSync(tasksPath, "utf8");
-      const census = parseTasks(content);
-      if (census.total === 0 && content.trim() !== "") {
-        // A non-empty tasks.md that yields no checkboxes is far more likely a
-        // parse failure than a deliberate prose-only file, and the archive that
-        // follows would look deliberate. Say so loudly.
-        console.log(
-          `::warning title=No tasks parsed::'${name}' has a non-empty tasks.md but no '- [ ]' or '- [x]' items were parsed. Treating it as complete; check the file's line endings and formatting.`
-        );
-      }
-      if (census.incomplete.length > 0) {
+      continue;
+    }
+    const content = fs.readFileSync(tasksPath, "utf8");
+    const census = parseTasks(content);
+    if (census.total === 0 && content.trim() !== "") {
+      // A non-empty tasks.md that yields no checkboxes is far more likely a
+      // parse failure than a deliberate prose-only file, and the archive that
+      // follows would look deliberate. Say so loudly. Unconditional because
+      // repo-wide detection archives such a change on ANY merge, not only on
+      // one that touches it.
+      console.log(
+        `::warning title=No tasks parsed::'${name}' has a non-empty tasks.md but no '- [ ]' or '- [x]' items were parsed. Treating it as complete; check the file's line endings and formatting.`
+      );
+    }
+    if (census.incomplete.length > 0) {
+      if (prTouched.includes(name)) {
         // Only the job summary consumes the URL, and building it forks git.
         const tasksUrl = process.env.GITHUB_STEP_SUMMARY
           ? tasksFileUrl(name)
@@ -688,9 +858,38 @@ async function main() {
         console.log(formatIncompleteReport(name, census));
         console.log(formatSkipNotice(name, census));
         writeStepSummary(formatIncompleteSummary(name, census, { tasksUrl }));
-        continue;
       }
+      continue;
+    }
+    complete.push(name);
+  }
 
+  // Skip changes an open archive PR already covers, BEFORE archiving anything
+  // (#141): the workflow serializes runs per repository, so an open archive PR
+  // at this point belongs to an earlier merge's run, and re-archiving its
+  // changes here would open a second PR carrying the same move.
+  let candidates = complete;
+  if (candidates.length > 0) {
+    const covered = await fetchCoveredChangeNames({ apiUrl, repo, token });
+    candidates = candidates.filter((name) => {
+      const coveringPr = covered.get(name);
+      if (coveringPr !== undefined) {
+        console.log(
+          `'${name}' is already covered by open archive PR #${coveringPr} — skipping.`
+        );
+        return false;
+      }
+      return true;
+    });
+  }
+
+  const archived = [];
+  let archiveFailures = 0;
+  for (const name of candidates) {
+    // Fault-isolated per candidate: an unexpected failure archiving one
+    // change (e.g. a merge that touches two changes at once) must not lose
+    // the result of another candidate that already succeeded in this run.
+    try {
       console.log(`'${name}' is complete — archiving...`);
       const result = runOpenspecArchive(name);
       if (!result.archive) {
@@ -726,6 +925,7 @@ async function main() {
 
 module.exports = {
   extractChangeNames,
+  listRepoChangeNames,
   parseTasks,
   truncate,
   isTasksComplete,
@@ -742,11 +942,16 @@ module.exports = {
   isRetryableResponse,
   fetchWithRetry,
   fetchPullRequestFiles,
+  fetchOpenArchivePullRequests,
+  fetchCoveredChangeNames,
   runOpenspecArchive,
   writeOutputs,
   main,
   MAX_FILE_PAGES,
   FILES_PER_PAGE,
+  ARCHIVE_BRANCH_PREFIX,
+  OPEN_PRS_PER_PAGE,
+  MAX_OPEN_PR_PAGES,
 };
 
 if (require.main === module) {
