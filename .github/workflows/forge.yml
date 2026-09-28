@@ -330,6 +330,7 @@ jobs:
               | sort -V | tail -1)
             [ -n "$TAG" ] || { echo "::error::no spec-to-pr release tag satisfies $ENGINE_REF"; exit 1; }
             ENGINE_SHA=$(tag_sha "$TAG")
+            [ -n "$ENGINE_SHA" ] || { echo "::error::could not resolve tag $TAG to a commit in deriv-com/spec-to-pr"; exit 1; }
             echo "engine_ref $ENGINE_REF -> $TAG ($ENGINE_SHA)"
           else
             echo "::error::engine_ref must be a caret range (^X.Y.Z), a release tag (vX.Y.Z) or a 40-char SHA — got '$ENGINE_REF'. Branches are not accepted."

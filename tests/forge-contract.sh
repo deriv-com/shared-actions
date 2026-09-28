@@ -7,10 +7,10 @@
 # downstream repos depend on.
 #
 # It also pins the two invariants the workflow's own comments promise but that
-# nothing else enforces: the engine ref resolves only to release tags (never a
-# branch), and no
-# caller-relative `uses: ./` creeps in (such a path resolves against the CALLER,
-# so it would work in one repo and break in every other).
+# nothing else enforces: the engine ref resolves only to release tags (never
+# a branch), and no caller-relative `uses: ./` creeps in (such a path resolves
+# against the CALLER, so it would work in one repo and break in every other).
+# The resolver's behaviour itself is exercised by tests/forge-resolver.sh.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
