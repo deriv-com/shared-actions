@@ -7,7 +7,8 @@
 # downstream repos depend on.
 #
 # It also pins the two invariants the workflow's own comments promise but that
-# nothing else enforces: the engine ref stays an immutable SHA, and no
+# nothing else enforces: the engine ref resolves only to release tags (never a
+# branch), and no
 # caller-relative `uses: ./` creeps in (such a path resolves against the CALLER,
 # so it would work in one repo and break in every other).
 set -euo pipefail
@@ -79,9 +80,12 @@ check 'grep -q "install_command" "$WF"' \
 
 # --- supply chain ---------------------------------------------------------
 # The engine runs with a write token in scope, so tracking a branch would let
-# any push to spec-to-pr execute in every caller repo.
-check 'awk "/^      engine_ref:/{f=1} f && /default:/{print; exit}" "$WF" | grep -qE "\"[0-9a-f]{40}\""' \
-  "engine_ref default is a full 40-char SHA, not a branch"
+# any push to spec-to-pr execute in every caller repo. A caret range is allowed
+# because it resolves against release tags only, never a branch.
+check 'awk "/^      engine_ref:/{f=1} f && /default:/{print; exit}" "$WF" | grep -qE "\"(\^[0-9]+\.[0-9]+\.[0-9]+|[0-9a-f]{40})\""' \
+  "engine_ref default is a caret range or a full 40-char SHA, not a branch"
+check 'grep -q "Branches are not accepted" "$WF"' \
+  "engine_ref resolver rejects anything that is not a range, release tag or SHA"
 
 # Every third-party action pinned by SHA (the repo-wide rule this workflow must
 # not be an exception to).
