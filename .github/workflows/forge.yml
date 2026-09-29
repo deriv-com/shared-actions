@@ -98,14 +98,27 @@ on:
         type: string
       engine_ref:
         description: >-
-          deriv-com/spec-to-pr commit SHA to run. Immutable on purpose: this job
-          runs the engine with a write token in scope, so tracking a branch would
-          let any push to that repo execute here. A SHA and not the tag name for
-          the same reason — a tag can be moved, a commit cannot.
+          Which deriv-com/spec-to-pr release to run. One of:
+            • a caret range, e.g. "^0.6.7" — the newest vX.Y.Z tag that is
+              semver-compatible with it (npm caret rules: while the engine is
+              0.x the minor is the breaking boundary, so "^0.6.7" means
+              ">=0.6.7 <0.7.0"; from 1.x on it means "same major");
+            • an exact tag, e.g. "v0.6.7";
+            • a full 40-char commit SHA, to freeze.
+          A range or tag follows whatever vX.Y.Z tags exist on spec-to-pr at run
+          time. Tags are not protected there (its rulesets cover branches only),
+          so anyone with write access to that repo can create or move one, and
+          the next run executes it with this job's write token in scope. A tag
+          can be moved, a commit cannot: pass a 40-char SHA to freeze.
+          Branches and pre-release tags are rejected. The resolved tag and SHA
+          are logged and posted on the issue.
         required: false
-        # v0.6.1 — annotated tag 7537bb5 dereferences to this commit.
-        # Previous pin: a20b48e (v0.2.0).
-        default: "26484fc22df1bc02106ed05c86527c8d05aa12e4"
+        # Policy: every caller that doesn't pass engine_ref runs the newest
+        # v0.6.x tag, and each new v0.6.x tag rolls out to them with no PR here.
+        # spec-to-pr ships features in 0.6.x patches, so this is "newest 0.6.x",
+        # not "bug fixes only". Bump the range deliberately for a new minor
+        # (0.x) / major (1.x+).
+        default: "^0.6.7"
         type: string
       fast_lane:
         description: >-
@@ -278,6 +291,7 @@ jobs:
           node-version: ${{ inputs.node_version }}
 
       - name: Fetch the spec-to-pr engine
+        id: engine
         # Fetched into RUNNER_TEMP, not the workspace, so the agent can never see
         # or commit the engine's own files.
         env:
@@ -286,13 +300,63 @@ jobs:
         run: |
           set -euo pipefail
           DIR="$RUNNER_TEMP/forge-engine"
-          # `git clone --branch` only accepts branch/tag names, so fetch the SHA
-          # explicitly. Works for a tag name too if you switch to releases later.
           git init -q "$DIR"
           git -C "$DIR" remote add origin \
             "https://x-access-token:${ENGINE_TOKEN}@github.com/deriv-com/spec-to-pr.git"
-          git -C "$DIR" fetch -q --depth 1 origin "$ENGINE_REF"
+
+          # ---- resolve engine_ref to a commit SHA -------------------------
+          # Everything below fetches a SHA, so a range or tag is resolved first,
+          # against the release tags only (strict vX.Y.Z — no pre-releases, no
+          # branches). An annotated tag's `^{}` line is the commit it points at;
+          # a lightweight tag has only the one line, which already is the commit.
+          tag_sha() {
+            git -C "$DIR" ls-remote --tags origin "refs/tags/$1" "refs/tags/$1^{}" \
+              | awk '{ sha[$2] = $1 } END {
+                  t = "refs/tags/'"$1"'"
+                  print (t "^{}" in sha) ? sha[t "^{}"] : sha[t]
+                }'
+          }
+          if [[ "$ENGINE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            ENGINE_SHA="$ENGINE_REF"
+            ENGINE_TAG=""
+            echo "engine_ref is a SHA — using it as-is"
+          elif [[ "$ENGINE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ENGINE_SHA=$(tag_sha "$ENGINE_REF")
+            ENGINE_TAG="$ENGINE_REF"
+            [ -n "$ENGINE_SHA" ] || { echo "::error::tag $ENGINE_REF does not exist in deriv-com/spec-to-pr"; exit 1; }
+            echo "engine_ref $ENGINE_REF -> $ENGINE_SHA"
+          elif [[ "$ENGINE_REF" =~ ^\^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            MAJ=${BASH_REMATCH[1]} MIN=${BASH_REMATCH[2]} PAT=${BASH_REMATCH[3]}
+            # npm caret: the left-most non-zero component is the breaking one.
+            #   ^1.2.3 -> 1.x.x >= 1.2.3 | ^0.6.7 -> 0.6.x >= 0.6.7 | ^0.0.3 -> 0.0.3 only
+            TAG=$(git -C "$DIR" ls-remote --tags --refs origin 'refs/tags/v*' \
+              | sed -nE 's#.*refs/tags/(v[0-9]+\.[0-9]+\.[0-9]+)$#\1#p' \
+              | awk -F'[v.]' -v M="$MAJ" -v m="$MIN" -v p="$PAT" '
+                  { x = $2 + 0; y = $3 + 0; z = $4 + 0 }
+                  M > 0             { if (x == M && (y > m || (y == m && z >= p))) print; next }
+                  M == 0 && m > 0   { if (x == 0 && y == m && z >= p) print; next }
+                                    { if (x == 0 && y == 0 && z == p) print }' \
+              | sort -V | tail -1)
+            [ -n "$TAG" ] || { echo "::error::no spec-to-pr release tag satisfies $ENGINE_REF"; exit 1; }
+            ENGINE_SHA=$(tag_sha "$TAG")
+            ENGINE_TAG="$TAG"
+            [ -n "$ENGINE_SHA" ] || { echo "::error::could not resolve tag $TAG to a commit in deriv-com/spec-to-pr"; exit 1; }
+            echo "engine_ref $ENGINE_REF -> $TAG ($ENGINE_SHA)"
+          else
+            echo "::error::engine_ref must be a caret range (^X.Y.Z), a release tag (vX.Y.Z) or a 40-char SHA — got '$ENGINE_REF'. Branches are not accepted."
+            exit 1
+          fi
+
+          # `git clone --branch` only accepts branch/tag names, so fetch the SHA
+          # explicitly — the tag lookup above and this fetch then cannot disagree.
+          git -C "$DIR" fetch -q --depth 1 origin "$ENGINE_SHA"
           git -C "$DIR" checkout -q --detach FETCH_HEAD
+          # The default floats, so the issue comment names what actually ran —
+          # the claim comment is posted before this step and can't.
+          {
+            echo "engine_tag=$ENGINE_TAG"
+            echo "engine_sha=$ENGINE_SHA"
+          } >> "$GITHUB_OUTPUT"
           # Drop the embedded credential; it isn't needed past the fetch.
           git -C "$DIR" remote set-url origin "https://github.com/deriv-com/spec-to-pr.git"
           echo "Engine at $(git -C "$DIR" rev-parse HEAD)"
@@ -458,6 +522,8 @@ jobs:
           COMMENT_ID: ${{ steps.claim.outputs.comment_id }}
           PR_URL: ${{ steps.forge.outputs.pr_url }}
           OUTCOME: ${{ steps.forge.outcome }}
+          ENGINE_TAG: ${{ steps.engine.outputs.engine_tag }}
+          ENGINE_SHA: ${{ steps.engine.outputs.engine_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # The same `xoxb-` token deriv-com/forge-agent uses, so the "PR opened"
           # message comes from the same bot that said "on it" and the thread reads
@@ -494,6 +560,13 @@ jobs:
               || echo "no output captured")
             BODY=$(printf '🔨 **Forge** failed — [full log](%s)\n\n<details><summary>Last output</summary>\n\n```\n%s\n```\n\n</details>\n\nRe-apply the `forge` label to retry.' "$RUN_URL" "$TAIL")
             LABEL="forge:failed"
+          fi
+
+          # Empty when the run failed before the engine was fetched. A SHA input
+          # has no tag, so only the commit is shown.
+          if [ -n "${ENGINE_SHA:-}" ]; then
+            BODY=$(printf '%s\n\n<sub>Engine: spec-to-pr %s`%s`</sub>' "$BODY" \
+              "${ENGINE_TAG:+$ENGINE_TAG }" "${ENGINE_SHA:0:7}")
           fi
 
           # Best-effort: never fail the job on reporting.
