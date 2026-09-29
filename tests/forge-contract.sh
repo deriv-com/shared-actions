@@ -7,8 +7,8 @@
 # downstream repos depend on.
 #
 # It also pins the two invariants the workflow's own comments promise but that
-# nothing else enforces: the engine ref resolves only to release tags (never
-# a branch), and no caller-relative `uses: ./` creeps in (such a path resolves
+# nothing else enforces: the engine ref is never a branch (a range or tag
+# resolves against vX.Y.Z tags; a SHA is used as-is), and no caller-relative `uses: ./` creeps in (such a path resolves
 # against the CALLER, so it would work in one repo and break in every other).
 # The resolver's behaviour itself is exercised by tests/forge-resolver.sh.
 set -euo pipefail
@@ -80,10 +80,11 @@ check 'grep -q "install_command" "$WF"' \
 
 # --- supply chain ---------------------------------------------------------
 # The engine runs with a write token in scope, so tracking a branch would let
-# any push to spec-to-pr execute in every caller repo. A caret range is allowed
-# because it resolves against release tags only, never a branch.
-check 'awk "/^      engine_ref:/{f=1} f && /default:/{print; exit}" "$WF" | grep -qE "\"(\^[0-9]+\.[0-9]+\.[0-9]+|[0-9a-f]{40})\""' \
-  "engine_ref default is a caret range or a full 40-char SHA, not a branch"
+# any push to spec-to-pr execute in every caller repo. The default may be a caret
+# range (resolved against vX.Y.Z tags only) or a 40-char SHA (which bypasses the
+# tag list entirely). Anchored: the whole quoted value must be one of the two.
+check 'awk "/^      engine_ref:/{f=1} f && /default:/{print; exit}" "$WF" | grep -qE "^ +default: \"(\^[0-9]+\.[0-9]+\.[0-9]+|[0-9a-f]{40})\"$"' \
+  "engine_ref default is exactly a caret range or a full 40-char SHA, not a branch"
 check 'grep -q "Branches are not accepted" "$WF"' \
   "engine_ref resolver rejects anything that is not a range, release tag or SHA"
 
