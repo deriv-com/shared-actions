@@ -1003,7 +1003,7 @@ jobs:
         id: engine-codex
         if: steps.engine.outputs.engine == 'codex'
         timeout-minutes: 60
-        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_codex@master
+        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_codex@smoke/codex-base
         with:
           repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}

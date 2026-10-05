@@ -35,7 +35,8 @@ jobs:
     # Absolute path at @master rather than a local `./` path, matching
     # docsync-ai.yml. It also keeps this caller identical in shape to the
     # consumer repos', so dogfooding exercises the same resolution path they use.
-    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@master
+    # SMOKE TEST ONLY (throwaway branch, never merge): codex engine from PR #143.
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@smoke/codex-base
 
     # Exactly what the shared workflow declares. `actions: write` and
     # `id-token: write` were dropped from it (nothing calls the Actions API, no
@@ -50,14 +51,9 @@ jobs:
       # All three pinned rather than inherited, so a change to a shared default
       # cannot silently alter what this repo runs — which matters more here than
       # anywhere, since this is where those defaults are edited.
-      engine: kimi
-      # LiteLLM proxy alias for K3. The Kimi-platform id `k3` resolves only at
-      # api.kimi.com/coding/v1 and the proxy answers it with a bare 400.
-      model: kimi-k3
-      # Wire dialect. Must match what base_url serves: the proxy serves plain
-      # /v1/chat/completions, which is `openai`. `kimi` targets the Kimi Code
-      # platform and the proxy rejects it, even with a correct model and key.
-      provider_type: openai
+      engine: codex
+      model: gpt-6.1-sol
+      reasoning_effort: low
 
       # `legacy_markers` is deliberately NOT set, so it keeps the shared default
       # ("Claude PR Review Complete"). It had to be emptied while claude.yml also
