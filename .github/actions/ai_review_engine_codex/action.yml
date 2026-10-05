@@ -65,9 +65,12 @@ description: >
 #      model that wrote elsewhere, or swapped in a symlink, fails loudly). The
 #      orchestrator's post step then copies it out of /tmp without following
 #      links before reading it.
-#   6. Live CLI output and the failure log dump are wrapped in random
+#   6. CLI output is captured to a runner.temp log and printed after each
+#      attempt; it and the failure log dump are wrapped in random
 #      ::stop-commands:: tokens, so text the model prints cannot run workflow
-#      commands.
+#      commands. codex exec runs in its own session, killed after each attempt.
+#   7. Codex ignores unknown config keys with only a warning, so that warning
+#      fails the job: a misspelled or renamed key cannot switch a control off.
 # RESIDUAL RISK, stated plainly. Unlike Kimi and Anthropic, whose path guard
 # denies reads outside the checkout, reads here are unscoped: the
 # workspace-write sandbox restricts writes, not reads. A same-uid command such as
@@ -414,6 +417,9 @@ runs:
         BASE_URL: ${{ steps.configure.outputs.base_url }}
         STRIP_SCRIPT: ${{ runner.temp }}/codex-engine-bin/strip-agent-config.sh
         STRIP_SHA256: ${{ steps.strip.outputs.strip_sha256 }}
+        # CLI output for the current attempt. Under runner.temp, so the
+        # model's sandboxed commands cannot write it.
+        CLI_LOG: ${{ runner.temp }}/codex-engine-bin/cli-attempt.log
         CONFIG_PRISTINE: ${{ runner.temp }}/codex-engine-bin/config.toml.pristine
       run: |
         [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Codex engine: missing or empty review context at $CONTEXT_PATH"; exit 1; }
@@ -586,19 +592,20 @@ runs:
         # (no TTY, no approval prompts). --skip-git-repo-check because the
         # checkout may not look like a git repo root to Codex.
         #
-        # The live CLI output (which includes text the model chose, and Codex is
-        # the only engine whose model has a shell) is wrapped in a random
-        # ::stop-commands:: token, so nothing it prints can run a workflow
+        # CLI output (which includes text the model chose, and Codex is the only
+        # engine whose model has a shell) goes to CLI_LOG, not to the step's
+        # stdout. It is printed after the attempt ends, inside a random
+        # ::stop-commands:: token, so nothing it contains can run a workflow
         # command. The token is never exported, so the model's commands cannot
-        # read it from their environment.
+        # read it from their environment. A process the model leaves behind
+        # writes to CLI_LOG too, never to the step log.
         #
         # codex exec runs in its own session, and the whole session is killed
-        # before workflow commands are turned back on and before the review is
-        # checked. A process the model detaches with nohup or & stays in that
-        # session, so it cannot print after the token is lifted or rewrite the
-        # review after review_file_ok. One that calls setsid itself leaves the
-        # session, so this kill does not reach it. Whether the bwrap sandbox
-        # takes it down with the command depends on how Codex builds the
+        # before the log is printed and before the review is checked. A process
+        # the model detaches with nohup or & stays in that session, so it cannot
+        # rewrite the review after review_file_ok. One that calls setsid itself
+        # leaves the session, and this kill does not reach it. Whether the bwrap
+        # sandbox takes it down with the command depends on how Codex builds the
         # sandbox: CLI 0.160.0 passes --die-with-parent, but its binary does not
         # contain --unshare-pid, so this is not relied on. The post step reads
         # only its own no-follow copy of the review, re-checked, so a late
@@ -612,12 +619,27 @@ runs:
             --skip-git-repo-check \
             "${PIN_ARGS[@]}" \
             "${REASONING_ARGS[@]}" \
-            "$REVIEW_PROMPT" &
+            "$REVIEW_PROMPT" > "$CLI_LOG" 2>&1 < /dev/null &
           CODEX_PID=$!
           wait "$CODEX_PID" && CODEX_STATUS=0 || CODEX_STATUS=$?
           pkill -KILL -s "$CODEX_PID" 2>/dev/null || true
+          # Printed only after the session is gone, still inside the token.
+          cat -- "$CLI_LOG"
           echo "::$LIVE_TOKEN::"
           unset LIVE_TOKEN
+
+          # Codex 0.160.0 does not reject an unknown config key: it prints
+          # "Codex is ignoring N unrecognized configuration setting" and runs
+          # anyway (the smoke test confirmed this with a misspelled
+          # [features] hooks). A renamed or misspelled key would then switch a
+          # control off without a sound, so treat that warning as fatal and
+          # post nothing. CLI_LOG lives under runner.temp, which the model
+          # cannot write.
+          if grep -cF "unrecognized configuration setting" "$CLI_LOG" >/dev/null; then
+            echo "❌ Codex engine: the CLI ignored a config setting (see the warning above). A control may be off, so the review is refused."
+            rm -f -- "$OUTPUT_PATH"
+            exit 1
+          fi
 
           if review_file_ok; then
             if [[ "$CODEX_STATUS" -ne 0 ]]; then

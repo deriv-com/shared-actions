@@ -318,6 +318,10 @@ check 'nc_fixed "base_url_re='"'"'^https?://" && nc_fixed "[[ ! \$BASE_URL =~ \$
 check 'nc_fixed "MODEL: \${{ steps.configure.outputs.model }}" && nc_fixed "echo \"model=\$MODEL\""' "codex run step uses the model value the configure step validated"
 check '! step_body "Run AI PR review (Codex)" "$CODEX" | grep -vE "^[[:space:]]*#" | grep -cF "inputs.model" >/dev/null' "codex run step never reads raw inputs.model"
 check 'nc_fixed "setsid --wait codex exec" && nc_fixed "pkill -KILL -s \"\$CODEX_PID\""' "codex exec runs in its own session, killed before commands resume"
+# Smoke test: Codex 0.160.0 only WARNS on an unknown config key and runs on,
+# so a misspelled control would be silently off. The warning must be fatal.
+check 'nc_fixed "grep -cF \"unrecognized configuration setting\" \"\$CLI_LOG\"" && ncgrep "the CLI ignored a config setting" "$CODEX"' "codex refuses the review when the CLI ignored a config setting"
+check 'nc_fixed "\"\$REVIEW_PROMPT\" > \"\$CLI_LOG\" 2>&1 < /dev/null &" && nc_fixed "CLI_LOG: \${{ runner.temp }}/"' "codex CLI output goes to a runner.temp log, not the live step log"
 
 # 4. The path guard: the only path control either CLI honours. Shared by the
 #    Kimi and Anthropic engines, fail-closed by construction.
