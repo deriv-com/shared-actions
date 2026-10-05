@@ -205,6 +205,11 @@ CODEX_TOML_BODY=$(awk '/cat > "\$CODEX_HOME\/config.toml" <<EOF/{f=1;next} f&&/^
 check '[[ -n "$CODEX_TOML_BODY" ]]' "codex config.toml heredoc located by the contract test"
 check '! printf "%s\n" "$CODEX_TOML_BODY" | grep -c -E "\`|\\\$\(" >/dev/null' "codex config.toml heredoc has no command substitution"
 check '! printf "%s\n" "$CODEX_TOML_BODY" | grep -c -E "^[[:space:]]*#" >/dev/null' "codex config.toml heredoc has no comment lines"
+# Codex CLI 0.160.0 refuses wire_api = "chat" at startup (found by the smoke
+# test), so both the config and the CLI pin must say "responses".
+check '[[ $(grep -vE "^[[:space:]]*#" "$CODEX" | grep -c "wire_api = \"responses\"") -eq 1 ]]' "codex config pins wire_api = responses"
+check '[[ $(grep -vE "^[[:space:]]*#" "$CODEX" | grep -cF "wire_api=\"responses\"") -eq 1 ]]' "codex CLI pins wire_api=responses"
+check '[[ $(grep -vE "^[[:space:]]*#" "$CODEX" | grep -c "\"chat\"") -eq 0 ]]' "codex engine never sets wire_api chat"
 check 'grep -vE "^[[:space:]]*#" "$WF" | grep -cF "b64_key_in \"\$REVIEW_OUTPUT_FILE\"" >/dev/null && grep -q "base64-encoded LLM_API_KEY" "$WF"' "post-step refuses a base64-encoded LLM API key (shell-engine exfil hardening)"
 
 # Sandbox and key-routing controls. Greps below go through ncgrep, which

@@ -311,7 +311,7 @@ jobs:
               REVIEW_TITLE="Grok PR Review"
               ;;
             codex)
-              # LiteLLM alias for GPT-6.1 Sol, OpenAI-compatible chat/completions.
+              # LiteLLM alias for GPT-6.1 Sol, served over the OpenAI Responses API.
               # The Codex engine ignores max_context_size (Codex manages its own
               # context window); cli_version pins the Codex CLI.
               DEFAULT_MODEL="gpt-6.1-sol"
