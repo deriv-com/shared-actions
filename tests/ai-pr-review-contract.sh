@@ -188,7 +188,7 @@ check 'grep -q "approval_policy = \"never\"" "$CODEX"' "codex engine forbids esc
 check 'grep -q "web_search = false" "$CODEX"' "codex engine disables web search (no outbound tool)"
 check 'grep -q -- "--sandbox workspace-write" "$CODEX"' "codex engine also pins the sandbox on the CLI (config regression cannot relax it)"
 check 'grep -q "sandbox_workspace_write.network_access=false" "$CODEX"' "codex engine also pins network_access=false on the CLI"
-check '! step_body "Run AI PR review (Codex)" "$CODEX" | grep -qE "^ *(GITHUB_TOKEN|GH_TOKEN):"' "codex engine run step env holds no GitHub token"
+check '! step_body "Run AI PR review (Codex)" "$CODEX" | grep -cE "^ *(GITHUB_TOKEN|GH_TOKEN):" >/dev/null' "codex engine run step env holds no GitHub token"
 check 'grep -q "path guard" "$CODEX"' "codex engine documents why it has no path guard"
 # The verify step still fails closed if no review landed at the /tmp output.
 check 'grep -q "no review written to \$OUTPUT_PATH" "$CODEX"' "codex engine fails if no review was written"
@@ -205,7 +205,7 @@ check 'grep -q "base64-encoded LLM_API_KEY" "$WF"' "post-step refuses a base64-e
 
 # Ako's review of d55ed7a. Greps below go through ncgrep, which ignores lines
 # whose first non-space character is '#', so a commented-out control fails.
-ncgrep() { grep -vE '^[[:space:]]*#' "$2" | grep -qE -- "$1"; }
+ncgrep() { grep -vE '^[[:space:]]*#' "$2" | grep -cE -- "$1" >/dev/null; }
 # Blocking: CODEX_HOME must not sit in a sandbox-writable root, or a model
 # could edit config.toml (e.g. base_url) for the retry to load.
 check '! grep -qE "CODEX_HOME: */tmp" "$CODEX"' "codex CODEX_HOME is not under /tmp (sandbox-writable)"
@@ -213,10 +213,10 @@ check '[[ $(grep -cE "^ +CODEX_HOME: \\$\\{\\{ runner\\.temp \\}\\}/codex-engine
 check 'ncgrep "is inside a sandbox-writable root" "$CODEX"' "codex configure step refuses a CODEX_HOME inside a writable root"
 check 'ncgrep "exclude_tmpdir_env_var = true" "$CODEX"' "codex sandbox excludes \$TMPDIR from writable roots"
 check 'ncgrep "config_sha256=" "$CODEX" && ncgrep "config.toml changed since the configure step" "$CODEX"' "codex verifies the config hash before starting the CLI"
-check 'step_body "Run AI PR review (Codex)" "$CODEX" | grep -vE "^[[:space:]]*#" | awk "/for attempt in 1 2/{f=1} f && /pre_attempt_guard\$/{print; exit}" | grep -q pre_attempt_guard' "codex runs the pre-attempt guard inside the retry loop"
+check 'step_body "Run AI PR review (Codex)" "$CODEX" | grep -vE "^[[:space:]]*#" | awk "/for attempt in 1 2/{f=1} f && /pre_attempt_guard\$/{n++} END{exit !n}"' "codex runs the pre-attempt guard inside the retry loop"
 # Every setting that routes the key or relaxes the sandbox is pinned on the CLI.
 for pin in "--sandbox workspace-write" "model_provider=\"litellm\"" "model_providers.litellm.base_url=" "model_providers.litellm.env_key=" "model_providers.litellm.wire_api=" "approval_policy='\"never\"'" "sandbox_workspace_write.network_access=false" "sandbox_workspace_write.exclude_tmpdir_env_var=true" "tools.web_search=false"; do
-  check 'grep -vE "^[[:space:]]*#" "$CODEX" | grep -qF -- "$pin"' "codex pins on the CLI: $pin"
+  check 'grep -vE "^[[:space:]]*#" "$CODEX" | grep -cF -- "$pin" >/dev/null' "codex pins on the CLI: $pin"
 done
 # output_path is resolved before the /tmp check, and /var/tmp is not accepted.
 check 'ncgrep "OUTPUT_REAL=\"\\$\\(realpath -m" "$CODEX"' "codex resolves output_path with realpath before checking it"
@@ -235,7 +235,7 @@ check '[[ -n "$ENUM_WF" && "$ENUM_WF" == "$ENUM_CODEX" ]]' "reasoning_effort cas
 ENUM_LIST="${ENUM_WF//|/, }"
 check 'grep -qF -- "${ENUM_LIST%, *}" "$WF" && grep -qF -- "${ENUM_LIST%, *}" "$CODEX"' "reasoning_effort input descriptions list the same values as the case arms"
 # Behavioural: run the engine's own validation block against good and bad values.
-EFFORT_BLOCK=$(step_body "Run AI PR review (Codex)" "$CODEX" | awk '/REASONING_ARGS=\(\)/{f=1} f{print} f && /^ +fi$/{exit}' | sed 's/^        //')
+EFFORT_BLOCK=$(step_body "Run AI PR review (Codex)" "$CODEX" | awk '/REASONING_ARGS=\(\)/{f=1} f{print} f && /^ +fi$/{f=0; done=1} done{next}' | sed 's/^        //')
 effort_ok() { REASONING_EFFORT="$1" bash -c "$EFFORT_BLOCK" >/dev/null 2>&1; }
 check 'effort_ok "" && effort_ok xhigh && effort_ok minimal' "codex engine accepts empty, minimal and xhigh"
 check '! effort_ok max && ! effort_ok ultra && ! effort_ok bogus' "codex engine rejects max, ultra and unknown values"
