@@ -1,0 +1,665 @@
+name: ai_review_engine_codex
+description: >
+  AI PR review engine — OpenAI Codex CLI. Reads a pre-built review context and a
+  pre-fetched PR diff, reviews the checked-out code, and writes the review
+  markdown to a file. It posts nothing: it is given no GitHub token and no shell
+  tool it can reach the network with. The calling workflow owns comment posting.
+
+# ENGINE CONTRACT (see .github/workflows/AI_PR_REVIEW_README.md)
+#
+# The caller guarantees: PR head is checked out; review_context_path and
+# pr_diff_path exist and are non-empty; the access gate has passed.
+#
+# This engine must: strip PR-supplied agent config FIRST, deny the model any
+# path to the network or the GitHub API, write the review to output_path, and
+# fail with an engine-named message if it wrote nothing. It must not post PR
+# comments or reach the GitHub API on the model's behalf.
+#
+# Composite-action gotchas that constrain this file:
+#   - The secrets context is not readable here, so api_key arrives as an input.
+#   - timeout-minutes is invalid on the steps below; the caller's dispatch
+#     step carries it.
+#   - All steps share one log group, so failures must name this engine.
+#
+# WHY THIS ENGINE HAS NO PreToolUse PATH GUARD (deviation from Kimi/Anthropic).
+# The shared ../ai_review_path_guard/path-guard.js is written against the Kimi
+# Code / Claude Code hook contract: a PreToolUse call carrying tool_name in
+# {Read, Grep, Glob, Write} and a filesystem path in tool_input.path /
+# tool_input.file_path, which the guard allow-lists against the checkout. Codex
+# does NOT present tools that way. Its PreToolUse hook reports tool_name as
+# `Bash` (shell / unified exec) or `apply_patch` (all file edits, matcher
+# aliases Edit/Write), and the input is tool_input.command — a shell string or
+# a patch body, never a `path`. There is no per-file Read/Grep/Glob tool to
+# scope. Dropping the shared guard in unchanged would make it deny EVERY Codex
+# tool call (it denies any tool_name it does not recognise, and then denies
+# again for the missing `path`), so no review would ever be written. Codex's
+# own docs also state plainly that tool hooks are "a useful guardrail, not a
+# complete enforcement boundary", and a non-managed hook needs interactive
+# trust (or --dangerously-bypass-hook-trust) to run at all. So the path guard
+# genuinely cannot be wired here without rewriting it against a second,
+# incompatible tool contract.
+#
+# What confines this engine instead — each control independent, all fail-closed:
+#   1. sandbox_mode = "workspace-write" with [sandbox_workspace_write]
+#      network_access = false. Commands the model runs cannot open a socket,
+#      so they cannot reach the GitHub API or send anything off the runner
+#      directly. This confines the model's commands, NOT the Codex process
+#      itself, which must talk to the LLM endpoint.
+#   2. No GITHUB_TOKEN in the run step's env (persist-credentials:false in the
+#      caller's checkout already left none on disk).
+#   2a. CODEX_HOME (config.toml, sessions, logs) lives under runner.temp, which
+#      is outside every sandbox-writable root (the checkout, /tmp, and $TMPDIR
+#      via exclude_tmpdir_env_var = true). The model therefore cannot edit the
+#      config the Codex process reads. The provider, base_url, wire_api and
+#      env_key are ALSO pinned on the CLI, and the config's sha256 is checked
+#      before every attempt, so a tampered config cannot redirect the API key
+#      to another host on the retry.
+#   3. web search disabled (tools.web_search = false + --config overrides) so
+#      the model has no outbound tool at all.
+#   4. approval_policy = "never": the model can never escalate out of the
+#      sandbox to run an unsandboxed command.
+#   5. output_path pinned under /tmp. workspace-write keeps the checkout
+#      writable, so the review belongs outside it. After the CLI exits, the run
+#      step accepts the review only if it is a regular, singly-linked file
+#      whose real path is still under /tmp, and fails the job otherwise (a
+#      model that wrote elsewhere, or swapped in a symlink, fails loudly). The
+#      orchestrator's post step then copies it out of /tmp without following
+#      links before reading it.
+#   6. CLI output is captured to a runner.temp log and printed after each
+#      attempt; it and the failure log dump are wrapped in random
+#      ::stop-commands:: tokens, so text the model prints cannot run workflow
+#      commands. codex exec runs in its own session, killed after each attempt.
+#   7. Codex ignores unknown config keys with only a warning, so that warning
+#      fails the job: a misspelled or renamed key cannot switch a control off.
+# RESIDUAL RISK, stated plainly. Unlike Kimi and Anthropic, whose path guard
+# denies reads outside the checkout, reads here are unscoped: the
+# workspace-write sandbox restricts writes, not reads. A same-uid command such as
+# `cat /proc/$PPID/environ` can probably still read OPENAI_API_KEY (and runner
+# variables) from the Codex process. [shell_environment_policy] only cleans the
+# env of commands the model spawns; it does not hide the parent's. The one way
+# out is then the review text itself. The post step refuses the literal key and
+# its base64 form, but a hex, reversed or split copy would pass. What bounds
+# this today: same-repo PRs only, the org-member access gate, no network from
+# the sandbox, and the shared key being rotatable. Treat codex as weaker than
+# Kimi/Anthropic on key confidentiality until Codex can deny /proc reads.
+
+inputs:
+  review_context_path:
+    description: "Path to the pre-built review context markdown (instructions, PR metadata, previous review, acknowledged suggestions, required output format). Built by the caller."
+    required: false
+    default: "/tmp/review_context.md"
+  pr_diff_path:
+    description: "Path to the pre-fetched PR diff. Fetched by the caller with the trusted token so the model needs no network access. Codex does give the model a shell, confined by the workspace-write sandbox with network_access = false (see the header)."
+    required: false
+    default: "/tmp/pr_diff.txt"
+  output_path:
+    description: "Path this engine MUST write the final review markdown to. Must resolve (after realpath, so `..` cannot escape) under /tmp; /var/tmp is not accepted. The sandbox keeps the checkout writable but the review belongs outside it, and the run step's final check refuses the job unless a regular, singly-linked file landed here."
+    required: false
+    default: "/tmp/ai_review_output.txt"
+  repository:
+    description: "owner/repo of the PR under review (prompt preamble only)."
+    required: true
+  pr_number:
+    description: "Number of the PR under review (prompt preamble only)."
+    required: true
+  model:
+    description: "Model ID as the endpoint in base_url names it. With the LiteLLM proxy that is a proxy alias, e.g. gpt-6.1-sol. Maps to config.toml top-level `model`."
+    required: false
+    default: "gpt-6.1-sol"
+  base_url:
+    description: "LLM API base URL. A trailing /v1 is appended when absent, so the identical value also works for the anthropic engine (which needs it removed). Maps to [model_providers.litellm].base_url."
+    required: false
+    default: "https://litellmsa.deriv.ai/v1"
+  api_key:
+    description: "API key for base_url. Composite actions cannot read the secrets context, so the caller must pass this explicitly. Mapped to OPENAI_API_KEY in the run step env (the provider's env_key) and never written to disk."
+    required: true
+  reasoning_effort:
+    description: "[engine-specific: codex] Reasoning effort for the review turn. One of minimal, low, medium, high, xhigh (the Codex CLI config enum). The gpt-6.1-sol model also exposes max/ultra, but the CLI validator rejects those and fail-fasts, so they are not accepted here. Empty leaves the model/endpoint default (no override is sent). Maps to `-c model_reasoning_effort=\"<v>\"` on the run step, applied ONLY when non-empty. Other engines ignore this input."
+    required: false
+    default: ""
+  cli_version:
+    description: "Exact @openai/codex version to install. Pinned deliberately — unpinned latest would pull both breaking changes and unreviewed code into a privileged job. 0.160.0 is the current stable release (the 0.162.0-alpha.* line is pre-release). Bump via PR; never use the `alpha` dist-tag."
+    required: false
+    default: "0.160.0"
+  node_version:
+    description: "Node.js version used to install and run the CLI."
+    required: false
+    default: "22"
+
+outputs:
+  output_path:
+    description: "Path the review markdown was written to."
+    value: ${{ steps.run.outputs.output_path }}
+
+runs:
+  using: composite
+  steps:
+    # Security boundary, not hygiene. Codex auto-loads AGENTS.md (and the
+    # project_doc_fallback_filenames it is configured with), CODEX.md, .codex/
+    # (config.toml, hooks, rules, skills) and ~/.codex/ — none of that is gated
+    # by the sandbox below, and all of the in-checkout copies are PR-controlled.
+    # These paths are engine-specific: another engine must revisit this list,
+    # never inherit it.
+    - name: Strip PR-supplied agent config (Codex)
+      id: strip
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        # The sweep is written once, to a directory outside every
+        # sandbox-writable root, and the run step re-runs this same file before
+        # each attempt. One copy, so the two sweeps cannot drift apart.
+        STRIP_SCRIPT: ${{ runner.temp }}/codex-engine-bin/strip-agent-config.sh
+      run: |
+        mkdir -p "$(dirname "$STRIP_SCRIPT")"
+        cat > "$STRIP_SCRIPT" <<'STRIP_EOF'
+        # Sourced with the checkout as the working directory.
+        # Recursive, not root-only. Instruction files are discovered per-directory
+        # as an agent reads files there, and this review's prompt explicitly tells
+        # it to traverse into dependencies. .git is pruned so the sweep cannot
+        # corrupt the checkout.
+        # Both sweeps match symlinks too (-type l): a link named AGENTS.md or
+        # .codex pointing at another file or directory in the PR would otherwise
+        # survive a sweep keyed on -type f / -type d. rm on a link removes the
+        # link only. This is the same sweep shape the contract test asserts
+        # across every engine (FILE_SWEEP / DIR_SWEEP).
+        # -iname: match mixed-case variants (AGENTS.md / Agents.md / agents.md);
+        # a lowercase agents.md would otherwise slip past -name and reach the
+        # model as trusted instructions in a job holding the LLM API key.
+        find . -name .git -prune -o \( -type f -o -type l \) \
+          \( -iname 'agents.md' -o -iname 'agent.md' \
+             -o -iname 'codex.md' -o -iname 'claude.md' -o -iname 'claude.local.md' \
+             -o -iname '.cursorrules' \) \
+          -print0 | xargs -0 -r rm -f
+        find . -name .git -prune -o \( -type d -o -type l \) \
+          \( -iname '.codex' -o -iname '.claude' -o -iname '.agents' \) \
+          -print0 | xargs -0 -r rm -rf
+        find . -name .git -prune -o \( -type d -o -type l \) -ipath '*/.cursor/rules' \
+          -print0 | xargs -0 -r rm -rf
+
+        # Codex also reads the default home ($HOME/.codex) even with an isolated
+        # CODEX_HOME; clear leftover default-home state on a persistent
+        # self-hosted runner so a previous run cannot inject config/hooks.
+        rm -rf "$HOME/.codex" "$HOME/.agents" "$HOME/.claude"
+        STRIP_EOF
+
+        bash -euo pipefail "$STRIP_SCRIPT"
+        echo "strip_sha256=$(sha256sum "$STRIP_SCRIPT" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        echo "✅ Stripped PR-supplied agent config (recursive)"
+
+    - name: Set up Node.js
+      # Pinned to a commit SHA, not a tag: tags are mutable, so a retagged
+      # release would execute in a job holding the LLM API key and a
+      # write-scoped GITHUB_TOKEN. Same pin as the Kimi and Grok engines.
+      # Bump via PR.
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: ${{ inputs.node_version }}
+
+    - name: Install review CLI (Codex)
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli_version }}
+        CODEX_HOME: ${{ runner.temp }}/codex-engine-home
+      run: |
+        # Isolate CODEX_HOME under runner.temp so config.toml, auth, history and
+        # caches never land in the runner home (where a persistent self-hosted
+        # runner would carry them between runs). runner.temp, not /tmp: /tmp is
+        # writable from inside the workspace-write sandbox, so a config there
+        # could be edited by the model between attempts. Recreate it clean.
+        rm -rf "$CODEX_HOME"
+        mkdir -p "$CODEX_HOME"
+
+        # Coarse kernel floor (>= 5.13, the Landlock threshold the Codex sandbox
+        # docs name). On the self-hosted github_claude_code_reviewer group an
+        # older kernel would make every model-spawned command fail and burn a
+        # retry before dying on confusing model-level errors. The real gate is
+        # the bubblewrap probe after the CLI install: CLI 0.160.0 runs model
+        # commands through bwrap. Fail-closed, just a clear early exit.
+        KREL="$(uname -r)"; IFS='.' read -r KMAJ KMIN _ <<< "$KREL"
+        # Drop suffixes such as `-rc1` or `-generic` so the arithmetic below
+        # cannot fail on a release string like 5.15-rc1.
+        KMAJ="${KMAJ%%[^0-9]*}"; KMIN="${KMIN%%[^0-9]*}"
+        if [[ -z "$KMAJ" || -z "$KMIN" ]] || (( KMAJ < 5 || (KMAJ == 5 && KMIN < 13) )); then
+          echo "❌ Codex engine: kernel $KREL is older than 5.13 (no Landlock); the workspace-write sandbox cannot apply on this runner."
+          exit 1
+        fi
+
+        npm install -g "@openai/codex@${CLI_VERSION}"
+        codex --version
+
+        # Codex's Linux sandbox runs commands through bubblewrap (found by the
+        # smoke test: without bwrap on PATH it falls back to a bundled copy, and
+        # every command dies with "bwrap: loopback: Failed RTM_NEWADDR:
+        # Operation not permitted"). GitHub-hosted Ubuntu 24.04 does not ship
+        # bwrap, and AppArmor blocks unprivileged user namespaces. Same
+        # workaround as the Grok engine: install bwrap, load a userns profile
+        # for /usr/bin/bwrap, then probe the exact namespaces Codex asks for.
+        if ! command -v bwrap >/dev/null 2>&1; then
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap apparmor-profiles
+        fi
+        if [[ -f /usr/share/apparmor/extra-profiles/bwrap-userns-restrict ]]; then
+          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+            /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+        elif [[ ! -f /etc/apparmor.d/bwrap ]]; then
+          printf '%s\n' \
+            'abi <abi/4.0>,' \
+            'include <tunables/global>' \
+            '' \
+            'profile bwrap /usr/bin/bwrap flags=(unconfined) {' \
+            '  userns,' \
+            '  include if exists <local/bwrap>' \
+            '}' \
+            | sudo tee /etc/apparmor.d/bwrap >/dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+        fi
+        if ! bwrap --unshare-user --unshare-net --die-with-parent --ro-bind / / --dev /dev true; then
+          echo "❌ Codex engine: bubblewrap cannot create a user + network namespace on this runner. The workspace-write sandbox cannot start."
+          exit 1
+        fi
+        bwrap --version
+        echo "✅ Codex CLI ${CLI_VERSION} installed (CODEX_HOME=$CODEX_HOME, kernel $KREL)"
+
+    - name: Configure review CLI (Codex)
+      id: configure
+      shell: bash
+      env:
+        CODEX_HOME: ${{ runner.temp }}/codex-engine-home
+        OUTPUT_PATH: ${{ inputs.output_path }}
+        MODEL: ${{ inputs.model }}
+        CONFIG_PRISTINE: ${{ runner.temp }}/codex-engine-bin/config.toml.pristine
+        INPUT_BASE_URL: ${{ inputs.base_url }}
+      run: |
+        # Fail closed if a caller pointed output at the checkout: workspace-write
+        # keeps the checkout writable, so a review written there would be swept
+        # as PR-controlled content and could overwrite source. The review's home
+        # is /tmp. Resolve first so `/tmp/../home/...` cannot pass the glob.
+        OUTPUT_REAL="$(realpath -m -- "$OUTPUT_PATH")"
+        case "$OUTPUT_REAL" in
+          /tmp/*) ;;
+          *)
+            echo "❌ Codex engine: output_path must resolve under /tmp: $OUTPUT_PATH (resolves to $OUTPUT_REAL)"
+            exit 1
+            ;;
+        esac
+
+        # CODEX_HOME holds the config the unsandboxed Codex process reads, so it
+        # must sit outside every root the sandbox lets the model write: the
+        # checkout and /tmp (and $TMPDIR, excluded below). A self-hosted runner
+        # whose runner.temp lands in one of those would reopen the
+        # config-tampering path, so refuse to run there.
+        HOME_REAL="$(realpath -m -- "$CODEX_HOME")"
+        WS_REAL="$(realpath -m -- "$GITHUB_WORKSPACE")"
+        case "$HOME_REAL/" in
+          /tmp/*|/var/tmp/*|"$WS_REAL"/*)
+            echo "❌ Codex engine: CODEX_HOME ($HOME_REAL) is inside a sandbox-writable root; the model could edit its own config."
+            exit 1
+            ;;
+        esac
+        if [[ -n "${TMPDIR:-}" ]] && [[ "$HOME_REAL/" == "$(realpath -m -- "$TMPDIR")"/* ]]; then
+          echo "❌ Codex engine: CODEX_HOME ($HOME_REAL) is inside \$TMPDIR; the model could edit its own config."
+          exit 1
+        fi
+
+        BASE_URL="${INPUT_BASE_URL%/}"
+        [[ "$BASE_URL" == */v1 ]] || BASE_URL="${BASE_URL}/v1"
+
+        # MODEL and BASE_URL go into TOML strings below and into --config
+        # strings on the run step. A quote, backslash or control character
+        # (including a newline) could close the string and add config, so
+        # refuse anything outside a plain identifier / URL alphabet. The
+        # patterns live in single-quoted variables: backslash escapes inside an
+        # unquoted bracket expression let a literal backslash through on bash
+        # older than 5.2.
+        model_re='^[A-Za-z0-9._:/@-]+$'
+        base_url_re='^https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$'
+        if [[ ! $MODEL =~ $model_re ]]; then
+          echo "❌ Codex engine: model contains characters not allowed in a TOML string value: '$MODEL'"
+          exit 1
+        fi
+        if [[ ! $BASE_URL =~ $base_url_re ]]; then
+          echo "❌ Codex engine: base_url must be an http(s) URL with no quotes, backslashes or whitespace: '$BASE_URL'"
+          exit 1
+        fi
+
+        mkdir -p "$CODEX_HOME"
+
+        # Credentials stay in OPENAI_API_KEY (the provider's env_key) on the run
+        # step — nothing sensitive is written to disk. wire_api = "responses" because
+        # Codex CLI 0.160.0 refuses "chat" at startup; LiteLLM serves /v1/responses for
+        # gpt-6.1-sol.
+        #
+        # sandbox_mode = workspace-write + network_access = false confines the
+        # commands the model runs (see the header): they get no socket, so no
+        # direct GitHub API access. It does not stop the model quoting what it
+        # read in the review text; the header's residual-risk note covers that.
+        # approval_policy = never forbids it escalating
+        # out of the sandbox. web search is off here AND on the CLI; both so a
+        # config regression on one does not silently re-enable an outbound tool.
+        # reasoning effort is NOT written here: it is applied on the run step
+        # only when the input is non-empty, so the model default is untouched
+        # otherwise.
+        #
+        # [shell_environment_policy] is defense-in-depth for the LLM API key.
+        # Codex authenticates by reading OPENAI_API_KEY from its OWN process env
+        # (env_key) and that path is untouched. The policy governs the env of
+        # commands the MODEL spawns inside the sandbox: Codex's default excludes
+        # stay on (ignore_default_excludes = false drops *KEY*/*TOKEN*/*SECRET*)
+        # and OPENAI_API_KEY is named explicitly, so a sandboxed env or printenv
+        # cannot read the org key from its environment. It does not hide the key
+        # in the Codex process's own /proc environ (see the header's
+        # residual-risk note).
+        #
+        # KEEP COMMENTS OUT OF THIS HEREDOC. It is unquoted so ${MODEL} and
+        # ${BASE_URL} expand, which means a backtick or $( in a comment inside it
+        # RUNS: an earlier comment quoting `env` dumped the runner environment
+        # into config.toml. The contract test rejects both.
+        cat > "$CODEX_HOME/config.toml" <<EOF
+        model = "${MODEL}"
+        model_provider = "litellm"
+        approval_policy = "never"
+        sandbox_mode = "workspace-write"
+
+        [model_providers.litellm]
+        name = "LiteLLM proxy"
+        base_url = "${BASE_URL}"
+        env_key = "OPENAI_API_KEY"
+        wire_api = "responses"
+
+        [sandbox_workspace_write]
+        network_access = false
+        exclude_tmpdir_env_var = true
+
+        [tools]
+        web_search = false
+
+        [features]
+        hooks = false
+
+        [shell_environment_policy]
+        ignore_default_excludes = false
+        exclude = ["OPENAI_API_KEY", "*_API_KEY", "*_TOKEN", "*_SECRET*"]
+        EOF
+
+        echo "🔧 Codex engine | model=$MODEL | base_url=$BASE_URL"
+        # Step outputs live in the runner, not in a file the model can reach, so
+        # the run step can verify the config it is about to load is this one.
+        {
+          echo "config_sha256=$(sha256sum "$CODEX_HOME/config.toml" | cut -d' ' -f1)"
+          echo "base_url=$BASE_URL"
+          echo "model=$MODEL"
+        } >> "$GITHUB_OUTPUT"
+        # Codex itself rewrites config.toml while it runs (the smoke test saw
+        # the hash change after attempt 1 with no model write possible), so
+        # keep a read-only pristine copy beside the strip script. The run step
+        # checks the copy's hash and restores it before every attempt.
+        install -D -m 0444 "$CODEX_HOME/config.toml" "$CONFIG_PRISTINE"
+        echo "✅ Codex config written (CODEX_HOME=$CODEX_HOME)"
+
+    - name: Run AI PR review (Codex)
+      id: run
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        CODEX_HOME: ${{ runner.temp }}/codex-engine-home
+        # The provider's env_key. Codex reads the key from here; it is never
+        # written to config.toml or any other file on disk.
+        OPENAI_API_KEY: ${{ inputs.api_key }}
+        CI: "1"
+        CONTEXT_PATH: ${{ inputs.review_context_path }}
+        DIFF_PATH: ${{ inputs.pr_diff_path }}
+        OUTPUT_PATH: ${{ inputs.output_path }}
+        # The value the configure step validated, not the raw input.
+        MODEL: ${{ steps.configure.outputs.model }}
+        REASONING_EFFORT: ${{ inputs.reasoning_effort }}
+        CONFIG_SHA256: ${{ steps.configure.outputs.config_sha256 }}
+        BASE_URL: ${{ steps.configure.outputs.base_url }}
+        STRIP_SCRIPT: ${{ runner.temp }}/codex-engine-bin/strip-agent-config.sh
+        STRIP_SHA256: ${{ steps.strip.outputs.strip_sha256 }}
+        # CLI output for the current attempt. Under runner.temp, so the
+        # model's sandboxed commands cannot write it.
+        CLI_LOG: ${{ runner.temp }}/codex-engine-bin/cli-attempt.log
+        CONFIG_PRISTINE: ${{ runner.temp }}/codex-engine-bin/config.toml.pristine
+      run: |
+        [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Codex engine: missing or empty review context at $CONTEXT_PATH"; exit 1; }
+        [[ -s "$DIFF_PATH"    ]] || { echo "❌ Codex engine: missing or empty PR diff at $DIFF_PATH"; exit 1; }
+
+        # Validate reasoning_effort here, not just in the orchestrator: this
+        # engine is referenced by absolute @master path and can be called
+        # directly, so the value must be checked where it is consumed. Empty
+        # means "send no override" and is the common case.
+        #
+        # The accepted set is the Codex CLI's config enum for
+        # model_reasoning_effort: minimal|low|medium|high|xhigh. gpt-6.1-sol the
+        # MODEL also exposes `max` and `ultra` (they show in the Codex app and in
+        # `codex debug models`), but the CLI's own local validator rejects them
+        # and fail-fasts at startup before any request — so accepting them here
+        # would let a caller configure a job that dies before it writes a review.
+        # Do not add max/ultra until the pinned CLI's enum accepts them.
+        REASONING_ARGS=()
+        if [[ -n "$REASONING_EFFORT" ]]; then
+          case "$REASONING_EFFORT" in
+            minimal|low|medium|high|xhigh) ;;
+            *)
+              echo "❌ Codex engine: reasoning_effort must be one of minimal|low|medium|high|xhigh (or empty), got '$REASONING_EFFORT'"
+              exit 1
+              ;;
+          esac
+          REASONING_ARGS=(-c "model_reasoning_effort=\"${REASONING_EFFORT}\"")
+          echo "🔧 Codex engine | reasoning_effort=$REASONING_EFFORT"
+        fi
+
+        echo "🔧 Codex engine | model=$MODEL | codex_home=$CODEX_HOME"
+
+        # Quoted heredoc: the inputs.* expressions below are substituted by
+        # Actions before bash sees this script, so no shell expansion happens in
+        # the prompt body.
+        #
+        # Do NOT write an empty Actions expression pair in this block. Actions
+        # scans the whole run: string for expressions, including text bash treats
+        # as a comment, and an empty one fails manifest validation before any
+        # step runs.
+        # The step-by-step review procedure lives in the caller-built context
+        # file (its "Review Procedure" section), NOT here — it is engine-neutral,
+        # and duplicating it per engine let the copies drift. This prompt only
+        # bootstraps the model into that file.
+        cat > /tmp/review_prompt.txt <<'EOF'
+        REPO: ${{ inputs.repository }}
+        PR NUMBER: ${{ inputs.pr_number }}
+
+        Read ${{ inputs.review_context_path }} and follow it exactly. It contains
+        the full review instructions, PR context, previous review (if any),
+        acknowledged suggestions to skip, and the required output format — plus a
+        "Review Procedure" section telling you what else to read, including the
+        pre-fetched PR diff at ${{ inputs.pr_diff_path }}. You have no network
+        access; everything you need is on disk.
+
+        HOW THIS TASK IS DELIVERED: your chat reply is discarded and never reaches
+        anyone. The ONLY output that counts is the file ${{ inputs.output_path }}.
+        So your final action must write the complete review to that exact path.
+        Writing an analysis as your reply instead means the review is lost and the
+        job fails.
+        EOF
+
+        dump_codex_log() {
+          set +e +o pipefail
+          bytes_of() { wc -c < "$1" 2>/dev/null | tr -d '[:space:]' || echo '?'; }
+
+          echo "ℹ️  config: model=$MODEL codex_home=$CODEX_HOME"
+          echo "ℹ️  input bytes: context=$(bytes_of "$CONTEXT_PATH") diff=$(bytes_of "$DIFF_PATH") prompt=$(bytes_of /tmp/review_prompt.txt)"
+          if [[ -s "$OUTPUT_PATH" ]]; then
+            echo "ℹ️  review file: PRESENT at $OUTPUT_PATH ($(bytes_of "$OUTPUT_PATH") bytes) — the review itself survived"
+          else
+            echo "ℹ️  review file: ABSENT at $OUTPUT_PATH — the model never wrote the review"
+          fi
+
+          # Only CODEX_HOME: it is outside the sandbox-writable roots, so the
+          # model cannot create or edit files there. The session logs inside it
+          # still record text the model chose, and searching /tmp would let the
+          # model choose which files land here too. Output is wrapped in
+          # ::stop-commands:: so log text cannot run workflow commands.
+          CODEX_LOGS=$(find "$CODEX_HOME" -maxdepth 5 -type f \( -name '*.log' -o -name '*.jsonl' \) 2>/dev/null | head -3 || true)
+          if [[ -n "$CODEX_LOGS" ]]; then
+            STOP_TOKEN="codex-log-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+            while IFS= read -r log; do
+              lines=$(wc -l < "$log" | tr -d '[:space:]')
+              echo "--- $log (last 200 of $lines lines) ---"
+              echo "::stop-commands::$STOP_TOKEN"
+              tail -n 200 "$log"
+              echo "::$STOP_TOKEN::"
+              [[ "$lines" -gt 200 ]] && echo "⚠️  truncated: $log has $lines lines"
+            done <<< "$CODEX_LOGS"
+          else
+            echo "ℹ️  no codex log written; provider response body unavailable"
+          fi
+
+          echo "ℹ️  Troubleshooting: a 400 on the FIRST request is config —"
+          echo "    the proxy not serving /v1/responses for this model, or the alias not resolving"
+          echo "    at the proxy. After the agent has started reading files,"
+          echo "    config is probably fine."
+        }
+
+        rm -f "$OUTPUT_PATH"
+        REVIEW_PROMPT="$(cat /tmp/review_prompt.txt)"
+
+        # Every setting that decides where the API key goes or what the sandbox
+        # allows is pinned here as well as in config.toml, so a config edit
+        # cannot change it: provider, base_url, env_key, wire_api, model, and
+        # the sandbox/approval/network/web-search settings.
+        PIN_ARGS=(
+          --sandbox workspace-write
+          --config "model=\"${MODEL}\""
+          --config 'model_provider="litellm"'
+          --config "model_providers.litellm.base_url=\"${BASE_URL}\""
+          --config 'model_providers.litellm.env_key="OPENAI_API_KEY"'
+          --config 'model_providers.litellm.wire_api="responses"'
+          --config approval_policy='"never"'
+          --config sandbox_workspace_write.network_access=false
+          --config sandbox_workspace_write.exclude_tmpdir_env_var=true
+          --config tools.web_search=false
+        )
+
+        # Run before EVERY attempt. Attempt 1 can write anything into the
+        # checkout, including a fresh AGENTS.md or .codex/ for attempt 2 to load,
+        # so the strip step's own script runs again (same file, hash-checked, so
+        # the two sweeps cannot drift). config.toml sits outside the sandbox's
+        # writable roots, but Codex itself may rewrite it during a run, so it is
+        # restored from the hash-checked pristine copy and re-hashed.
+        pre_attempt_guard() {
+          [[ -n "$CONFIG_SHA256" && -n "$BASE_URL" && -n "$MODEL" && -n "$STRIP_SHA256" ]] || { echo "❌ Codex engine: strip/configure step outputs missing"; exit 1; }
+          if [[ "$(sha256sum "$STRIP_SCRIPT" | cut -d' ' -f1)" != "$STRIP_SHA256" ]]; then
+            echo "❌ Codex engine: strip script changed since the strip step. Refusing to start the CLI."
+            exit 1
+          fi
+          bash -euo pipefail "$STRIP_SCRIPT"
+          if [[ "$(sha256sum "$CONFIG_PRISTINE" | cut -d' ' -f1)" != "$CONFIG_SHA256" ]]; then
+            echo "❌ Codex engine: pristine config.toml copy changed since the configure step. Refusing to start the CLI."
+            exit 1
+          fi
+          cp -f -- "$CONFIG_PRISTINE" "$CODEX_HOME/config.toml"
+          ACTUAL_SHA="$(sha256sum "$CODEX_HOME/config.toml" | cut -d' ' -f1)"
+          if [[ "$ACTUAL_SHA" != "$CONFIG_SHA256" ]]; then
+            echo "❌ Codex engine: config.toml changed since the configure step (sha256 $ACTUAL_SHA, expected $CONFIG_SHA256). Refusing to start the CLI."
+            exit 1
+          fi
+        }
+
+        # The model can write /tmp, so after it has run the review file may be
+        # a symlink or hard link to some other readable file, or a path that
+        # no longer resolves under /tmp. Accept only a regular, singly-linked
+        # file whose real path is still under /tmp. The orchestrator's post
+        # step then copies it out of /tmp without following links before it
+        # reads it (see ai-pr-review.yml).
+        review_file_ok() {
+          [[ -e "$OUTPUT_PATH" || -L "$OUTPUT_PATH" ]] || return 1
+          if [[ -L "$OUTPUT_PATH" || ! -f "$OUTPUT_PATH" ]]; then
+            echo "❌ Codex engine: $OUTPUT_PATH is not a regular file (symlink or special file). Refusing it."
+            exit 1
+          fi
+          if [[ "$(stat -c %h -- "$OUTPUT_PATH")" -ne 1 ]]; then
+            echo "❌ Codex engine: $OUTPUT_PATH has more than one hard link. Refusing it."
+            exit 1
+          fi
+          case "$(realpath -e -- "$OUTPUT_PATH")" in
+            /tmp/*) ;;
+            *) echo "❌ Codex engine: $OUTPUT_PATH no longer resolves under /tmp. Refusing it."; exit 1 ;;
+          esac
+          [[ -s "$OUTPUT_PATH" ]]
+        }
+
+        # No GitHub token in this step's env. codex exec runs non-interactively
+        # (no TTY, no approval prompts). --skip-git-repo-check because the
+        # checkout may not look like a git repo root to Codex.
+        #
+        # CLI output (which includes text the model chose, and Codex is the only
+        # engine whose model has a shell) goes to CLI_LOG, not to the step's
+        # stdout. It is printed after the attempt ends, inside a random
+        # ::stop-commands:: token, so nothing it contains can run a workflow
+        # command. The token is never exported, so the model's commands cannot
+        # read it from their environment. A process the model leaves behind
+        # writes to CLI_LOG too, never to the step log.
+        #
+        # codex exec runs in its own session, and the whole session is killed
+        # before the log is printed and before the review is checked. A process
+        # the model detaches with nohup or & stays in that session, so it cannot
+        # rewrite the review after review_file_ok. One that calls setsid itself
+        # leaves the session, and this kill does not reach it. Whether the bwrap
+        # sandbox takes it down with the command depends on how Codex builds the
+        # sandbox: CLI 0.160.0 passes --die-with-parent, but its binary does not
+        # contain --unshare-pid, so this is not relied on. The post step reads
+        # only its own no-follow copy of the review, re-checked, so a late
+        # rewrite changes model-authored text at most and still goes through
+        # the leak checks. The job's orphan-process cleanup ends any survivor.
+        for attempt in 1 2; do
+          pre_attempt_guard
+          LIVE_TOKEN="codex-live-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::$LIVE_TOKEN"
+          setsid --wait codex exec \
+            --skip-git-repo-check \
+            "${PIN_ARGS[@]}" \
+            "${REASONING_ARGS[@]}" \
+            "$REVIEW_PROMPT" > "$CLI_LOG" 2>&1 < /dev/null &
+          CODEX_PID=$!
+          wait "$CODEX_PID" && CODEX_STATUS=0 || CODEX_STATUS=$?
+          pkill -KILL -s "$CODEX_PID" 2>/dev/null || true
+          # Printed only after the session is gone, still inside the token.
+          cat -- "$CLI_LOG"
+          echo "::$LIVE_TOKEN::"
+          unset LIVE_TOKEN
+
+          # Codex 0.160.0 does not reject an unknown config key: it prints
+          # "Codex is ignoring N unrecognized configuration setting" and runs
+          # anyway (the smoke test confirmed this with a misspelled
+          # [features] hooks). A renamed or misspelled key would then switch a
+          # control off without a sound, so treat that warning as fatal and
+          # post nothing. CLI_LOG lives under runner.temp, which the model
+          # cannot write.
+          if grep -cF "unrecognized configuration setting" "$CLI_LOG" >/dev/null; then
+            echo "❌ Codex engine: the CLI ignored a config setting (see the warning above). A control may be off, so the review is refused."
+            rm -f -- "$OUTPUT_PATH"
+            exit 1
+          fi
+
+          if review_file_ok; then
+            if [[ "$CODEX_STATUS" -ne 0 ]]; then
+              echo "⚠️  Codex engine: CLI exited $CODEX_STATUS AFTER writing the review — keeping the review and continuing."
+              ( dump_codex_log ) || true
+            fi
+            break
+          fi
+
+          if [[ "$attempt" -eq 1 ]]; then
+            echo "⚠️  Codex engine: CLI exited $CODEX_STATUS with no review written — retrying once."
+            ( dump_codex_log ) || true
+            echo "🔁 Codex engine: attempt 2 of 2"
+          fi
+        done
+
+        if ! review_file_ok; then
+          echo "❌ Codex engine: no review written to $OUTPUT_PATH after 2 attempts (last CLI exit: $CODEX_STATUS)"
+          ( dump_codex_log ) || true
+          exit 1
+        fi
+        echo "✅ Codex engine: review written ($(wc -c < "$OUTPUT_PATH") bytes)"
+        echo "output_path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"

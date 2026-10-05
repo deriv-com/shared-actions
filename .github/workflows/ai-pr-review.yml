@@ -16,11 +16,14 @@ name: AI PR Review
 #   .github/actions/ai_review_engine_<engine>/ owning its own CLI, sandbox model,
 #   tool restrictions and PR-supplied-config stripping.
 #
-# Adding an engine is exactly 3 edits:
+# Adding an engine takes at least 4 edits (AI_PR_REVIEW_README.md, "Adding an
+# engine", lists the extra ones an engine-specific input needs):
 #   1. .github/actions/ai_review_engine_<name>/action.yml   (the engine contract)
 #   2. a `case` arm in "Resolve and validate engine" below  (enum + defaults)
 #   3. an `if:`-gated step in the ENGINE DISPATCH block      (`uses:` takes no
 #      expressions, so dispatch cannot be a single dynamic step)
+#   4. the engine's title in the `jobs.ai-review.name` ternary (job names
+#      cannot read step outputs, so it repeats the case arm's REVIEW_TITLE)
 #
 # Everything outside ENGINE DISPATCH is engine-neutral scaffolding: access gate,
 # prompt fetch, previous-review capture/cleanup, context build, diff pre-fetch,
@@ -32,17 +35,17 @@ on:
   workflow_call:
     inputs:
       engine:
-        description: "Review engine: `kimi` (Kimi Code CLI), `anthropic` (Claude Code Action), or `grok` (Grok Build CLI). Each is a composite action under .github/actions/ai_review_engine_<engine>/. Set this explicitly — the default is `kimi`, so an omitted value on a repo migrating from claude-pr-review.yml would switch LLM vendor."
+        description: "Review engine: `kimi` (Kimi Code CLI), `anthropic` (Claude Code Action), `grok` (Grok Build CLI), or `codex` (OpenAI Codex CLI). Each is a composite action under .github/actions/ai_review_engine_<engine>/. Set this explicitly — the default is `kimi`, so an omitted value on a repo migrating from claude-pr-review.yml would switch LLM vendor."
         required: false
         default: "kimi"
         type: string
       review_title:
-        description: "Visible Checks name and comment heading (the post step appends ' Complete'). Empty keeps the engine default (Kimi PR Review / Claude PR Review / Grok PR Review) and one slot per engine. Set this to run a second caller on the same engine as a concurrent slot — e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review. Must end in ' PR Review' so follow-up header strip stays in lockstep. Concurrency, the canonical HTML marker, and the progress marker include the title when set. An invalid value still appears in the Check name at parse time; the job name is not authoritative until the run succeeds."
+        description: "Visible Checks name and comment heading (the post step appends ' Complete'). Empty keeps the engine default (Kimi PR Review / Claude PR Review / Grok PR Review / Codex PR Review) and one slot per engine. Set this to run a second caller on the same engine as a concurrent slot — e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review. Must end in ' PR Review' so follow-up header strip stays in lockstep. Concurrency, the canonical HTML marker, and the progress marker include the title when set. An invalid value still appears in the Check name at parse time; the job name is not authoritative until the run succeeds."
         required: false
         default: ""
         type: string
       model:
-        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5, grok -> grok-4.6). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
+        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5, grok -> grok-4.6, codex -> gpt-6.1-sol). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
         required: false
         default: ""
         type: string
@@ -52,17 +55,22 @@ on:
         default: ""
         type: string
       max_context_size:
-        description: "[engine-specific: kimi, grok] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; grok-4.6 is 500000; the 256k Kimi variants are 262144. Empty resolves per engine. Ignored when engine is `anthropic`."
+        description: "[engine-specific: kimi, grok] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; grok-4.6 is 500000; the 256k Kimi variants are 262144. Empty resolves per engine. Ignored when engine is `anthropic` or `codex`."
         required: false
         default: ""
         type: string
       cli_version:
-        description: "[engine-specific: kimi, grok] Exact CLI version to install (`@moonshot-ai/kimi-code` for kimi, `@xai-official/grok` for grok). Pinned deliberately — `latest` risks both breaking changes and unreviewed code in a privileged job. Empty resolves to the per-engine pin in the 'Resolve and validate engine' step; bump it there via PR. Ignored when engine is `anthropic`."
+        description: "[engine-specific: kimi, grok, codex] Exact CLI version to install (`@moonshot-ai/kimi-code` for kimi, `@xai-official/grok` for grok, `@openai/codex` for codex). Pinned deliberately — `latest` risks both breaking changes and unreviewed code in a privileged job. Empty resolves to the per-engine pin in the 'Resolve and validate engine' step; bump it there via PR. Ignored when engine is `anthropic`."
         required: false
         default: ""
         type: string
       provider_type:
         description: "[engine-specific: kimi] Wire dialect the Kimi CLI speaks: kimi, anthropic, openai, openai_responses, google-genai, vertexai. Must match what `base_url` serves — `kimi` targets api.kimi.com/coding/v1 and a LiteLLM proxy rejects it with a bare 400, while `openai` speaks the plain /v1/chat/completions the proxy serves. Change this only alongside `base_url`. Empty resolves to `openai`. Ignored when engine is not `kimi`."
+        required: false
+        default: ""
+        type: string
+      reasoning_effort:
+        description: "[engine-specific: codex] Reasoning effort for the Codex review turn: minimal, low, medium, high, or xhigh (the Codex CLI config enum). The gpt-6.1-sol model also exposes max/ultra, but the CLI rejects those, so they are not accepted; widen the set here, in the resolve step and in the engine once the pinned CLI accepts them. Empty sends no override and leaves the model/endpoint default. Validated in the 'Resolve and validate engine' step and passed to the codex dispatch step as `-c model_reasoning_effort`. Ignored when engine is not `codex` (the other engines take no such input)."
         required: false
         default: ""
         type: string
@@ -89,7 +97,7 @@ on:
 
 jobs:
   ai-review:
-    name: ${{ inputs.review_title != '' && inputs.review_title || (inputs.engine == 'grok' && 'Grok PR Review' || (inputs.engine == 'anthropic' && 'Claude PR Review' || 'Kimi PR Review')) }}
+    name: ${{ inputs.review_title != '' && inputs.review_title || (inputs.engine == 'grok' && 'Grok PR Review' || (inputs.engine == 'codex' && 'Codex PR Review' || (inputs.engine == 'anthropic' && 'Claude PR Review' || 'Kimi PR Review'))) }}
     runs-on:
       group: github_claude_code_reviewer
     # Bot actors are skipped, not failed: dependabot and friends are not org
@@ -251,6 +259,7 @@ jobs:
           MAX_CONTEXT_INPUT: ${{ inputs.max_context_size }}
           CLI_VERSION_INPUT: ${{ inputs.cli_version }}
           PROVIDER_TYPE_INPUT: ${{ inputs.provider_type }}
+          REASONING_EFFORT_INPUT: ${{ inputs.reasoning_effort }}
           PROMPT_GIST_URL_INPUT: ${{ inputs.prompt_gist_url }}
         run: |
           ENGINE="${ENGINE_INPUT:-kimi}"
@@ -301,9 +310,20 @@ jobs:
               DEFAULT_CLI_VERSION="1.0.5"
               REVIEW_TITLE="Grok PR Review"
               ;;
+            codex)
+              # LiteLLM alias for GPT-6.1 Sol, served over the OpenAI Responses API.
+              # The Codex engine ignores max_context_size (Codex manages its own
+              # context window); cli_version pins the Codex CLI.
+              DEFAULT_MODEL="gpt-6.1-sol"
+              METRICS_AGENT="codex_review"
+              ARTIFACT_PREFIX="codex-review"
+              DEFAULT_MAX_CONTEXT=""
+              DEFAULT_CLI_VERSION="0.160.0"
+              REVIEW_TITLE="Codex PR Review"
+              ;;
             *)
               echo "❌ Unknown engine: '$ENGINE'"
-              echo "   Supported values for the \`engine\` input: kimi, anthropic, grok"
+              echo "   Supported values for the \`engine\` input: kimi, anthropic, grok, codex"
               exit 1
               ;;
           esac
@@ -341,6 +361,27 @@ jobs:
           PROVIDER_TYPE="${PROVIDER_TYPE_INPUT:-openai}"
           PROMPT_GIST_URL="${PROMPT_GIST_URL_INPUT:-https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/2d5131aa058801e99fe77f69db124bf583f7d3ea/claude-review-format.md}"
 
+          # reasoning_effort is codex-only (like provider_type is kimi-only).
+          # Empty is the default — no override is sent, and the codex engine
+          # leaves the model default untouched. Validate a non-empty value here
+          # so a typo fails at resolve time with a clear message rather than
+          # inside the engine an hour later. The other engines ignore it.
+          # The set is the Codex CLI config enum. The model also has max/ultra;
+          # add them here, in the input description and in the engine once the
+          # pinned CLI accepts them (tests/ai-pr-review-contract.sh checks that
+          # all copies match).
+          REASONING_EFFORT="${REASONING_EFFORT_INPUT:-}"
+          if [[ -n "$REASONING_EFFORT" ]]; then
+            case "$REASONING_EFFORT" in
+              minimal|low|medium|high|xhigh) ;;
+              *)
+                echo "❌ Invalid reasoning_effort '$REASONING_EFFORT'"
+                echo "   Use one of: minimal, low, medium, high, xhigh (or leave empty for the model default)."
+                exit 1
+                ;;
+            esac
+          fi
+
           {
             echo "engine=$ENGINE"
             echo "model=$MODEL"
@@ -349,6 +390,7 @@ jobs:
             echo "max_context_size=$MAX_CONTEXT"
             echo "cli_version=$CLI_VERSION"
             echo "provider_type=$PROVIDER_TYPE"
+            echo "reasoning_effort=$REASONING_EFFORT"
             echo "prompt_gist_url=$PROMPT_GIST_URL"
           } >> "$GITHUB_OUTPUT"
 
@@ -820,7 +862,7 @@ jobs:
             echo ""
             echo "Work through these steps in order:"
             echo ""
-            echo "1. Read $PR_DIFF_FILE — the full diff for this PR (changed files and hunks), already fetched for you. You have no shell tool; everything you need is on disk."
+            echo "1. Read $PR_DIFF_FILE — the full diff for this PR (changed files and hunks), already fetched for you. You have no network access, so do not try to fetch anything; everything you need is on disk."
             echo "2. For each changed file, use Read to open the full file — not just the diff hunk. Full file context is required to understand the complete impact of each change."
             echo "3. For each changed file, identify and Read its dependencies:"
             echo "   - Imported modules, utilities, or shared helpers referenced in the changed code"
@@ -900,7 +942,9 @@ jobs:
       # supported on steps inside a composite action. Keep the values in sync.
       #
       # Each engine owns: stripping PR-supplied agent config, its own CLI and
-      # sandbox config, and granting the model NO shell tool. Each reads
+      # sandbox config, and granting the model NO shell tool (codex is the one
+      # exception: a sandboxed shell with no network and no token; see its
+      # header). Each reads
       # review_context_path + pr_diff_path and writes output_path. None of them
       # post comments — the post step below is the only thing that can.
       # =====================================================================
@@ -955,6 +999,23 @@ jobs:
           max_context_size: ${{ steps.engine.outputs.max_context_size }}
           cli_version: ${{ steps.engine.outputs.cli_version }}
 
+      - name: AI review (OpenAI Codex engine)
+        id: engine-codex
+        if: steps.engine.outputs.engine == 'codex'
+        timeout-minutes: 60
+        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_codex@master
+        with:
+          repository: ${{ github.repository }}
+          pr_number: ${{ github.event.pull_request.number }}
+          review_context_path: ${{ env.REVIEW_CONTEXT_FILE }}
+          pr_diff_path: ${{ env.PR_DIFF_FILE }}
+          output_path: ${{ env.REVIEW_OUTPUT_FILE }}
+          model: ${{ steps.engine.outputs.model }}
+          base_url: ${{ steps.engine.outputs.base_url }}
+          api_key: ${{ secrets.LLM_API_KEY }}
+          cli_version: ${{ steps.engine.outputs.cli_version }}
+          reasoning_effort: ${{ steps.engine.outputs.reasoning_effort }}
+
       # ====================== END ENGINE DISPATCH ==========================
 
       - name: Post review as single PR comment
@@ -973,6 +1034,25 @@ jobs:
             exit 1
           fi
 
+          # The review sits in /tmp, which an engine whose model has a shell
+          # (codex) can write. Take a private copy before trusting it: refuse a
+          # symlink, special file or hard-linked file, copy without following
+          # links into a fresh directory under runner.temp, and re-check the
+          # copy. Every read and every scratch file below uses that directory,
+          # so a symlink planted in /tmp cannot redirect a read or a `>` write.
+          POST_DIR="$(mktemp -d "$RUNNER_TEMP/ai-review-post.XXXXXX")"
+          if [[ -L "$REVIEW_OUTPUT_FILE" || ! -f "$REVIEW_OUTPUT_FILE" ]] \
+             || [[ "$(stat -c %h -- "$REVIEW_OUTPUT_FILE")" -ne 1 ]]; then
+            echo "❌ Review file $REVIEW_OUTPUT_FILE is not a regular, singly-linked file — refusing to post."
+            exit 1
+          fi
+          cp -P -- "$REVIEW_OUTPUT_FILE" "$POST_DIR/review.md"
+          if [[ -L "$POST_DIR/review.md" || ! -f "$POST_DIR/review.md" || ! -s "$POST_DIR/review.md" ]]; then
+            echo "❌ Review file changed while it was being copied — refusing to post."
+            exit 1
+          fi
+          REVIEW_OUTPUT_FILE="$POST_DIR/review.md"
+
           # Exfiltration guard. Actions masks secrets in LOGS, not in comment
           # bodies — and the model's output is derived from attacker-influenced
           # input (the diff, the PR description). If an injection ever talks the
@@ -981,8 +1061,9 @@ jobs:
           # Everything up to the post below is deliberately fail-CLOSED: on any
           # failure in this step's checks, the previous review is untouched.
           #
-          # Checked in order: the LLM API key and the job's GitHub token as
-          # literals (GH_TOKEN in this step's env IS the job token —
+          # Checked in order: the LLM API key as a literal and as base64 (a model
+          # with a shell can encode it); then the job's GitHub token as a
+          # literal (GH_TOKEN in this step's env IS the job token —
           # secrets.GITHUB_TOKEN — so one literal check covers it; do not add a
           # second variable holding the same value); then GitHub token shapes
           # (ghp_/gho_/ghu_/ghs_/ghr_, github_pat_) in case the model quoted one
@@ -1004,9 +1085,37 @@ jobs:
           # secret should be. (HackerOne #4037167)
           token_shapes_re='gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}'
           cred_shapes_re='authorization: *basic +[A-Za-z0-9+/=]{16,}|extraheader *= *authorization|includeif *"?gitdir:|git-credentials-[0-9a-f-]{8,}\.config|eC1hY2Nlc3MtdG9rZW46[A-Za-z0-9+/=]{10,}|x-access-token:[A-Za-z0-9_.-]{20,}@'
+          # base64 of the key at each of the three byte alignments. Encoding
+          # the key on its own, after `echo`'s newline, or inside a longer
+          # string (`env | base64`, `K=$KEY`) only changes the 4-character
+          # groups at the edges, so each form drops those edges and keeps the
+          # middle, which depends on key bytes alone. Matched against the
+          # review with every whitespace character removed, so 76-column
+          # wrapping cannot split it.
+          b64_key_in() {
+            local flat form pad
+            flat="$(tr -d '[:space:]' < "$1")"
+            for pad in "" "A" "AA"; do
+              form="$(printf '%s%s' "$pad" "$LLM_API_KEY" | base64 -w0)"
+              [[ -n "$pad" ]] && form="${form:4}"
+              (( ${#form} > 4 )) && form="${form:0:${#form}-4}" || form=""
+              (( ${#form} >= 12 )) && [[ "$flat" == *"$form"* ]] && return 0
+            done
+            return 1
+          }
           LEAK=""
           if [[ -n "$LLM_API_KEY" ]] && grep -qF -- "$LLM_API_KEY" "$REVIEW_OUTPUT_FILE"; then
             LEAK="the LLM API key (literal LLM_API_KEY value)"
+          elif [[ -n "$LLM_API_KEY" ]] && b64_key_in "$REVIEW_OUTPUT_FILE"; then
+            # The engines whose model gets a shell (codex) could, under prompt
+            # injection, base64 the key to slip past the literal check above.
+            # Match that encoding too, at all three byte alignments (so the key
+            # encoded alone, after a newline, or inside `env | base64` output),
+            # against the review with all whitespace removed so base64's
+            # 76-column wrapping cannot split it. Still fail-closed,
+            # still prefix-only. A hex, reversed or split copy still passes;
+            # the engine header's residual-risk note says so.
+            LEAK="the LLM API key (base64-encoded LLM_API_KEY value)"
           elif [[ -n "${GH_TOKEN:-}" ]] && grep -qF -- "$GH_TOKEN" "$REVIEW_OUTPUT_FILE"; then
             LEAK="the job's GitHub token (literal GH_TOKEN value)"
           elif HIT=$(grep -oE "$token_shapes_re" "$REVIEW_OUTPUT_FILE" | head -n1); [[ -n "$HIT" ]]; then
@@ -1037,10 +1146,10 @@ jobs:
             # writes the valid prefix but still exits non-zero ("incomplete
             # character"), and under this step's pipefail that would fail the
             # run on exactly the input truncation exists to handle.
-            head -c "$MAX_BODY" "$REVIEW_OUTPUT_FILE" | iconv -f UTF-8 -t UTF-8 -c > /tmp/review_truncated.txt || true
+            head -c "$MAX_BODY" "$REVIEW_OUTPUT_FILE" | iconv -f UTF-8 -t UTF-8 -c > "$POST_DIR/review_truncated.txt" || true
             printf '\n\n> ⚠️ Review truncated from %s to %s bytes to fit GitHub'"'"'s comment size limit. The full text is in this run'"'"'s job log.\n' \
-              "$SIZE" "$MAX_BODY" >> /tmp/review_truncated.txt
-            mv /tmp/review_truncated.txt "$REVIEW_OUTPUT_FILE"
+              "$SIZE" "$MAX_BODY" >> "$POST_DIR/review_truncated.txt"
+            mv "$POST_DIR/review_truncated.txt" "$REVIEW_OUTPUT_FILE"
           fi
 
           # Visible header is injected here so it cannot drift per model and the
@@ -1051,8 +1160,8 @@ jobs:
             printf '## 🤖 %s Complete\n\n' "$REVIEW_TITLE"
             printf '%s\n\n' "${REVIEW_TYPE:-📋 Initial Review}"
             cat "$REVIEW_OUTPUT_FILE"
-          } > /tmp/review_with_header.txt
-          mv /tmp/review_with_header.txt "$REVIEW_OUTPUT_FILE"
+          } > "$POST_DIR/review_with_header.txt"
+          mv "$POST_DIR/review_with_header.txt" "$REVIEW_OUTPUT_FILE"
 
           # Append the detection metadata here rather than asking the model to
           # emit it. Dedup on the next push then depends on this step, not on LLM
@@ -1073,9 +1182,10 @@ jobs:
           # including legacy.
           #
           # This step runs AFTER the engine, so nothing it executes or trusts
-          # may come from a path an engine's Write tool could reach: the filter
-          # is job env, not a /tmp file, and every /tmp file below is written
-          # fresh with `>` before it is read. Keep it that way.
+          # may come from a path an engine could write: the filter is job env,
+          # not a /tmp file, and every scratch file in this step lives in
+          # $POST_DIR (a fresh mktemp -d under runner.temp, outside every
+          # sandbox-writable root), never in /tmp. Keep it that way.
           #
           # Post FIRST, delete after. Deletion used to happen in the capture
           # step, an hour earlier — any failure in between left the PR with no
@@ -1085,10 +1195,10 @@ jobs:
           # trades it for the harmless inverse — a transient duplicate that the
           # next run reaps, since its reap-list is built the same way.
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            | jq -s 'add // []' > /tmp/comments_at_post.json
-          jq "$REVIEW_MARKER_FILTER" /tmp/comments_at_post.json \
+            | jq -s 'add // []' > "$POST_DIR/comments_at_post.json"
+          jq "$REVIEW_MARKER_FILTER" "$POST_DIR/comments_at_post.json" \
             | jq -r --arg skip "${PROGRESS_COMMENT_ID:-}" \
-              '.[] | select((.id | tostring) != $skip) | .id' > /tmp/reap_ids.txt
+              '.[] | select((.id | tostring) != $skip) | .id' > "$POST_DIR/reap_ids.txt"
 
           # Edit the progress comment into the review (same comment id, same
           # URL) so the thread is one conversation, like Claude's tracker.
@@ -1107,7 +1217,7 @@ jobs:
           # "did not finish".
           echo "REVIEW_POSTED=1" >> "$GITHUB_ENV"
 
-          xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE < /tmp/reap_ids.txt
+          xargs -r -I {} gh api "repos/${REPO}/issues/comments/{}" -X DELETE < "$POST_DIR/reap_ids.txt"
           echo "✅ Previous review(s) reaped"
 
       - name: Mark progress comment failed
@@ -1122,8 +1232,8 @@ jobs:
             printf '%s did not finish this review.\n\n' "${REVIEW_TITLE%% PR Review}"
             printf 'See the [job log](%s) for details. The previous review comment, if any, is unchanged.\n\n' "$RUN_URL"
             printf '%s\n' "${PROGRESS_MARKER:-<!-- deriv-pr-review-progress-${REVIEW_ENGINE}${REVIEW_SLOT_SUFFIX:-} -->}"
-          } > /tmp/progress_failed.md
-          jq -n --arg body "$(cat /tmp/progress_failed.md)" '{body: $body}' \
+          } > "$RUNNER_TEMP/progress_failed.md"
+          jq -n --arg body "$(cat "$RUNNER_TEMP/progress_failed.md")" '{body: $body}' \
             | gh api "repos/${{ github.repository }}/issues/comments/${PROGRESS_COMMENT_ID}" --method PATCH --input -
           echo "⚠️ Progress comment updated to failed"
 

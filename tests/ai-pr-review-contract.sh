@@ -99,6 +99,7 @@ check 'grep -q "test-scripts:" "$LINT"' "lint-actions keeps master's test-script
 KIMI="$ROOT/.github/actions/ai_review_engine_kimi/action.yml"
 ANTH="$ROOT/.github/actions/ai_review_engine_anthropic/action.yml"
 GROK="$ROOT/.github/actions/ai_review_engine_grok/action.yml"
+CODEX="$ROOT/.github/actions/ai_review_engine_codex/action.yml"
 GUARD="$ROOT/.github/actions/ai_review_path_guard/path-guard.js"
 GUARD_TEST="$ROOT/.github/actions/ai_review_path_guard/path-guard.test.js"
 
@@ -134,12 +135,193 @@ check 'grep -q "git/trees/" <<< "$SYMLINK_STEP" && grep -qF ".mode == \"120000\"
 check '! grep -q "recursive=1" <<< "$SYMLINK_STEP"' "symlink step walks non-recursive tree listings (the recursive form truncates silently)"
 FILE_SWEEP='-o \( -type f -o -type l \)'
 DIR_SWEEP='-o \( -type d -o -type l \)'
-for engine in "$KIMI" "$ANTH" "$GROK"; do
+for engine in "$KIMI" "$ANTH" "$GROK" "$CODEX"; do
   name=$(basename "$(dirname "$engine")")
   check 'grep -qF -- "$FILE_SWEEP" "$engine"' "$name: instruction-file scrub matches symlinks"
   check 'grep -qF -- "$DIR_SWEEP" "$engine"' "$name: config-directory scrub matches symlinks"
   check '! grep -qE -- "-prune -o -type [fd] " "$engine"' "$name: no scrub keyed on a bare -type f / -type d remains"
 done
+
+# ---------------------------------------------------------------------------
+# Codex engine — the fourth engine. The "adding an engine is N edits" contract
+# (header, enum case arm, dispatch gate, job name, outputs) plus the inputs the
+# user asked for (reasoning_effort), plus the one place this engine DEVIATES
+# from Kimi/Anthropic: it cannot wire the shared path guard, so its sandbox is
+# the enforcement and that must stay. These checks fail if a refactor drops the
+# codex arm, un-wires reasoning_effort, or relaxes the sandbox controls.
+# ---------------------------------------------------------------------------
+check '[[ -f "$CODEX" ]]' "codex engine action.yml is committed"
+
+# Enum: resolve-step case arm, unknown-engine error list, and job name all name codex.
+check 'grep -qE "^            codex\)" "$WF"' "resolve step has a codex case arm"
+check 'grep -q "kimi, anthropic, grok, codex" "$WF"' "unknown-engine error lists codex"
+check 'grep -qF "inputs.engine == '\''codex'\'' && '\''Codex PR Review'\''" "$WF"' "job name resolves codex to Codex PR Review"
+check 'grep -q "DEFAULT_MODEL=\"gpt-6.1-sol\"" "$WF"' "codex arm pins DEFAULT_MODEL=gpt-6.1-sol"
+check 'grep -q "METRICS_AGENT=\"codex_review\"" "$WF"' "codex arm pins METRICS_AGENT=codex_review"
+check 'grep -q "ARTIFACT_PREFIX=\"codex-review\"" "$WF"' "codex arm pins ARTIFACT_PREFIX=codex-review"
+
+# Dispatch: an if-gated step referencing the codex engine by absolute @master path.
+check 'grep -q "if: steps.engine.outputs.engine == '\''codex'\''" "$WF"' "codex dispatch step is if-gated on the engine output"
+check 'grep -q "ai_review_engine_codex@master" "$WF"' "codex dispatch references the engine by absolute @master path"
+check 'awk '\''/if: steps.engine.outputs.engine == .codex./{g=1} g && /timeout-minutes: 60/{print; exit}'\'' "$WF" | grep -q "timeout-minutes: 60"' "codex dispatch step carries timeout-minutes: 60"
+
+# reasoning_effort: declared input (default empty), resolve-step validation,
+# emitted on the step outputs, and passed to the codex dispatch step.
+check 'grep -q "^      reasoning_effort:" "$WF"' "reasoning_effort input is declared"
+check 'awk '\''/^      reasoning_effort:/{f=1} f && /default:/{print; exit}'\'' "$WF" | grep -q "default: \"\""' "reasoning_effort defaults to empty"
+check 'grep -q "REASONING_EFFORT_INPUT:" "$WF"' "resolve step reads reasoning_effort"
+check 'grep -q "minimal|low|medium|high|xhigh" "$WF"' "resolve step validates reasoning_effort against minimal|low|medium|high|xhigh"
+check 'grep -q "echo \"reasoning_effort=\$REASONING_EFFORT\"" "$WF"' "resolve step emits reasoning_effort on the step outputs"
+check 'grep -q "reasoning_effort: \${{ steps.engine.outputs.reasoning_effort }}" "$WF"' "codex dispatch step passes reasoning_effort through"
+# Engine side: accepts the input and only overrides when non-empty.
+check 'grep -q "^  reasoning_effort:" "$CODEX"' "codex engine declares the reasoning_effort input"
+check 'grep -q "model_reasoning_effort" "$CODEX"' "codex engine maps reasoning_effort onto model_reasoning_effort"
+check 'grep -qE "if \[\[ -n \"\\\$REASONING_EFFORT\" \]\]" "$CODEX"' "codex engine applies reasoning_effort only when non-empty"
+
+# This engine CANNOT wire the shared path guard (Codex's hook contract uses
+# Bash/apply_patch tool names and tool_input.command, not Read/Write + a path),
+# so the sandbox is the enforcement boundary. These are its load-bearing
+# controls; a refactor must not quietly remove them.
+check 'grep -q -- "--sandbox workspace-write" "$CODEX"' "codex engine also pins the sandbox on the CLI (config regression cannot relax it)"
+check 'grep -q "sandbox_workspace_write.network_access=false" "$CODEX"' "codex engine also pins network_access=false on the CLI"
+check '! step_body "Run AI PR review (Codex)" "$CODEX" | grep -cE "^ *(GITHUB_TOKEN|GH_TOKEN):" >/dev/null' "codex engine run step env holds no GitHub token"
+check 'grep -q "path guard" "$CODEX"' "codex engine documents why it has no path guard"
+# review_file_ok in the run step still fails closed if no review landed at the /tmp output.
+check 'grep -q "no review written to \$OUTPUT_PATH" "$CODEX"' "codex engine fails if no review was written"
+check 'grep -qF -- "$FILE_SWEEP" "$CODEX"' "codex engine instruction-file scrub matches symlinks"
+check 'grep -qF -- "$DIR_SWEEP" "$CODEX"' "codex engine config-directory scrub matches symlinks"
+check 'grep -q "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020" "$CODEX"' "codex engine pins setup-node to the shared SHA"
+# Added in review: fail fast if the Landlock sandbox cannot exist on the runner
+# (mirrors the Grok engine's bubblewrap userns probe), scrub the LLM key from
+# the env of model-spawned commands, and catch the base64 encoding of the key
+# in the shared post-step exfiltration guard.
+check 'grep -q "is older than 5.13 (no Landlock)" "$CODEX"' "codex engine fails fast on a kernel older than 5.13"
+# Smoke test: Codex runs commands through bubblewrap and dies without a
+# userns-capable bwrap; the pristine config copy survives Codex rewriting
+# config.toml between attempts.
+nc_fixed() { grep -vE '^[[:space:]]*#' "$CODEX" | grep -cF -- "$1" >/dev/null; }
+check 'nc_fixed "bwrap --unshare-user --unshare-net"' "codex engine probes bubblewrap user+net namespaces before running"
+check 'nc_fixed "apparmor_parser -r"' "codex engine loads a bwrap userns AppArmor profile"
+check 'nc_fixed "cp -f -- \"\$CONFIG_PRISTINE\" \"\$CODEX_HOME/config.toml\""' "codex restores config.toml from the pristine copy before each attempt"
+check 'grep -q "\[shell_environment_policy\]" "$CODEX"' "codex engine scrubs the LLM key from model-spawned command env"
+# The config.toml heredoc is unquoted (so ${MODEL}/${BASE_URL} expand). A
+# backtick or $( anywhere in its body is command substitution: a comment that
+# quoted `env` once dumped the runner environment into config.toml and the CLI
+# refused to start. Keep the body free of both, and of comments altogether.
+CODEX_TOML_BODY=$(awk '/cat > "\$CODEX_HOME\/config.toml" <<EOF/{f=1;next} f&&/^ *EOF$/{f=0} f' "$CODEX")
+check '[[ -n "$CODEX_TOML_BODY" ]]' "codex config.toml heredoc located by the contract test"
+check '! printf "%s\n" "$CODEX_TOML_BODY" | grep -c -E "\`|\\\$\(" >/dev/null' "codex config.toml heredoc has no command substitution"
+check '! printf "%s\n" "$CODEX_TOML_BODY" | grep -c -E "^[[:space:]]*#" >/dev/null' "codex config.toml heredoc has no comment lines"
+# Codex CLI 0.160.0 refuses wire_api = "chat" at startup (found by the smoke
+# test), so both the config and the CLI pin must say "responses".
+check '[[ $(grep -vE "^[[:space:]]*#" "$CODEX" | grep -c "wire_api = \"responses\"") -eq 1 ]]' "codex config pins wire_api = responses"
+check '[[ $(grep -vE "^[[:space:]]*#" "$CODEX" | grep -cF "wire_api=\"responses\"") -eq 1 ]]' "codex CLI pins wire_api=responses"
+check '[[ $(grep -vE "^[[:space:]]*#" "$CODEX" | grep -c "\"chat\"") -eq 0 ]]' "codex engine never sets wire_api chat"
+check 'grep -vE "^[[:space:]]*#" "$WF" | grep -cF "b64_key_in \"\$REVIEW_OUTPUT_FILE\"" >/dev/null && grep -q "base64-encoded LLM_API_KEY" "$WF"' "post-step refuses a base64-encoded LLM API key (shell-engine exfil hardening)"
+
+# Sandbox and key-routing controls. Greps below go through ncgrep, which
+# ignores lines whose first non-space character is '#', so a commented-out
+# control fails.
+ncgrep() { grep -vE '^[[:space:]]*#' "$2" | grep -cE -- "$1" >/dev/null; }
+check 'ncgrep "^ *sandbox_mode = \"workspace-write\"$" "$CODEX"' "codex config.toml runs under the workspace-write sandbox"
+check 'ncgrep "^ *network_access = false$" "$CODEX"' "codex config.toml disables sandbox network access for model commands"
+check 'ncgrep "^ *approval_policy = \"never\"$" "$CODEX"' "codex config.toml forbids escalation out of the sandbox"
+check 'ncgrep "^ *web_search = false$" "$CODEX"' "codex config.toml disables web search (no outbound tool)"
+check 'ncgrep "\"\\\$\{PIN_ARGS\[@\]\}\"" "$CODEX"' "codex passes PIN_ARGS to codex exec"
+check 'step_body "Configure review CLI (Codex)" "$CODEX" | grep -vE "^[[:space:]]*#" | grep -cE "^ +/tmp/\*\) ;;$" >/dev/null' "codex output_path guard accepts /tmp/* (the only allowed arm)"
+check 'ncgrep "model contains characters not allowed" "$CODEX" && ncgrep "base_url must be an http\(s\) URL" "$CODEX"' "codex rejects model/base_url values that could break out of a TOML string"
+check 'ncgrep "KMIN=\"\\\$\{KMIN%%\[\^0-9\]\*\}\"" "$CODEX"' "codex kernel probe strips -rc style suffixes"
+# The strip sweep exists once (a script under runner.temp) and is re-run,
+# hash-checked, before every attempt.
+check 'ncgrep "STRIP_SCRIPT: \\\$\{\{ runner\.temp \}\}/codex-engine-bin/" "$CODEX"' "codex strip script lives under runner.temp"
+check '[[ $(grep -vE "^[[:space:]]*#" "$CODEX" | grep -cE "bash -euo pipefail \"\\\$STRIP_SCRIPT\"") -eq 2 ]]' "codex runs the same strip script in the strip step and before each attempt"
+check 'ncgrep "strip script changed since the strip step" "$CODEX"' "codex verifies the strip script hash before each attempt"
+check '[[ $(grep -vE "^[[:space:]]*#" "$CODEX" | grep -cE "iname .agents\.md." ) -eq 1 ]]' "codex has one copy of the instruction-file sweep"
+# After the run, the review must be a regular singly-linked file still under /tmp.
+check 'ncgrep "is not a regular file \(symlink or special file\)" "$CODEX" && ncgrep "has more than one hard link" "$CODEX"' "codex refuses a symlinked or hard-linked review file"
+check 'ncgrep "if ! review_file_ok; then" "$CODEX"' "codex final check goes through review_file_ok"
+# Live CLI output is wrapped in a random ::stop-commands:: token.
+check 'step_body "Run AI PR review (Codex)" "$CODEX" | grep -vE "^[[:space:]]*#" | awk "/stop-commands::\\\$LIVE_TOKEN/{a=1} a && /codex exec/{b=1} b && /\"::\\\$LIVE_TOKEN::\"/{c=1} END{exit !c}"' "codex wraps live codex exec output in ::stop-commands::"
+check '! ncgrep "no exfiltration" "$CODEX"' "codex engine makes no 'no exfiltration' claim (contradicts its residual-risk note)"
+check '! grep -q "neither a shell tool nor network access" "$CODEX"' "codex pr_diff_path description does not claim the model has no shell"
+check '! grep -q "exactly 3 edits" "$WF"' "orchestrator header no longer claims exactly 3 edits"
+# Post step: private no-follow copy of the review; no /tmp scratch files.
+check 'ncgrep "POST_DIR=\"\\\$\(mktemp -d \"\\\$RUNNER_TEMP/" "$WF" && ncgrep "cp -P -- \"\\\$REVIEW_OUTPUT_FILE\"" "$WF"' "post step copies the review into a private dir without following links"
+check '! step_body "Post review as single PR comment" "$WF" | grep -vE "^[[:space:]]*#" | grep -cE "[> ]/tmp/[a-z_]+\.(txt|json|md)" >/dev/null' "post step keeps no scratch files in /tmp"
+# Behavioural: the base64 key check catches printf, echo and wrapped encodings,
+# and the key encoded inside a longer string at every byte alignment.
+B64_FN=$(step_body "Post review as single PR comment" "$WF" | awk '/^ +b64_key_in\(\) \{/{f=1} f{print} f && /^ +\}$/{exit}' | sed 's/^          //')
+b64_hit() { LLM_API_KEY="$1" bash -c "$B64_FN"$'\n''b64_key_in "$0"' "$2"; }
+B64_TMP=$(mktemp -d); FAKE_KEY="sk-fake-$(printf 'a%.0s' {1..60})"
+printf 'x %s y\n' "$(printf '%s' "$FAKE_KEY" | base64 -w0)" > "$B64_TMP/printf"
+printf 'x %s y\n' "$(echo "$FAKE_KEY" | base64 -w0)" > "$B64_TMP/echo"
+printf '%s\n' "$FAKE_KEY" | base64 -w 76 > "$B64_TMP/wrapped"
+printf 'an ordinary review\n' > "$B64_TMP/clean"
+for pfx in "K=" "KEY=" "LLM_KEY="; do
+  printf 'x %s y\n' "$(printf 'HOME=/x\n%s%s\nPATH=/y\n' "$pfx" "$FAKE_KEY" | base64 -w0)" > "$B64_TMP/env-${#pfx}"
+done
+check '[[ -n "$B64_FN" ]] && b64_hit "$FAKE_KEY" "$B64_TMP/printf" && b64_hit "$FAKE_KEY" "$B64_TMP/echo" && b64_hit "$FAKE_KEY" "$B64_TMP/wrapped"' "post-step base64 check catches printf, echo and 76-column wrapped encodings"
+check 'b64_hit "$FAKE_KEY" "$B64_TMP/env-2" && b64_hit "$FAKE_KEY" "$B64_TMP/env-4" && b64_hit "$FAKE_KEY" "$B64_TMP/env-8"' "post-step base64 check catches the key inside env | base64 output at all three alignments"
+check '! b64_hit "$FAKE_KEY" "$B64_TMP/clean"' "post-step base64 check does not fire on a clean review"
+rm -rf "$B64_TMP"
+# Blocking: CODEX_HOME must not sit in a sandbox-writable root, or a model
+# could edit config.toml (e.g. base_url) for the retry to load.
+check '! grep -qE "CODEX_HOME: */tmp" "$CODEX"' "codex CODEX_HOME is not under /tmp (sandbox-writable)"
+check '[[ $(grep -cE "^ +CODEX_HOME: \\$\\{\\{ runner\\.temp \\}\\}/codex-engine-home$" "$CODEX") -eq 3 ]]' "codex CODEX_HOME is runner.temp in all three steps"
+check 'ncgrep "is inside a sandbox-writable root" "$CODEX"' "codex configure step refuses a CODEX_HOME inside a writable root"
+check 'ncgrep "exclude_tmpdir_env_var = true" "$CODEX"' "codex sandbox excludes \$TMPDIR from writable roots"
+check 'ncgrep "config_sha256=" "$CODEX" && ncgrep "config.toml changed since the configure step" "$CODEX"' "codex verifies the config hash before starting the CLI"
+check 'step_body "Run AI PR review (Codex)" "$CODEX" | grep -vE "^[[:space:]]*#" | awk "/for attempt in 1 2/{f=1} f && /pre_attempt_guard\$/{n++} END{exit !n}"' "codex runs the pre-attempt guard inside the retry loop"
+# Every setting that routes the key or relaxes the sandbox is pinned on the CLI.
+for pin in "--sandbox workspace-write" "model=\\\"\${MODEL}\\\"" "model_provider=\"litellm\"" "model_providers.litellm.base_url=" "model_providers.litellm.env_key=" "model_providers.litellm.wire_api=" "approval_policy='\"never\"'" "sandbox_workspace_write.network_access=false" "sandbox_workspace_write.exclude_tmpdir_env_var=true" "tools.web_search=false"; do
+  check 'grep -vE "^[[:space:]]*#" "$CODEX" | grep -cF -- "$pin" >/dev/null' "codex pins on the CLI: $pin"
+done
+# output_path is resolved before the /tmp check, and /var/tmp is not accepted.
+check 'ncgrep "OUTPUT_REAL=\"\\$\\(realpath -m" "$CODEX"' "codex resolves output_path with realpath before checking it"
+check '! step_body "Configure review CLI (Codex)" "$CODEX" | grep -cE "^ *[^#]*/var/tmp/\\*\\)" >/dev/null' "codex output_path guard no longer accepts /var/tmp"
+check '! awk "/^  output_path:/{f=1;next} f && /^  [a-z_]+:/{exit} f" "$CODEX" | grep -cE "/tmp or /var/tmp|under temp" >/dev/null' "codex output_path input description matches the /tmp-only guard"
+# Failure-path log dump reads only CODEX_HOME and blocks workflow commands.
+check '! ncgrep "find \"\\\$CODEX_HOME\" /tmp" "$CODEX"' "codex log dump does not search the model-writable /tmp"
+check 'ncgrep "::stop-commands::" "$CODEX"' "codex log dump is wrapped in ::stop-commands::"
+# The shared prompt no longer tells every engine it has no shell.
+check '! grep -q "You have no shell tool" "$WF"' "shared review procedure does not claim 'no shell tool' (false for codex)"
+check '! grep -q "Exactly three edits" "$ROOT/.github/workflows/AI_PR_REVIEW_README.md"' "README 'Adding an engine' no longer claims exactly three edits"
+# The reasoning_effort enum is duplicated on purpose (the engine can be called
+# directly). Every case-arm copy must be identical, so widening one cannot drift.
+ENUM_WF=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
+ENUM_CODEX=$(grep -vE '^[[:space:]]*#' "$CODEX" | grep -oE '^ +[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
+check '[[ -n "$ENUM_WF" && "$ENUM_WF" == "$ENUM_CODEX" ]]' "reasoning_effort case arms match in the orchestrator and the engine ($ENUM_WF)"
+ENUM_LIST="${ENUM_WF//|/, }"
+check 'grep -qF -- "${ENUM_LIST%, *}" "$WF" && grep -qF -- "${ENUM_LIST%, *}" "$CODEX"' "reasoning_effort input descriptions list the same values as the case arms"
+# Every other copy (descriptions, error messages, comments, README) sits on a
+# line that names xhigh. Each such line must name every case-arm value, so a
+# value added to the arms but not to the prose turns this red.
+enum_prose_ok() {
+  local f line v
+  for f in "$WF" "$CODEX" "$README"; do
+    while IFS= read -r line; do
+      for v in ${ENUM_WF//|/ }; do
+        [[ "$line" =~ (^|[^a-z])$v([^a-z]|$) ]] || { echo "  missing '$v' in $(basename "$f"): ${line:0:100}"; return 1; }
+      done
+    done < <(grep -E '(^|[^a-z])xhigh([^a-z]|$)' "$f")
+  done
+}
+check 'enum_prose_ok' "every reasoning_effort description, error and doc line lists all case-arm values"
+# Behavioural: run the engine's own validation block against good and bad values.
+EFFORT_BLOCK=$(step_body "Run AI PR review (Codex)" "$CODEX" | awk '/REASONING_ARGS=\(\)/{f=1} f{print} f && /^ +fi$/{f=0; done=1} done{next}' | sed 's/^        //')
+effort_ok() { REASONING_EFFORT="$1" bash -c "$EFFORT_BLOCK" >/dev/null 2>&1; }
+check 'effort_ok "" && effort_ok xhigh && effort_ok minimal' "codex engine accepts empty, minimal and xhigh"
+check '! effort_ok max && ! effort_ok ultra && ! effort_ok bogus' "codex engine rejects max, ultra and unknown values"
+
+# Ako round 3 nits.
+check 'nc_fixed "base_url_re='"'"'^https?://" && nc_fixed "[[ ! \$BASE_URL =~ \$base_url_re ]]"' "codex base_url check uses a quoted pattern variable (no bracket escapes)"
+check 'nc_fixed "MODEL: \${{ steps.configure.outputs.model }}" && nc_fixed "echo \"model=\$MODEL\""' "codex run step uses the model value the configure step validated"
+check '! step_body "Run AI PR review (Codex)" "$CODEX" | grep -vE "^[[:space:]]*#" | grep -cF "inputs.model" >/dev/null' "codex run step never reads raw inputs.model"
+check 'nc_fixed "setsid --wait codex exec" && nc_fixed "pkill -KILL -s \"\$CODEX_PID\""' "codex exec runs in its own session, killed before commands resume"
+# Smoke test: Codex 0.160.0 only WARNS on an unknown config key and runs on,
+# so a misspelled control would be silently off. The warning must be fatal.
+check 'nc_fixed "grep -cF \"unrecognized configuration setting\" \"\$CLI_LOG\"" && ncgrep "the CLI ignored a config setting" "$CODEX"' "codex refuses the review when the CLI ignored a config setting"
+check 'nc_fixed "\"\$REVIEW_PROMPT\" > \"\$CLI_LOG\" 2>&1 < /dev/null &" && nc_fixed "CLI_LOG: \${{ runner.temp }}/"' "codex CLI output goes to a runner.temp log, not the live step log"
 
 # 4. The path guard: the only path control either CLI honours. Shared by the
 #    Kimi and Anthropic engines, fail-closed by construction.
