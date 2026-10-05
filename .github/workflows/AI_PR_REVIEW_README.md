@@ -239,23 +239,31 @@ assuming parity:
   search. Before each of the two attempts the run step re-runs the strip
   step's own script (attempt 1 could have written a new `AGENTS.md` or
   `.codex/` into the checkout; the script lives under `runner.temp` and is
-  hash-checked) and checks config.toml against the sha256 the configure step
-  recorded. `workspace-write` keeps the checkout writable (looser than Grok's
+  hash-checked) and restores config.toml from a read-only copy whose sha256
+  the configure step recorded (Codex rewrites config.toml during a run). The
+  install step sets up bubblewrap, which CLI 0.160.0 runs model commands
+  through, with the same AppArmor userns profile as the Grok engine, and
+  probes a user + network namespace before going further. Codex only warns on
+  an unknown config key and runs on, so that warning fails the job: a
+  misspelled or renamed key cannot quietly switch a control off. `workspace-write` keeps the checkout writable (looser than Grok's
   output-dir-only guarantee), so `output_path` must resolve (via `realpath`)
   under `/tmp`. After the CLI exits, the run step **fails the job** unless a
   regular, singly-linked review file landed there whose real path is still
   under `/tmp`, so a planted symlink or hard link is refused. The post step
   also copies the review out of `/tmp` without following links before reading
   it, for every engine. `$HOME/.codex` is cleared so a persistent runner cannot
-  inject config/hooks. The live CLI output and the failure-path log dump are
-  wrapped in random `::stop-commands::` tokens, so model-chosen text cannot run
-  workflow commands; the log dump reads only `CODEX_HOME`.
+  inject config/hooks. `codex exec` runs in its own session, which is killed
+  after each attempt. Its output goes to a log under `runner.temp` and is
+  printed after the attempt; that and the failure-path log dump are wrapped in
+  random `::stop-commands::` tokens, so model-chosen text cannot run workflow
+  commands. The log dump reads only `CODEX_HOME`.
 
   **Residual risk:** reads are unscoped. A same-uid command such as
   `cat /proc/$PPID/environ` can probably still read `OPENAI_API_KEY` from the
   Codex process; `[shell_environment_policy]` only cleans the env of spawned
   commands. The way out is the review text: the post step refuses the literal
-  key and its base64 form, but a hex, reversed or split copy would pass. What
+  key and its base64 form at any byte alignment (so `env | base64` is caught),
+  but a hex, reversed or split copy would pass. What
   bounds it: same-repo PRs only, the org-member access gate, no network from the
   sandbox, and a rotatable key. Codex is weaker than Kimi/Anthropic on key
   confidentiality until it can deny `/proc` reads.
