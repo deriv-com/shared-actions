@@ -197,6 +197,14 @@ check 'grep -q "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020" "$C
 # in the shared post-step exfiltration guard.
 check 'grep -q "lacks Landlock" "$CODEX"' "codex engine fails fast on a kernel without Landlock (>= 5.13)"
 check 'grep -q "\[shell_environment_policy\]" "$CODEX"' "codex engine scrubs the LLM key from model-spawned command env"
+# The config.toml heredoc is unquoted (so ${MODEL}/${BASE_URL} expand). A
+# backtick or $( anywhere in its body is command substitution: a comment that
+# quoted `env` once dumped the runner environment into config.toml and the CLI
+# refused to start. Keep the body free of both, and of comments altogether.
+CODEX_TOML_BODY=$(awk '/cat > "\$CODEX_HOME\/config.toml" <<EOF/{f=1;next} f&&/^ *EOF$/{f=0} f' "$CODEX")
+check '[[ -n "$CODEX_TOML_BODY" ]]' "codex config.toml heredoc located by the contract test"
+check '! printf "%s\n" "$CODEX_TOML_BODY" | grep -c -E "\`|\\\$\(" >/dev/null' "codex config.toml heredoc has no command substitution"
+check '! printf "%s\n" "$CODEX_TOML_BODY" | grep -c -E "^[[:space:]]*#" >/dev/null' "codex config.toml heredoc has no comment lines"
 check 'grep -vE "^[[:space:]]*#" "$WF" | grep -cF "b64_key_in \"\$REVIEW_OUTPUT_FILE\"" >/dev/null && grep -q "base64-encoded LLM_API_KEY" "$WF"' "post-step refuses a base64-encoded LLM API key (shell-engine exfil hardening)"
 
 # Sandbox and key-routing controls. Greps below go through ncgrep, which

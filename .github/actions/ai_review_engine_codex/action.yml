@@ -299,6 +299,21 @@ runs:
         # reasoning effort is NOT written here: it is applied on the run step
         # only when the input is non-empty, so the model default is untouched
         # otherwise.
+        #
+        # [shell_environment_policy] is defense-in-depth for the LLM API key.
+        # Codex authenticates by reading OPENAI_API_KEY from its OWN process env
+        # (env_key) and that path is untouched. The policy governs the env of
+        # commands the MODEL spawns inside the sandbox: Codex's default excludes
+        # stay on (ignore_default_excludes = false drops *KEY*/*TOKEN*/*SECRET*)
+        # and OPENAI_API_KEY is named explicitly, so a sandboxed env or printenv
+        # cannot read the org key from its environment. It does not hide the key
+        # in the Codex process's own /proc environ (see the header's
+        # residual-risk note).
+        #
+        # KEEP COMMENTS OUT OF THIS HEREDOC. It is unquoted so ${MODEL} and
+        # ${BASE_URL} expand, which means a backtick or $( in a comment inside it
+        # RUNS: an earlier comment quoting `env` dumped the runner environment
+        # into config.toml. The contract test rejects both.
         cat > "$CODEX_HOME/config.toml" <<EOF
         model = "${MODEL}"
         model_provider = "litellm"
@@ -313,8 +328,6 @@ runs:
 
         [sandbox_workspace_write]
         network_access = false
-        # /tmp stays writable (the review lands there); $TMPDIR does not, so a
-        # runner whose TMPDIR is runner.temp cannot expose CODEX_HOME.
         exclude_tmpdir_env_var = true
 
         [tools]
@@ -323,17 +336,6 @@ runs:
         [features]
         hooks = false
 
-        # Defense-in-depth for the LLM API key. Codex authenticates by reading
-        # OPENAI_API_KEY from its OWN process env (env_key above) — that path is
-        # untouched. This policy governs the env of commands the MODEL spawns
-        # inside the sandbox: keep Codex's default excludes on
-        # (ignore_default_excludes = false already drops *KEY*/*TOKEN*/*SECRET*)
-        # and name OPENAI_API_KEY explicitly so a sandboxed `env`/`printenv`
-        # cannot read the shared org key straight out of its environment. The
-        # sandbox already has no network, so this closes the easiest *read* path.
-        # It does not hide the key in the Codex process's own /proc environ (see
-        # the header's residual-risk note). Additive to the
-        # defaults, so it cannot weaken them even if a glob is a no-op.
         [shell_environment_policy]
         ignore_default_excludes = false
         exclude = ["OPENAI_API_KEY", "*_API_KEY", "*_TOKEN", "*_SECRET*"]
