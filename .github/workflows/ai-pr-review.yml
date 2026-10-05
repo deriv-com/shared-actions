@@ -32,17 +32,17 @@ on:
   workflow_call:
     inputs:
       engine:
-        description: "Review engine: `kimi` (Kimi Code CLI), `anthropic` (Claude Code Action), or `grok` (Grok Build CLI). Each is a composite action under .github/actions/ai_review_engine_<engine>/. Set this explicitly — the default is `kimi`, so an omitted value on a repo migrating from claude-pr-review.yml would switch LLM vendor."
+        description: "Review engine: `kimi` (Kimi Code CLI), `anthropic` (Claude Code Action), `grok` (Grok Build CLI), or `codex` (OpenAI Codex CLI). Each is a composite action under .github/actions/ai_review_engine_<engine>/. Set this explicitly — the default is `kimi`, so an omitted value on a repo migrating from claude-pr-review.yml would switch LLM vendor."
         required: false
         default: "kimi"
         type: string
       review_title:
-        description: "Visible Checks name and comment heading (the post step appends ' Complete'). Empty keeps the engine default (Kimi PR Review / Claude PR Review / Grok PR Review) and one slot per engine. Set this to run a second caller on the same engine as a concurrent slot — e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review. Must end in ' PR Review' so follow-up header strip stays in lockstep. Concurrency, the canonical HTML marker, and the progress marker include the title when set. An invalid value still appears in the Check name at parse time; the job name is not authoritative until the run succeeds."
+        description: "Visible Checks name and comment heading (the post step appends ' Complete'). Empty keeps the engine default (Kimi PR Review / Claude PR Review / Grok PR Review / Codex PR Review) and one slot per engine. Set this to run a second caller on the same engine as a concurrent slot — e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review. Must end in ' PR Review' so follow-up header strip stays in lockstep. Concurrency, the canonical HTML marker, and the progress marker include the title when set. An invalid value still appears in the Check name at parse time; the job name is not authoritative until the run succeeds."
         required: false
         default: ""
         type: string
       model:
-        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5, grok -> grok-4.6). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
+        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5, grok -> grok-4.6, codex -> gpt-6.1-sol). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
         required: false
         default: ""
         type: string
@@ -63,6 +63,11 @@ on:
         type: string
       provider_type:
         description: "[engine-specific: kimi] Wire dialect the Kimi CLI speaks: kimi, anthropic, openai, openai_responses, google-genai, vertexai. Must match what `base_url` serves — `kimi` targets api.kimi.com/coding/v1 and a LiteLLM proxy rejects it with a bare 400, while `openai` speaks the plain /v1/chat/completions the proxy serves. Change this only alongside `base_url`. Empty resolves to `openai`. Ignored when engine is not `kimi`."
+        required: false
+        default: ""
+        type: string
+      reasoning_effort:
+        description: "[engine-specific: codex] Reasoning effort for the Codex review turn: low, medium, or high. Empty sends no override and leaves the model/endpoint default. Validated in the 'Resolve and validate engine' step and passed to the codex dispatch step as `-c model_reasoning_effort`. Ignored when engine is not `codex` (the other engines take no such input)."
         required: false
         default: ""
         type: string
@@ -89,7 +94,7 @@ on:
 
 jobs:
   ai-review:
-    name: ${{ inputs.review_title != '' && inputs.review_title || (inputs.engine == 'grok' && 'Grok PR Review' || (inputs.engine == 'anthropic' && 'Claude PR Review' || 'Kimi PR Review')) }}
+    name: ${{ inputs.review_title != '' && inputs.review_title || (inputs.engine == 'grok' && 'Grok PR Review' || (inputs.engine == 'codex' && 'Codex PR Review' || (inputs.engine == 'anthropic' && 'Claude PR Review' || 'Kimi PR Review'))) }}
     runs-on:
       group: github_claude_code_reviewer
     # Bot actors are skipped, not failed: dependabot and friends are not org
@@ -251,6 +256,7 @@ jobs:
           MAX_CONTEXT_INPUT: ${{ inputs.max_context_size }}
           CLI_VERSION_INPUT: ${{ inputs.cli_version }}
           PROVIDER_TYPE_INPUT: ${{ inputs.provider_type }}
+          REASONING_EFFORT_INPUT: ${{ inputs.reasoning_effort }}
           PROMPT_GIST_URL_INPUT: ${{ inputs.prompt_gist_url }}
         run: |
           ENGINE="${ENGINE_INPUT:-kimi}"
@@ -301,9 +307,20 @@ jobs:
               DEFAULT_CLI_VERSION="1.0.5"
               REVIEW_TITLE="Grok PR Review"
               ;;
+            codex)
+              # LiteLLM alias for GPT-6.1 Sol, OpenAI-compatible chat/completions.
+              # The Codex engine ignores max_context_size (Codex manages its own
+              # context window); cli_version pins the Codex CLI.
+              DEFAULT_MODEL="gpt-6.1-sol"
+              METRICS_AGENT="codex_review"
+              ARTIFACT_PREFIX="codex-review"
+              DEFAULT_MAX_CONTEXT=""
+              DEFAULT_CLI_VERSION="0.160.0"
+              REVIEW_TITLE="Codex PR Review"
+              ;;
             *)
               echo "❌ Unknown engine: '$ENGINE'"
-              echo "   Supported values for the \`engine\` input: kimi, anthropic, grok"
+              echo "   Supported values for the \`engine\` input: kimi, anthropic, grok, codex"
               exit 1
               ;;
           esac
@@ -341,6 +358,23 @@ jobs:
           PROVIDER_TYPE="${PROVIDER_TYPE_INPUT:-openai}"
           PROMPT_GIST_URL="${PROMPT_GIST_URL_INPUT:-https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/2d5131aa058801e99fe77f69db124bf583f7d3ea/claude-review-format.md}"
 
+          # reasoning_effort is codex-only (like provider_type is kimi-only).
+          # Empty is the default — no override is sent, and the codex engine
+          # leaves the model default untouched. Validate a non-empty value here
+          # so a typo fails at resolve time with a clear message rather than
+          # inside the engine an hour later. The other engines ignore it.
+          REASONING_EFFORT="${REASONING_EFFORT_INPUT:-}"
+          if [[ -n "$REASONING_EFFORT" ]]; then
+            case "$REASONING_EFFORT" in
+              low|medium|high) ;;
+              *)
+                echo "❌ Invalid reasoning_effort '$REASONING_EFFORT'"
+                echo "   Use one of: low, medium, high (or leave empty for the model default)."
+                exit 1
+                ;;
+            esac
+          fi
+
           {
             echo "engine=$ENGINE"
             echo "model=$MODEL"
@@ -349,6 +383,7 @@ jobs:
             echo "max_context_size=$MAX_CONTEXT"
             echo "cli_version=$CLI_VERSION"
             echo "provider_type=$PROVIDER_TYPE"
+            echo "reasoning_effort=$REASONING_EFFORT"
             echo "prompt_gist_url=$PROMPT_GIST_URL"
           } >> "$GITHUB_OUTPUT"
 
@@ -954,6 +989,23 @@ jobs:
           api_key: ${{ secrets.LLM_API_KEY }}
           max_context_size: ${{ steps.engine.outputs.max_context_size }}
           cli_version: ${{ steps.engine.outputs.cli_version }}
+
+      - name: AI review (OpenAI Codex engine)
+        id: engine-codex
+        if: steps.engine.outputs.engine == 'codex'
+        timeout-minutes: 60
+        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_codex@master
+        with:
+          repository: ${{ github.repository }}
+          pr_number: ${{ github.event.pull_request.number }}
+          review_context_path: ${{ env.REVIEW_CONTEXT_FILE }}
+          pr_diff_path: ${{ env.PR_DIFF_FILE }}
+          output_path: ${{ env.REVIEW_OUTPUT_FILE }}
+          model: ${{ steps.engine.outputs.model }}
+          base_url: ${{ steps.engine.outputs.base_url }}
+          api_key: ${{ secrets.LLM_API_KEY }}
+          cli_version: ${{ steps.engine.outputs.cli_version }}
+          reasoning_effort: ${{ steps.engine.outputs.reasoning_effort }}
 
       # ====================== END ENGINE DISPATCH ==========================
 

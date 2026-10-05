@@ -99,6 +99,7 @@ check 'grep -q "test-scripts:" "$LINT"' "lint-actions keeps master's test-script
 KIMI="$ROOT/.github/actions/ai_review_engine_kimi/action.yml"
 ANTH="$ROOT/.github/actions/ai_review_engine_anthropic/action.yml"
 GROK="$ROOT/.github/actions/ai_review_engine_grok/action.yml"
+CODEX="$ROOT/.github/actions/ai_review_engine_codex/action.yml"
 GUARD="$ROOT/.github/actions/ai_review_path_guard/path-guard.js"
 GUARD_TEST="$ROOT/.github/actions/ai_review_path_guard/path-guard.test.js"
 
@@ -134,12 +135,66 @@ check 'grep -q "git/trees/" <<< "$SYMLINK_STEP" && grep -qF ".mode == \"120000\"
 check '! grep -q "recursive=1" <<< "$SYMLINK_STEP"' "symlink step walks non-recursive tree listings (the recursive form truncates silently)"
 FILE_SWEEP='-o \( -type f -o -type l \)'
 DIR_SWEEP='-o \( -type d -o -type l \)'
-for engine in "$KIMI" "$ANTH" "$GROK"; do
+for engine in "$KIMI" "$ANTH" "$GROK" "$CODEX"; do
   name=$(basename "$(dirname "$engine")")
   check 'grep -qF -- "$FILE_SWEEP" "$engine"' "$name: instruction-file scrub matches symlinks"
   check 'grep -qF -- "$DIR_SWEEP" "$engine"' "$name: config-directory scrub matches symlinks"
   check '! grep -qE -- "-prune -o -type [fd] " "$engine"' "$name: no scrub keyed on a bare -type f / -type d remains"
 done
+
+# ---------------------------------------------------------------------------
+# Codex engine — the fourth engine. The "adding an engine is N edits" contract
+# (header, enum case arm, dispatch gate, job name, outputs) plus the inputs the
+# user asked for (reasoning_effort), plus the one place this engine DEVIATES
+# from Kimi/Anthropic: it cannot wire the shared path guard, so its sandbox is
+# the enforcement and that must stay. These checks fail if a refactor drops the
+# codex arm, un-wires reasoning_effort, or relaxes the sandbox controls.
+# ---------------------------------------------------------------------------
+check '[[ -f "$CODEX" ]]' "codex engine action.yml is committed"
+
+# Enum: resolve-step case arm, unknown-engine error list, and job name all name codex.
+check 'grep -qE "^            codex\)" "$WF"' "resolve step has a codex case arm"
+check 'grep -q "kimi, anthropic, grok, codex" "$WF"' "unknown-engine error lists codex"
+check 'grep -qF "inputs.engine == '\''codex'\'' && '\''Codex PR Review'\''" "$WF"' "job name resolves codex to Codex PR Review"
+check 'grep -q "DEFAULT_MODEL=\"gpt-6.1-sol\"" "$WF"' "codex arm pins DEFAULT_MODEL=gpt-6.1-sol"
+check 'grep -q "METRICS_AGENT=\"codex_review\"" "$WF"' "codex arm pins METRICS_AGENT=codex_review"
+check 'grep -q "ARTIFACT_PREFIX=\"codex-review\"" "$WF"' "codex arm pins ARTIFACT_PREFIX=codex-review"
+
+# Dispatch: an if-gated step referencing the codex engine by absolute @master path.
+check 'grep -q "if: steps.engine.outputs.engine == '\''codex'\''" "$WF"' "codex dispatch step is if-gated on the engine output"
+check 'grep -q "ai_review_engine_codex@master" "$WF"' "codex dispatch references the engine by absolute @master path"
+check 'awk '\''/if: steps.engine.outputs.engine == .codex./{g=1} g && /timeout-minutes: 60/{print; exit}'\'' "$WF" | grep -q "timeout-minutes: 60"' "codex dispatch step carries timeout-minutes: 60"
+
+# reasoning_effort: declared input (default empty), resolve-step validation,
+# emitted on the step outputs, and passed to the codex dispatch step.
+check 'grep -q "^      reasoning_effort:" "$WF"' "reasoning_effort input is declared"
+check 'awk '\''/^      reasoning_effort:/{f=1} f && /default:/{print; exit}'\'' "$WF" | grep -q "default: \"\""' "reasoning_effort defaults to empty"
+check 'grep -q "REASONING_EFFORT_INPUT:" "$WF"' "resolve step reads reasoning_effort"
+check 'grep -q "low|medium|high" "$WF"' "resolve step validates reasoning_effort against low|medium|high"
+check 'grep -q "echo \"reasoning_effort=\$REASONING_EFFORT\"" "$WF"' "resolve step emits reasoning_effort on the step outputs"
+check 'grep -q "reasoning_effort: \${{ steps.engine.outputs.reasoning_effort }}" "$WF"' "codex dispatch step passes reasoning_effort through"
+# Engine side: accepts the input and only overrides when non-empty.
+check 'grep -q "^  reasoning_effort:" "$CODEX"' "codex engine declares the reasoning_effort input"
+check 'grep -q "model_reasoning_effort" "$CODEX"' "codex engine maps reasoning_effort onto model_reasoning_effort"
+check 'grep -qE "if \[\[ -n \"\\\$REASONING_EFFORT\" \]\]" "$CODEX"' "codex engine applies reasoning_effort only when non-empty"
+
+# This engine CANNOT wire the shared path guard (Codex's hook contract uses
+# Bash/apply_patch tool names and tool_input.command, not Read/Write + a path),
+# so the sandbox is the enforcement boundary. These are its load-bearing
+# controls; a refactor must not quietly remove them.
+check 'grep -q "sandbox_mode = \"workspace-write\"" "$CODEX"' "codex engine runs under the workspace-write sandbox"
+check 'grep -q "network_access = false" "$CODEX"' "codex engine disables sandbox network access (no exfiltration path)"
+check 'grep -q "approval_policy = \"never\"" "$CODEX"' "codex engine forbids escalation out of the sandbox"
+check 'grep -q "web_search = false" "$CODEX"' "codex engine disables web search (no outbound tool)"
+check 'grep -q -- "--sandbox workspace-write" "$CODEX"' "codex engine also pins the sandbox on the CLI (config regression cannot relax it)"
+check 'grep -q "sandbox_workspace_write.network_access=false" "$CODEX"' "codex engine also pins network_access=false on the CLI"
+check '! step_body "Run AI PR review (Codex)" "$CODEX" | grep -qE "^ *(GITHUB_TOKEN|GH_TOKEN):"' "codex engine run step env holds no GitHub token"
+check 'grep -q "path guard" "$CODEX"' "codex engine documents why it has no path guard"
+# The verify step still fails closed if no review landed at the /tmp output.
+check 'grep -q "no review written to \$OUTPUT_PATH" "$CODEX"' "codex engine fails if no review was written"
+check 'grep -qF -- "$FILE_SWEEP" "$CODEX"' "codex engine instruction-file scrub matches symlinks"
+check 'grep -qF -- "$DIR_SWEEP" "$CODEX"' "codex engine config-directory scrub matches symlinks"
+check 'grep -q "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020" "$CODEX"' "codex engine pins setup-node to the shared SHA"
 
 # 4. The path guard: the only path control either CLI honours. Shared by the
 #    Kimi and Anthropic engines, fail-closed by construction.

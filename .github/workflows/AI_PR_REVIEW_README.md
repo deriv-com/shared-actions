@@ -10,21 +10,21 @@
 </pre>
 
 A reusable GitHub Actions workflow that reviews pull requests with an LLM. The
-engine is pluggable: pick `kimi`, `anthropic`, or `grok` with one input.
+engine is pluggable: pick `kimi`, `anthropic`, `grok`, or `codex` with one input.
 
 ## Features
 
 - 🤖 Full-context review — reads changed files whole, plus their imports, types, callers and tests
 - 🔄 Follow-up mode — on re-push, feeds the previous review plus an incremental diff so fixed items are not re-reported
 - 🧹 Exactly one review comment per engine per PR — a "working on it" comment is posted first, then **edited** into the finished review (same comment URL). The previous review is deleted only after that edit, so a failed or cancelled run never leaves the PR without its last completed review
-- 🔌 Pluggable engine (`kimi` | `anthropic` | `grok`), each a composite action with its own CLI and sandbox
+- 🔌 Pluggable engine (`kimi` | `anthropic` | `grok` | `codex`), each a composite action with its own CLI and sandbox
 - 🔒 The model gets **no shell tool** and no comment tool, and PR-supplied agent config is stripped before it starts. Only same-repo PRs are reviewed (the job is skipped for forks), the checkout keeps no git credentials on disk (`persist-credentials: false`, and the Anthropic engine runs claude-code-action in the one mode that does not write the token back into `.git/config`, then re-checks the file), and a PR that adds or retargets a symlink is refused before any engine runs
 - 🧱 The Kimi and Anthropic engines confine the model's `Read`/`Grep`/`Glob` to the PR checkout and its `Write` to the single output file with a shared, unit-tested **PreToolUse path guard** (match-all, fail-closed, unknown tools denied), and fail the job if a review was produced while the guard never ran
 - 🛡️ The post step refuses to publish a review containing the LLM API key, the job's GitHub token, anything shaped like a GitHub token, or the on-disk shapes of git credential plumbing (comment bodies are not covered by Actions secret masking; the failure message names the exact pattern that hit), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
 - 📊 Emits events to the OneAboveAll metrics dashboard, and always to the job summary
 - ⏳ Posts a caller-owned "working on it" comment (model at the top) before the engine runs, then edits that same comment into the review; the CLI never gets a GitHub token
-- 🏷️ The reusable job is named after the engine (`Grok PR Review` / `Kimi PR Review` / `Claude PR Review`), or after `review_title` when that input is set. empty title = one slot per engine; set title = concurrent slot on that engine (concurrency, HTML marker, and progress marker include the title)
+- 🏷️ The reusable job is named after the engine (`Grok PR Review` / `Kimi PR Review` / `Claude PR Review` / `Codex PR Review`), or after `review_title` when that input is set. empty title = one slot per engine; set title = concurrent slot on that engine (concurrency, HTML marker, and progress marker include the title)
 
 ## Usage
 
@@ -45,7 +45,7 @@ jobs:
       id-token: write
       actions: write
     with:
-      engine: kimi          # or: anthropic | grok
+      engine: kimi          # or: anthropic | grok | codex
       # Optional. Empty keeps the engine default heading ("Kimi PR Review").
       # review_title: GLM PR Review
     secrets:
@@ -64,22 +64,22 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 
 ## Engines
 
-| | `kimi` | `anthropic` | `grok` |
-|---|---|---|---|
-| Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) | `@xai-official/grok` CLI — Grok Build (npm, pinned) |
-| Default model | `kimi-k3` | `claude-sonnet-5` | `grok-4.6` |
-| `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** | proxy origin **+ `/v1`** |
-| Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (+ Claude Code's permission-free `Grep`/`Glob`; the only GitHub MCP server agent mode mounts here is `github_file_ops`, denied by name and by the guard — see below) | `Read`, `Grep`, `Write`/`Edit` **output dir only** |
-| Shell | none (absent from `[tools] enabled`; the deny rule is intent only, and the path guard denies it too) | none (`--allowedTools` omits Bash, `--disallowedTools` re-denies it, the path guard denies it too) | none (`dontAsk` + `--tools` allowlist + `--deny Bash`) |
-| `Read` scope | PR checkout minus `.git/`, plus the context/diff/output files (**PreToolUse path guard**) | same guard, same scope (registered via the action's `settings` input) | **unscoped** (`--sandbox read-only` limits writes, not reads) |
-| `Write` scope | exactly the output file (path guard) | exactly the output file (path guard) | output directory only (`dontAsk`; Grok deny-wins, so no catch-all deny) |
-| GitHub token in the CLI process | none | **yes** — claude-code-action spawns the CLI with `GITHUB_TOKEN`/`GH_TOKEN` in its env for its own MCP servers; the path guard's `/proc` denial and the post-step scan are what stand between that and the PR | none |
-| `.git/config` after the run | untouched (`persist-credentials: false`) | untouched: `use_commit_signing: true` keeps the action off the path that rewrites the `origin` URL with the token, its base-branch fetch authenticates from env-only git config, and the file is asserted clean **before** and re-checked **after** | untouched |
-| Base-branch config restored | no | **yes** — the action fetches the PR's base branch and restores `.claude/`, `.mcp.json`, `CLAUDE.md`, `.gitmodules`, `.husky`, … from it after the strip step removed the PR's copies (maintainer-merged versions, never the PR's); `.claude/settings.json` from there is still not loaded (`--setting-sources user`) | no |
-| Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `.mcp.json` / `.cursorrules`; dirs `.grok/`, `.claude/`, `.claude-plugin/`, `.agents/`, `.cursor/rules/` |
-| Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type` | all except `max_context_size`, `cli_version`, `provider_type` | all except `provider_type` |
-| `agent` reported | `ai_review` | `claude_review` | `grok_review` |
-| Artifact | `ai-review-summary-*` | `claude-review-summary-*` | `grok-review-summary-*` |
+| | `kimi` | `anthropic` | `grok` | `codex` |
+|---|---|---|---|---|
+| Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) | `@xai-official/grok` CLI — Grok Build (npm, pinned) | `@openai/codex` CLI (npm, pinned) |
+| Default model | `kimi-k3` | `claude-sonnet-5` | `grok-4.6` | `gpt-6.1-sol` |
+| `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** | proxy origin **+ `/v1`** | proxy origin **+ `/v1`** |
+| Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (+ Claude Code's permission-free `Grep`/`Glob`; the only GitHub MCP server agent mode mounts here is `github_file_ops`, denied by name and by the guard — see below) | `Read`, `Grep`, `Write`/`Edit` **output dir only** | Codex's unified exec + `apply_patch` (no per-file Read/Grep/Glob tools to scope) |
+| Shell | none (absent from `[tools] enabled`; the deny rule is intent only, and the path guard denies it too) | none (`--allowedTools` omits Bash, `--disallowedTools` re-denies it, the path guard denies it too) | none (`dontAsk` + `--tools` allowlist + `--deny Bash`) | sandboxed (`exec` runs commands inside the sandbox; `network_access=false` + `approval_policy=never` keep them off the network and un-escalatable) |
+| `Read` scope | PR checkout minus `.git/`, plus the context/diff/output files (**PreToolUse path guard**) | same guard, same scope (registered via the action's `settings` input) | **unscoped** (`--sandbox read-only` limits writes, not reads) | **unscoped** (`workspace-write` sandbox limits writes and network, not reads) |
+| `Write` scope | exactly the output file (path guard) | exactly the output file (path guard) | output directory only (`dontAsk`; Grok deny-wins, so no catch-all deny) | checkout + temp (`workspace-write`); the review belongs in `/tmp` and the verify step fails if it did not land there |
+| GitHub token in the CLI process | none | **yes** — claude-code-action spawns the CLI with `GITHUB_TOKEN`/`GH_TOKEN` in its env for its own MCP servers; the path guard's `/proc` denial and the post-step scan are what stand between that and the PR | none | none |
+| `.git/config` after the run | untouched (`persist-credentials: false`) | untouched: `use_commit_signing: true` keeps the action off the path that rewrites the `origin` URL with the token, its base-branch fetch authenticates from env-only git config, and the file is asserted clean **before** and re-checked **after** | untouched | untouched (`persist-credentials: false`; no token in the step) |
+| Base-branch config restored | no | **yes** — the action fetches the PR's base branch and restores `.claude/`, `.mcp.json`, `CLAUDE.md`, `.gitmodules`, `.husky`, … from it after the strip step removed the PR's copies (maintainer-merged versions, never the PR's); `.claude/settings.json` from there is still not loaded (`--setting-sources user`) | no | no |
+| Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `.mcp.json` / `.cursorrules`; dirs `.grok/`, `.claude/`, `.claude-plugin/`, `.agents/`, `.cursor/rules/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CODEX.md` / `CLAUDE.md` / `CLAUDE.local.md` / `.cursorrules`; dirs `.codex/`, `.claude/`, `.agents/`, `.cursor/rules/`; plus `$HOME/.codex` on persistent runners |
+| Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type` | all except `max_context_size`, `cli_version`, `provider_type` | all except `provider_type` | all except `max_context_size`, `provider_type`; **only** engine honouring `reasoning_effort` |
+| `agent` reported | `ai_review` | `claude_review` | `grok_review` | `codex_review` |
+| Artifact | `ai-review-summary-*` | `claude-review-summary-*` | `grok-review-summary-*` | `codex-review-summary-*` |
 
 **`provider_type` must match what `base_url` serves.** This is the Kimi engine's
 sharpest trap, because a mismatch produces a bare `400 The request was invalid`
@@ -215,6 +215,31 @@ assuming parity:
   loosening the sandbox. `GROK_HOME` is `/tmp/grok-engine-home` and is wiped
   *before* `npm install` so leftover runner state cannot survive, without
   deleting the binary postinstall just wrote.
+
+- **Codex** — the one engine that **cannot** wire the shared path guard, so its
+  sandbox is the whole enforcement boundary rather than a backstop. The guard is
+  written against the Kimi/Claude hook contract (a PreToolUse call naming
+  `Read`/`Grep`/`Glob`/`Write` and carrying a filesystem `path`); Codex instead
+  reports `Bash` (unified exec) or `apply_patch` (all edits) with the input in
+  `tool_input.command`, never a `path`, so the guard would deny every call and
+  no review would ever be written. What confines it instead, each control
+  independent and fail-closed: `sandbox_mode = "workspace-write"` with
+  `[sandbox_workspace_write] network_access = false` (no socket, so no GitHub
+  API and no exfiltration even if a token were present), no GitHub token in the
+  run step at all, `tools.web_search = false` (no outbound tool), and
+  `approval_policy = "never"` (the model can never escalate out of the sandbox).
+  All four are also pinned on the CLI (`--sandbox workspace-write`,
+  `-c sandbox_workspace_write.network_access=false`, `-c tools.web_search=false`,
+  `-c approval_policy='"never"'`) so a config regression cannot silently relax
+  one. `workspace-write` keeps the checkout writable (looser than Grok's
+  output-dir-only guarantee), so `output_path` is pinned under `/tmp` and the
+  verify step **fails the job if no review landed there** rather than silently
+  posting nothing. `CODEX_HOME` is `/tmp/codex-engine-home`, wiped before
+  install; `$HOME/.codex` is cleared too so a persistent runner cannot inject
+  config/hooks. This engine is the only one that honours **`reasoning_effort`**
+  (`low` | `medium` | `high`, empty = model default): validated at resolve time
+  and again in the engine, mapped to `-c model_reasoning_effort` only when
+  non-empty. The other engines ignore the input.
 
 Changing either CLI's hook registration (the Kimi `[[hooks]]` block, the
 Anthropic `settings` JSON) or the guard's argument contract needs a
