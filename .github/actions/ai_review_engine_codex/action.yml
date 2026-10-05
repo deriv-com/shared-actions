@@ -69,8 +69,8 @@ description: >
 #      ::stop-commands:: tokens, so text the model prints cannot run workflow
 #      commands.
 # RESIDUAL RISK, stated plainly. Unlike Kimi and Anthropic, whose path guard
-# denies reads outside the checkout, reads here are unscoped: Landlock
-# workspace-write restricts writes, not reads. A same-uid command such as
+# denies reads outside the checkout, reads here are unscoped: the
+# workspace-write sandbox restricts writes, not reads. A same-uid command such as
 # `cat /proc/$PPID/environ` can probably still read OPENAI_API_KEY (and runner
 # variables) from the Codex process. [shell_environment_policy] only cleans the
 # env of commands the model spawns; it does not hide the parent's. The one way
@@ -206,19 +206,18 @@ runs:
         rm -rf "$CODEX_HOME"
         mkdir -p "$CODEX_HOME"
 
-        # Fail fast if the sandbox cannot exist on this runner, mirroring the
-        # Grok engine's bubblewrap userns probe. Codex's Linux sandbox is
-        # Landlock-based and needs kernel >= 5.13; on the self-hosted
-        # github_claude_code_reviewer group an older/restricted kernel would make
-        # every model-spawned command fail and the job would burn a retry and up
-        # to the 60-minute timeout before dying on confusing model-level errors.
-        # This is fail-closed (no security exposure), just a clear early exit.
+        # Coarse kernel floor (>= 5.13, the Landlock threshold the Codex sandbox
+        # docs name). On the self-hosted github_claude_code_reviewer group an
+        # older kernel would make every model-spawned command fail and burn a
+        # retry before dying on confusing model-level errors. The real gate is
+        # the bubblewrap probe after the CLI install: CLI 0.160.0 runs model
+        # commands through bwrap. Fail-closed, just a clear early exit.
         KREL="$(uname -r)"; IFS='.' read -r KMAJ KMIN _ <<< "$KREL"
         # Drop suffixes such as `-rc1` or `-generic` so the arithmetic below
         # cannot fail on a release string like 5.15-rc1.
         KMAJ="${KMAJ%%[^0-9]*}"; KMIN="${KMIN%%[^0-9]*}"
         if [[ -z "$KMAJ" || -z "$KMIN" ]] || (( KMAJ < 5 || (KMAJ == 5 && KMIN < 13) )); then
-          echo "❌ Codex engine: kernel $KREL lacks Landlock (>= 5.13 required); the workspace-write sandbox cannot apply on this runner."
+          echo "❌ Codex engine: kernel $KREL is older than 5.13 (no Landlock); the workspace-write sandbox cannot apply on this runner."
           exit 1
         fi
 
@@ -306,12 +305,17 @@ runs:
         # MODEL and BASE_URL go into TOML strings below and into --config
         # strings on the run step. A quote, backslash or control character
         # (including a newline) could close the string and add config, so
-        # refuse anything outside a plain identifier / URL alphabet.
-        if [[ ! "$MODEL" =~ ^[A-Za-z0-9._:/@-]+$ ]]; then
+        # refuse anything outside a plain identifier / URL alphabet. The
+        # patterns live in single-quoted variables: backslash escapes inside an
+        # unquoted bracket expression let a literal backslash through on bash
+        # older than 5.2.
+        model_re='^[A-Za-z0-9._:/@-]+$'
+        base_url_re='^https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$'
+        if [[ ! $MODEL =~ $model_re ]]; then
           echo "❌ Codex engine: model contains characters not allowed in a TOML string value: '$MODEL'"
           exit 1
         fi
-        if [[ ! "$BASE_URL" =~ ^https?://[A-Za-z0-9._~:/?#@!\$\&\(\)*+,\;=%-]+$ ]]; then
+        if [[ ! $BASE_URL =~ $base_url_re ]]; then
           echo "❌ Codex engine: base_url must be an http(s) URL with no quotes, backslashes or whitespace: '$BASE_URL'"
           exit 1
         fi
@@ -381,6 +385,7 @@ runs:
         {
           echo "config_sha256=$(sha256sum "$CODEX_HOME/config.toml" | cut -d' ' -f1)"
           echo "base_url=$BASE_URL"
+          echo "model=$MODEL"
         } >> "$GITHUB_OUTPUT"
         # Codex itself rewrites config.toml while it runs (the smoke test saw
         # the hash change after attempt 1 with no model write possible), so
@@ -402,7 +407,8 @@ runs:
         CONTEXT_PATH: ${{ inputs.review_context_path }}
         DIFF_PATH: ${{ inputs.pr_diff_path }}
         OUTPUT_PATH: ${{ inputs.output_path }}
-        MODEL: ${{ inputs.model }}
+        # The value the configure step validated, not the raw input.
+        MODEL: ${{ steps.configure.outputs.model }}
         REASONING_EFFORT: ${{ inputs.reasoning_effort }}
         CONFIG_SHA256: ${{ steps.configure.outputs.config_sha256 }}
         BASE_URL: ${{ steps.configure.outputs.base_url }}
@@ -535,7 +541,7 @@ runs:
         # writable roots, but Codex itself may rewrite it during a run, so it is
         # restored from the hash-checked pristine copy and re-hashed.
         pre_attempt_guard() {
-          [[ -n "$CONFIG_SHA256" && -n "$BASE_URL" && -n "$STRIP_SHA256" ]] || { echo "❌ Codex engine: strip/configure step outputs missing"; exit 1; }
+          [[ -n "$CONFIG_SHA256" && -n "$BASE_URL" && -n "$MODEL" && -n "$STRIP_SHA256" ]] || { echo "❌ Codex engine: strip/configure step outputs missing"; exit 1; }
           if [[ "$(sha256sum "$STRIP_SCRIPT" | cut -d' ' -f1)" != "$STRIP_SHA256" ]]; then
             echo "❌ Codex engine: strip script changed since the strip step. Refusing to start the CLI."
             exit 1
@@ -585,15 +591,31 @@ runs:
         # ::stop-commands:: token, so nothing it prints can run a workflow
         # command. The token is never exported, so the model's commands cannot
         # read it from their environment.
+        #
+        # codex exec runs in its own session, and the whole session is killed
+        # before workflow commands are turned back on and before the review is
+        # checked. A process the model detaches with nohup or & stays in that
+        # session, so it cannot print after the token is lifted or rewrite the
+        # review after review_file_ok. One that calls setsid itself leaves the
+        # session, so this kill does not reach it. Whether the bwrap sandbox
+        # takes it down with the command depends on how Codex builds the
+        # sandbox: CLI 0.160.0 passes --die-with-parent, but its binary does not
+        # contain --unshare-pid, so this is not relied on. The post step reads
+        # only its own no-follow copy of the review, re-checked, so a late
+        # rewrite changes model-authored text at most and still goes through
+        # the leak checks. The job's orphan-process cleanup ends any survivor.
         for attempt in 1 2; do
           pre_attempt_guard
           LIVE_TOKEN="codex-live-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
           echo "::stop-commands::$LIVE_TOKEN"
-          codex exec \
+          setsid --wait codex exec \
             --skip-git-repo-check \
             "${PIN_ARGS[@]}" \
             "${REASONING_ARGS[@]}" \
-            "$REVIEW_PROMPT" && CODEX_STATUS=0 || CODEX_STATUS=$?
+            "$REVIEW_PROMPT" &
+          CODEX_PID=$!
+          wait "$CODEX_PID" && CODEX_STATUS=0 || CODEX_STATUS=$?
+          pkill -KILL -s "$CODEX_PID" 2>/dev/null || true
           echo "::$LIVE_TOKEN::"
           unset LIVE_TOKEN
 

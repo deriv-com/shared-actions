@@ -186,7 +186,7 @@ check 'grep -q -- "--sandbox workspace-write" "$CODEX"' "codex engine also pins 
 check 'grep -q "sandbox_workspace_write.network_access=false" "$CODEX"' "codex engine also pins network_access=false on the CLI"
 check '! step_body "Run AI PR review (Codex)" "$CODEX" | grep -cE "^ *(GITHUB_TOKEN|GH_TOKEN):" >/dev/null' "codex engine run step env holds no GitHub token"
 check 'grep -q "path guard" "$CODEX"' "codex engine documents why it has no path guard"
-# The verify step still fails closed if no review landed at the /tmp output.
+# review_file_ok in the run step still fails closed if no review landed at the /tmp output.
 check 'grep -q "no review written to \$OUTPUT_PATH" "$CODEX"' "codex engine fails if no review was written"
 check 'grep -qF -- "$FILE_SWEEP" "$CODEX"' "codex engine instruction-file scrub matches symlinks"
 check 'grep -qF -- "$DIR_SWEEP" "$CODEX"' "codex engine config-directory scrub matches symlinks"
@@ -195,7 +195,7 @@ check 'grep -q "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020" "$C
 # (mirrors the Grok engine's bubblewrap userns probe), scrub the LLM key from
 # the env of model-spawned commands, and catch the base64 encoding of the key
 # in the shared post-step exfiltration guard.
-check 'grep -q "lacks Landlock" "$CODEX"' "codex engine fails fast on a kernel without Landlock (>= 5.13)"
+check 'grep -q "is older than 5.13 (no Landlock)" "$CODEX"' "codex engine fails fast on a kernel older than 5.13"
 # Smoke test: Codex runs commands through bubblewrap and dies without a
 # userns-capable bwrap; the pristine config copy survives Codex rewriting
 # config.toml between attempts.
@@ -248,7 +248,8 @@ check '! grep -q "exactly 3 edits" "$WF"' "orchestrator header no longer claims 
 # Post step: private no-follow copy of the review; no /tmp scratch files.
 check 'ncgrep "POST_DIR=\"\\\$\(mktemp -d \"\\\$RUNNER_TEMP/" "$WF" && ncgrep "cp -P -- \"\\\$REVIEW_OUTPUT_FILE\"" "$WF"' "post step copies the review into a private dir without following links"
 check '! step_body "Post review as single PR comment" "$WF" | grep -vE "^[[:space:]]*#" | grep -cE "[> ]/tmp/[a-z_]+\.(txt|json|md)" >/dev/null' "post step keeps no scratch files in /tmp"
-# Behavioural: the base64 key check catches printf, echo and wrapped encodings.
+# Behavioural: the base64 key check catches printf, echo and wrapped encodings,
+# and the key encoded inside a longer string at every byte alignment.
 B64_FN=$(step_body "Post review as single PR comment" "$WF" | awk '/^ +b64_key_in\(\) \{/{f=1} f{print} f && /^ +\}$/{exit}' | sed 's/^          //')
 b64_hit() { LLM_API_KEY="$1" bash -c "$B64_FN"$'\n''b64_key_in "$0"' "$2"; }
 B64_TMP=$(mktemp -d); FAKE_KEY="sk-fake-$(printf 'a%.0s' {1..60})"
@@ -256,7 +257,11 @@ printf 'x %s y\n' "$(printf '%s' "$FAKE_KEY" | base64 -w0)" > "$B64_TMP/printf"
 printf 'x %s y\n' "$(echo "$FAKE_KEY" | base64 -w0)" > "$B64_TMP/echo"
 printf '%s\n' "$FAKE_KEY" | base64 -w 76 > "$B64_TMP/wrapped"
 printf 'an ordinary review\n' > "$B64_TMP/clean"
+for pfx in "K=" "KEY=" "LLM_KEY="; do
+  printf 'x %s y\n' "$(printf 'HOME=/x\n%s%s\nPATH=/y\n' "$pfx" "$FAKE_KEY" | base64 -w0)" > "$B64_TMP/env-${#pfx}"
+done
 check '[[ -n "$B64_FN" ]] && b64_hit "$FAKE_KEY" "$B64_TMP/printf" && b64_hit "$FAKE_KEY" "$B64_TMP/echo" && b64_hit "$FAKE_KEY" "$B64_TMP/wrapped"' "post-step base64 check catches printf, echo and 76-column wrapped encodings"
+check 'b64_hit "$FAKE_KEY" "$B64_TMP/env-2" && b64_hit "$FAKE_KEY" "$B64_TMP/env-4" && b64_hit "$FAKE_KEY" "$B64_TMP/env-8"' "post-step base64 check catches the key inside env | base64 output at all three alignments"
 check '! b64_hit "$FAKE_KEY" "$B64_TMP/clean"' "post-step base64 check does not fire on a clean review"
 rm -rf "$B64_TMP"
 # Blocking: CODEX_HOME must not sit in a sandbox-writable root, or a model
@@ -288,11 +293,31 @@ ENUM_CODEX=$(grep -vE '^[[:space:]]*#' "$CODEX" | grep -oE '^ +[a-z|]*xhigh[a-z|
 check '[[ -n "$ENUM_WF" && "$ENUM_WF" == "$ENUM_CODEX" ]]' "reasoning_effort case arms match in the orchestrator and the engine ($ENUM_WF)"
 ENUM_LIST="${ENUM_WF//|/, }"
 check 'grep -qF -- "${ENUM_LIST%, *}" "$WF" && grep -qF -- "${ENUM_LIST%, *}" "$CODEX"' "reasoning_effort input descriptions list the same values as the case arms"
+# Every other copy (descriptions, error messages, comments, README) sits on a
+# line that names xhigh. Each such line must name every case-arm value, so a
+# value added to the arms but not to the prose turns this red.
+enum_prose_ok() {
+  local f line v
+  for f in "$WF" "$CODEX" "$README"; do
+    while IFS= read -r line; do
+      for v in ${ENUM_WF//|/ }; do
+        [[ "$line" =~ (^|[^a-z])$v([^a-z]|$) ]] || { echo "  missing '$v' in $(basename "$f"): ${line:0:100}"; return 1; }
+      done
+    done < <(grep -E '(^|[^a-z])xhigh([^a-z]|$)' "$f")
+  done
+}
+check 'enum_prose_ok' "every reasoning_effort description, error and doc line lists all case-arm values"
 # Behavioural: run the engine's own validation block against good and bad values.
 EFFORT_BLOCK=$(step_body "Run AI PR review (Codex)" "$CODEX" | awk '/REASONING_ARGS=\(\)/{f=1} f{print} f && /^ +fi$/{f=0; done=1} done{next}' | sed 's/^        //')
 effort_ok() { REASONING_EFFORT="$1" bash -c "$EFFORT_BLOCK" >/dev/null 2>&1; }
 check 'effort_ok "" && effort_ok xhigh && effort_ok minimal' "codex engine accepts empty, minimal and xhigh"
 check '! effort_ok max && ! effort_ok ultra && ! effort_ok bogus' "codex engine rejects max, ultra and unknown values"
+
+# Ako round 3 nits.
+check 'nc_fixed "base_url_re='"'"'^https?://" && nc_fixed "[[ ! \$BASE_URL =~ \$base_url_re ]]"' "codex base_url check uses a quoted pattern variable (no bracket escapes)"
+check 'nc_fixed "MODEL: \${{ steps.configure.outputs.model }}" && nc_fixed "echo \"model=\$MODEL\""' "codex run step uses the model value the configure step validated"
+check '! step_body "Run AI PR review (Codex)" "$CODEX" | grep -vE "^[[:space:]]*#" | grep -cF "inputs.model" >/dev/null' "codex run step never reads raw inputs.model"
+check 'nc_fixed "setsid --wait codex exec" && nc_fixed "pkill -KILL -s \"\$CODEX_PID\""' "codex exec runs in its own session, killed before commands resume"
 
 # 4. The path guard: the only path control either CLI honours. Shared by the
 #    Kimi and Anthropic engines, fail-closed by construction.
