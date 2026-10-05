@@ -236,16 +236,20 @@ assuming parity:
   resolves inside one. Every setting that decides where the key goes or what
   the sandbox allows is pinned on the CLI as well as in config.toml: provider,
   `base_url`, `env_key`, `wire_api`, model, sandbox, approval, network and web
-  search. Before each of the two attempts the run step re-runs the config strip
-  (attempt 1 could have written a new `AGENTS.md` or `.codex/` into the
-  checkout) and checks config.toml against the sha256 the configure step
+  search. Before each of the two attempts the run step re-runs the strip
+  step's own script (attempt 1 could have written a new `AGENTS.md` or
+  `.codex/` into the checkout; the script lives under `runner.temp` and is
+  hash-checked) and checks config.toml against the sha256 the configure step
   recorded. `workspace-write` keeps the checkout writable (looser than Grok's
   output-dir-only guarantee), so `output_path` must resolve (via `realpath`)
-  under `/tmp` and the verify step **fails the job if no review landed there**.
-  `$HOME/.codex` is cleared so a persistent runner cannot inject config/hooks.
-  Failure-path log dumps read only `CODEX_HOME` and are wrapped in
-  `::stop-commands::`, so the model cannot choose log content or inject
-  workflow commands.
+  under `/tmp`. After the CLI exits, the run step **fails the job** unless a
+  regular, singly-linked review file landed there whose real path is still
+  under `/tmp`, so a planted symlink or hard link is refused. The post step
+  also copies the review out of `/tmp` without following links before reading
+  it, for every engine. `$HOME/.codex` is cleared so a persistent runner cannot
+  inject config/hooks. The live CLI output and the failure-path log dump are
+  wrapped in random `::stop-commands::` tokens, so model-chosen text cannot run
+  workflow commands; the log dump reads only `CODEX_HOME`.
 
   **Residual risk:** reads are unscoped. A same-uid command such as
   `cat /proc/$PPID/environ` can probably still read `OPENAI_API_KEY` from the
@@ -493,7 +497,7 @@ review prose to change. Compare quality on real PRs before rolling it out.
 
 ## Adding an engine
 
-Three edits at minimum:
+Four edits at minimum:
 
 1. **`.github/actions/ai_review_engine_<name>/action.yml`** — satisfy the engine
    contract (below).
@@ -501,6 +505,8 @@ Three edits at minimum:
    default model, metrics agent and artifact prefix.
 3. **An `if:`-gated step** in the `ENGINE DISPATCH` block. `uses:` accepts no
    expressions, so dispatch cannot be one dynamic step.
+4. **The job-name ternary** (`jobs.ai-review.name`), which cannot read step
+   outputs and so repeats the engine-to-title mapping from the `case` arm.
 
 An engine with its own knob needs more: an `[engine-specific: <name>]` input,
 its validation in the resolve step, a step output, and a row in the Inputs

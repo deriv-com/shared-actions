@@ -182,10 +182,6 @@ check 'grep -qE "if \[\[ -n \"\\\$REASONING_EFFORT\" \]\]" "$CODEX"' "codex engi
 # Bash/apply_patch tool names and tool_input.command, not Read/Write + a path),
 # so the sandbox is the enforcement boundary. These are its load-bearing
 # controls; a refactor must not quietly remove them.
-check 'grep -q "sandbox_mode = \"workspace-write\"" "$CODEX"' "codex engine runs under the workspace-write sandbox"
-check 'grep -q "network_access = false" "$CODEX"' "codex engine disables sandbox network access (no exfiltration path)"
-check 'grep -q "approval_policy = \"never\"" "$CODEX"' "codex engine forbids escalation out of the sandbox"
-check 'grep -q "web_search = false" "$CODEX"' "codex engine disables web search (no outbound tool)"
 check 'grep -q -- "--sandbox workspace-write" "$CODEX"' "codex engine also pins the sandbox on the CLI (config regression cannot relax it)"
 check 'grep -q "sandbox_workspace_write.network_access=false" "$CODEX"' "codex engine also pins network_access=false on the CLI"
 check '! step_body "Run AI PR review (Codex)" "$CODEX" | grep -cE "^ *(GITHUB_TOKEN|GH_TOKEN):" >/dev/null' "codex engine run step env holds no GitHub token"
@@ -201,11 +197,48 @@ check 'grep -q "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020" "$C
 # in the shared post-step exfiltration guard.
 check 'grep -q "lacks Landlock" "$CODEX"' "codex engine fails fast on a kernel without Landlock (>= 5.13)"
 check 'grep -q "\[shell_environment_policy\]" "$CODEX"' "codex engine scrubs the LLM key from model-spawned command env"
-check 'grep -q "base64-encoded LLM_API_KEY" "$WF"' "post-step refuses a base64-encoded LLM API key (shell-engine exfil hardening)"
+check 'grep -vE "^[[:space:]]*#" "$WF" | grep -cF "b64_key_in \"\$REVIEW_OUTPUT_FILE\"" >/dev/null && grep -q "base64-encoded LLM_API_KEY" "$WF"' "post-step refuses a base64-encoded LLM API key (shell-engine exfil hardening)"
 
-# Ako's review of d55ed7a. Greps below go through ncgrep, which ignores lines
-# whose first non-space character is '#', so a commented-out control fails.
+# Sandbox and key-routing controls. Greps below go through ncgrep, which
+# ignores lines whose first non-space character is '#', so a commented-out
+# control fails.
 ncgrep() { grep -vE '^[[:space:]]*#' "$2" | grep -cE -- "$1" >/dev/null; }
+check 'ncgrep "^ *sandbox_mode = \"workspace-write\"$" "$CODEX"' "codex config.toml runs under the workspace-write sandbox"
+check 'ncgrep "^ *network_access = false$" "$CODEX"' "codex config.toml disables sandbox network access for model commands"
+check 'ncgrep "^ *approval_policy = \"never\"$" "$CODEX"' "codex config.toml forbids escalation out of the sandbox"
+check 'ncgrep "^ *web_search = false$" "$CODEX"' "codex config.toml disables web search (no outbound tool)"
+check 'ncgrep "\"\\\$\{PIN_ARGS\[@\]\}\"" "$CODEX"' "codex passes PIN_ARGS to codex exec"
+check 'step_body "Configure review CLI (Codex)" "$CODEX" | grep -vE "^[[:space:]]*#" | grep -cE "^ +/tmp/\*\) ;;$" >/dev/null' "codex output_path guard accepts /tmp/* (the only allowed arm)"
+check 'ncgrep "model contains characters not allowed" "$CODEX" && ncgrep "base_url must be an http\(s\) URL" "$CODEX"' "codex rejects model/base_url values that could break out of a TOML string"
+check 'ncgrep "KMIN=\"\\\$\{KMIN%%\[\^0-9\]\*\}\"" "$CODEX"' "codex kernel probe strips -rc style suffixes"
+# The strip sweep exists once (a script under runner.temp) and is re-run,
+# hash-checked, before every attempt.
+check 'ncgrep "STRIP_SCRIPT: \\\$\{\{ runner\.temp \}\}/codex-engine-bin/" "$CODEX"' "codex strip script lives under runner.temp"
+check '[[ $(grep -vE "^[[:space:]]*#" "$CODEX" | grep -cE "bash -euo pipefail \"\\\$STRIP_SCRIPT\"") -eq 2 ]]' "codex runs the same strip script in the strip step and before each attempt"
+check 'ncgrep "strip script changed since the strip step" "$CODEX"' "codex verifies the strip script hash before each attempt"
+check '[[ $(grep -vE "^[[:space:]]*#" "$CODEX" | grep -cE "iname .agents\.md." ) -eq 1 ]]' "codex has one copy of the instruction-file sweep"
+# After the run, the review must be a regular singly-linked file still under /tmp.
+check 'ncgrep "is not a regular file \(symlink or special file\)" "$CODEX" && ncgrep "has more than one hard link" "$CODEX"' "codex refuses a symlinked or hard-linked review file"
+check 'ncgrep "if ! review_file_ok; then" "$CODEX"' "codex final check goes through review_file_ok"
+# Live CLI output is wrapped in a random ::stop-commands:: token.
+check 'step_body "Run AI PR review (Codex)" "$CODEX" | grep -vE "^[[:space:]]*#" | awk "/stop-commands::\\\$LIVE_TOKEN/{a=1} a && /codex exec/{b=1} b && /\"::\\\$LIVE_TOKEN::\"/{c=1} END{exit !c}"' "codex wraps live codex exec output in ::stop-commands::"
+check '! ncgrep "no exfiltration" "$CODEX"' "codex engine makes no 'no exfiltration' claim (contradicts its residual-risk note)"
+check '! grep -q "neither a shell tool nor network access" "$CODEX"' "codex pr_diff_path description does not claim the model has no shell"
+check '! grep -q "exactly 3 edits" "$WF"' "orchestrator header no longer claims exactly 3 edits"
+# Post step: private no-follow copy of the review; no /tmp scratch files.
+check 'ncgrep "POST_DIR=\"\\\$\(mktemp -d \"\\\$RUNNER_TEMP/" "$WF" && ncgrep "cp -P -- \"\\\$REVIEW_OUTPUT_FILE\"" "$WF"' "post step copies the review into a private dir without following links"
+check '! step_body "Post review as single PR comment" "$WF" | grep -vE "^[[:space:]]*#" | grep -cE "[> ]/tmp/[a-z_]+\.(txt|json|md)" >/dev/null' "post step keeps no scratch files in /tmp"
+# Behavioural: the base64 key check catches printf, echo and wrapped encodings.
+B64_FN=$(step_body "Post review as single PR comment" "$WF" | awk '/^ +b64_key_in\(\) \{/{f=1} f{print} f && /^ +\}$/{exit}' | sed 's/^          //')
+b64_hit() { LLM_API_KEY="$1" bash -c "$B64_FN"$'\n''b64_key_in "$0"' "$2"; }
+B64_TMP=$(mktemp -d); FAKE_KEY="sk-fake-$(printf 'a%.0s' {1..60})"
+printf 'x %s y\n' "$(printf '%s' "$FAKE_KEY" | base64 -w0)" > "$B64_TMP/printf"
+printf 'x %s y\n' "$(echo "$FAKE_KEY" | base64 -w0)" > "$B64_TMP/echo"
+printf '%s\n' "$FAKE_KEY" | base64 -w 76 > "$B64_TMP/wrapped"
+printf 'an ordinary review\n' > "$B64_TMP/clean"
+check '[[ -n "$B64_FN" ]] && b64_hit "$FAKE_KEY" "$B64_TMP/printf" && b64_hit "$FAKE_KEY" "$B64_TMP/echo" && b64_hit "$FAKE_KEY" "$B64_TMP/wrapped"' "post-step base64 check catches printf, echo and 76-column wrapped encodings"
+check '! b64_hit "$FAKE_KEY" "$B64_TMP/clean"' "post-step base64 check does not fire on a clean review"
+rm -rf "$B64_TMP"
 # Blocking: CODEX_HOME must not sit in a sandbox-writable root, or a model
 # could edit config.toml (e.g. base_url) for the retry to load.
 check '! grep -qE "CODEX_HOME: */tmp" "$CODEX"' "codex CODEX_HOME is not under /tmp (sandbox-writable)"
@@ -215,7 +248,7 @@ check 'ncgrep "exclude_tmpdir_env_var = true" "$CODEX"' "codex sandbox excludes 
 check 'ncgrep "config_sha256=" "$CODEX" && ncgrep "config.toml changed since the configure step" "$CODEX"' "codex verifies the config hash before starting the CLI"
 check 'step_body "Run AI PR review (Codex)" "$CODEX" | grep -vE "^[[:space:]]*#" | awk "/for attempt in 1 2/{f=1} f && /pre_attempt_guard\$/{n++} END{exit !n}"' "codex runs the pre-attempt guard inside the retry loop"
 # Every setting that routes the key or relaxes the sandbox is pinned on the CLI.
-for pin in "--sandbox workspace-write" "model_provider=\"litellm\"" "model_providers.litellm.base_url=" "model_providers.litellm.env_key=" "model_providers.litellm.wire_api=" "approval_policy='\"never\"'" "sandbox_workspace_write.network_access=false" "sandbox_workspace_write.exclude_tmpdir_env_var=true" "tools.web_search=false"; do
+for pin in "--sandbox workspace-write" "model=\\\"\${MODEL}\\\"" "model_provider=\"litellm\"" "model_providers.litellm.base_url=" "model_providers.litellm.env_key=" "model_providers.litellm.wire_api=" "approval_policy='\"never\"'" "sandbox_workspace_write.network_access=false" "sandbox_workspace_write.exclude_tmpdir_env_var=true" "tools.web_search=false"; do
   check 'grep -vE "^[[:space:]]*#" "$CODEX" | grep -cF -- "$pin" >/dev/null' "codex pins on the CLI: $pin"
 done
 # output_path is resolved before the /tmp check, and /var/tmp is not accepted.
