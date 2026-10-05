@@ -224,6 +224,39 @@ runs:
 
         npm install -g "@openai/codex@${CLI_VERSION}"
         codex --version
+
+        # Codex's Linux sandbox runs commands through bubblewrap (found by the
+        # smoke test: without bwrap on PATH it falls back to a bundled copy, and
+        # every command dies with "bwrap: loopback: Failed RTM_NEWADDR:
+        # Operation not permitted"). GitHub-hosted Ubuntu 24.04 does not ship
+        # bwrap, and AppArmor blocks unprivileged user namespaces. Same
+        # workaround as the Grok engine: install bwrap, load a userns profile
+        # for /usr/bin/bwrap, then probe the exact namespaces Codex asks for.
+        if ! command -v bwrap >/dev/null 2>&1; then
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap apparmor-profiles
+        fi
+        if [[ -f /usr/share/apparmor/extra-profiles/bwrap-userns-restrict ]]; then
+          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+            /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+        elif [[ ! -f /etc/apparmor.d/bwrap ]]; then
+          printf '%s\n' \
+            'abi <abi/4.0>,' \
+            'include <tunables/global>' \
+            '' \
+            'profile bwrap /usr/bin/bwrap flags=(unconfined) {' \
+            '  userns,' \
+            '  include if exists <local/bwrap>' \
+            '}' \
+            | sudo tee /etc/apparmor.d/bwrap >/dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+        fi
+        if ! bwrap --unshare-user --unshare-net --die-with-parent --ro-bind / / --dev /dev true; then
+          echo "❌ Codex engine: bubblewrap cannot create a user + network namespace on this runner. The workspace-write sandbox cannot start."
+          exit 1
+        fi
+        bwrap --version
         echo "✅ Codex CLI ${CLI_VERSION} installed (CODEX_HOME=$CODEX_HOME, kernel $KREL)"
 
     - name: Configure review CLI (Codex)
@@ -233,6 +266,7 @@ runs:
         CODEX_HOME: ${{ runner.temp }}/codex-engine-home
         OUTPUT_PATH: ${{ inputs.output_path }}
         MODEL: ${{ inputs.model }}
+        CONFIG_PRISTINE: ${{ runner.temp }}/codex-engine-bin/config.toml.pristine
         INPUT_BASE_URL: ${{ inputs.base_url }}
       run: |
         # Fail closed if a caller pointed output at the checkout: workspace-write
@@ -348,6 +382,11 @@ runs:
           echo "config_sha256=$(sha256sum "$CODEX_HOME/config.toml" | cut -d' ' -f1)"
           echo "base_url=$BASE_URL"
         } >> "$GITHUB_OUTPUT"
+        # Codex itself rewrites config.toml while it runs (the smoke test saw
+        # the hash change after attempt 1 with no model write possible), so
+        # keep a read-only pristine copy beside the strip script. The run step
+        # checks the copy's hash and restores it before every attempt.
+        install -D -m 0444 "$CODEX_HOME/config.toml" "$CONFIG_PRISTINE"
         echo "✅ Codex config written (CODEX_HOME=$CODEX_HOME)"
 
     - name: Run AI PR review (Codex)
@@ -369,6 +408,7 @@ runs:
         BASE_URL: ${{ steps.configure.outputs.base_url }}
         STRIP_SCRIPT: ${{ runner.temp }}/codex-engine-bin/strip-agent-config.sh
         STRIP_SHA256: ${{ steps.strip.outputs.strip_sha256 }}
+        CONFIG_PRISTINE: ${{ runner.temp }}/codex-engine-bin/config.toml.pristine
       run: |
         [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Codex engine: missing or empty review context at $CONTEXT_PATH"; exit 1; }
         [[ -s "$DIFF_PATH"    ]] || { echo "❌ Codex engine: missing or empty PR diff at $DIFF_PATH"; exit 1; }
@@ -491,9 +531,9 @@ runs:
         # Run before EVERY attempt. Attempt 1 can write anything into the
         # checkout, including a fresh AGENTS.md or .codex/ for attempt 2 to load,
         # so the strip step's own script runs again (same file, hash-checked, so
-        # the two sweeps cannot drift). The config hash catches any change to
-        # config.toml (it sits outside the sandbox's writable roots, so a
-        # mismatch means something unexpected; fail rather than load it).
+        # the two sweeps cannot drift). config.toml sits outside the sandbox's
+        # writable roots, but Codex itself may rewrite it during a run, so it is
+        # restored from the hash-checked pristine copy and re-hashed.
         pre_attempt_guard() {
           [[ -n "$CONFIG_SHA256" && -n "$BASE_URL" && -n "$STRIP_SHA256" ]] || { echo "❌ Codex engine: strip/configure step outputs missing"; exit 1; }
           if [[ "$(sha256sum "$STRIP_SCRIPT" | cut -d' ' -f1)" != "$STRIP_SHA256" ]]; then
@@ -501,6 +541,11 @@ runs:
             exit 1
           fi
           bash -euo pipefail "$STRIP_SCRIPT"
+          if [[ "$(sha256sum "$CONFIG_PRISTINE" | cut -d' ' -f1)" != "$CONFIG_SHA256" ]]; then
+            echo "❌ Codex engine: pristine config.toml copy changed since the configure step. Refusing to start the CLI."
+            exit 1
+          fi
+          cp -f -- "$CONFIG_PRISTINE" "$CODEX_HOME/config.toml"
           ACTUAL_SHA="$(sha256sum "$CODEX_HOME/config.toml" | cut -d' ' -f1)"
           if [[ "$ACTUAL_SHA" != "$CONFIG_SHA256" ]]; then
             echo "❌ Codex engine: config.toml changed since the configure step (sha256 $ACTUAL_SHA, expected $CONFIG_SHA256). Refusing to start the CLI."

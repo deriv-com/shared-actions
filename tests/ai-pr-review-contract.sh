@@ -196,6 +196,13 @@ check 'grep -q "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020" "$C
 # the env of model-spawned commands, and catch the base64 encoding of the key
 # in the shared post-step exfiltration guard.
 check 'grep -q "lacks Landlock" "$CODEX"' "codex engine fails fast on a kernel without Landlock (>= 5.13)"
+# Smoke test: Codex runs commands through bubblewrap and dies without a
+# userns-capable bwrap; the pristine config copy survives Codex rewriting
+# config.toml between attempts.
+nc_fixed() { grep -vE '^[[:space:]]*#' "$CODEX" | grep -cF -- "$1" >/dev/null; }
+check 'nc_fixed "bwrap --unshare-user --unshare-net"' "codex engine probes bubblewrap user+net namespaces before running"
+check 'nc_fixed "apparmor_parser -r"' "codex engine loads a bwrap userns AppArmor profile"
+check 'nc_fixed "cp -f -- \"\$CONFIG_PRISTINE\" \"\$CODEX_HOME/config.toml\""' "codex restores config.toml from the pristine copy before each attempt"
 check 'grep -q "\[shell_environment_policy\]" "$CODEX"' "codex engine scrubs the LLM key from model-spawned command env"
 # The config.toml heredoc is unquoted (so ${MODEL}/${BASE_URL} expand). A
 # backtick or $( anywhere in its body is command substitution: a comment that
