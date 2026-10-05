@@ -237,10 +237,15 @@ assuming parity:
   posting nothing. `CODEX_HOME` is `/tmp/codex-engine-home`, wiped before
   install; `$HOME/.codex` is cleared too so a persistent runner cannot inject
   config/hooks. This engine is the only one that honours **`reasoning_effort`**
-  (`low` | `medium` | `high` | `xhigh` | `max`, empty = model default):
+  (`minimal` | `low` | `medium` | `high` | `xhigh`, empty = model default):
   validated at resolve time
   and again in the engine, mapped to `-c model_reasoning_effort` only when
-  non-empty. The other engines ignore the input.
+  non-empty. The other engines ignore the input. The gpt-6.1-sol model itself
+  exposes two higher tiers, `max` and `ultra` (they appear in the Codex app and
+  in `codex debug models`), but the Codex CLI's own config enum does not accept
+  them yet — it fail-fasts at startup on an unknown variant — so they are
+  deliberately rejected here rather than letting a caller configure a job that
+  dies before writing a review. Widen the set once the pinned CLI accepts them.
 
 Changing either CLI's hook registration (the Kimi `[[hooks]]` block, the
 Anthropic `settings` JSON) or the guard's argument contract needs a

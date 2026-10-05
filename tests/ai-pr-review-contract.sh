@@ -170,7 +170,7 @@ check 'awk '\''/if: steps.engine.outputs.engine == .codex./{g=1} g && /timeout-m
 check 'grep -q "^      reasoning_effort:" "$WF"' "reasoning_effort input is declared"
 check 'awk '\''/^      reasoning_effort:/{f=1} f && /default:/{print; exit}'\'' "$WF" | grep -q "default: \"\""' "reasoning_effort defaults to empty"
 check 'grep -q "REASONING_EFFORT_INPUT:" "$WF"' "resolve step reads reasoning_effort"
-check 'grep -q "low|medium|high|xhigh|max" "$WF"' "resolve step validates reasoning_effort against low|medium|high|xhigh|max"
+check 'grep -q "minimal|low|medium|high|xhigh" "$WF"' "resolve step validates reasoning_effort against minimal|low|medium|high|xhigh"
 check 'grep -q "echo \"reasoning_effort=\$REASONING_EFFORT\"" "$WF"' "resolve step emits reasoning_effort on the step outputs"
 check 'grep -q "reasoning_effort: \${{ steps.engine.outputs.reasoning_effort }}" "$WF"' "codex dispatch step passes reasoning_effort through"
 # Engine side: accepts the input and only overrides when non-empty.
