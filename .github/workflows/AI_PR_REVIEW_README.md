@@ -237,7 +237,8 @@ assuming parity:
   posting nothing. `CODEX_HOME` is `/tmp/codex-engine-home`, wiped before
   install; `$HOME/.codex` is cleared too so a persistent runner cannot inject
   config/hooks. This engine is the only one that honours **`reasoning_effort`**
-  (`low` | `medium` | `high`, empty = model default): validated at resolve time
+  (`low` | `medium` | `high` | `xhigh` | `max`, empty = model default):
+  validated at resolve time
   and again in the engine, mapped to `-c model_reasoning_effort` only when
   non-empty. The other engines ignore the input.
 

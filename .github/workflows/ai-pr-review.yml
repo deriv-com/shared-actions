@@ -67,7 +67,7 @@ on:
         default: ""
         type: string
       reasoning_effort:
-        description: "[engine-specific: codex] Reasoning effort for the Codex review turn: low, medium, or high. Empty sends no override and leaves the model/endpoint default. Validated in the 'Resolve and validate engine' step and passed to the codex dispatch step as `-c model_reasoning_effort`. Ignored when engine is not `codex` (the other engines take no such input)."
+        description: "[engine-specific: codex] Reasoning effort for the Codex review turn: low, medium, high, xhigh, or max. Empty sends no override and leaves the model/endpoint default. Validated in the 'Resolve and validate engine' step and passed to the codex dispatch step as `-c model_reasoning_effort`. Ignored when engine is not `codex` (the other engines take no such input)."
         required: false
         default: ""
         type: string
@@ -366,10 +366,10 @@ jobs:
           REASONING_EFFORT="${REASONING_EFFORT_INPUT:-}"
           if [[ -n "$REASONING_EFFORT" ]]; then
             case "$REASONING_EFFORT" in
-              low|medium|high) ;;
+              low|medium|high|xhigh|max) ;;
               *)
                 echo "❌ Invalid reasoning_effort '$REASONING_EFFORT'"
-                echo "   Use one of: low, medium, high (or leave empty for the model default)."
+                echo "   Use one of: low, medium, high, xhigh, max (or leave empty for the model default)."
                 exit 1
                 ;;
             esac

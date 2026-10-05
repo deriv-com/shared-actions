@@ -87,7 +87,7 @@ inputs:
     description: "API key for base_url. Composite actions cannot read the secrets context, so the caller must pass this explicitly. Mapped to OPENAI_API_KEY in the run step env (the provider's env_key) and never written to disk."
     required: true
   reasoning_effort:
-    description: "[engine-specific: codex] Reasoning effort for the review turn. One of low, medium, high. Empty leaves the model/endpoint default (no override is sent). Maps to `-c model_reasoning_effort=\"<v>\"` on the run step, applied ONLY when non-empty. Other engines ignore this input."
+    description: "[engine-specific: codex] Reasoning effort for the review turn. One of low, medium, high, xhigh, max. Empty leaves the model/endpoint default (no override is sent). Maps to `-c model_reasoning_effort=\"<v>\"` on the run step, applied ONLY when non-empty. Other engines ignore this input."
     required: false
     default: ""
   cli_version:
@@ -261,9 +261,9 @@ runs:
         REASONING_ARGS=()
         if [[ -n "$REASONING_EFFORT" ]]; then
           case "$REASONING_EFFORT" in
-            low|medium|high) ;;
+            low|medium|high|xhigh|max) ;;
             *)
-              echo "❌ Codex engine: reasoning_effort must be one of low|medium|high (or empty), got '$REASONING_EFFORT'"
+              echo "❌ Codex engine: reasoning_effort must be one of low|medium|high|xhigh|max (or empty), got '$REASONING_EFFORT'"
               exit 1
               ;;
           esac
