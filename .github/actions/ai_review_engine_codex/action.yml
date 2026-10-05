@@ -372,7 +372,7 @@ runs:
         web_search = false
 
         [features]
-        hooks = false
+        hookz = false
 
         [shell_environment_policy]
         ignore_default_excludes = false
