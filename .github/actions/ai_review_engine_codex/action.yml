@@ -140,8 +140,8 @@ runs:
         find . -name .git -prune -o \( -type d -o -type l \) -ipath '*/.cursor/rules' \
           -print0 | xargs -0 -r rm -rf
 
-        # Codex also reads $CODEX_HOME/.codex under the runner home even with an
-        # isolated CODEX_HOME; clear leftover default-home state on a persistent
+        # Codex also reads the default home ($HOME/.codex) even with an isolated
+        # CODEX_HOME; clear leftover default-home state on a persistent
         # self-hosted runner so a previous run cannot inject config/hooks.
         rm -rf "$HOME/.codex" "$HOME/.agents" "$HOME/.claude"
         echo "✅ Stripped PR-supplied agent config (recursive)"
@@ -168,9 +168,22 @@ runs:
         rm -rf "$CODEX_HOME"
         mkdir -p "$CODEX_HOME"
 
+        # Fail fast if the sandbox cannot exist on this runner, mirroring the
+        # Grok engine's bubblewrap userns probe. Codex's Linux sandbox is
+        # Landlock-based and needs kernel >= 5.13; on the self-hosted
+        # github_claude_code_reviewer group an older/restricted kernel would make
+        # every model-spawned command fail and the job would burn a retry and up
+        # to the 60-minute timeout before dying on confusing model-level errors.
+        # This is fail-closed (no security exposure), just a clear early exit.
+        KREL="$(uname -r)"; IFS='.' read -r KMAJ KMIN _ <<< "$KREL"
+        if (( KMAJ < 5 || (KMAJ == 5 && KMIN < 13) )); then
+          echo "❌ Codex engine: kernel $KREL lacks Landlock (>= 5.13 required); the workspace-write sandbox cannot apply on this runner."
+          exit 1
+        fi
+
         npm install -g "@openai/codex@${CLI_VERSION}"
         codex --version
-        echo "✅ Codex CLI ${CLI_VERSION} installed (CODEX_HOME=$CODEX_HOME)"
+        echo "✅ Codex CLI ${CLI_VERSION} installed (CODEX_HOME=$CODEX_HOME, kernel $KREL)"
 
     - name: Configure review CLI (Codex)
       shell: bash
@@ -230,6 +243,20 @@ runs:
 
         [features]
         hooks = false
+
+        # Defense-in-depth for the LLM API key. Codex authenticates by reading
+        # OPENAI_API_KEY from its OWN process env (env_key above) — that path is
+        # untouched. This policy governs the env of commands the MODEL spawns
+        # inside the sandbox: keep Codex's default excludes on
+        # (ignore_default_excludes = false already drops *KEY*/*TOKEN*/*SECRET*)
+        # and name OPENAI_API_KEY explicitly so a sandboxed `env`/`printenv`
+        # cannot read the shared org key straight out of its environment. The
+        # sandbox already has no network, so this closes the easiest *read* path
+        # rather than the (already blocked) exfiltration path. Additive to the
+        # defaults, so it cannot weaken them even if a glob is a no-op.
+        [shell_environment_policy]
+        ignore_default_excludes = false
+        exclude = ["OPENAI_API_KEY", "*_API_KEY", "*_TOKEN", "*_SECRET*"]
         EOF
 
         echo "🔧 Codex engine | model=$MODEL | base_url=$BASE_URL"

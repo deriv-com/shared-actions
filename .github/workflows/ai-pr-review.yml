@@ -52,12 +52,12 @@ on:
         default: ""
         type: string
       max_context_size:
-        description: "[engine-specific: kimi, grok] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; grok-4.6 is 500000; the 256k Kimi variants are 262144. Empty resolves per engine. Ignored when engine is `anthropic`."
+        description: "[engine-specific: kimi, grok] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; grok-4.6 is 500000; the 256k Kimi variants are 262144. Empty resolves per engine. Ignored when engine is `anthropic` or `codex`."
         required: false
         default: ""
         type: string
       cli_version:
-        description: "[engine-specific: kimi, grok] Exact CLI version to install (`@moonshot-ai/kimi-code` for kimi, `@xai-official/grok` for grok). Pinned deliberately — `latest` risks both breaking changes and unreviewed code in a privileged job. Empty resolves to the per-engine pin in the 'Resolve and validate engine' step; bump it there via PR. Ignored when engine is `anthropic`."
+        description: "[engine-specific: kimi, grok, codex] Exact CLI version to install (`@moonshot-ai/kimi-code` for kimi, `@xai-official/grok` for grok, `@openai/codex` for codex). Pinned deliberately — `latest` risks both breaking changes and unreviewed code in a privileged job. Empty resolves to the per-engine pin in the 'Resolve and validate engine' step; bump it there via PR. Ignored when engine is `anthropic`."
         required: false
         default: ""
         type: string
@@ -1059,6 +1059,11 @@ jobs:
           LEAK=""
           if [[ -n "$LLM_API_KEY" ]] && grep -qF -- "$LLM_API_KEY" "$REVIEW_OUTPUT_FILE"; then
             LEAK="the LLM API key (literal LLM_API_KEY value)"
+          elif [[ -n "$LLM_API_KEY" ]] && B64_KEY=$(printf '%s' "$LLM_API_KEY" | base64 | tr -d '\n'); [[ -n "$B64_KEY" ]] && grep -qF -- "$B64_KEY" "$REVIEW_OUTPUT_FILE"; then
+            # The engines whose model gets a shell (codex) could, under prompt
+            # injection, base64 the key to slip past the literal check above.
+            # Match that encoding too. Still fail-closed, still prefix-only.
+            LEAK="the LLM API key (base64-encoded LLM_API_KEY value)"
           elif [[ -n "${GH_TOKEN:-}" ]] && grep -qF -- "$GH_TOKEN" "$REVIEW_OUTPUT_FILE"; then
             LEAK="the job's GitHub token (literal GH_TOKEN value)"
           elif HIT=$(grep -oE "$token_shapes_re" "$REVIEW_OUTPUT_FILE" | head -n1); [[ -n "$HIT" ]]; then

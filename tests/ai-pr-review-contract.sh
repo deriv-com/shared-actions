@@ -195,6 +195,13 @@ check 'grep -q "no review written to \$OUTPUT_PATH" "$CODEX"' "codex engine fail
 check 'grep -qF -- "$FILE_SWEEP" "$CODEX"' "codex engine instruction-file scrub matches symlinks"
 check 'grep -qF -- "$DIR_SWEEP" "$CODEX"' "codex engine config-directory scrub matches symlinks"
 check 'grep -q "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020" "$CODEX"' "codex engine pins setup-node to the shared SHA"
+# Added in review: fail fast if the Landlock sandbox cannot exist on the runner
+# (mirrors the Grok engine's bubblewrap userns probe), scrub the LLM key from
+# the env of model-spawned commands, and catch the base64 encoding of the key
+# in the shared post-step exfiltration guard.
+check 'grep -q "lacks Landlock" "$CODEX"' "codex engine fails fast on a kernel without Landlock (>= 5.13)"
+check 'grep -q "\[shell_environment_policy\]" "$CODEX"' "codex engine scrubs the LLM key from model-spawned command env"
+check 'grep -q "base64-encoded LLM_API_KEY" "$WF"' "post-step refuses a base64-encoded LLM API key (shell-engine exfil hardening)"
 
 # 4. The path guard: the only path control either CLI honours. Shared by the
 #    Kimi and Anthropic engines, fail-closed by construction.

@@ -284,12 +284,13 @@ still the same engine, not a new one.
 
 | Input | Description | Required | Default (resolved when empty) |
 |-------|-------------|----------|---------|
-| `engine` | `kimi`, `anthropic`, or `grok` | ❌ | `kimi` |
-| `review_title` | Visible Checks name and comment heading (` Complete` is appended). Empty keeps the engine default and one slot per engine. Set title = concurrent slot on that engine. Must end in ` PR Review`. Example: `engine: anthropic`, `model: glm-5.3`, `review_title: GLM PR Review` | ❌ | engine name (`Kimi PR Review` / `Claude PR Review` / `Grok PR Review`) |
+| `engine` | `kimi`, `anthropic`, `grok`, or `codex` | ❌ | `kimi` |
+| `review_title` | Visible Checks name and comment heading (` Complete` is appended). Empty keeps the engine default and one slot per engine. Set title = concurrent slot on that engine. Must end in ` PR Review`. Example: `engine: anthropic`, `model: glm-5.3`, `review_title: GLM PR Review` | ❌ | engine name (`Kimi PR Review` / `Claude PR Review` / `Grok PR Review` / `Codex PR Review`) |
 | `model` | Model ID; resolved per engine when empty | ❌ | per engine |
 | `base_url` | LLM API endpoint; `/v1` added or stripped per engine | ❌ | `https://litellmsa.deriv.ai/v1` |
 | `max_context_size` | **[kimi, grok]** Context window in tokens. Must match the model, or the CLI over-packs and the API rejects the request | ❌ | per engine (`1048576` kimi, `500000` grok) |
-| `cli_version` | **[kimi, grok]** Exact CLI version (`@moonshot-ai/kimi-code` or `@xai-official/grok`) | ❌ | per engine (`0.34.0` kimi, `1.0.5` grok) |
+| `cli_version` | **[kimi, grok, codex]** Exact CLI version (`@moonshot-ai/kimi-code`, `@xai-official/grok`, or `@openai/codex`) | ❌ | per engine (`0.34.0` kimi, `1.0.5` grok, `0.160.0` codex) |
+| `reasoning_effort` | **[codex]** Reasoning effort for the review turn: `minimal`, `low`, `medium`, `high`, or `xhigh`. Empty sends no override | ❌ | empty (model default) |
 | `provider_type` | **[kimi]** Wire dialect; must match what `base_url` serves | ❌ | `openai` |
 | `legacy_markers` | Newline-separated markers from superseded workflows to also delete | ❌ | `Claude PR Review Complete` |
 | `prompt_gist_url` | Review prompt template | ❌ | DerivFE gist, **pinned to a revision** |
@@ -298,8 +299,8 @@ An invalid `review_title` still renders verbatim in the Check name at
 workflow-parse time; the run then fails in "Resolve and validate engine".
 The job name is not authoritative until the run succeeds.
 
-Inputs marked **[kimi]** / **[kimi, grok]** are ignored by engines that do not
-use them. Every input except
+Inputs marked **[kimi]** / **[kimi, grok]** / **[kimi, grok, codex]** / **[codex]**
+are ignored by engines that do not use them. Every input except
 `engine` and `legacy_markers` declares `default: ""` and is resolved to the
 values above inside the `Resolve and validate engine` step — so each default
 exists in exactly one place, and that step is where you bump any of them.
