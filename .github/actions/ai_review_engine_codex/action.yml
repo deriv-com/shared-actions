@@ -285,8 +285,8 @@ runs:
         mkdir -p "$CODEX_HOME"
 
         # Credentials stay in OPENAI_API_KEY (the provider's env_key) on the run
-        # step — nothing sensitive is written to disk. wire_api = "chat" because
-        # the LiteLLM proxy serves OpenAI-compatible /v1/chat/completions for
+        # step — nothing sensitive is written to disk. wire_api = "responses" because
+        # Codex CLI 0.160.0 refuses "chat" at startup; LiteLLM serves /v1/responses for
         # gpt-6.1-sol.
         #
         # sandbox_mode = workspace-write + network_access = false confines the
@@ -324,7 +324,7 @@ runs:
         name = "LiteLLM proxy"
         base_url = "${BASE_URL}"
         env_key = "OPENAI_API_KEY"
-        wire_api = "chat"
+        wire_api = "responses"
 
         [sandbox_workspace_write]
         network_access = false
@@ -463,7 +463,7 @@ runs:
           fi
 
           echo "ℹ️  Troubleshooting: a 400 on the FIRST request is config —"
-          echo "    wire_api (chat vs responses) or the model alias not resolving"
+          echo "    the proxy not serving /v1/responses for this model, or the alias not resolving"
           echo "    at the proxy. After the agent has started reading files,"
           echo "    config is probably fine."
         }
@@ -481,7 +481,7 @@ runs:
           --config 'model_provider="litellm"'
           --config "model_providers.litellm.base_url=\"${BASE_URL}\""
           --config 'model_providers.litellm.env_key="OPENAI_API_KEY"'
-          --config 'model_providers.litellm.wire_api="chat"'
+          --config 'model_providers.litellm.wire_api="responses"'
           --config approval_policy='"never"'
           --config sandbox_workspace_write.network_access=false
           --config sandbox_workspace_write.exclude_tmpdir_env_var=true
