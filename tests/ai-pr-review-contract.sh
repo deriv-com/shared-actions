@@ -220,7 +220,8 @@ for pin in "--sandbox workspace-write" "model_provider=\"litellm\"" "model_provi
 done
 # output_path is resolved before the /tmp check, and /var/tmp is not accepted.
 check 'ncgrep "OUTPUT_REAL=\"\\$\\(realpath -m" "$CODEX"' "codex resolves output_path with realpath before checking it"
-check '! step_body "Configure review CLI (Codex)" "$CODEX" | grep -qE "^ *[^#]*/var/tmp/\\*\\)"' "codex output_path guard no longer accepts /var/tmp"
+check '! step_body "Configure review CLI (Codex)" "$CODEX" | grep -cE "^ *[^#]*/var/tmp/\\*\\)" >/dev/null' "codex output_path guard no longer accepts /var/tmp"
+check '! awk "/^  output_path:/{f=1;next} f && /^  [a-z_]+:/{exit} f" "$CODEX" | grep -cE "/tmp or /var/tmp|under temp" >/dev/null' "codex output_path input description matches the /tmp-only guard"
 # Failure-path log dump reads only CODEX_HOME and blocks workflow commands.
 check '! ncgrep "find \"\\\$CODEX_HOME\" /tmp" "$CODEX"' "codex log dump does not search the model-writable /tmp"
 check 'ncgrep "::stop-commands::" "$CODEX"' "codex log dump is wrapped in ::stop-commands::"

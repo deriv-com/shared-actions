@@ -84,7 +84,7 @@ inputs:
     required: false
     default: "/tmp/pr_diff.txt"
   output_path:
-    description: "Path this engine MUST write the final review markdown to. Must be under temp (/tmp or /var/tmp): the sandbox keeps the checkout writable but the review belongs outside it, and the verify step asserts the file landed here."
+    description: "Path this engine MUST write the final review markdown to. Must resolve (after realpath, so `..` cannot escape) under /tmp; /var/tmp is not accepted. The sandbox keeps the checkout writable but the review belongs outside it, and the verify step asserts the file landed here."
     required: false
     default: "/tmp/ai_review_output.txt"
   repository:
