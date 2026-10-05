@@ -67,7 +67,7 @@ on:
         default: ""
         type: string
       reasoning_effort:
-        description: "[engine-specific: codex] Reasoning effort for the Codex review turn: minimal, low, medium, high, or xhigh (the Codex CLI config enum). The gpt-6.1-sol model also exposes max/ultra, but the CLI rejects those, so they are not accepted. Empty sends no override and leaves the model/endpoint default. Validated in the 'Resolve and validate engine' step and passed to the codex dispatch step as `-c model_reasoning_effort`. Ignored when engine is not `codex` (the other engines take no such input)."
+        description: "[engine-specific: codex] Reasoning effort for the Codex review turn: minimal, low, medium, high, or xhigh (the Codex CLI config enum). The gpt-6.1-sol model also exposes max/ultra, but the CLI rejects those, so they are not accepted; widen the set here, in the resolve step and in the engine once the pinned CLI accepts them. Empty sends no override and leaves the model/endpoint default. Validated in the 'Resolve and validate engine' step and passed to the codex dispatch step as `-c model_reasoning_effort`. Ignored when engine is not `codex` (the other engines take no such input)."
         required: false
         default: ""
         type: string
@@ -363,6 +363,10 @@ jobs:
           # leaves the model default untouched. Validate a non-empty value here
           # so a typo fails at resolve time with a clear message rather than
           # inside the engine an hour later. The other engines ignore it.
+          # The set is the Codex CLI config enum. The model also has max/ultra;
+          # add them here, in the input description and in the engine once the
+          # pinned CLI accepts them (tests/ai-pr-review-contract.sh checks that
+          # all copies match).
           REASONING_EFFORT="${REASONING_EFFORT_INPUT:-}"
           if [[ -n "$REASONING_EFFORT" ]]; then
             case "$REASONING_EFFORT" in
@@ -855,7 +859,7 @@ jobs:
             echo ""
             echo "Work through these steps in order:"
             echo ""
-            echo "1. Read $PR_DIFF_FILE — the full diff for this PR (changed files and hunks), already fetched for you. You have no shell tool; everything you need is on disk."
+            echo "1. Read $PR_DIFF_FILE — the full diff for this PR (changed files and hunks), already fetched for you. You have no network access, so do not try to fetch anything; everything you need is on disk."
             echo "2. For each changed file, use Read to open the full file — not just the diff hunk. Full file context is required to understand the complete impact of each change."
             echo "3. For each changed file, identify and Read its dependencies:"
             echo "   - Imported modules, utilities, or shared helpers referenced in the changed code"
@@ -935,7 +939,9 @@ jobs:
       # supported on steps inside a composite action. Keep the values in sync.
       #
       # Each engine owns: stripping PR-supplied agent config, its own CLI and
-      # sandbox config, and granting the model NO shell tool. Each reads
+      # sandbox config, and granting the model NO shell tool (codex is the one
+      # exception: a sandboxed shell with no network and no token; see its
+      # header). Each reads
       # review_context_path + pr_diff_path and writes output_path. None of them
       # post comments — the post step below is the only thing that can.
       # =====================================================================
@@ -1033,8 +1039,9 @@ jobs:
           # Everything up to the post below is deliberately fail-CLOSED: on any
           # failure in this step's checks, the previous review is untouched.
           #
-          # Checked in order: the LLM API key and the job's GitHub token as
-          # literals (GH_TOKEN in this step's env IS the job token —
+          # Checked in order: the LLM API key as a literal and as base64 (a model
+          # with a shell can encode it); then the job's GitHub token as a
+          # literal (GH_TOKEN in this step's env IS the job token —
           # secrets.GITHUB_TOKEN — so one literal check covers it; do not add a
           # second variable holding the same value); then GitHub token shapes
           # (ghp_/gho_/ghu_/ghs_/ghr_, github_pat_) in case the model quoted one

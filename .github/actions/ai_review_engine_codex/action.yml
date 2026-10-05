@@ -41,10 +41,19 @@ description: >
 #
 # What confines this engine instead — each control independent, all fail-closed:
 #   1. sandbox_mode = "workspace-write" with [sandbox_workspace_write]
-#      network_access = false. The model cannot open a socket, so it cannot
-#      reach the GitHub API or exfiltrate anything even if it read a token.
+#      network_access = false. Commands the model runs cannot open a socket,
+#      so they cannot reach the GitHub API or send anything off the runner
+#      directly. This confines the model's commands, NOT the Codex process
+#      itself, which must talk to the LLM endpoint.
 #   2. No GITHUB_TOKEN in the run step's env (persist-credentials:false in the
-#      caller's checkout already left none on disk). Nothing to steal.
+#      caller's checkout already left none on disk).
+#   2a. CODEX_HOME (config.toml, sessions, logs) lives under runner.temp, which
+#      is outside every sandbox-writable root (the checkout, /tmp, and $TMPDIR
+#      via exclude_tmpdir_env_var = true). The model therefore cannot edit the
+#      config the Codex process reads. The provider, base_url, wire_api and
+#      env_key are ALSO pinned on the CLI, and the config's sha256 is checked
+#      before every attempt, so a tampered config cannot redirect the API key
+#      to another host on the retry.
 #   3. web search disabled (tools.web_search = false + --config overrides) so
 #      the model has no outbound tool at all.
 #   4. approval_policy = "never": the model can never escalate out of the
@@ -53,8 +62,17 @@ description: >
 #      writable, but the verify step fails the job if no review landed at that
 #      /tmp path, so a model that wrote elsewhere fails loudly rather than
 #      silently posting nothing.
-# This is the same posture the Grok engine's read-only sandbox provides, minus
-# the per-file read scoping no sandbox mode offers here.
+# RESIDUAL RISK, stated plainly. Unlike Kimi and Anthropic, whose path guard
+# denies reads outside the checkout, reads here are unscoped: Landlock
+# workspace-write restricts writes, not reads. A same-uid command such as
+# `cat /proc/$PPID/environ` can probably still read OPENAI_API_KEY (and runner
+# variables) from the Codex process. [shell_environment_policy] only cleans the
+# env of commands the model spawns; it does not hide the parent's. The one way
+# out is then the review text itself. The post step refuses the literal key and
+# its base64 form, but a hex, reversed or split copy would pass. What bounds
+# this today: same-repo PRs only, the org-member access gate, no network from
+# the sandbox, and the shared key being rotatable. Treat codex as weaker than
+# Kimi/Anthropic on key confidentiality until Codex can deny /proc reads.
 
 inputs:
   review_context_path:
@@ -159,12 +177,13 @@ runs:
       shell: bash
       env:
         CLI_VERSION: ${{ inputs.cli_version }}
-        CODEX_HOME: /tmp/codex-engine-home
+        CODEX_HOME: ${{ runner.temp }}/codex-engine-home
       run: |
-        # Isolate CODEX_HOME under /tmp so config.toml, auth, history and caches
-        # never land in the runner home (where a persistent self-hosted runner
-        # would carry them between runs) and the config step has one stable path
-        # to write. Recreate it clean for the same reason.
+        # Isolate CODEX_HOME under runner.temp so config.toml, auth, history and
+        # caches never land in the runner home (where a persistent self-hosted
+        # runner would carry them between runs). runner.temp, not /tmp: /tmp is
+        # writable from inside the workspace-write sandbox, so a config there
+        # could be edited by the model between attempts. Recreate it clean.
         rm -rf "$CODEX_HOME"
         mkdir -p "$CODEX_HOME"
 
@@ -186,9 +205,10 @@ runs:
         echo "✅ Codex CLI ${CLI_VERSION} installed (CODEX_HOME=$CODEX_HOME, kernel $KREL)"
 
     - name: Configure review CLI (Codex)
+      id: configure
       shell: bash
       env:
-        CODEX_HOME: /tmp/codex-engine-home
+        CODEX_HOME: ${{ runner.temp }}/codex-engine-home
         OUTPUT_PATH: ${{ inputs.output_path }}
         MODEL: ${{ inputs.model }}
         INPUT_BASE_URL: ${{ inputs.base_url }}
@@ -196,14 +216,33 @@ runs:
         # Fail closed if a caller pointed output at the checkout: workspace-write
         # keeps the checkout writable, so a review written there would be swept
         # as PR-controlled content and could overwrite source. The review's home
-        # is temp.
-        case "$OUTPUT_PATH" in
-          /tmp/*|/var/tmp/*) ;;
+        # is /tmp. Resolve first so `/tmp/../home/...` cannot pass the glob.
+        OUTPUT_REAL="$(realpath -m -- "$OUTPUT_PATH")"
+        case "$OUTPUT_REAL" in
+          /tmp/*) ;;
           *)
-            echo "❌ Codex engine: output_path must be under temp: $OUTPUT_PATH"
+            echo "❌ Codex engine: output_path must resolve under /tmp: $OUTPUT_PATH (resolves to $OUTPUT_REAL)"
             exit 1
             ;;
         esac
+
+        # CODEX_HOME holds the config the unsandboxed Codex process reads, so it
+        # must sit outside every root the sandbox lets the model write: the
+        # checkout and /tmp (and $TMPDIR, excluded below). A self-hosted runner
+        # whose runner.temp lands in one of those would reopen the
+        # config-tampering path, so refuse to run there.
+        HOME_REAL="$(realpath -m -- "$CODEX_HOME")"
+        WS_REAL="$(realpath -m -- "$GITHUB_WORKSPACE")"
+        case "$HOME_REAL/" in
+          /tmp/*|/var/tmp/*|"$WS_REAL"/*)
+            echo "❌ Codex engine: CODEX_HOME ($HOME_REAL) is inside a sandbox-writable root; the model could edit its own config."
+            exit 1
+            ;;
+        esac
+        if [[ -n "${TMPDIR:-}" ]] && [[ "$HOME_REAL/" == "$(realpath -m -- "$TMPDIR")"/* ]]; then
+          echo "❌ Codex engine: CODEX_HOME ($HOME_REAL) is inside \$TMPDIR; the model could edit its own config."
+          exit 1
+        fi
 
         BASE_URL="${INPUT_BASE_URL%/}"
         [[ "$BASE_URL" == */v1 ]] || BASE_URL="${BASE_URL}/v1"
@@ -237,6 +276,9 @@ runs:
 
         [sandbox_workspace_write]
         network_access = false
+        # /tmp stays writable (the review lands there); $TMPDIR does not, so a
+        # runner whose TMPDIR is runner.temp cannot expose CODEX_HOME.
+        exclude_tmpdir_env_var = true
 
         [tools]
         web_search = false
@@ -260,6 +302,12 @@ runs:
         EOF
 
         echo "🔧 Codex engine | model=$MODEL | base_url=$BASE_URL"
+        # Step outputs live in the runner, not in a file the model can reach, so
+        # the run step can verify the config it is about to load is this one.
+        {
+          echo "config_sha256=$(sha256sum "$CODEX_HOME/config.toml" | cut -d' ' -f1)"
+          echo "base_url=$BASE_URL"
+        } >> "$GITHUB_OUTPUT"
         echo "✅ Codex config written (CODEX_HOME=$CODEX_HOME)"
 
     - name: Run AI PR review (Codex)
@@ -267,7 +315,7 @@ runs:
       shell: bash
       working-directory: ${{ github.workspace }}
       env:
-        CODEX_HOME: /tmp/codex-engine-home
+        CODEX_HOME: ${{ runner.temp }}/codex-engine-home
         # The provider's env_key. Codex reads the key from here; it is never
         # written to config.toml or any other file on disk.
         OPENAI_API_KEY: ${{ inputs.api_key }}
@@ -277,6 +325,8 @@ runs:
         OUTPUT_PATH: ${{ inputs.output_path }}
         MODEL: ${{ inputs.model }}
         REASONING_EFFORT: ${{ inputs.reasoning_effort }}
+        CONFIG_SHA256: ${{ steps.configure.outputs.config_sha256 }}
+        BASE_URL: ${{ steps.configure.outputs.base_url }}
       run: |
         [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Codex engine: missing or empty review context at $CONTEXT_PATH"; exit 1; }
         [[ -s "$DIFF_PATH"    ]] || { echo "❌ Codex engine: missing or empty PR diff at $DIFF_PATH"; exit 1; }
@@ -350,13 +400,19 @@ runs:
             echo "ℹ️  review file: ABSENT at $OUTPUT_PATH — the model never wrote the review"
           fi
 
-          CODEX_LOGS=$(find "$CODEX_HOME" /tmp -maxdepth 5 -type f \( -name '*.log' -o -name '*.jsonl' \) 2>/dev/null | grep -i codex | head -3 || true)
+          # Only CODEX_HOME: it is outside the sandbox-writable roots, so the
+          # model cannot plant files there. Searching /tmp would let the model
+          # choose what lands in the job log. Output is wrapped in
+          # ::stop-commands:: so log text cannot run workflow commands either.
+          CODEX_LOGS=$(find "$CODEX_HOME" -maxdepth 5 -type f \( -name '*.log' -o -name '*.jsonl' \) 2>/dev/null | head -3 || true)
           if [[ -n "$CODEX_LOGS" ]]; then
+            STOP_TOKEN="codex-log-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
             while IFS= read -r log; do
               lines=$(wc -l < "$log" | tr -d '[:space:]')
-              echo "::group::$log (last 200 of $lines lines)"
+              echo "--- $log (last 200 of $lines lines) ---"
+              echo "::stop-commands::$STOP_TOKEN"
               tail -n 200 "$log"
-              echo "::endgroup::"
+              echo "::$STOP_TOKEN::"
               [[ "$lines" -gt 200 ]] && echo "⚠️  truncated: $log has $lines lines"
             done <<< "$CODEX_LOGS"
           else
@@ -372,20 +428,53 @@ runs:
         rm -f "$OUTPUT_PATH"
         REVIEW_PROMPT="$(cat /tmp/review_prompt.txt)"
 
-        # No GitHub token in this step's env, network_access = false in the
-        # sandbox, web search off, approval_policy = never. The agent cannot
-        # reach the GitHub API or any network endpoint. codex exec runs
-        # non-interactively (no TTY, no approval prompts). --skip-git-repo-check
-        # because the review runs against a checkout that may not look like a
-        # git repo root to Codex. The sandbox/approval flags are also passed on
-        # the CLI so a config regression cannot silently relax them.
+        # Every setting that decides where the API key goes or what the sandbox
+        # allows is pinned here as well as in config.toml, so a config edit
+        # cannot change it: provider, base_url, env_key, wire_api, model, and
+        # the sandbox/approval/network/web-search settings.
+        PIN_ARGS=(
+          --sandbox workspace-write
+          --config "model=\"${MODEL}\""
+          --config 'model_provider="litellm"'
+          --config "model_providers.litellm.base_url=\"${BASE_URL}\""
+          --config 'model_providers.litellm.env_key="OPENAI_API_KEY"'
+          --config 'model_providers.litellm.wire_api="chat"'
+          --config approval_policy='"never"'
+          --config sandbox_workspace_write.network_access=false
+          --config sandbox_workspace_write.exclude_tmpdir_env_var=true
+          --config tools.web_search=false
+        )
+
+        # Run before EVERY attempt. Attempt 1 can write anything into the
+        # checkout, including a fresh AGENTS.md or .codex/ for attempt 2 to load,
+        # so the strip sweep runs again. The config hash catches any change to
+        # config.toml (it sits outside the sandbox's writable roots, so a
+        # mismatch means something unexpected; fail rather than load it).
+        pre_attempt_guard() {
+          find . -name .git -prune -o \( -type f -o -type l \) \
+            \( -iname 'agents.md' -o -iname 'agent.md' \
+               -o -iname 'codex.md' -o -iname 'claude.md' -o -iname 'claude.local.md' \
+               -o -iname '.cursorrules' \) \
+            -print0 | xargs -0 -r rm -f
+          find . -name .git -prune -o \( -type d -o -type l \) \
+            \( -iname '.codex' -o -iname '.claude' -o -iname '.agents' \) \
+            -print0 | xargs -0 -r rm -rf
+          [[ -n "$CONFIG_SHA256" && -n "$BASE_URL" ]] || { echo "❌ Codex engine: configure step outputs missing"; exit 1; }
+          ACTUAL_SHA="$(sha256sum "$CODEX_HOME/config.toml" | cut -d' ' -f1)"
+          if [[ "$ACTUAL_SHA" != "$CONFIG_SHA256" ]]; then
+            echo "❌ Codex engine: config.toml changed since the configure step (sha256 $ACTUAL_SHA, expected $CONFIG_SHA256). Refusing to start the CLI."
+            exit 1
+          fi
+        }
+
+        # No GitHub token in this step's env. codex exec runs non-interactively
+        # (no TTY, no approval prompts). --skip-git-repo-check because the
+        # checkout may not look like a git repo root to Codex.
         for attempt in 1 2; do
+          pre_attempt_guard
           codex exec \
             --skip-git-repo-check \
-            --sandbox workspace-write \
-            --config approval_policy='"never"' \
-            --config sandbox_workspace_write.network_access=false \
-            --config tools.web_search=false \
+            "${PIN_ARGS[@]}" \
             "${REASONING_ARGS[@]}" \
             "$REVIEW_PROMPT" && CODEX_STATUS=0 || CODEX_STATUS=$?
 

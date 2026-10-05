@@ -203,6 +203,43 @@ check 'grep -q "lacks Landlock" "$CODEX"' "codex engine fails fast on a kernel w
 check 'grep -q "\[shell_environment_policy\]" "$CODEX"' "codex engine scrubs the LLM key from model-spawned command env"
 check 'grep -q "base64-encoded LLM_API_KEY" "$WF"' "post-step refuses a base64-encoded LLM API key (shell-engine exfil hardening)"
 
+# Ako's review of d55ed7a. Greps below go through ncgrep, which ignores lines
+# whose first non-space character is '#', so a commented-out control fails.
+ncgrep() { grep -vE '^[[:space:]]*#' "$2" | grep -qE -- "$1"; }
+# Blocking: CODEX_HOME must not sit in a sandbox-writable root, or a model
+# could edit config.toml (e.g. base_url) for the retry to load.
+check '! grep -qE "CODEX_HOME: */tmp" "$CODEX"' "codex CODEX_HOME is not under /tmp (sandbox-writable)"
+check '[[ $(grep -cE "^ +CODEX_HOME: \\$\\{\\{ runner\\.temp \\}\\}/codex-engine-home$" "$CODEX") -eq 3 ]]' "codex CODEX_HOME is runner.temp in all three steps"
+check 'ncgrep "is inside a sandbox-writable root" "$CODEX"' "codex configure step refuses a CODEX_HOME inside a writable root"
+check 'ncgrep "exclude_tmpdir_env_var = true" "$CODEX"' "codex sandbox excludes \$TMPDIR from writable roots"
+check 'ncgrep "config_sha256=" "$CODEX" && ncgrep "config.toml changed since the configure step" "$CODEX"' "codex verifies the config hash before starting the CLI"
+check 'step_body "Run AI PR review (Codex)" "$CODEX" | grep -vE "^[[:space:]]*#" | awk "/for attempt in 1 2/{f=1} f && /pre_attempt_guard\$/{print; exit}" | grep -q pre_attempt_guard' "codex runs the pre-attempt guard inside the retry loop"
+# Every setting that routes the key or relaxes the sandbox is pinned on the CLI.
+for pin in "--sandbox workspace-write" "model_provider=\"litellm\"" "model_providers.litellm.base_url=" "model_providers.litellm.env_key=" "model_providers.litellm.wire_api=" "approval_policy='\"never\"'" "sandbox_workspace_write.network_access=false" "sandbox_workspace_write.exclude_tmpdir_env_var=true" "tools.web_search=false"; do
+  check 'grep -vE "^[[:space:]]*#" "$CODEX" | grep -qF -- "$pin"' "codex pins on the CLI: $pin"
+done
+# output_path is resolved before the /tmp check, and /var/tmp is not accepted.
+check 'ncgrep "OUTPUT_REAL=\"\\$\\(realpath -m" "$CODEX"' "codex resolves output_path with realpath before checking it"
+check '! step_body "Configure review CLI (Codex)" "$CODEX" | grep -qE "^ *[^#]*/var/tmp/\\*\\)"' "codex output_path guard no longer accepts /var/tmp"
+# Failure-path log dump reads only CODEX_HOME and blocks workflow commands.
+check '! ncgrep "find \"\\\$CODEX_HOME\" /tmp" "$CODEX"' "codex log dump does not search the model-writable /tmp"
+check 'ncgrep "::stop-commands::" "$CODEX"' "codex log dump is wrapped in ::stop-commands::"
+# The shared prompt no longer tells every engine it has no shell.
+check '! grep -q "You have no shell tool" "$WF"' "shared review procedure does not claim 'no shell tool' (false for codex)"
+check '! grep -q "Exactly three edits" "$ROOT/.github/workflows/AI_PR_REVIEW_README.md"' "README 'Adding an engine' no longer claims exactly three edits"
+# The reasoning_effort enum is duplicated on purpose (the engine can be called
+# directly). Every case-arm copy must be identical, so widening one cannot drift.
+ENUM_WF=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
+ENUM_CODEX=$(grep -vE '^[[:space:]]*#' "$CODEX" | grep -oE '^ +[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
+check '[[ -n "$ENUM_WF" && "$ENUM_WF" == "$ENUM_CODEX" ]]' "reasoning_effort case arms match in the orchestrator and the engine ($ENUM_WF)"
+ENUM_LIST="${ENUM_WF//|/, }"
+check 'grep -qF -- "${ENUM_LIST%, *}" "$WF" && grep -qF -- "${ENUM_LIST%, *}" "$CODEX"' "reasoning_effort input descriptions list the same values as the case arms"
+# Behavioural: run the engine's own validation block against good and bad values.
+EFFORT_BLOCK=$(step_body "Run AI PR review (Codex)" "$CODEX" | awk '/REASONING_ARGS=\(\)/{f=1} f{print} f && /^ +fi$/{exit}' | sed 's/^        //')
+effort_ok() { REASONING_EFFORT="$1" bash -c "$EFFORT_BLOCK" >/dev/null 2>&1; }
+check 'effort_ok "" && effort_ok xhigh && effort_ok minimal' "codex engine accepts empty, minimal and xhigh"
+check '! effort_ok max && ! effort_ok ultra && ! effort_ok bogus' "codex engine rejects max, ultra and unknown values"
+
 # 4. The path guard: the only path control either CLI honours. Shared by the
 #    Kimi and Anthropic engines, fail-closed by construction.
 check '[[ -f "$GUARD" ]]' "path guard script is committed"
