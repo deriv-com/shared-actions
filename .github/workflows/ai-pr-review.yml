@@ -1085,16 +1085,21 @@ jobs:
           # secret should be. (HackerOne #4037167)
           token_shapes_re='gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}'
           cred_shapes_re='authorization: *basic +[A-Za-z0-9+/=]{16,}|extraheader *= *authorization|includeif *"?gitdir:|git-credentials-[0-9a-f-]{8,}\.config|eC1hY2Nlc3MtdG9rZW46[A-Za-z0-9+/=]{10,}|x-access-token:[A-Za-z0-9_.-]{20,}@'
-          # base64 of the key with and without a trailing newline. The last
-          # 4-character group differs between the two, so both are matched.
-          # Each form is also matched with its padding dropped, against the
-          # review with every whitespace character removed.
+          # base64 of the key at each of the three byte alignments. Encoding
+          # the key on its own, after `echo`'s newline, or inside a longer
+          # string (`env | base64`, `K=$KEY`) only changes the 4-character
+          # groups at the edges, so each form drops those edges and keeps the
+          # middle, which depends on key bytes alone. Matched against the
+          # review with every whitespace character removed, so 76-column
+          # wrapping cannot split it.
           b64_key_in() {
-            local flat form
+            local flat form pad
             flat="$(tr -d '[:space:]' < "$1")"
-            for form in "$(printf '%s' "$LLM_API_KEY" | base64 -w0)" "$(printf '%s\n' "$LLM_API_KEY" | base64 -w0)"; do
-              form="${form%%=*}"
-              [[ -n "$form" && "$flat" == *"$form"* ]] && return 0
+            for pad in "" "A" "AA"; do
+              form="$(printf '%s%s' "$pad" "$LLM_API_KEY" | base64 -w0)"
+              [[ -n "$pad" ]] && form="${form:4}"
+              (( ${#form} > 4 )) && form="${form:0:${#form}-4}" || form=""
+              (( ${#form} >= 12 )) && [[ "$flat" == *"$form"* ]] && return 0
             done
             return 1
           }
@@ -1104,9 +1109,10 @@ jobs:
           elif [[ -n "$LLM_API_KEY" ]] && b64_key_in "$REVIEW_OUTPUT_FILE"; then
             # The engines whose model gets a shell (codex) could, under prompt
             # injection, base64 the key to slip past the literal check above.
-            # Match that encoding too, with and without the trailing newline
-            # `echo` adds, and against the review with all whitespace removed so
-            # base64's 76-column wrapping cannot split it. Still fail-closed,
+            # Match that encoding too, at all three byte alignments (so the key
+            # encoded alone, after a newline, or inside `env | base64` output),
+            # against the review with all whitespace removed so base64's
+            # 76-column wrapping cannot split it. Still fail-closed,
             # still prefix-only. A hex, reversed or split copy still passes;
             # the engine header's residual-risk note says so.
             LEAK="the LLM API key (base64-encoded LLM_API_KEY value)"
