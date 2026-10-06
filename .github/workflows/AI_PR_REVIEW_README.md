@@ -492,7 +492,7 @@ Keep the caller's filename, `name:` and job id — they determine the left
 half of the status-check name (`{caller job} / {reusable job}`), and
 changing one can block merges on a repo with branch protection. The
 reusable job is named after `engine` (`Kimi PR Review`, `Grok PR Review`,
-`Claude PR Review`) so two *engines* on one PR are distinguishable in
+`Claude PR Review`, `Codex PR Review`) so two *engines* on one PR are distinguishable in
 Checks. Override that heading with `review_title` when replacing the model
 on the same engine (for example `review_title: GLM PR Review`). set title =
 concurrent slot — two anthropic callers with distinct titles keep both
