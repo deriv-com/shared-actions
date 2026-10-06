@@ -342,10 +342,10 @@ URL is mutable, and a gist edit would rewrite the review agent's instructions
 for every consumer live, with no PR and no audit trail. To roll out a new
 prompt, edit the gist, then bump the revision hash in the resolve step via PR.
 
-`cli_version` is pinned deliberately: both `@moonshot-ai/kimi-code` and
-`@xai-official/grok` ship frequently, so `latest` would pull both breaking
-changes and unreviewed code into a job holding `LLM_API_KEY` and a write-scoped
-`GITHUB_TOKEN`. Bump it by PR. The Anthropic engine's action SHA is pinned the
+`cli_version` is pinned deliberately: `@moonshot-ai/kimi-code`,
+`@xai-official/grok` and `@openai/codex` all ship frequently, so `latest`
+would pull both breaking changes and unreviewed code into a job holding
+`LLM_API_KEY` and a write-scoped `GITHUB_TOKEN`. Bump it by PR. The Anthropic engine's action SHA is pinned the
 same way but *inside* the action, because `uses:` accepts no expressions.
 
 ## Secrets
@@ -492,8 +492,8 @@ Keep the caller's filename, `name:` and job id — they determine the left
 half of the status-check name (`{caller job} / {reusable job}`), and
 changing one can block merges on a repo with branch protection. The
 reusable job is named after `engine` (`Kimi PR Review`, `Grok PR Review`,
-`Claude PR Review`, `Codex PR Review`) so two *engines* on one PR are distinguishable in
-Checks. Override that heading with `review_title` when replacing the model
+`Claude PR Review`, `Codex PR Review`) so two *engines* on one PR are
+distinguishable in Checks. Override that heading with `review_title` when replacing the model
 on the same engine (for example `review_title: GLM PR Review`). set title =
 concurrent slot — two anthropic callers with distinct titles keep both
 comments. After adopting this, update any required check that still names
