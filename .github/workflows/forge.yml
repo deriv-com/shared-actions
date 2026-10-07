@@ -114,11 +114,11 @@ on:
           are logged and posted on the issue.
         required: false
         # Policy: every caller that doesn't pass engine_ref runs the newest
-        # v0.6.x tag, and each new v0.6.x tag rolls out to them with no PR here.
-        # spec-to-pr ships features in 0.6.x patches, so this is "newest 0.6.x",
+        # v0.7.x tag, and each new v0.7.x tag rolls out to them with no PR here.
+        # spec-to-pr ships features in 0.7.x patches, so this is "newest 0.7.x",
         # not "bug fixes only". Bump the range deliberately for a new minor
         # (0.x) / major (1.x+).
-        default: "^0.6.7"
+        default: "^0.7.0"
         type: string
       fast_lane:
         description: >-
