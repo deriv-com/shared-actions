@@ -60,8 +60,11 @@ Output file:
 
 ### Archive on Merge (openspec)
 
-When a PR that completes an openspec change merges, archive it and open a
-follow-up PR (never pushes directly to a protected branch).
+When a merge lands on the base branch, archive every openspec change whose
+tasks are all checked and open a follow-up PR (never pushes directly to a
+protected branch). Runs are serialized per repository and changes an open
+archive PR already covers are skipped, so back-to-back merges cannot open
+duplicate archive PRs.
 
 Thin caller in the consumer repo:
 
