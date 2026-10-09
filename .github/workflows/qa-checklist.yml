@@ -6,7 +6,7 @@ on:
       claude_model:
         description: "Claude model to use for checklist generation"
         required: false
-        default: "claude-sonnet-5"
+        default: "claude-sonnet-5-5"
         type: string
       anthropic_base_url:
         description: >-
@@ -40,7 +40,7 @@ jobs:
       cancel-in-progress: true
 
     env:
-      CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-sonnet-5' }}
+      CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-sonnet-5-5' }}
 
     steps:
       - name: Security Check - Validate User Access

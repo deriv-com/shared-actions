@@ -28,7 +28,9 @@ jobs:
       actions: read
     with:
       anthropic_base_url: https://litellmsa.deriv.ai
-      claude_model: ${{ vars.QA_CHECKLIST_MODEL || 'claude-sonnet-5' }}
+      # Leave the fallback to the shared workflow: an unset variable passes an
+      # empty string, and the shared workflow then uses its own default.
+      claude_model: ${{ vars.QA_CHECKLIST_MODEL }}
     secrets:
       ANTHROPIC_AUTH_TOKEN: ${{ secrets.FORGE_API_KEY }}
 ```
@@ -38,7 +40,7 @@ jobs:
 | Input | Required | Default | Notes |
 |---|---|---|---|
 | `anthropic_base_url` | yes | | Gateway base URL without the trailing `/v1`. Claude Code appends `/v1/messages` itself. |
-| `claude_model` | no | `claude-sonnet-5` | Must be an alias the gateway fronts. An unknown alias surfaces as a LiteLLM 500. |
+| `claude_model` | no | `claude-sonnet-5-5` | Must be an alias the gateway fronts. An unknown alias surfaces as a LiteLLM 500. An empty string also falls back to the default. A caller that hard-codes its own fallback (`vars.X \|\| 'claude-sonnet-5'`) keeps that model when the default here changes. |
 
 | Secret | Required | Notes |
 |---|---|---|
@@ -51,6 +53,6 @@ jobs:
 
 ## Output
 
-- A PR comment with the checklist. Its footer names the model the workflow requested, for example `Model: claude-sonnet-5`. That is the alias sent to the gateway. If the gateway maps the alias to another model, the footer does not show it. The footer is part of the prompt template, so it appears when Claude follows the template.
+- A PR comment with the checklist. Its footer names the model the workflow requested, for example `Model: claude-sonnet-5-5`. That is the alias sent to the gateway. If the gateway maps the alias to another model, the footer does not show it. The footer is part of the prompt template, so it appears when Claude follows the template.
 - A run summary table with trigger, PR, actor, model and status.
 - An event-log artifact (`qa-checklist-event-log-<run_id>`, kept 90 days). Its `workflow_completed` event carries `payload.model`.
