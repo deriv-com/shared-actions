@@ -113,8 +113,6 @@ jobs:
           fi
           echo "✅ ${#actions[@]} composite action(s) passed"
 
-      # Runs before the AI PR review contract tests, which currently exit 141
-      # (SIGPIPE) on ubuntu-latest and would otherwise skip every step after them.
       - name: QA checklist contract tests
         run: bash tests/qa-checklist-contract.sh
 
