@@ -33,7 +33,7 @@ check 'grep -qF "$HEADER_STRIP" "$WF"' "follow-up strip matches any * PR Review 
 check '! grep -qF "(AI|Claude|Kimi|Grok) PR Review Complete" "$WF"' "follow-up strip is not hardcoded to engine names"
 check 'grep -q "review_title_re=" "$WF"' "validation holds the regex in a variable"
 
-TITLE_RE="$(sed -n "s/.*review_title_re='\([^']*\)'.*/\1/p" "$WF" | head -1)"
+TITLE_RE="$(sed -n "s/.*review_title_re='\([^']*\)'.*/\1/p" "$WF" | awk 'NR==1')"
 check '[[ -n "$TITLE_RE" ]]' "review_title_re assignment is parseable"
 check '[[ "GLM PR Review" =~ $TITLE_RE ]]' "accepts GLM PR Review"
 check '[[ "Kimi PR Review" =~ $TITLE_RE ]]' "accepts Kimi PR Review"
@@ -61,9 +61,9 @@ check 'grep -q "REVIEW_SLOT_SUFFIX" "$WF"' "resolve step exports REVIEW_SLOT_SUF
 # append-side (bash on the validated REVIEW_TITLE) are two implementations.
 # Extract the prefix each uses before {0} / ${REVIEW_TITLE}; if they drift,
 # capture never sees the marker the post step just appended.
-MARKER_LINE=$(grep -F 'deriv-pr-review-${{ inputs.engine }}' "$WF" | head -1)
+MARKER_LINE=$(grep -m1 -F 'deriv-pr-review-${{ inputs.engine }}' "$WF")
 YAML_PREFIX=$(printf '%s\n' "$MARKER_LINE" | sed -n "s/.*format('\([^']*\){0}'.*/\1/p")
-BASH_PREFIX=$(sed -n 's/.*REVIEW_SLOT_SUFFIX="\(.*\)\${REVIEW_TITLE}".*/\1/p' "$WF" | head -1)
+BASH_PREFIX=$(sed -n 's/.*REVIEW_SLOT_SUFFIX="\(.*\)\${REVIEW_TITLE}".*/\1/p' "$WF" | awk 'NR==1')
 check '[[ -n "$YAML_PREFIX" ]]' "REVIEW_MARKERS format() prefix is parseable"
 check '[[ -n "$BASH_PREFIX" ]]' "REVIEW_SLOT_SUFFIX assignment prefix is parseable"
 check '[[ "$YAML_PREFIX" == "$BASH_PREFIX" ]]' "match-side format prefix equals append-side REVIEW_SLOT_SUFFIX prefix"
@@ -107,6 +107,13 @@ GUARD_TEST="$ROOT/.github/actions/ai_review_path_guard/path-guard.test.js"
 # contains X" checks that must not be satisfied by some other step.
 step_body() { awk -v name="- name: $1" 'index($0, name){f=1; next} f && /^ *- name: /{exit} f' "$2"; }
 
+# This script runs under `set -o pipefail`. A reader that quits early (`head`,
+# `grep -q`, `awk ... {exit}`) can SIGPIPE the writer before it finishes, and
+# pipefail turns that into exit 141: outside check() it kills the script, inside
+# check() it flips the result. Readers on a pipe must consume all input: use
+# `grep -c ... >/dev/null` instead of `grep -q`, `awk 'NR==1'` instead of
+# `head -1`, and a done-flag instead of `exit` in awk.
+
 # 1. Fork PRs never reach the privileged job. Same-repo Forge
 #    (gh-app-write[bot]) is the only *[bot] exception: wrap the skip, do not
 #    delete it. A bare allow-all-bots if: is a regression. Presence greps
@@ -118,10 +125,10 @@ check 'grep -qE "^    if: .*!endsWith\(github\.actor, .\[bot\].\)" "$WF"' "job-l
 check 'grep -qE "^    if: .*gh-app-write\[bot\]" "$WF"' "job-level if: allowlists gh-app-write[bot]"
 check 'grep -qE "^    if: .*\(!endsWith\(github\.actor, .\[bot\].\) *\|\| *github\.actor == .gh-app-write\[bot\].\).*&& *github\.event\.pull_request\.head\.repo\.full_name == github\.repository" "$WF"' "job-level if: scopes the gh-app-write[bot] exception inside the bot check, with the same-repo clause outside"
 GATE_BODY="$(step_body "Security Check - Validate User Access" "$WF")"
-check 'grep -F "gh-app-write[bot]" <<< "$GATE_BODY" | grep -q "exit 0"' "access gate allowlists gh-app-write[bot] on a line that exits 0"
+check 'grep -F "gh-app-write[bot]" <<< "$GATE_BODY" | grep -c "exit 0" >/dev/null' "access gate allowlists gh-app-write[bot] on a line that exits 0"
 
 # 2. The checkout leaves no token on disk.
-check 'step_body "Checkout PR head" "$WF" | grep -q "persist-credentials: false"' "PR-head checkout sets persist-credentials: false"
+check 'step_body "Checkout PR head" "$WF" | grep -c "persist-credentials: false" >/dev/null' "PR-head checkout sets persist-credentials: false"
 
 # 3. Symlinks: rejected up front, and swept by every engine's scrub.
 check 'grep -q "name: Reject symlinks introduced by the PR" "$WF"' "symlink rejection step exists"
@@ -250,7 +257,7 @@ check 'ncgrep "POST_DIR=\"\\\$\(mktemp -d \"\\\$RUNNER_TEMP/" "$WF" && ncgrep "c
 check '! step_body "Post review as single PR comment" "$WF" | grep -vE "^[[:space:]]*#" | grep -cE "[> ]/tmp/[a-z_]+\.(txt|json|md)" >/dev/null' "post step keeps no scratch files in /tmp"
 # Behavioural: the base64 key check catches printf, echo and wrapped encodings,
 # and the key encoded inside a longer string at every byte alignment.
-B64_FN=$(step_body "Post review as single PR comment" "$WF" | awk '/^ +b64_key_in\(\) \{/{f=1} f{print} f && /^ +\}$/{exit}' | sed 's/^          //')
+B64_FN=$(step_body "Post review as single PR comment" "$WF" | awk '!d && /^ +b64_key_in\(\) \{/{f=1} f && !d{print} f && !d && /^ +\}$/{d=1}' | sed 's/^          //')
 b64_hit() { LLM_API_KEY="$1" bash -c "$B64_FN"$'\n''b64_key_in "$0"' "$2"; }
 B64_TMP=$(mktemp -d); FAKE_KEY="sk-fake-$(printf 'a%.0s' {1..60})"
 printf 'x %s y\n' "$(printf '%s' "$FAKE_KEY" | base64 -w0)" > "$B64_TMP/printf"
@@ -328,7 +335,7 @@ check 'nc_fixed "\"\$REVIEW_PROMPT\" > \"\$CLI_LOG\" 2>&1 < /dev/null &" && nc_f
 check '[[ -f "$GUARD" ]]' "path guard script is committed"
 check '[[ -f "$GUARD_TEST" ]]' "path guard has a node --test file (run by lint-actions test-scripts)"
 check 'node --check "$GUARD"' "path guard parses"
-check '! grep -oE "require\(['\''\"][^'\''\"]+" "$GUARD" | grep -v "node:" | grep -q .' "path guard requires only node: builtins"
+check '! grep -oE "require\(['\''\"][^'\''\"]+" "$GUARD" | grep -v "node:" | grep -c . >/dev/null' "path guard requires only node: builtins"
 check 'grep -q "is not permitted in this review" "$GUARD"' "path guard denies any tool it does not know"
 check 'grep -q "a \`path\` argument is required" "$GUARD"' "path guard denies Read/Write without a path instead of waving them through"
 check 'grep -q "file_path" "$GUARD"' "path guard accepts Claude Code's file_path argument"
@@ -344,7 +351,7 @@ check 'grep -q "^        timeout = 600" "$KIMI"' "Kimi hook timeout is the schem
 check 'grep -q "node --check \"\$HOME/.kimi-code/path-guard.js\"" "$KIMI"' "Kimi guard is syntax-checked before the run step"
 check 'grep -q "kimi doctor config" "$KIMI" && grep -q "salvageConfigData" "$KIMI"' "Kimi action runs kimi doctor config and documents why it is load-bearing"
 check 'grep -q "not applied in \`-p\` mode\|not apply \`\[\[permission.rules\]\]\`\|are not applied" "$KIMI" || grep -qi "permission.rules.*not" "$KIMI"' "Kimi action documents that permission.rules are not enforcement"
-check 'step_body "Run AI PR review (Kimi Code)" "$KIMI" | grep -q "PATH_GUARD_LOG: \${{ runner.temp }}/" && step_body "Run AI PR review (Kimi Code)" "$KIMI" | grep -q "\[\[ ! -s \"\$PATH_GUARD_LOG\" \]\]"' "Kimi run step fails if a review was written without the guard ever running"
+check 'step_body "Run AI PR review (Kimi Code)" "$KIMI" | grep -c "PATH_GUARD_LOG: \${{ runner.temp }}/" >/dev/null && step_body "Run AI PR review (Kimi Code)" "$KIMI" | grep -c "\[\[ ! -s \"\$PATH_GUARD_LOG\" \]\]" >/dev/null' "Kimi run step fails if a review was written without the guard ever running"
 # Anthropic wiring
 check 'awk '\''/- name: Install path guard \(Claude Code\)/{i=NR} /uses: anthropics\/claude-code-action@/{a=NR} /- name: Verify the sandbox held/{v=NR} END{exit !(i && a && v && i<a && a<v)}'\'' "$ANTH"' "Anthropic: guard install runs before claude-code-action, sandbox verification after"
 ANTH_INSTALL="$(step_body "Install path guard (Claude Code)" "$ANTH")"
@@ -378,8 +385,8 @@ check '[[ "$(grep -c "jq \"\$REVIEW_MARKER_FILTER\"" "$WF")" -eq 2 ]]' "capture 
 
 # 6. The post step refuses to publish credentials — and does not refuse
 #    reviews that merely talk about credential plumbing.
-TOKEN_RE="$(sed -n "s/^ *token_shapes_re='\([^']*\)'.*/\1/p" "$WF" | head -1)"
-CRED_RE="$(sed -n "s/^ *cred_shapes_re='\([^']*\)'.*/\1/p" "$WF" | head -1)"
+TOKEN_RE="$(sed -n "s/^ *token_shapes_re='\([^']*\)'.*/\1/p" "$WF" | awk 'NR==1')"
+CRED_RE="$(sed -n "s/^ *cred_shapes_re='\([^']*\)'.*/\1/p" "$WF" | awk 'NR==1')"
 check '[[ -n "$TOKEN_RE" && -n "$CRED_RE" ]]' "exfiltration guard regexes are parseable"
 check 'grep -q "grep -oE \"\$token_shapes_re\"" "$WF"' "post step applies the token-shape regex"
 check 'grep -q "grep -oiE \"\$cred_shapes_re\"" "$WF"' "post step applies the credential-shape regex case-insensitively"
