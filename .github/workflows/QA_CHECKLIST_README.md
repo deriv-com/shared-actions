@@ -48,7 +48,7 @@ jobs:
 
 ## What it checks before running
 
-- The commenter must be a `deriv-com` org member or a collaborator on the calling repo.
+- The user who triggered the run (`github.actor`) must be a `deriv-com` org member or a collaborator on the calling repo. This is usually the commenter, but on a re-run it is whoever re-ran the workflow.
 - PRs from forks are refused.
 
 ## Output

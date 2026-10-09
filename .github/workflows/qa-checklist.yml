@@ -6,6 +6,8 @@ on:
       claude_model:
         description: "Claude model to use for checklist generation"
         required: false
+        # Keep in sync with the CLAUDE_MODEL fallback below and the Inputs table
+        # in QA_CHECKLIST_README.md. tests/qa-checklist-contract.sh checks all three.
         default: "claude-sonnet-5-5"
         type: string
       anthropic_base_url:
@@ -40,6 +42,10 @@ jobs:
       cancel-in-progress: true
 
     env:
+      # Second copy of the default: `default:` above does not apply when a caller
+      # passes an empty string, so the fallback is needed here too. Keep it in
+      # sync with the input default and QA_CHECKLIST_README.md
+      # (tests/qa-checklist-contract.sh checks all three).
       CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-sonnet-5-5' }}
 
     steps:
