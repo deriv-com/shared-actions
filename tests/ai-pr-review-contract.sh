@@ -170,6 +170,22 @@ check 'grep -q "DEFAULT_MODEL=\"gpt-6.1-sol\"" "$WF"' "codex arm pins DEFAULT_MO
 check 'grep -q "METRICS_AGENT=\"codex_review\"" "$WF"' "codex arm pins METRICS_AGENT=codex_review"
 check 'grep -q "ARTIFACT_PREFIX=\"codex-review\"" "$WF"' "codex arm pins ARTIFACT_PREFIX=codex-review"
 
+# Anthropic default model. Every live copy of the alias must match, so a bump
+# that misses one fails here instead of shipping to every consumer. The copies:
+# the resolve-step arm and the `model` input description in ai-pr-review.yml,
+# the engine action's own default, the README engines table, and the two
+# copies in the deprecated claude-pr-review.yml (input default and the
+# CLAUDE_MODEL env fallback).
+ANTH_DEFAULT_MODEL="claude-sonnet-5-5"
+DEPRECATED_WF="$ROOT/.github/workflows/claude-pr-review.yml"
+check 'grep -q "DEFAULT_MODEL=\"${ANTH_DEFAULT_MODEL}\"" "$WF"' "anthropic arm pins DEFAULT_MODEL=${ANTH_DEFAULT_MODEL}"
+check 'grep -qF "anthropic -> ${ANTH_DEFAULT_MODEL}," "$WF"' "model input description names ${ANTH_DEFAULT_MODEL} for anthropic"
+check 'grep -qF "default: \"${ANTH_DEFAULT_MODEL}\"" "$ANTH"' "anthropic engine action defaults model to ${ANTH_DEFAULT_MODEL}"
+# Match only the anthropic cell (second column), so a kimi bump cannot fail it.
+check 'grep -qE "^\| Default model \|[^|]*\| \`${ANTH_DEFAULT_MODEL}\` \|" "$README"' "README engines table lists ${ANTH_DEFAULT_MODEL} for anthropic"
+check 'grep -qF "default: \"${ANTH_DEFAULT_MODEL}\"" "$DEPRECATED_WF"' "deprecated claude-pr-review.yml defaults claude_model to ${ANTH_DEFAULT_MODEL}"
+check 'grep -qF "inputs.claude_model || '\''${ANTH_DEFAULT_MODEL}'\''" "$DEPRECATED_WF"' "deprecated claude-pr-review.yml falls back to ${ANTH_DEFAULT_MODEL}"
+
 # Dispatch: an if-gated step referencing the codex engine by absolute @master path.
 check 'grep -q "if: steps.engine.outputs.engine == '\''codex'\''" "$WF"' "codex dispatch step is if-gated on the engine output"
 check 'grep -q "ai_review_engine_codex@master" "$WF"' "codex dispatch references the engine by absolute @master path"

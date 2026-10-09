@@ -67,7 +67,7 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 | | `kimi` | `anthropic` | `grok` | `codex` |
 |---|---|---|---|---|
 | Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) | `@xai-official/grok` CLI — Grok Build (npm, pinned) | `@openai/codex` CLI (npm, pinned) |
-| Default model | `kimi-k3` | `claude-sonnet-5` | `grok-4.6` | `gpt-6.1-sol` |
+| Default model | `kimi-k3` | `claude-sonnet-5-5` | `grok-4.6` | `gpt-6.1-sol` |
 | `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** | proxy origin **+ `/v1`** | proxy origin **+ `/v1`** |
 | Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (+ Claude Code's permission-free `Grep`/`Glob`; the only GitHub MCP server agent mode mounts here is `github_file_ops`, denied by name and by the guard — see below) | `Read`, `Grep`, `Write`/`Edit` **output dir only** | Codex's unified exec + `apply_patch` (no per-file Read/Grep/Glob tools to scope) |
 | Shell | none (absent from `[tools] enabled`; the deny rule is intent only, and the path guard denies it too) | none (`--allowedTools` omits Bash, `--disallowedTools` re-denies it, the path guard denies it too) | none (`dontAsk` + `--tools` allowlist + `--deny Bash`) | sandboxed (`exec` runs commands inside the sandbox; `network_access=false` + `approval_policy=never` keep them off the network and un-escalatable) |

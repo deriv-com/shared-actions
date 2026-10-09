@@ -45,7 +45,7 @@ on:
         default: ""
         type: string
       model:
-        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5, grok -> grok-4.6, codex -> gpt-6.1-sol). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
+        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5-5, grok -> grok-4.6, codex -> gpt-6.1-sol). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
         required: false
         default: ""
         type: string
@@ -292,7 +292,7 @@ jobs:
               REVIEW_TITLE="Kimi PR Review"
               ;;
             anthropic)
-              DEFAULT_MODEL="claude-sonnet-5"
+              DEFAULT_MODEL="claude-sonnet-5-5"
               METRICS_AGENT="claude_review"
               ARTIFACT_PREFIX="claude-review"
               # Unused by this engine — the anthropic dispatch consumes neither.
