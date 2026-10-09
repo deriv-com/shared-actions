@@ -6,7 +6,9 @@ on:
       claude_model:
         description: "Claude model to use for checklist generation"
         required: false
-        default: "claude-sonnet-5"
+        # Keep in sync with the CLAUDE_MODEL fallback below and the Inputs table
+        # in QA_CHECKLIST_README.md. tests/qa-checklist-contract.sh checks all three.
+        default: "claude-sonnet-5-5"
         type: string
       anthropic_base_url:
         description: >-
@@ -40,7 +42,11 @@ jobs:
       cancel-in-progress: true
 
     env:
-      CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-sonnet-5' }}
+      # Second copy of the default: `default:` above does not apply when a caller
+      # passes an empty string, so the fallback is needed here too. Keep it in
+      # sync with the input default and QA_CHECKLIST_README.md
+      # (tests/qa-checklist-contract.sh checks all three).
+      CLAUDE_MODEL: ${{ inputs.claude_model || 'claude-sonnet-5-5' }}
 
     steps:
       - name: Security Check - Validate User Access
@@ -255,7 +261,7 @@ jobs:
             - [ ] [Edge case relevant to the changes]
 
             ---
-            *Regenerate: comment `@checkmaite`*
+            *Regenerate: comment `@checkmaite`* · Model: `${{ env.CLAUDE_MODEL }}`
             ```
 
             ## Scaling Guidelines
@@ -312,6 +318,7 @@ jobs:
           echo "| PR Number | #${{ github.event.issue.number }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Actor | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Triggered by | @${{ github.event.comment.user.login }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Model | $CLAUDE_MODEL |" >> $GITHUB_STEP_SUMMARY
           echo "| Status | $JOB_STATUS |" >> $GITHUB_STEP_SUMMARY
 
           # Compute duration
@@ -334,6 +341,7 @@ jobs:
             --arg run_id "$GITHUB_RUN_ID" \
             --arg repo "${{ github.repository }}" \
             --arg status "$STATUS_VAL" \
+            --arg model "$CLAUDE_MODEL" \
             --argjson duration "$DURATION_SECONDS" \
             --argjson checklist_generated "$CHECKLIST_BOOL" \
             --argjson changes_made "$CHECKLIST_BOOL" \
@@ -347,6 +355,7 @@ jobs:
               payload: {
                 repository: $repo,
                 status: $status,
+                model: $model,
                 duration_seconds: $duration,
                 checklist_generated: $checklist_generated,
                 changes_made: $changes_made,
