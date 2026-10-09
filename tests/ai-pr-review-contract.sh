@@ -160,6 +160,14 @@ check 'grep -q "DEFAULT_MODEL=\"gpt-6.1-sol\"" "$WF"' "codex arm pins DEFAULT_MO
 check 'grep -q "METRICS_AGENT=\"codex_review\"" "$WF"' "codex arm pins METRICS_AGENT=codex_review"
 check 'grep -q "ARTIFACT_PREFIX=\"codex-review\"" "$WF"' "codex arm pins ARTIFACT_PREFIX=codex-review"
 
+# Anthropic default model. The resolve-step arm, the engine action's own
+# default and the README engines table must name the same alias, so a bump
+# that misses one copy fails here instead of shipping to every consumer.
+ANTH_DEFAULT_MODEL="claude-sonnet-5-5"
+check 'grep -q "DEFAULT_MODEL=\"${ANTH_DEFAULT_MODEL}\"" "$WF"' "anthropic arm pins DEFAULT_MODEL=${ANTH_DEFAULT_MODEL}"
+check 'grep -qF "default: \"${ANTH_DEFAULT_MODEL}\"" "$ANTH"' "anthropic engine action defaults model to ${ANTH_DEFAULT_MODEL}"
+check 'grep -qF "| Default model | \`kimi-k3\` | \`${ANTH_DEFAULT_MODEL}\` |" "$README"' "README engines table lists ${ANTH_DEFAULT_MODEL} for anthropic"
+
 # Dispatch: an if-gated step referencing the codex engine by absolute @master path.
 check 'grep -q "if: steps.engine.outputs.engine == '\''codex'\''" "$WF"' "codex dispatch step is if-gated on the engine output"
 check 'grep -q "ai_review_engine_codex@master" "$WF"' "codex dispatch references the engine by absolute @master path"

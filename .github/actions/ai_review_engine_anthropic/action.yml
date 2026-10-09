@@ -45,9 +45,9 @@ inputs:
     description: "Number of the PR under review (prompt preamble only)."
     required: true
   model:
-    description: "Claude model ID, e.g. claude-sonnet-5. Passed via claude_args --model (the action's `model` input was removed upstream)."
+    description: "Claude model ID, e.g. claude-sonnet-5-5. Passed via claude_args --model (the action's `model` input was removed upstream)."
     required: false
-    default: "claude-sonnet-5"
+    default: "claude-sonnet-5-5"
   base_url:
     description: "LLM API base URL. A trailing /v1 is REMOVED before use — the Anthropic SDK appends /v1/messages itself. Accepting it and stripping means one caller-facing value works for every engine, so flipping `engine` never silently 404s."
     required: false
