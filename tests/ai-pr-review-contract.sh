@@ -25,7 +25,7 @@ check '[[ -f "$WF" ]]' "ai-pr-review.yml exists"
 check '[[ -f "$README" ]]' "AI_PR_REVIEW_README.md exists"
 
 check 'grep -q "^      review_title:" "$WF"' "review_title input is declared"
-check 'awk '\''/^      review_title:/{f=1} f && /default:/{print; exit}'\'' "$WF" | grep -q "default: \"\""' "review_title defaults to empty"
+check 'awk '\''/^      review_title:/{f=1} f && /default:/{print; exit}'\'' "$WF" | grep -c "default: \"\"" >/dev/null' "review_title defaults to empty"
 check 'grep -q "REVIEW_TITLE_INPUT:" "$WF"' "resolve step reads review_title"
 check 'grep -qE "^    name: .*inputs\\.review_title" "$WF"' "job name uses review_title"
 check 'grep -q "REVIEW_TITLE=\"\$REVIEW_TITLE_INPUT\"" "$WF" || grep -q "REVIEW_TITLE=\"\${REVIEW_TITLE_INPUT}\"" "$WF"' "non-empty review_title overrides engine default"
@@ -170,12 +170,12 @@ check 'grep -q "ARTIFACT_PREFIX=\"codex-review\"" "$WF"' "codex arm pins ARTIFAC
 # Dispatch: an if-gated step referencing the codex engine by absolute @master path.
 check 'grep -q "if: steps.engine.outputs.engine == '\''codex'\''" "$WF"' "codex dispatch step is if-gated on the engine output"
 check 'grep -q "ai_review_engine_codex@master" "$WF"' "codex dispatch references the engine by absolute @master path"
-check 'awk '\''/if: steps.engine.outputs.engine == .codex./{g=1} g && /timeout-minutes: 60/{print; exit}'\'' "$WF" | grep -q "timeout-minutes: 60"' "codex dispatch step carries timeout-minutes: 60"
+check 'awk '\''/if: steps.engine.outputs.engine == .codex./{g=1} g && /timeout-minutes: 60/{print; exit}'\'' "$WF" | grep -c "timeout-minutes: 60" >/dev/null' "codex dispatch step carries timeout-minutes: 60"
 
 # reasoning_effort: declared input (default empty), resolve-step validation,
 # emitted on the step outputs, and passed to the codex dispatch step.
 check 'grep -q "^      reasoning_effort:" "$WF"' "reasoning_effort input is declared"
-check 'awk '\''/^      reasoning_effort:/{f=1} f && /default:/{print; exit}'\'' "$WF" | grep -q "default: \"\""' "reasoning_effort defaults to empty"
+check 'awk '\''/^      reasoning_effort:/{f=1} f && /default:/{print; exit}'\'' "$WF" | grep -c "default: \"\"" >/dev/null' "reasoning_effort defaults to empty"
 check 'grep -q "REASONING_EFFORT_INPUT:" "$WF"' "resolve step reads reasoning_effort"
 check 'grep -q "minimal|low|medium|high|xhigh" "$WF"' "resolve step validates reasoning_effort against minimal|low|medium|high|xhigh"
 check 'grep -q "echo \"reasoning_effort=\$REASONING_EFFORT\"" "$WF"' "resolve step emits reasoning_effort on the step outputs"
