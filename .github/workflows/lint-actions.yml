@@ -24,6 +24,7 @@ on:
       - 'tests/ai-pr-review-contract.sh'
       - 'tests/forge-contract.sh'
       - 'tests/forge-resolver.sh'
+      - 'tests/qa-checklist-contract.sh'
   workflow_dispatch:
 
 permissions:
@@ -111,6 +112,11 @@ jobs:
             exit 1
           fi
           echo "✅ ${#actions[@]} composite action(s) passed"
+
+      # Runs before the AI PR review contract tests, which currently exit 141
+      # (SIGPIPE) on ubuntu-latest and would otherwise skip every step after them.
+      - name: QA checklist contract tests
+        run: bash tests/qa-checklist-contract.sh
 
       - name: AI PR review contract tests
         run: bash tests/ai-pr-review-contract.sh
