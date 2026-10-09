@@ -112,7 +112,10 @@ step_body() { awk -v name="- name: $1" 'index($0, name){f=1; next} f && /^ *- na
 # pipefail turns that into exit 141: outside check() it kills the script, inside
 # check() it flips the result. Readers on a pipe must consume all input: use
 # `grep -c ... >/dev/null` instead of `grep -q`, `awk 'NR==1'` instead of
-# `head -1`, and a done-flag instead of `exit` in awk.
+# `head -1`, and a done-flag instead of `exit` in awk. This applies only to the
+# reader end of a pipe: a command that reads a file or `<<<` input directly
+# (e.g. `grep -q PATTERN "$WF"`, `grep -m1 ... "$WF"`) may exit early, since
+# there is no writer to kill.
 
 # 1. Fork PRs never reach the privileged job. Same-repo Forge
 #    (gh-app-write[bot]) is the only *[bot] exception: wrap the skip, do not
