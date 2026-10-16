@@ -55,6 +55,10 @@ inputs:
   api_key:
     description: "API key for base_url (a LiteLLM virtual key with the default base_url). Composite actions cannot read the `secrets` context, so the caller must pass this explicitly."
     required: true
+  effort:
+    description: "[engine-specific: anthropic] Effort level for the review turn. One of low, medium, high, xhigh, max (the Claude Code CLI `--effort` enum / API `output_config.effort`). Empty leaves the model/endpoint default (no `--effort` is sent). ultracode is a Claude Code workflow setting, not an API effort level, and needs CLI >= 2.1.203; the pinned action is 2.1.126, so it is not accepted here. Applied ONLY when non-empty. Other engines ignore this input."
+    required: false
+    default: ""
 
 outputs:
   output_path:
@@ -190,6 +194,38 @@ runs:
         BASE_URL="${BASE_URL%/v1}"
         echo "base_url=$BASE_URL" >> "$GITHUB_OUTPUT"
         echo "🔧 Anthropic engine | model=${{ inputs.model }} | base_url=$BASE_URL"
+
+    - name: Resolve effort override
+      id: effort
+      shell: bash
+      env:
+        EFFORT: ${{ inputs.effort }}
+      run: |
+        # Validate effort here, not just in the orchestrator: this engine is
+        # referenced by absolute @master path and can be called directly, so the
+        # value must be checked where it is consumed. Empty means "send no
+        # override" and is the common case.
+        #
+        # The accepted set is the Claude Code CLI --effort enum, which maps to
+        # API output_config.effort: low|medium|high|xhigh|max. ultracode is a
+        # Claude Code workflow setting (extra agent orchestration), not an
+        # API level, and requires CLI >= 2.1.203; the pinned action ships
+        # 2.1.126, so accepting it here would let a caller configure a job the
+        # CLI rejects. Do not add ultracode until the pinned SHA's CLI accepts
+        # it as --effort.
+        FLAG=""
+        if [[ -n "$EFFORT" ]]; then
+          case "$EFFORT" in
+            low|medium|high|xhigh|max) ;;
+            *)
+              echo "❌ Anthropic engine: effort must be one of low|medium|high|xhigh|max (or empty), got '$EFFORT'"
+              exit 1
+              ;;
+          esac
+          FLAG="--effort ${EFFORT}"
+          echo "🔧 Anthropic engine | effort=$EFFORT"
+        fi
+        echo "flag=$FLAG" >> "$GITHUB_OUTPUT"
 
     - name: Claude Code PR review
       # Not a release tag — this is the SHA claude-pr-review.yml was pinned to
@@ -365,6 +401,7 @@ runs:
         # settings inside the PR checkout are not, whatever the strip step did.
         claude_args: |
           --model ${{ inputs.model }}
+          ${{ steps.effort.outputs.flag }}
           --allowedTools "Read,Write"
           --disallowedTools "Bash,WebFetch,WebSearch,mcp__github_comment,mcp__github_inline_comment,mcp__github_file_ops,mcp__github"
           --setting-sources user

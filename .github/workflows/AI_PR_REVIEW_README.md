@@ -77,7 +77,7 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 | `.git/config` after the run | untouched (`persist-credentials: false`) | untouched: `use_commit_signing: true` keeps the action off the path that rewrites the `origin` URL with the token, its base-branch fetch authenticates from env-only git config, and the file is asserted clean **before** and re-checked **after** | untouched | untouched (`persist-credentials: false`; no token in the step) |
 | Base-branch config restored | no | **yes** — the action fetches the PR's base branch and restores `.claude/`, `.mcp.json`, `CLAUDE.md`, `.gitmodules`, `.husky`, … from it after the strip step removed the PR's copies (maintainer-merged versions, never the PR's); `.claude/settings.json` from there is still not loaded (`--setting-sources user`) | no | no |
 | Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `.mcp.json` / `.cursorrules`; dirs `.grok/`, `.claude/`, `.claude-plugin/`, `.agents/`, `.cursor/rules/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CODEX.md` / `CLAUDE.md` / `CLAUDE.local.md` / `.cursorrules`; dirs `.codex/`, `.claude/`, `.agents/`, `.cursor/rules/`; plus `$HOME/.codex` on persistent runners |
-| Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type` | all except `max_context_size`, `cli_version`, `provider_type` | all except `provider_type` | all except `max_context_size`, `provider_type`; **only** engine honouring `reasoning_effort` |
+| Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type` | all except `max_context_size`, `cli_version`, `provider_type`; **only** engine honouring `effort` | all except `provider_type` | all except `max_context_size`, `provider_type`; **only** engine honouring `reasoning_effort` |
 | `agent` reported | `ai_review` | `claude_review` | `grok_review` | `codex_review` |
 | Artifact | `ai-review-summary-*` | `claude-review-summary-*` | `grok-review-summary-*` | `codex-review-summary-*` |
 
@@ -202,6 +202,13 @@ assuming parity:
   `Bash` and the workflow this replaced recorded that a scoped `Write(/path)`
   made the tool unavailable entirely; the hook does the scoping instead.
 
+  This engine honours **`effort`** (`--effort`: `low` | `medium` | `high` | `xhigh` | `max`, empty = model default):
+  validated at resolve time and again in the engine, mapped to `--effort` on
+  `claude_args` only when non-empty. The other engines ignore the input.
+  Official Claude Code / API effort; `ultracode` is a Claude Code workflow
+  setting rather than an API level and needs CLI >= 2.1.203, while the pinned
+  action ships 2.1.126, so it is rejected here.
+
 - **Grok** — permissions (`dontAsk`) plus `--tools Read,Grep,Write,Edit` are the
   guarantee; `--sandbox read-only` is extra (cannot write the checkout; temp
   and `$GROK_HOME` stay writable). Bash, WebFetch and WebSearch are denied and
@@ -268,7 +275,7 @@ assuming parity:
   sandbox, and a rotatable key. Codex is weaker than Kimi/Anthropic on key
   confidentiality until it can deny `/proc` reads.
 
-  This engine is the only one that honours **`reasoning_effort`**
+  This engine honours **`reasoning_effort`**
   (`minimal` | `low` | `medium` | `high` | `xhigh`, empty = model default):
   validated at resolve time
   and again in the engine, mapped to `-c model_reasoning_effort` only when
@@ -323,6 +330,7 @@ still the same engine, not a new one.
 | `max_context_size` | **[kimi, grok]** Context window in tokens. Must match the model, or the CLI over-packs and the API rejects the request | ❌ | per engine (`1048576` kimi, `500000` grok) |
 | `cli_version` | **[kimi, grok, codex]** Exact CLI version (`@moonshot-ai/kimi-code`, `@xai-official/grok`, or `@openai/codex`) | ❌ | per engine (`0.34.0` kimi, `1.0.5` grok, `0.160.0` codex) |
 | `reasoning_effort` | **[codex]** Reasoning effort for the review turn: `minimal`, `low`, `medium`, `high`, or `xhigh`. Empty sends no override | ❌ | empty (model default) |
+| `effort` | **[anthropic]** Effort for the review turn: `low`, `medium`, `high`, `xhigh`, or `max`. Empty sends no override | ❌ | empty (model default) |
 | `provider_type` | **[kimi]** Wire dialect; must match what `base_url` serves | ❌ | `openai` |
 | `legacy_markers` | Newline-separated markers from superseded workflows to also delete | ❌ | `Claude PR Review Complete` |
 | `prompt_gist_url` | Review prompt template | ❌ | DerivFE gist, **pinned to a revision** |
@@ -331,8 +339,8 @@ An invalid `review_title` still renders verbatim in the Check name at
 workflow-parse time; the run then fails in "Resolve and validate engine".
 The job name is not authoritative until the run succeeds.
 
-Inputs marked **[kimi]** / **[kimi, grok]** / **[kimi, grok, codex]** / **[codex]**
-are ignored by engines that do not use them. Every input except
+Inputs marked **[kimi]** / **[kimi, grok]** / **[kimi, grok, codex]** / **[codex]** /
+**[anthropic]** are ignored by engines that do not use them. Every input except
 `engine` and `legacy_markers` declares `default: ""` and is resolved to the
 values above inside the `Resolve and validate engine` step — so each default
 exists in exactly one place, and that step is where you bump any of them.
@@ -520,10 +528,10 @@ Four edits at minimum:
 
 An engine with its own knob needs more: an `[engine-specific: <name>]` input,
 its validation in the resolve step, a step output, and a row in the Inputs
-table (codex's `reasoning_effort` is the example). An engine whose model gets a
-shell should also review the post step's leak checks, since it widens what the
-model can put in the review text. Extend `tests/ai-pr-review-contract.sh` for
-each of these.
+table (codex's `reasoning_effort` and anthropic's `effort` are the examples).
+An engine whose model gets a shell should also review the post step's leak
+checks, since it widens what the model can put in the review text. Extend
+`tests/ai-pr-review-contract.sh` for each of these.
 
 ### The contract
 

@@ -80,6 +80,7 @@ check 'grep -qF "$KIMI_EMPTY_GATE" "$WF"' "pre-split legacy marker gated on empt
 check 'grep -qF "$ANTHROPIC_EMPTY_GATE" "$WF"' "pre-split legacy marker gated on empty title (anthropic)"
 
 check 'grep -q "| \`review_title\`" "$README"' "README documents review_title"
+check 'grep -q "| \`effort\`" "$README"' "README documents effort"
 check 'grep -q "GLM PR Review" "$README"' "README shows GLM PR Review as the caller example"
 check 'grep -q "empty title = one slot per engine" "$README"' "README documents empty-title per-engine slots"
 check 'grep -q "set title = concurrent slot" "$README"' "README documents title-scoped concurrent slots"
@@ -204,6 +205,17 @@ check 'grep -q "^  reasoning_effort:" "$CODEX"' "codex engine declares the reaso
 check 'grep -q "model_reasoning_effort" "$CODEX"' "codex engine maps reasoning_effort onto model_reasoning_effort"
 check 'grep -qE "if \[\[ -n \"\\\$REASONING_EFFORT\" \]\]" "$CODEX"' "codex engine applies reasoning_effort only when non-empty"
 
+# effort: anthropic-only, same dual-validation pattern as reasoning_effort.
+check 'grep -q "^      effort:" "$WF"' "effort input is declared"
+check 'awk '\''/^      effort:/{f=1} f && /default:/{print; exit}'\'' "$WF" | grep -c "default: \"\"" >/dev/null' "effort defaults to empty"
+check 'grep -q "EFFORT_INPUT:" "$WF"' "resolve step reads effort"
+check 'grep -q "low|medium|high|xhigh|max" "$WF"' "resolve step validates effort against low|medium|high|xhigh|max"
+check 'grep -q "echo \"effort=\$EFFORT\"" "$WF"' "resolve step emits effort on the step outputs"
+check 'grep -q "effort: \${{ steps.engine.outputs.effort }}" "$WF"' "anthropic dispatch step passes effort through"
+check 'grep -q "^  effort:" "$ANTH"' "anthropic engine declares the effort input"
+check 'grep -q "steps.effort.outputs.flag" "$ANTH"' "anthropic engine maps effort onto claude_args via the resolve-effort step"
+check 'grep -qE "if \[\[ -n \"\\\$EFFORT\" \]\]" "$ANTH"' "anthropic engine applies effort only when non-empty"
+
 # This engine CANNOT wire the shared path guard (Codex's hook contract uses
 # Bash/apply_patch tool names and tool_input.command, not Read/Write + a path),
 # so the sandbox is the enforcement boundary. These are its load-bearing
@@ -312,32 +324,60 @@ check 'ncgrep "::stop-commands::" "$CODEX"' "codex log dump is wrapped in ::stop
 # The shared prompt no longer tells every engine it has no shell.
 check '! grep -q "You have no shell tool" "$WF"' "shared review procedure does not claim 'no shell tool' (false for codex)"
 check '! grep -q "Exactly three edits" "$ROOT/.github/workflows/AI_PR_REVIEW_README.md"' "README 'Adding an engine' no longer claims exactly three edits"
-# The reasoning_effort enum is duplicated on purpose (the engine can be called
-# directly). Every case-arm copy must be identical, so widening one cannot drift.
-ENUM_WF=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
-ENUM_CODEX=$(grep -vE '^[[:space:]]*#' "$CODEX" | grep -oE '^ +[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
+# The reasoning_effort and effort enums are each duplicated on purpose (the
+# engines can be called directly). Extract Codex arms by the `minimal|` prefix
+# and Claude arms by the trailing `|max`, so a second xhigh case arm cannot
+# make ENUM_WF a two-line string that never equals ENUM_CODEX.
+ENUM_WF=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +minimal\|[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
+ENUM_CODEX=$(grep -vE '^[[:space:]]*#' "$CODEX" | grep -oE '^ +minimal\|[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
 check '[[ -n "$ENUM_WF" && "$ENUM_WF" == "$ENUM_CODEX" ]]' "reasoning_effort case arms match in the orchestrator and the engine ($ENUM_WF)"
 ENUM_LIST="${ENUM_WF//|/, }"
 check 'grep -qF -- "${ENUM_LIST%, *}" "$WF" && grep -qF -- "${ENUM_LIST%, *}" "$CODEX"' "reasoning_effort input descriptions list the same values as the case arms"
+ENUM_WF_ANTH=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +low\|medium\|high\|xhigh\|max\) ;;' | tr -d ' ;)' | sort -u)
+ENUM_ANTH=$(grep -vE '^[[:space:]]*#' "$ANTH" | grep -oE '^ +low\|medium\|high\|xhigh\|max\) ;;' | tr -d ' ;)' | sort -u)
+check '[[ -n "$ENUM_WF_ANTH" && "$ENUM_WF_ANTH" == "$ENUM_ANTH" ]]' "effort case arms match in the orchestrator and the anthropic engine ($ENUM_WF_ANTH)"
+ENUM_ANTH_LIST="${ENUM_WF_ANTH//|/, }"
+check 'grep -qF -- "${ENUM_ANTH_LIST%, *}" "$WF" && grep -qF -- "${ENUM_ANTH_LIST%, *}" "$ANTH"' "effort input descriptions list the same values as the case arms"
 # Every other copy (descriptions, error messages, comments, README) sits on a
-# line that names xhigh. Each such line must name every case-arm value, so a
-# value added to the arms but not to the prose turns this red.
+# line that names xhigh. Case-arm lines are already locked by the extractors
+# above. Remaining xhigh lines are classified as Codex or Claude so the two
+# enums cannot demand each other's values.
+is_case_arm() { [[ "$1" =~ \)[[:space:]]*\;\;[[:space:]]*$ ]]; }
+is_codex_effort_line() {
+  [[ "$1" =~ reasoning_effort ]] || [[ "$1" =~ model_reasoning_effort ]] || [[ "$1" =~ Codex\ CLI ]] || [[ "$1" =~ (^|[^a-z])minimal([^a-z]|$) ]]
+}
+is_claude_effort_line() {
+  [[ "$1" =~ --effort ]] || [[ "$1" =~ output_config ]] || [[ "$1" =~ engine-specific:\ anthropic ]] || [[ "$1" =~ Anthropic\ engine:\ effort ]] || [[ "$1" =~ Invalid\ effort ]] || [[ "$1" =~ \*\*\[anthropic\]\*\* ]]
+}
 enum_prose_ok() {
-  local f line v
-  for f in "$WF" "$CODEX" "$README"; do
+  local f line v enum
+  for f in "$WF" "$CODEX" "$ANTH" "$README"; do
     while IFS= read -r line; do
-      for v in ${ENUM_WF//|/ }; do
+      is_case_arm "$line" && continue
+      if is_codex_effort_line "$line"; then
+        enum="$ENUM_WF"
+      elif is_claude_effort_line "$line"; then
+        enum="$ENUM_WF_ANTH"
+      else
+        echo "  unclassified xhigh line in $(basename "$f"): ${line:0:120}"
+        return 1
+      fi
+      for v in ${enum//|/ }; do
         [[ "$line" =~ (^|[^a-z])$v([^a-z]|$) ]] || { echo "  missing '$v' in $(basename "$f"): ${line:0:100}"; return 1; }
       done
     done < <(grep -E '(^|[^a-z])xhigh([^a-z]|$)' "$f")
   done
 }
-check 'enum_prose_ok' "every reasoning_effort description, error and doc line lists all case-arm values"
-# Behavioural: run the engine's own validation block against good and bad values.
+check 'enum_prose_ok' "every reasoning_effort or effort description, error and doc line lists all of its case-arm values"
+# Behavioural: run each engine's own validation block against good and bad values.
 EFFORT_BLOCK=$(step_body "Run AI PR review (Codex)" "$CODEX" | awk '/REASONING_ARGS=\(\)/{f=1} f{print} f && /^ +fi$/{f=0; done=1} done{next}' | sed 's/^        //')
 effort_ok() { REASONING_EFFORT="$1" bash -c "$EFFORT_BLOCK" >/dev/null 2>&1; }
 check 'effort_ok "" && effort_ok xhigh && effort_ok minimal' "codex engine accepts empty, minimal and xhigh"
 check '! effort_ok max && ! effort_ok ultra && ! effort_ok bogus' "codex engine rejects max, ultra and unknown values"
+CLAUDE_EFFORT_BLOCK=$(step_body "Resolve effort override" "$ANTH" | awk '/FLAG=""/ {f=1} f{print} f && /^ +fi$/{f=0; done=1} done{next}' | sed 's/^        //')
+claude_effort_ok() { EFFORT="$1" bash -c "$CLAUDE_EFFORT_BLOCK" >/dev/null 2>&1; }
+check 'claude_effort_ok "" && claude_effort_ok low && claude_effort_ok max' "anthropic engine accepts empty, low and max"
+check '! claude_effort_ok minimal && ! claude_effort_ok ultracode && ! claude_effort_ok bogus' "anthropic engine rejects minimal, ultracode and unknown values"
 
 # Ako round 3 nits.
 check 'nc_fixed "base_url_re='"'"'^https?://" && nc_fixed "[[ ! \$BASE_URL =~ \$base_url_re ]]"' "codex base_url check uses a quoted pattern variable (no bracket escapes)"
