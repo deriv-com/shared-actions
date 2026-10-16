@@ -399,9 +399,12 @@ runs:
         # --setting-sources user: only $HOME/.claude/settings.json (which the
         # action writes from `settings` above) is loaded; project and local
         # settings inside the PR checkout are not, whatever the strip step did.
+        #
+        # --effort sits on the --model line so an empty flag cannot become a
+        # blank line in this block. Tokenization today drops empty tokens; a
+        # later line-split parser would not.
         claude_args: |
-          --model ${{ inputs.model }}
-          ${{ steps.effort.outputs.flag }}
+          --model ${{ inputs.model }} ${{ steps.effort.outputs.flag }}
           --allowedTools "Read,Write"
           --disallowedTools "Bash,WebFetch,WebSearch,mcp__github_comment,mcp__github_inline_comment,mcp__github_file_ops,mcp__github"
           --setting-sources user
