@@ -283,7 +283,7 @@ runs:
         BASE_URL="${INPUT_BASE_URL%/}"
         [[ "$BASE_URL" == */v1 ]] || BASE_URL="${BASE_URL}/v1"
         export KIMI_MODEL_BASE_URL="$BASE_URL"
-        echo "🔧 Kimi engine | model=$KIMI_MODEL_NAME | base_url=$BASE_URL thinking_effort=${KIMI_MODEL_THINKING_EFFORT:-}"
+        echo "🔧 Kimi engine | model=$KIMI_MODEL_NAME | base_url=$BASE_URL | thinking_effort=${KIMI_MODEL_THINKING_EFFORT:-}"
 
         # Quoted heredoc: the inputs.* expressions below are substituted by
         # Actions before bash sees this script, so no shell expansion happens in
