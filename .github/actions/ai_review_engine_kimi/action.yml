@@ -63,6 +63,10 @@ inputs:
     # OpenAI-style chat/completions request for kimi-k3 succeeds against that
     # proxy, while provider_type=kimi returns 400 for the same model and key.
     default: "openai"
+  thinking_effort:
+    description: "Thinking effort for the review turn: low, high, or max. Empty sends no override and leaves the model default (high on K3). Maps to KIMI_MODEL_THINKING_EFFORT when set. Dual-validated here because this engine can be called at @master without the orchestrator."
+    required: false
+    default: ""
   cli_version:
     description: "Exact @moonshot-ai/kimi-code version to install. Pinned deliberately — the package is pre-1.0 and ships minor releases weekly, so `latest` risks both breaking changes and unreviewed code in a privileged job. Bump via PR."
     required: false
@@ -251,17 +255,35 @@ runs:
         # unconfined. Env reaches the hook because the CLI spawns it with its
         # own environment — the same way the guard receives OUTPUT_PATH.
         PATH_GUARD_LOG: ${{ runner.temp }}/kimi-path-guard.log
+        THINKING_EFFORT: ${{ inputs.thinking_effort }}
       run: |
         [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Kimi engine: missing or empty review context at $CONTEXT_PATH"; exit 1; }
         [[ -s "$DIFF_PATH"    ]] || { echo "❌ Kimi engine: missing or empty PR diff at $DIFF_PATH"; exit 1; }
         rm -f "$PATH_GUARD_LOG"
+
+        # thinking_effort is dual-validated here because this engine can be
+        # called at @master without the orchestrator. Empty unsets the env
+        # (do not export an empty string — that is not a valid wire value).
+        # Non-empty must be one of the native K3 / K2.8 Preview values.
+        if [[ -n "$THINKING_EFFORT" ]]; then
+          case "$THINKING_EFFORT" in
+            low|high|max) ;;
+            *)
+              echo "❌ Kimi engine: thinking_effort must be one of low, high, max (or empty), got '$THINKING_EFFORT'"
+              exit 1
+              ;;
+          esac
+          export KIMI_MODEL_THINKING_EFFORT="$THINKING_EFFORT"
+        else
+          unset KIMI_MODEL_THINKING_EFFORT
+        fi
 
         # base_url is accepted with or without a trailing /v1 so one caller-facing
         # value works for every engine. The anthropic engine strips it instead.
         BASE_URL="${INPUT_BASE_URL%/}"
         [[ "$BASE_URL" == */v1 ]] || BASE_URL="${BASE_URL}/v1"
         export KIMI_MODEL_BASE_URL="$BASE_URL"
-        echo "🔧 Kimi engine | model=$KIMI_MODEL_NAME | base_url=$BASE_URL"
+        echo "🔧 Kimi engine | model=$KIMI_MODEL_NAME | base_url=$BASE_URL thinking_effort=${KIMI_MODEL_THINKING_EFFORT:-}"
 
         # Quoted heredoc: the inputs.* expressions below are substituted by
         # Actions before bash sees this script, so no shell expansion happens in
@@ -318,7 +340,7 @@ runs:
           # tr strips the padding BSD wc emits, harmless on the Linux runner.
           bytes_of() { wc -c < "$1" 2>/dev/null | tr -d '[:space:]' || echo '?'; }
 
-          echo "ℹ️  config: model=$KIMI_MODEL_NAME base_url=$KIMI_MODEL_BASE_URL provider_type=$KIMI_MODEL_PROVIDER_TYPE max_context_size=$KIMI_MODEL_MAX_CONTEXT_SIZE"
+          echo "ℹ️  config: model=$KIMI_MODEL_NAME base_url=$KIMI_MODEL_BASE_URL provider_type=$KIMI_MODEL_PROVIDER_TYPE max_context_size=$KIMI_MODEL_MAX_CONTEXT_SIZE thinking_effort=${KIMI_MODEL_THINKING_EFFORT:-}"
           echo "ℹ️  input bytes: context=$(bytes_of "$CONTEXT_PATH") diff=$(bytes_of "$DIFF_PATH") prompt=$(bytes_of /tmp/review_prompt.txt)"
           # Whether the review survived is the first thing anyone reading this
           # needs, and it used to be absent: a CLI that dies after writing looks

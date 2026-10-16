@@ -69,6 +69,11 @@ on:
         required: false
         default: ""
         type: string
+      thinking_effort:
+        description: "[engine-specific: kimi] Thinking effort for the Kimi review turn: low, high, or max (K3 / K2.8 Preview native values; K3 default is high). Empty sends no override and leaves the model default. Validated in the 'Resolve and validate engine' step and passed to the kimi dispatch step as KIMI_MODEL_THINKING_EFFORT. Ignored when engine is not `kimi` (the other engines take no such input)."
+        required: false
+        default: ""
+        type: string
       reasoning_effort:
         description: "[engine-specific: codex] Reasoning effort for the Codex review turn: minimal, low, medium, high, or xhigh (the Codex CLI config enum). The gpt-6.1-sol model also exposes max/ultra, but the CLI rejects those, so they are not accepted; widen the set here, in the resolve step and in the engine once the pinned CLI accepts them. Empty sends no override and leaves the model/endpoint default. Validated in the 'Resolve and validate engine' step and passed to the codex dispatch step as `-c model_reasoning_effort`. Ignored when engine is not `codex` (the other engines take no such input)."
         required: false
@@ -264,6 +269,7 @@ jobs:
           MAX_CONTEXT_INPUT: ${{ inputs.max_context_size }}
           CLI_VERSION_INPUT: ${{ inputs.cli_version }}
           PROVIDER_TYPE_INPUT: ${{ inputs.provider_type }}
+          THINKING_EFFORT_INPUT: ${{ inputs.thinking_effort }}
           REASONING_EFFORT_INPUT: ${{ inputs.reasoning_effort }}
           EFFORT_INPUT: ${{ inputs.effort }}
           PROMPT_GIST_URL_INPUT: ${{ inputs.prompt_gist_url }}
@@ -367,6 +373,25 @@ jobs:
           PROVIDER_TYPE="${PROVIDER_TYPE_INPUT:-openai}"
           PROMPT_GIST_URL="${PROMPT_GIST_URL_INPUT:-https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/2d5131aa058801e99fe77f69db124bf583f7d3ea/claude-review-format.md}"
 
+          # thinking_effort is kimi-only (like provider_type). Empty is the
+          # default — KIMI_MODEL_THINKING_EFFORT is left unset, and K3 stays
+          # at the model default (high). Validate a non-empty value here so a
+          # typo fails at resolve time with a clear message rather than inside
+          # the engine an hour later. The other engines ignore it. The set is
+          # the native K3 / K2.8 Preview values: low|high|max
+          # (tests/ai-pr-review-contract.sh checks that all copies match).
+          THINKING_EFFORT="${THINKING_EFFORT_INPUT:-}"
+          if [[ -n "$THINKING_EFFORT" ]]; then
+            case "$THINKING_EFFORT" in
+              low|high|max) ;;
+              *)
+                echo "❌ Invalid thinking_effort '$THINKING_EFFORT'"
+                echo "   Use one of: low, high, max (or leave empty for the model default)."
+                exit 1
+                ;;
+            esac
+          fi
+
           # reasoning_effort is codex-only (like provider_type is kimi-only).
           # Empty is the default — no override is sent, and the codex engine
           # leaves the model default untouched. Validate a non-empty value here
@@ -418,6 +443,7 @@ jobs:
             echo "max_context_size=$MAX_CONTEXT"
             echo "cli_version=$CLI_VERSION"
             echo "provider_type=$PROVIDER_TYPE"
+            echo "thinking_effort=$THINKING_EFFORT"
             echo "reasoning_effort=$REASONING_EFFORT"
             echo "effort=$EFFORT"
             echo "prompt_gist_url=$PROMPT_GIST_URL"
@@ -995,6 +1021,7 @@ jobs:
           max_context_size: ${{ steps.engine.outputs.max_context_size }}
           cli_version: ${{ steps.engine.outputs.cli_version }}
           provider_type: ${{ steps.engine.outputs.provider_type }}
+          thinking_effort: ${{ steps.engine.outputs.thinking_effort }}
 
       - name: AI review (Anthropic / Claude Code engine)
         id: engine-anthropic
