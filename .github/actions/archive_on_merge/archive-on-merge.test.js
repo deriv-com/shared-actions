@@ -5,9 +5,13 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const http = require("node:http");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 const {
   extractChangeNames,
+  listRepoChangeNames,
   parseTasks,
   truncate,
   isTasksComplete,
@@ -24,8 +28,12 @@ const {
   isRetryableResponse,
   fetchWithRetry,
   fetchPullRequestFiles,
+  fetchOpenArchivePullRequests,
+  fetchCoveredChangeNames,
   FILES_PER_PAGE,
   MAX_FILE_PAGES,
+  ARCHIVE_BRANCH_PREFIX,
+  OPEN_PRS_PER_PAGE,
 } = require("./archive-on-merge.js");
 
 /**
@@ -795,4 +803,174 @@ test("a failed job-summary write is annotated, not just logged", (t) => {
     logs.some((l) => l.startsWith("::warning::") && l.includes("job summary")),
     `expected a ::warning:: annotation, got: ${JSON.stringify(logs)}`
   );
+});
+
+// --- repo-wide detection (#141) ----------------------------------------------
+
+test("the archive branch prefix is pinned to what the workflow builds", () => {
+  // The coverage check below and the workflow's `if:` skip both key on this
+  // prefix; drifting apart would re-open the duplicate-PR hole.
+  assert.strictEqual(ARCHIVE_BRANCH_PREFIX, "archive-on-merge/");
+});
+
+/** A temp dir shaped like a consumer repo checkout; removed after the test. */
+function stubRepo(t, entries) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "aom-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const [rel, isDir] of entries) {
+    const target = path.join(root, "openspec", "changes", rel);
+    if (isDir) {
+      fs.mkdirSync(target, { recursive: true });
+    } else {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, "x");
+    }
+  }
+  return root;
+}
+
+test("listRepoChangeNames returns change directories, sorted", (t) => {
+  const root = stubRepo(t, [
+    ["b-change", true],
+    ["a-change", true],
+    ["c-change", true],
+  ]);
+  assert.deepStrictEqual(listRepoChangeNames(root), [
+    "a-change",
+    "b-change",
+    "c-change",
+  ]);
+});
+
+test("listRepoChangeNames excludes the archive dir, files, and non-kebab names", (t) => {
+  const root = stubRepo(t, [
+    ["real-change", true],
+    ["archive", true],
+    ["Not_Kebab", true],
+    ["..dots", true],
+    ["stray-file.md", false],
+  ]);
+  assert.deepStrictEqual(listRepoChangeNames(root), ["real-change"]);
+});
+
+test("listRepoChangeNames treats a missing openspec setup as empty, not an error", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "aom-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  assert.deepStrictEqual(listRepoChangeNames(root), []);
+});
+
+// --- open archive PR coverage (#141) ------------------------------------------
+
+const openPr = (number, headRef) => ({ number, head: { ref: headRef } });
+
+test("fetchOpenArchivePullRequests keeps only archive branches", async (t) => {
+  const apiUrl = await stubApi(t, () => [
+    openPr(5, "archive-on-merge/a-change"),
+    openPr(6, "feature/unrelated"),
+    openPr(7, "archive-on-merge/b-change"),
+    openPr(8, "archive-on-merger/not-quite-the-prefix"),
+  ]);
+  const pulls = await fetchOpenArchivePullRequests({
+    apiUrl,
+    repo: "o/r",
+    token: "tok",
+  });
+  assert.deepStrictEqual(pulls, [
+    { number: 5, headRef: "archive-on-merge/a-change" },
+    { number: 7, headRef: "archive-on-merge/b-change" },
+  ]);
+});
+
+test("fetchOpenArchivePullRequests paginates and tolerates malformed entries", async (t) => {
+  const seen = [];
+  const apiUrl = await stubApi(t, (url) => {
+    seen.push(url.searchParams.get("page"));
+    if (url.searchParams.get("page") === "1") {
+      return [
+        ...page(OPEN_PRS_PER_PAGE - 2, (i) => openPr(i + 1, "feature/x")),
+        { number: "not-a-number", head: { ref: "archive-on-merge/skip" } },
+        { number: 500 }, // no head at all
+      ];
+    }
+    return [openPr(900, "archive-on-merge/late-change")];
+  });
+  const pulls = await fetchOpenArchivePullRequests({
+    apiUrl,
+    repo: "o/r",
+    token: "tok",
+  });
+  assert.deepStrictEqual(seen, ["1", "2"]);
+  assert.deepStrictEqual(pulls, [
+    { number: 900, headRef: "archive-on-merge/late-change" },
+  ]);
+});
+
+test("fetchOpenArchivePullRequests throws on a real API error", async (t) => {
+  const apiUrl = await stubApi(t, () => ({ status: 404, body: {} }));
+  await assert.rejects(
+    fetchOpenArchivePullRequests({
+      apiUrl,
+      repo: "o/r",
+      token: "tok",
+      retry: { baseDelayMs: 0 },
+    }),
+    /404/
+  );
+});
+
+test("fetchCoveredChangeNames unions what every open archive PR covers", async (t) => {
+  const apiUrl = await stubApi(t, (url) => {
+    if (url.pathname === "/repos/o/r/pulls") {
+      return [
+        openPr(5, "archive-on-merge/a-change"),
+        openPr(6, "archive-on-merge/b-change_c-change"),
+        openPr(7, "feature/not-an-archive-pr"),
+      ];
+    }
+    if (url.pathname === "/repos/o/r/pulls/5/files") {
+      // An archive PR deletes the change directory…
+      return [{ filename: "openspec/changes/a-change/tasks.md" }];
+    }
+    if (url.pathname === "/repos/o/r/pulls/6/files") {
+      return [
+        // …and adds it back under archive/, which must NOT count as covering
+        // a change named after the archived directory's first segment.
+        { filename: "openspec/changes/archive/2026-09-28-b-change/spec.md" },
+        { filename: "openspec/changes/b-change/tasks.md" },
+        { filename: "openspec/changes/c-change/tasks.md" },
+        { filename: "openspec/specs/b-change/spec.md" },
+      ];
+    }
+    throw new Error(`unexpected URL: ${url.pathname}`);
+  });
+  const covered = await fetchCoveredChangeNames({
+    apiUrl,
+    repo: "o/r",
+    token: "tok",
+  });
+  assert.deepStrictEqual(
+    covered,
+    new Map([
+      ["a-change", 5],
+      ["b-change", 6],
+      ["c-change", 6],
+    ])
+  );
+});
+
+test("fetchCoveredChangeNames fetches no files when no archive PR is open", async (t) => {
+  let fileCalls = 0;
+  const apiUrl = await stubApi(t, (url) => {
+    if (url.pathname.endsWith("/files")) {
+      fileCalls += 1;
+    }
+    return [openPr(3, "bugfix/something-else")];
+  });
+  const covered = await fetchCoveredChangeNames({
+    apiUrl,
+    repo: "o/r",
+    token: "tok",
+  });
+  assert.deepStrictEqual(covered, new Map());
+  assert.strictEqual(fileCalls, 0, "no per-PR file listing without archive PRs");
 });

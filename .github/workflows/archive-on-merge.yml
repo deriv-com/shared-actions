@@ -1,9 +1,12 @@
 name: Archive on Merge
 
-# Reusable workflow: when a merged PR completes an openspec change (every task
-# checked), run `openspec archive --yes --json` and open a follow-up PR moving
-# it to openspec/changes/archive/. Never pushes directly to a protected branch;
-# a human still merges the archive PR.
+# Reusable workflow: when a merge lands on the base branch, archive every
+# openspec change whose tasks are all checked — run `openspec archive --yes
+# --json` and open a follow-up PR moving it to openspec/changes/archive/.
+# Never pushes directly to a protected branch; a human still merges the
+# archive PR. Runs are serialized per repository and changes an open archive
+# PR already covers are skipped, so back-to-back merges cannot open duplicate
+# archive PRs (#141).
 #
 # Caller example (thin wrapper in the consumer repo):
 #
@@ -67,12 +70,14 @@ jobs:
       contents: write
       pull-requests: write
 
-    # Keyed per PR, deliberately not per repository: a repo-wide group would
-    # queue concurrent merges, and GitHub drops an already-pending run when a
-    # newer one arrives — silently losing that merge's archive. Two runs
-    # racing on the same branch instead fail loudly at `gh pr create`.
+    # Serialized per repository: two runs archiving the same change at the same
+    # time race to open duplicate PRs (#141). GitHub keeps only the newest
+    # pending run in a concurrency group and silently drops an older pending
+    # one — safe here ONLY because detection is repo-wide: the surviving run
+    # archives every completed change on the base branch, including anything a
+    # dropped run would have covered.
     concurrency:
-      group: archive-on-merge-${{ github.repository }}-${{ github.event.pull_request.number }}
+      group: archive-on-merge-${{ github.repository }}
       cancel-in-progress: false
 
     steps:
@@ -157,7 +162,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Idempotency: skip if a PR for this branch is already open.
+          # Idempotency backstop: skip if a PR for this branch is already
+          # open. The script has already excluded changes covered by ANY open
+          # archive PR; this catches the identical-set case (same change list
+          # → same branch name) even if that listing was incomplete.
           # `// empty` (rather than bare `.[0].number`) matters here: on no
           # match, `.[0]` is `null` and `.number` on `null` is still `null`,
           # which `jq` prints as the *string* "null" — truthy to `[ -n ]`.

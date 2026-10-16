@@ -1,7 +1,8 @@
 # archive_on_merge
 
-Detects openspec change(s) completed by a merged PR, verifies every item in
-each change's `tasks.md` is checked, and runs `openspec archive --yes --json`.
+Detects every openspec change on the base branch whose `tasks.md` is fully
+checked, skips changes an open archive PR already covers, and runs
+`openspec archive --yes --json`.
 
 Prefer the reusable workflow for the full flow (detect + open archive PR):
 
@@ -31,21 +32,51 @@ Requires:
 
 | Name | Required | Description |
 | --- | --- | --- |
-| `pr_number` | yes | Number of the merged PR whose files are inspected |
-| `github_token` | yes | Token with `pull-requests: read` to list the PR's files |
+| `pr_number` | yes | Number of the merged PR; its file list scopes which incomplete changes get a remaining-tasks report |
+| `github_token` | yes | Token with `pull-requests: read` to list the PR's files and the open archive PRs |
 | `repository` | no | `owner/repo` the PR belongs to (default `github.repository`) |
+
+### What gets archived
+
+Every change under `openspec/changes/` whose `tasks.md` has no unchecked items
+— not only the change(s) the merged PR touched. Repo-wide detection is what
+makes the reusable workflow's per-repository concurrency group safe: GitHub
+keeps only the newest pending run in a group and drops an older one, and a
+dropped run loses nothing because the surviving run archives everything
+complete, including what the dropped run would have covered. It also
+self-heals: a change whose post-merge tasks get checked in a later, unrelated
+commit is archived by the next merge, with no PR needing to touch its
+directory again.
+
+### How duplicate archive PRs are prevented
+
+Back-to-back merges must not open several PRs archiving the same change
+([#141](https://github.com/deriv-com/shared-actions/issues/141)). Three layers
+see to that:
+
+- **Serialized runs** — the reusable workflow's concurrency group is per
+  repository, so two runs never race.
+- **Coverage check** — before archiving anything, this script lists the open
+  `archive-on-merge/*` PRs and skips every change their diffs already cover
+  (an archive PR's diff deletes `openspec/changes/<name>/…`).
+- **Canonical branch names** — the workflow names the archive branch after the
+  change(s), so an identical change set lands on a branch whose open PR is
+  found and skipped, and change names are sorted so the slug is the same
+  whatever order they were discovered in.
 
 ### Which files count as "touched"
 
-The changed-file list comes from the GitHub API (`GET /repos/{repo}/pulls/{n}/files`),
-not from a local `git diff`. `base.sha..merge_commit_sha` is *not* the PR's own
-diff — for a PR opened against an older base it also contains every commit
-merged in between, so an unrelated PR merged afterwards would appear to touch a
-change some earlier PR had completed and would archive it a second time. Asking
-the API is exact and works the same for merge, squash, and rebase merges.
+The merged PR's changed-file list comes from the GitHub API
+(`GET /repos/{repo}/pulls/{n}/files`), not from a local `git diff`.
+`base.sha..merge_commit_sha` is *not* the PR's own diff — for a PR opened
+against an older base it also contains every commit merged in between, so an
+unrelated PR merged afterwards would appear to touch a change some earlier PR
+had completed. Asking the API is exact and works the same for merge, squash,
+and rebase merges.
 
-Change names come back sorted, so the branch slug the caller derives from them
-is the same whatever order the API listed the files in.
+With repo-wide detection this list no longer decides *what* gets archived; it
+scopes the remaining-tasks report, so an unrelated merge stays quiet about
+incomplete changes it did not touch.
 
 ### What a declined archive reports
 
@@ -87,13 +118,13 @@ task. Files with CRLF, CR, or U+2028 line endings parse the same as LF.
 
 ### Failure handling
 
-`pull_request: closed` never fires twice for the same merge, so a request lost
-to a blip loses that archive for good. Each attempt is therefore capped at 30s
-and retried up to 3 times with exponential backoff on network errors, timeouts,
-5xx, 429, and the rate-limit flavour of 403 (identified by `retry-after` or
-`x-ratelimit-remaining: 0`). A 403 without those headers is a permissions
-failure — a real answer — and fails immediately rather than retrying three
-times and burying the cause.
+Each API attempt is capped at 30s and retried up to 3 times with exponential
+backoff on network errors, timeouts, 5xx, 429, and the rate-limit flavour of
+403 (identified by `retry-after` or `x-ratelimit-remaining: 0`). A 403 without
+those headers is a permissions failure — a real answer — and fails immediately
+rather than retrying three times and burying the cause. A run that still fails
+goes red rather than risking a duplicate PR, and because detection is
+repo-wide the next merge re-attempts anything left unarchived.
 
 ## Tests
 

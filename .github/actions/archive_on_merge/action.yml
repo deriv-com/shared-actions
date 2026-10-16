@@ -1,15 +1,20 @@
 name: archive_on_merge
 description: >
-  Detect openspec change(s) completed by a merge, verify every tasks.md item
-  is checked, and run `openspec archive --yes --json`. Emits outputs used by
-  a follow-up step/workflow that opens the archive PR (never pushes to a
-  protected branch).
+  Detect every openspec change on the base branch whose tasks.md is fully
+  checked, skip changes an open archive PR already covers, and run
+  `openspec archive --yes --json`. Emits outputs used by a follow-up
+  step/workflow that opens the archive PR (never pushes to a protected
+  branch).
 inputs:
   pr_number:
-    description: Number of the merged pull request whose files are inspected
+    description: >
+      Number of the merged pull request. Its file list scopes which
+      incomplete changes get a remaining-tasks report.
     required: true
   github_token:
-    description: Token used to read the merged PR's file list (needs pull-requests read)
+    description: >
+      Token used to read the merged PR's file list and the open archive PRs
+      (needs pull-requests read)
     required: true
   repository:
     description: "'owner/repo' the pull request belongs to"
