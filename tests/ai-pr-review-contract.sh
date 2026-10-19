@@ -223,7 +223,7 @@ check 'grep -qF "low|high|max) ;;" "$WF"' "resolve step validates thinking_effor
 check 'grep -q "echo \"thinking_effort=\$THINKING_EFFORT\"" "$WF"' "resolve step emits thinking_effort on the step outputs"
 check 'grep -q "thinking_effort: \${{ steps.engine.outputs.thinking_effort }}" "$WF"' "kimi dispatch step passes thinking_effort through"
 check 'grep -q "^  thinking_effort:" "$KIMI"' "kimi engine declares the thinking_effort input"
-check 'grep -q "KIMI_MODEL_THINKING_EFFORT" "$KIMI"' "kimi engine maps thinking_effort onto KIMI_MODEL_THINKING_EFFORT"
+check 'grep -qF "export KIMI_MODEL_THINKING_EFFORT=\"\$THINKING_EFFORT\"" "$KIMI"' "kimi engine maps thinking_effort onto KIMI_MODEL_THINKING_EFFORT"
 check 'grep -qE "if \[\[ -n \"\\\$THINKING_EFFORT\" \]\]" "$KIMI"' "kimi engine applies thinking_effort only when non-empty"
 check 'grep -q "unset KIMI_MODEL_THINKING_EFFORT" "$KIMI"' "kimi engine unsets KIMI_MODEL_THINKING_EFFORT when thinking_effort is empty"
 
@@ -371,8 +371,7 @@ check 'grep -qF -- "${ENUM_ANTH_LIST%, *}" "$WF" && grep -qF -- "${ENUM_ANTH_LIS
 ENUM_WF_KIMI=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +low\|high\|max\) ;;' | tr -d ' ;)' | sort -u)
 ENUM_KIMI=$(grep -vE '^[[:space:]]*#' "$KIMI" | grep -oE '^ +low\|high\|max\) ;;' | tr -d ' ;)' | sort -u)
 check '[[ -n "$ENUM_WF_KIMI" && "$ENUM_WF_KIMI" == "$ENUM_KIMI" ]]' "thinking_effort case arms match in the orchestrator and the kimi engine ($ENUM_WF_KIMI)"
-ENUM_KIMI_LIST="${ENUM_WF_KIMI//|/, }"
-check 'grep -qF -- "${ENUM_KIMI_LIST%, *}" "$WF" && grep -qF -- "${ENUM_KIMI_LIST%, *}" "$KIMI"' "thinking_effort input descriptions list the same values as the case arms"
+check 'grep -qF "low, high, or max" "$WF" && grep -qF "low, high, or max" "$KIMI" && grep -qF "low, high, or max" "$README"' "thinking_effort input descriptions list the same values as the case arms"
 # Every other copy (descriptions, error messages, comments, README) sits on a
 # line that names xhigh. Case-arm lines are already locked by the extractors
 # above. Remaining xhigh lines are classified as Codex or Claude so the two

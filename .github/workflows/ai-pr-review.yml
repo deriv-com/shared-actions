@@ -70,7 +70,7 @@ on:
         default: ""
         type: string
       thinking_effort:
-        description: "[engine-specific: kimi] Thinking effort for the Kimi review turn: low, high, or max (K3 / K2.8 Preview native values; K3 default is high). Empty sends no override and leaves the model default. Validated in the 'Resolve and validate engine' step and passed to the kimi dispatch step as KIMI_MODEL_THINKING_EFFORT. Ignored when engine is not `kimi` (the other engines take no such input)."
+        description: "[engine-specific: kimi] Thinking effort for the Kimi review turn: low, high, or max (K3 / K2.8 Preview native values). Empty sends no override and leaves the model default. Validated in the 'Resolve and validate engine' step and passed to the kimi dispatch step as KIMI_MODEL_THINKING_EFFORT. Ignored when engine is not `kimi` (the other engines take no such input)."
         required: false
         default: ""
         type: string
@@ -374,8 +374,8 @@ jobs:
           PROMPT_GIST_URL="${PROMPT_GIST_URL_INPUT:-https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/2d5131aa058801e99fe77f69db124bf583f7d3ea/claude-review-format.md}"
 
           # thinking_effort is kimi-only (like provider_type). Empty is the
-          # default — KIMI_MODEL_THINKING_EFFORT is left unset, and K3 stays
-          # at the model default (high). Validate a non-empty value here so a
+          # default — KIMI_MODEL_THINKING_EFFORT is left unset, and the model
+          # default is left untouched. Validate a non-empty value here so a
           # typo fails at resolve time with a clear message rather than inside
           # the engine an hour later. The other engines ignore it. The set is
           # the native K3 / K2.8 Preview values: low|high|max
@@ -434,12 +434,12 @@ jobs:
             esac
           fi
 
-          # Posted under **Model:**. Empty knobs show the engine default so a
-          # reader can see what ran; an explicit value is shown without
-          # "(default)" even when it matches that default. Grok has no knob.
-          # Only the active engine's input is used. Defaults: kimi high
-          # (KIMI_MODEL_THINKING_EFFORT unset), anthropic medium (--effort
-          # omitted), codex medium (model_reasoning_effort omitted).
+          # Posted under **Model:**. Empty knobs show the value we print when
+          # the env / --effort / -c is omitted (not a vendor-doc product
+          # default). An explicit value omits "(default)" even when it matches.
+          # Grok has no knob. Only the active engine's input is used.
+          # Display when empty: kimi `high`, anthropic `medium`,
+          # codex `medium`.
           case "$ENGINE" in
             kimi)
               if [[ -n "$THINKING_EFFORT" ]]; then

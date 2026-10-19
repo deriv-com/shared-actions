@@ -149,9 +149,9 @@ assuming parity:
   config loader drops a section that fails schema validation and carries on,
   so a `[[hooks]]` entry that stopped validating after a version bump would
   silently remove the guard; `doctor` fails on the same condition, before the
-  run. Thinking effort is `KIMI_MODEL_THINKING_EFFORT` (`low` / `high` / `max`),
+  run. Thinking effort is `KIMI_MODEL_THINKING_EFFORT` (low, high, or max),
   not a `[thinking]` section in that config, so `doctor` still validates the
-  same file. Empty `thinking_effort` leaves the env unset (K3 default `high`).
+  same file. Empty `thinking_effort` leaves the env unset.
   No GitHub token reaches the step at all, and the caller's post step
   still scans the review before publishing (see below).
 - **Anthropic** — stronger than the action's docs suggest on comment tools,
@@ -343,7 +343,7 @@ still the same engine, not a new one.
 | `reasoning_effort` | **[codex]** Reasoning effort for the review turn: `minimal`, `low`, `medium`, `high`, or `xhigh`. Empty sends no override | ❌ | empty (model default) |
 | `effort` | **[anthropic]** Effort for the review turn: `low`, `medium`, `high`, `xhigh`, or `max`. Empty sends no override | ❌ | empty (model default) |
 | `provider_type` | **[kimi]** Wire dialect; must match what `base_url` serves | ❌ | `openai` |
-| `thinking_effort` | **[kimi]** Thinking effort for the review turn: `low`, `high`, or `max`. Empty sends no override | ❌ | empty (model default) |
+| `thinking_effort` | **[kimi]** Thinking effort for the review turn: low, high, or max. Empty sends no override | ❌ | empty (model default) |
 | `legacy_markers` | Newline-separated markers from superseded workflows to also delete | ❌ | `Claude PR Review Complete` |
 | `prompt_gist_url` | Review prompt template | ❌ | DerivFE gist, **pinned to a revision** |
 

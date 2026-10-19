@@ -64,7 +64,7 @@ inputs:
     # proxy, while provider_type=kimi returns 400 for the same model and key.
     default: "openai"
   thinking_effort:
-    description: "Thinking effort for the review turn: low, high, or max. Empty sends no override and leaves the model default (high on K3). Maps to KIMI_MODEL_THINKING_EFFORT when set. Dual-validated here because this engine can be called at @master without the orchestrator."
+    description: "Thinking effort for the review turn: low, high, or max. Empty sends no override and leaves the model default. Maps to KIMI_MODEL_THINKING_EFFORT when set. Dual-validated here because this engine can be called at @master without the orchestrator."
     required: false
     default: ""
   cli_version:
