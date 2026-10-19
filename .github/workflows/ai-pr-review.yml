@@ -434,18 +434,19 @@ jobs:
             esac
           fi
 
-          # Posted under **Model:**. Empty knobs show the value we print when
-          # the env / --effort / -c is omitted (not a vendor-doc product
-          # default). An explicit value omits "(default)" even when it matches.
-          # Grok has no knob. Only the active engine's input is used.
-          # Display when empty: kimi `high`, anthropic `medium`,
-          # codex `medium`.
+          # Posted under **Model:**. Empty knobs show what we print when the
+          # env / --effort / -c is omitted. An explicit value omits
+          # "(default)" even when it matches. Grok has no knob. Only the
+          # active engine's input is used. Display when empty: kimi
+          # "model default (no override sent)" (env unset; do not name a
+          # value — kimi-code openai chat does not send `high`),
+          # anthropic `medium`, codex `medium`.
           case "$ENGINE" in
             kimi)
               if [[ -n "$THINKING_EFFORT" ]]; then
                 REVIEW_EFFORT_DISPLAY=$(printf '`%s`' "$THINKING_EFFORT")
               else
-                REVIEW_EFFORT_DISPLAY=$(printf '`%s` (default)' high)
+                REVIEW_EFFORT_DISPLAY='model default (no override sent)'
               fi
               ;;
             anthropic)

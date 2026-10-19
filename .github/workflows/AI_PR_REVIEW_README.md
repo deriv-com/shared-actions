@@ -23,7 +23,7 @@ engine is pluggable: pick `kimi`, `anthropic`, `grok`, or `codex` with one input
 - 🛡️ The post step refuses to publish a review containing the LLM API key, the job's GitHub token, anything shaped like a GitHub token, or the on-disk shapes of git credential plumbing (comment bodies are not covered by Actions secret masking; the failure message names the exact pattern that hit), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
 - 📊 Emits events to the OneAboveAll metrics dashboard, and always to the job summary
-- ⏳ Posts a caller-owned "working on it" comment (**Model:** then **Effort:** at the top) before the engine runs, then edits that same comment into the review; the CLI never gets a GitHub token. Empty effort knobs show the engine default (`high` kimi, `medium` anthropic/codex); Grok prints `n/a`
+- ⏳ Posts a caller-owned "working on it" comment (**Model:** then **Effort:** at the top) before the engine runs, then edits that same comment into the review; the CLI never gets a GitHub token. Empty Kimi knobs show `model default (no override sent)`; empty anthropic/codex knobs show `medium` (default); Grok prints `n/a`
 - 🏷️ The reusable job is named after the engine (`Grok PR Review` / `Kimi PR Review` / `Claude PR Review` / `Codex PR Review`), or after `review_title` when that input is set. empty title = one slot per engine; set title = concurrent slot on that engine (concurrency, HTML marker, and progress marker include the title)
 
 ## Usage
@@ -619,7 +619,7 @@ asserts all of it.
    job-level allowlist is enough for them.
 2. **Resolve engine** — validate `engine`, resolve per-engine and engine-neutral
    defaults (the single place every default value lives), including the Effort
-   line: kimi `high`, anthropic/codex `medium` when the knob is empty, Grok `n/a`.
+   line: kimi `model default (no override sent)`, anthropic/codex `medium` when the knob is empty, Grok `n/a`.
 3. **Progress comment** — the caller (not the engine) posts a Claude-style
    "working on it" comment with **Model:** then **Effort:** at the top and a
    job link. This is the comment that later becomes the review (same id). The

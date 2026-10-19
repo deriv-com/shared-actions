@@ -229,7 +229,7 @@ check 'grep -q "unset KIMI_MODEL_THINKING_EFFORT" "$KIMI"' "kimi engine unsets K
 
 # Posted **Effort:** line: resolved once, printed under **Model:**, stripped on follow-up.
 check 'grep -q "REVIEW_EFFORT_DISPLAY=" "$WF"' "resolve exports REVIEW_EFFORT_DISPLAY"
-check 'grep -qF "printf '\''\`%s\` (default)'\'' high" "$WF"' "kimi empty effort display is high (default)"
+check 'grep -qF "model default (no override sent)" "$WF"' "kimi empty effort display is model default (no override sent)"
 check '[[ "$(grep -cF "printf '\''\`%s\` (default)'\'' medium" "$WF")" -eq 2 ]]' "anthropic and codex empty effort display is medium (default)"
 check 'grep -qF "n/a (this engine has no effort override)" "$WF"' "grok effort display is n/a"
 effort_under_model() {
