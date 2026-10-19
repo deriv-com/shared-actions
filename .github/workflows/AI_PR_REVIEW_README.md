@@ -23,7 +23,7 @@ engine is pluggable: pick `kimi`, `anthropic`, `grok`, or `codex` with one input
 - 🛡️ The post step refuses to publish a review containing the LLM API key, the job's GitHub token, anything shaped like a GitHub token, or the on-disk shapes of git credential plumbing (comment bodies are not covered by Actions secret masking; the failure message names the exact pattern that hit), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
 - 📊 Emits events to the OneAboveAll metrics dashboard, and always to the job summary
-- ⏳ Posts a caller-owned "working on it" comment (model at the top) before the engine runs, then edits that same comment into the review; the CLI never gets a GitHub token
+- ⏳ Posts a caller-owned "working on it" comment (**Model:** then **Effort:** at the top) before the engine runs, then edits that same comment into the review; the CLI never gets a GitHub token. Empty Kimi knobs show `model default (no override sent)`; empty anthropic/codex knobs show `medium` (default); Grok prints `n/a`
 - 🏷️ The reusable job is named after the engine (`Grok PR Review` / `Kimi PR Review` / `Claude PR Review` / `Codex PR Review`), or after `review_title` when that input is set. empty title = one slot per engine; set title = concurrent slot on that engine (concurrency, HTML marker, and progress marker include the title)
 
 ## Usage
@@ -77,7 +77,7 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 | `.git/config` after the run | untouched (`persist-credentials: false`) | origin stays token-free: `use_commit_signing: true` plus `allowed_non_write_users: _never` so the action writes a helper under `_actions/` instead of embedding the token in origin; base-branch fetch also authenticates from env-only git config; asserted clean **before**, re-checked **after** (that helper is the only allowed exception) | untouched | untouched (`persist-credentials: false`; no token in the step) |
 | Base-branch config restored | no | **yes** — the action fetches the PR's base branch and restores `.claude/`, `.mcp.json`, `CLAUDE.md`, `.gitmodules`, `.husky`, … from it after the strip step removed the PR's copies (maintainer-merged versions, never the PR's); `.claude/settings.json` from there is still not loaded (`--setting-sources user`) | no | no |
 | Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `.mcp.json` / `.cursorrules`; dirs `.grok/`, `.claude/`, `.claude-plugin/`, `.agents/`, `.cursor/rules/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CODEX.md` / `CLAUDE.md` / `CLAUDE.local.md` / `.cursorrules`; dirs `.codex/`, `.claude/`, `.agents/`, `.cursor/rules/`; plus `$HOME/.codex` on persistent runners |
-| Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type`; except `effort`, `reasoning_effort` | all except `max_context_size`, `cli_version`, `provider_type`, `reasoning_effort`; **only** engine honouring `effort` | all except `provider_type`, `effort`, `reasoning_effort` | all except `max_context_size`, `provider_type`, `effort`; **only** engine honouring `reasoning_effort` |
+| Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type`; except `effort`, `reasoning_effort`; **only** engine honouring `thinking_effort` | all except `max_context_size`, `cli_version`, `provider_type`, `thinking_effort`, `reasoning_effort`; **only** engine honouring `effort` | all except `provider_type`, `thinking_effort`, `effort`, `reasoning_effort` | all except `max_context_size`, `provider_type`, `effort`, `thinking_effort`; **only** engine honouring `reasoning_effort` |
 | `agent` reported | `ai_review` | `claude_review` | `grok_review` | `codex_review` |
 | Artifact | `ai-review-summary-*` | `claude-review-summary-*` | `grok-review-summary-*` | `codex-review-summary-*` |
 
@@ -149,7 +149,10 @@ assuming parity:
   config loader drops a section that fails schema validation and carries on,
   so a `[[hooks]]` entry that stopped validating after a version bump would
   silently remove the guard; `doctor` fails on the same condition, before the
-  run. No GitHub token reaches the step at all, and the caller's post step
+  run. Thinking effort is `KIMI_MODEL_THINKING_EFFORT` (low, high, or max),
+  not a `[thinking]` section in that config, so `doctor` still validates the
+  same file. Empty `thinking_effort` leaves the env unset.
+  No GitHub token reaches the step at all, and the caller's post step
   still scans the review before publishing (see below).
 - **Anthropic** — stronger than the action's docs suggest on comment tools,
   weaker than the Kimi engine on tokens, and the engine compensates for both.
@@ -340,6 +343,7 @@ still the same engine, not a new one.
 | `reasoning_effort` | **[codex]** Reasoning effort for the review turn: `minimal`, `low`, `medium`, `high`, or `xhigh`. Empty sends no override | ❌ | empty (model default) |
 | `effort` | **[anthropic]** Effort for the review turn: `low`, `medium`, `high`, `xhigh`, or `max`. Empty sends no override | ❌ | empty (model default) |
 | `provider_type` | **[kimi]** Wire dialect; must match what `base_url` serves | ❌ | `openai` |
+| `thinking_effort` | **[kimi]** Thinking effort for the review turn: low, high, or max. Empty sends no override | ❌ | empty (model default) |
 | `legacy_markers` | Newline-separated markers from superseded workflows to also delete | ❌ | `Claude PR Review Complete` |
 | `prompt_gist_url` | Review prompt template | ❌ | DerivFE gist, **pinned to a revision** |
 
@@ -536,7 +540,8 @@ Four edits at minimum:
 
 An engine with its own knob needs more: an `[engine-specific: <name>]` input,
 its validation in the resolve step, a step output, and a row in the Inputs
-table (codex's `reasoning_effort` and anthropic's `effort` are the examples).
+table (codex's `reasoning_effort`, anthropic's `effort`, and kimi's
+`thinking_effort` are the examples).
 An engine whose model gets a shell should also review the post step's leak
 checks, since it widens what the model can put in the review text. Extend
 `tests/ai-pr-review-contract.sh` for each of these.
@@ -613,11 +618,12 @@ asserts all of it.
    `gh-app-write` (not `*`). Kimi and Grok do not use that action, so the
    job-level allowlist is enough for them.
 2. **Resolve engine** — validate `engine`, resolve per-engine and engine-neutral
-   defaults (the single place every default value lives).
+   defaults (the single place every default value lives), including the Effort
+   line: kimi `model default (no override sent)`, anthropic/codex `medium` when the knob is empty, Grok `n/a`.
 3. **Progress comment** — the caller (not the engine) posts a Claude-style
-   "working on it" comment with the model at the top and a job link. This is
-   the comment that later becomes the review (same id). The CLI never
-   receives `GITHUB_TOKEN`.
+   "working on it" comment with **Model:** then **Effort:** at the top and a
+   job link. This is the comment that later becomes the review (same id). The
+   CLI never receives `GITHUB_TOKEN`.
 4. **Checkout** the event's `head.sha` — not the branch, which could have moved
    past what the gate validated — at depth 20, for the incremental diff, with
    `persist-credentials: false` so the token is never written under
@@ -662,7 +668,7 @@ asserts all of it.
     anchored to what the tools write — not bare words like `includeIf` — so a
     review that *discusses* git config still posts; the contract test holds
     that line with fixtures on both sides. Then truncate over
-    GitHub's comment limit, prepend the model and engine title, append
+    GitHub's comment limit, prepend Model, Effort, and the engine title, append
     detection markers, **PATCH the progress comment** into that body (or
     `gh pr comment` if progress never posted), **then** delete the prior
     review comments (never the comment just patched). On failure, PATCH the

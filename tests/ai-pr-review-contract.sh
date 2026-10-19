@@ -215,6 +215,37 @@ check 'grep -q "^  effort:" "$ANTH"' "anthropic engine declares the effort input
 check 'grep -qF -- '"'"'--model ${{ inputs.model }} ${{ steps.effort.outputs.flag }}'"'"' "$ANTH"' "anthropic engine maps effort onto claude_args via the resolve-effort step"
 check 'grep -qE "if \[\[ -n \"\\\$EFFORT\" \]\]" "$ANTH"' "anthropic engine applies effort only when non-empty"
 
+# thinking_effort: kimi-only, same dual-validation pattern as effort.
+check 'grep -q "^      thinking_effort:" "$WF"' "thinking_effort input is declared"
+check 'awk '\''/^      thinking_effort:/{f=1} f && /default:/{print; exit}'\'' "$WF" | grep -c "default: \"\"" >/dev/null' "thinking_effort defaults to empty"
+check 'grep -q "THINKING_EFFORT_INPUT:" "$WF"' "resolve step reads thinking_effort"
+check 'grep -qF "low|high|max) ;;" "$WF"' "resolve step validates thinking_effort against low|high|max"
+check 'grep -q "echo \"thinking_effort=\$THINKING_EFFORT\"" "$WF"' "resolve step emits thinking_effort on the step outputs"
+check 'grep -q "thinking_effort: \${{ steps.engine.outputs.thinking_effort }}" "$WF"' "kimi dispatch step passes thinking_effort through"
+check 'grep -q "^  thinking_effort:" "$KIMI"' "kimi engine declares the thinking_effort input"
+check 'grep -qF "export KIMI_MODEL_THINKING_EFFORT=\"\$THINKING_EFFORT\"" "$KIMI"' "kimi engine maps thinking_effort onto KIMI_MODEL_THINKING_EFFORT"
+check 'grep -qE "if \[\[ -n \"\\\$THINKING_EFFORT\" \]\]" "$KIMI"' "kimi engine applies thinking_effort only when non-empty"
+check 'grep -q "unset KIMI_MODEL_THINKING_EFFORT" "$KIMI"' "kimi engine unsets KIMI_MODEL_THINKING_EFFORT when thinking_effort is empty"
+
+# Posted **Effort:** line: resolved once, printed under **Model:**, stripped on follow-up.
+check 'grep -q "REVIEW_EFFORT_DISPLAY=" "$WF"' "resolve exports REVIEW_EFFORT_DISPLAY"
+check 'grep -qF "model default (no override sent)" "$WF"' "kimi empty effort display is model default (no override sent)"
+check '[[ "$(grep -cF "printf '\''\`%s\` (default)'\'' medium" "$WF")" -eq 2 ]]' "anthropic and codex empty effort display is medium (default)"
+check 'grep -qF "n/a (this engine has no effort override)" "$WF"' "grok effort display is n/a"
+effort_under_model() {
+  awk '/printf '\''\*\*Model:\*\*/{m=NR} /printf '\''\*\*Effort:\*\*/{e=NR} END{exit !(m && e && e==m+1)}' <<< "$1"
+}
+PROGRESS_BODY="$(step_body "Post progress comment" "$WF")"
+POST_BODY="$(step_body "Post review as single PR comment" "$WF")"
+FAILED_BODY="$(step_body "Mark progress comment failed" "$WF")"
+check 'effort_under_model "$PROGRESS_BODY"' "progress comment prints Effort immediately after Model"
+check 'effort_under_model "$POST_BODY"' "posted review prints Effort immediately after Model"
+check 'effort_under_model "$FAILED_BODY"' "failed progress comment prints Effort immediately after Model"
+check 'grep -qF "/^\\*\\*Effort:\\*\\*/d" "$WF"' "follow-up sed drops the Effort header"
+check 'grep -qF "a **Effort:** line" "$WF"' "prompt forbids an Effort line"
+check 'grep -q "| \*\*effort\*\*" "$WF"' "job summary has an effort row"
+check 'grep -qF "**Effort:**" "$README"' "README documents Model then Effort on the posted comment"
+
 # This engine CANNOT wire the shared path guard (Codex's hook contract uses
 # Bash/apply_patch tool names and tool_input.command, not Read/Write + a path),
 # so the sandbox is the enforcement boundary. These are its load-bearing
@@ -323,10 +354,10 @@ check 'ncgrep "::stop-commands::" "$CODEX"' "codex log dump is wrapped in ::stop
 # The shared prompt no longer tells every engine it has no shell.
 check '! grep -q "You have no shell tool" "$WF"' "shared review procedure does not claim 'no shell tool' (false for codex)"
 check '! grep -q "Exactly three edits" "$ROOT/.github/workflows/AI_PR_REVIEW_README.md"' "README 'Adding an engine' no longer claims exactly three edits"
-# The reasoning_effort and effort enums are each duplicated on purpose (the
-# engines can be called directly). Extract Codex arms by the `minimal|` prefix
-# and Claude arms by the trailing `|max`, so a second xhigh case arm cannot
-# make ENUM_WF a two-line string that never equals ENUM_CODEX.
+# The reasoning_effort, effort and thinking_effort enums are each duplicated
+# on purpose (the engines can be called directly). Extract Codex arms by the
+# `minimal|` prefix, Claude arms by the trailing `|max`, and Kimi arms as the
+# exact `low|high|max` (do not key Kimi on a Codex/Claude-only token).
 ENUM_WF=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +minimal\|[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
 ENUM_CODEX=$(grep -vE '^[[:space:]]*#' "$CODEX" | grep -oE '^ +minimal\|[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
 check '[[ -n "$ENUM_WF" && "$ENUM_WF" == "$ENUM_CODEX" ]]' "reasoning_effort case arms match in the orchestrator and the engine ($ENUM_WF)"
@@ -337,10 +368,15 @@ ENUM_ANTH=$(grep -vE '^[[:space:]]*#' "$ANTH" | grep -oE '^ +low\|medium\|high\|
 check '[[ -n "$ENUM_WF_ANTH" && "$ENUM_WF_ANTH" == "$ENUM_ANTH" ]]' "effort case arms match in the orchestrator and the anthropic engine ($ENUM_WF_ANTH)"
 ENUM_ANTH_LIST="${ENUM_WF_ANTH//|/, }"
 check 'grep -qF -- "${ENUM_ANTH_LIST%, *}" "$WF" && grep -qF -- "${ENUM_ANTH_LIST%, *}" "$ANTH"' "effort input descriptions list the same values as the case arms"
+ENUM_WF_KIMI=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +low\|high\|max\) ;;' | tr -d ' ;)' | sort -u)
+ENUM_KIMI=$(grep -vE '^[[:space:]]*#' "$KIMI" | grep -oE '^ +low\|high\|max\) ;;' | tr -d ' ;)' | sort -u)
+check '[[ -n "$ENUM_WF_KIMI" && "$ENUM_WF_KIMI" == "$ENUM_KIMI" ]]' "thinking_effort case arms match in the orchestrator and the kimi engine ($ENUM_WF_KIMI)"
+check 'grep -qF "low, high, or max" "$WF" && grep -qF "low, high, or max" "$KIMI" && grep -qF "low, high, or max" "$README"' "thinking_effort input descriptions list the same values as the case arms"
 # Every other copy (descriptions, error messages, comments, README) sits on a
 # line that names xhigh. Case-arm lines are already locked by the extractors
 # above. Remaining xhigh lines are classified as Codex or Claude so the two
-# enums cannot demand each other's values.
+# enums cannot demand each other's values. Kimi prose must not name that
+# token — a reject-list sentence would land unclassified here.
 is_case_arm() { [[ "$1" =~ \)[[:space:]]*\;\;[[:space:]]*$ ]]; }
 is_codex_effort_line() {
   [[ "$1" =~ reasoning_effort ]] || [[ "$1" =~ model_reasoning_effort ]] || [[ "$1" =~ Codex\ CLI ]] || [[ "$1" =~ (^|[^a-z])minimal([^a-z]|$) ]]
@@ -377,6 +413,10 @@ CLAUDE_EFFORT_BLOCK=$(step_body "Resolve effort override" "$ANTH" | awk '/FLAG="
 claude_effort_ok() { EFFORT="$1" bash -c "$CLAUDE_EFFORT_BLOCK" >/dev/null 2>&1; }
 check 'claude_effort_ok "" && claude_effort_ok low && claude_effort_ok max' "anthropic engine accepts empty, low and max"
 check '! claude_effort_ok minimal && ! claude_effort_ok ultracode && ! claude_effort_ok bogus' "anthropic engine rejects minimal, ultracode and unknown values"
+KIMI_THINKING_BLOCK=$(step_body "Run AI PR review (Kimi Code)" "$KIMI" | awk '/thinking_effort is dual-validated here/{f=1} f{print} f && /^ +fi$/{f=0; done=1} done{next}' | sed 's/^        //')
+kimi_thinking_ok() { THINKING_EFFORT="$1" bash -c "$KIMI_THINKING_BLOCK" >/dev/null 2>&1; }
+check 'kimi_thinking_ok "" && kimi_thinking_ok low && kimi_thinking_ok max' "kimi engine accepts empty, low and max"
+check '! kimi_thinking_ok medium && ! kimi_thinking_ok xhigh && ! kimi_thinking_ok bogus' "kimi engine rejects medium, xhigh and unknown values"
 
 # Ako round 3 nits.
 check 'nc_fixed "base_url_re='"'"'^https?://" && nc_fixed "[[ ! \$BASE_URL =~ \$base_url_re ]]"' "codex base_url check uses a quoted pattern variable (no bracket escapes)"
