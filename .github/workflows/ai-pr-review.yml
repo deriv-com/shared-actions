@@ -75,7 +75,7 @@ on:
         default: ""
         type: string
       effort:
-        description: "[engine-specific: anthropic] Effort level for the Claude review turn: low, medium, high, xhigh, or max (the Claude Code CLI `--effort` enum and Anthropic API `output_config.effort`). Empty sends no override and leaves the model/endpoint default (medium on claude-sonnet-5-5). Validated in the 'Resolve and validate engine' step and passed to the anthropic dispatch step as `--effort` on `claude_args`. `ultracode` is a Claude Code workflow setting, not an API effort level, so it is not accepted. Ignored when engine is not `anthropic` (the other engines take no such input)."
+        description: "[engine-specific: anthropic] Effort level for the Claude review turn: low, medium, high, xhigh, or max (the Claude Code CLI `--effort` enum and Anthropic API `output_config.effort`). Empty sends no override and leaves the model/endpoint default. Validated in the 'Resolve and validate engine' step and passed to the anthropic dispatch step as `--effort` on `claude_args`. `ultracode` is a Claude Code workflow setting, not an API effort level, so it is not accepted. Ignored when engine is not `anthropic` (the other engines take no such input)."
         required: false
         default: ""
         type: string

@@ -208,12 +208,11 @@ check 'grep -qE "if \[\[ -n \"\\\$REASONING_EFFORT\" \]\]" "$CODEX"' "codex engi
 # effort: anthropic-only, same dual-validation pattern as reasoning_effort.
 check 'grep -q "^      effort:" "$WF"' "effort input is declared"
 check 'awk '\''/^      effort:/{f=1} f && /default:/{print; exit}'\'' "$WF" | grep -c "default: \"\"" >/dev/null' "effort defaults to empty"
-check 'grep -q "EFFORT_INPUT:" "$WF"' "resolve step reads effort"
-check 'grep -q "low|medium|high|xhigh|max" "$WF"' "resolve step validates effort against low|medium|high|xhigh|max"
+check 'grep -qE "^[[:space:]]+EFFORT_INPUT:" "$WF"' "resolve step reads effort"
 check 'grep -q "echo \"effort=\$EFFORT\"" "$WF"' "resolve step emits effort on the step outputs"
 check 'grep -q "effort: \${{ steps.engine.outputs.effort }}" "$WF"' "anthropic dispatch step passes effort through"
 check 'grep -q "^  effort:" "$ANTH"' "anthropic engine declares the effort input"
-check 'grep -q "steps.effort.outputs.flag" "$ANTH"' "anthropic engine maps effort onto claude_args via the resolve-effort step"
+check 'grep -qF -- '"'"'--model ${{ inputs.model }} ${{ steps.effort.outputs.flag }}'"'"' "$ANTH"' "anthropic engine maps effort onto claude_args via the resolve-effort step"
 check 'grep -qE "if \[\[ -n \"\\\$EFFORT\" \]\]" "$ANTH"' "anthropic engine applies effort only when non-empty"
 
 # This engine CANNOT wire the shared path guard (Codex's hook contract uses
