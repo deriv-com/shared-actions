@@ -1,0 +1,55 @@
+# DO NOT MERGE.
+#
+# Throwaway caller to dogfood #150 (Claude `effort`) and #151 (Kimi
+# `thinking_effort`) before those PRs land. Master's `ai-review.yml` is
+# `pull_request_target` + `@master`, so it cannot exercise the new inputs.
+#
+# `on: pull_request` runs this file from the PR head. The reusable workflow
+# and the Kimi/Anthropic engines are pinned at `dogfood/effort-knobs` (stack
+# of #150+#151 with those two `uses:` self-pinned). Same LiteLLM key as the
+# standing Kimi review (`secrets.LLM_API_KEY`).
+#
+# What to check in the logs, then close this PR and delete both branches:
+#   - Kimi: banner/config `thinking_effort=max`; a 400 must fail the step
+#   - Opus: `🔧 Anthropic engine | effort=high` and `--effort high` in
+#     show_full_output; a CLI usage error or 400 must fail the step
+name: DO NOT MERGE — effort dogfood
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  kimi-max:
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@dogfood/effort-knobs
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    with:
+      engine: kimi
+      model: kimi-k3
+      provider_type: openai
+      thinking_effort: max
+      # Distinct slot from master's default Kimi review on this PR.
+      review_title: Kimi thinking-effort PR Review
+      # Empty so this job cannot reap the Opus comment via the default
+      # "Claude PR Review Complete" substring.
+      legacy_markers: ""
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+
+  opus-high:
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@dogfood/effort-knobs
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    with:
+      engine: anthropic
+      model: claude-opus-5-5
+      effort: high
+      review_title: Opus PR Review
+      legacy_markers: ""
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
