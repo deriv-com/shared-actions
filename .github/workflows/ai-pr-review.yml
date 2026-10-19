@@ -434,6 +434,43 @@ jobs:
             esac
           fi
 
+          # Posted under **Model:**. Empty knobs show the engine default so a
+          # reader can see what ran; an explicit value is shown without
+          # "(default)" even when it matches that default. Grok has no knob.
+          # Only the active engine's input is used. Defaults: kimi high
+          # (KIMI_MODEL_THINKING_EFFORT unset), anthropic medium (--effort
+          # omitted), codex medium (model_reasoning_effort omitted).
+          case "$ENGINE" in
+            kimi)
+              if [[ -n "$THINKING_EFFORT" ]]; then
+                REVIEW_EFFORT_DISPLAY=$(printf '`%s`' "$THINKING_EFFORT")
+              else
+                REVIEW_EFFORT_DISPLAY=$(printf '`%s` (default)' high)
+              fi
+              ;;
+            anthropic)
+              if [[ -n "$EFFORT" ]]; then
+                REVIEW_EFFORT_DISPLAY=$(printf '`%s`' "$EFFORT")
+              else
+                REVIEW_EFFORT_DISPLAY=$(printf '`%s` (default)' medium)
+              fi
+              ;;
+            codex)
+              if [[ -n "$REASONING_EFFORT" ]]; then
+                REVIEW_EFFORT_DISPLAY=$(printf '`%s`' "$REASONING_EFFORT")
+              else
+                REVIEW_EFFORT_DISPLAY=$(printf '`%s` (default)' medium)
+              fi
+              ;;
+            grok)
+              REVIEW_EFFORT_DISPLAY='n/a (this engine has no effort override)'
+              ;;
+            *)
+              echo "❌ Unknown engine when resolving effort display: '$ENGINE'"
+              exit 1
+              ;;
+          esac
+
           {
             echo "engine=$ENGINE"
             echo "model=$MODEL"
@@ -463,13 +500,15 @@ jobs:
           fi
           {
             echo "REVIEW_MODEL=$MODEL"
+            printf 'REVIEW_EFFORT_DISPLAY=%s\n' "$REVIEW_EFFORT_DISPLAY"
             echo "REVIEW_ENGINE=$ENGINE"
             echo "REVIEW_TITLE=$REVIEW_TITLE"
             echo "METRICS_AGENT=$METRICS_AGENT"
             echo "REVIEW_SLOT_SUFFIX=$REVIEW_SLOT_SUFFIX"
           } >> "$GITHUB_ENV"
 
-          echo "✅ Engine: $ENGINE | Model: $MODEL | Metrics agent: $METRICS_AGENT"
+          printf '✅ Engine: %s | Model: %s | Effort: %s | Metrics agent: %s\n' \
+            "$ENGINE" "$MODEL" "$REVIEW_EFFORT_DISPLAY" "$METRICS_AGENT"
 
       - name: Post progress comment
         # Caller-owned, Claude-style "working on it". This is the same comment
@@ -504,7 +543,8 @@ jobs:
           set -e
 
           {
-            printf '**Model:** `%s`\n\n' "$REVIEW_MODEL"
+            printf '**Model:** `%s`\n' "$REVIEW_MODEL"
+            printf '**Effort:** %s\n\n' "$REVIEW_EFFORT_DISPLAY"
             printf '## 🤖 %s\n\n' "$REVIEW_TITLE"
             printf '%s is working on this pull request.\n\n' "${REVIEW_TITLE%% PR Review}"
             printf '%s\n\n' "I'll analyze the changes and get back to you with the review."
@@ -848,6 +888,7 @@ jobs:
                 -e '/^## 🤖 .+ PR Review Complete$/d' \
                 -e '/^## 🤖 .+ PR Review$/d' \
                 -e '/^\*\*Model:\*\*/d' \
+                -e '/^\*\*Effort:\*\*/d' \
                 -e '/^\*\*Review Type:\*\*/d' \
                 -e '/^📋 Initial Review$/d' \
                 -e '/^🔄 Follow-up Review$/d' \
@@ -931,9 +972,9 @@ jobs:
             # post step appends. Do NOT emit a title, a Model line, or those
             # tags, or a compliant model plus the caller yields duplicates.
             echo "## Review Output Format Requirements"
-            echo "Do not begin with a heading, a **Model:** line, or HTML comments."
-            echo "Write only the review body. The caller wraps it with the model"
-            echo "and title."
+            echo "Do not begin with a heading, a **Model:** line, a **Effort:** line, or HTML comments."
+            echo "Write only the review body. The caller wraps it with the model,"
+            echo "effort, and title."
 
           } > "$REVIEW_CONTEXT_FILE"
 
@@ -1208,11 +1249,12 @@ jobs:
             mv "$POST_DIR/review_truncated.txt" "$REVIEW_OUTPUT_FILE"
           fi
 
-          # Visible header is injected here so it cannot drift per model and the
-          # model name is always the first line. Truncation already happened, so
-          # the header cannot be cut off.
+          # Visible header is injected here so it cannot drift per model: Model
+          # then Effort then the title. Truncation already happened, so the
+          # header cannot be cut off.
           {
-            printf '**Model:** `%s`\n\n' "$REVIEW_MODEL"
+            printf '**Model:** `%s`\n' "$REVIEW_MODEL"
+            printf '**Effort:** %s\n\n' "$REVIEW_EFFORT_DISPLAY"
             printf '## 🤖 %s Complete\n\n' "$REVIEW_TITLE"
             printf '%s\n\n' "${REVIEW_TYPE:-📋 Initial Review}"
             cat "$REVIEW_OUTPUT_FILE"
@@ -1283,7 +1325,8 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           {
-            printf '**Model:** `%s`\n\n' "$REVIEW_MODEL"
+            printf '**Model:** `%s`\n' "$REVIEW_MODEL"
+            printf '**Effort:** %s\n\n' "$REVIEW_EFFORT_DISPLAY"
             printf '## 🤖 %s\n\n' "$REVIEW_TITLE"
             printf '%s did not finish this review.\n\n' "${REVIEW_TITLE%% PR Review}"
             printf 'See the [job log](%s) for details. The previous review comment, if any, is unchanged.\n\n' "$RUN_URL"
@@ -1351,6 +1394,7 @@ jobs:
           echo "| **commit_sha** | \`$CURRENT_SHA\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **engine** | \`${REVIEW_ENGINE:-unknown}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **model** | \`${REVIEW_MODEL:-unknown}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **effort** | ${REVIEW_EFFORT_DISPLAY:-unknown} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **review_size_bytes** | $REVIEW_SIZE |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **timestamp** | $TIMESTAMP |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"

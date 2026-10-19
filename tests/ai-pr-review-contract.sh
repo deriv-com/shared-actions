@@ -228,6 +228,25 @@ check 'grep -q "KIMI_MODEL_THINKING_EFFORT" "$KIMI"' "kimi engine maps thinking_
 check 'grep -qE "if \[\[ -n \"\\\$THINKING_EFFORT\" \]\]" "$KIMI"' "kimi engine applies thinking_effort only when non-empty"
 check 'grep -q "unset KIMI_MODEL_THINKING_EFFORT" "$KIMI"' "kimi engine unsets KIMI_MODEL_THINKING_EFFORT when thinking_effort is empty"
 
+# Posted **Effort:** line: resolved once, printed under **Model:**, stripped on follow-up.
+check 'grep -q "REVIEW_EFFORT_DISPLAY=" "$WF"' "resolve exports REVIEW_EFFORT_DISPLAY"
+check 'grep -qF "printf '\''\`%s\` (default)'\'' high" "$WF"' "kimi empty effort display is high (default)"
+check '[[ "$(grep -cF "printf '\''\`%s\` (default)'\'' medium" "$WF")" -eq 2 ]]' "anthropic and codex empty effort display is medium (default)"
+check 'grep -qF "n/a (this engine has no effort override)" "$WF"' "grok effort display is n/a"
+effort_under_model() {
+  awk '/printf '\''\*\*Model:\*\*/{m=NR} /printf '\''\*\*Effort:\*\*/{e=NR} END{exit !(m && e && e==m+1)}' <<< "$1"
+}
+PROGRESS_BODY="$(step_body "Post progress comment" "$WF")"
+POST_BODY="$(step_body "Post review as single PR comment" "$WF")"
+FAILED_BODY="$(step_body "Mark progress comment failed" "$WF")"
+check 'effort_under_model "$PROGRESS_BODY"' "progress comment prints Effort immediately after Model"
+check 'effort_under_model "$POST_BODY"' "posted review prints Effort immediately after Model"
+check 'effort_under_model "$FAILED_BODY"' "failed progress comment prints Effort immediately after Model"
+check 'grep -qF "/^\\*\\*Effort:\\*\\*/d" "$WF"' "follow-up sed drops the Effort header"
+check 'grep -qF "a **Effort:** line" "$WF"' "prompt forbids an Effort line"
+check 'grep -q "| \*\*effort\*\*" "$WF"' "job summary has an effort row"
+check 'grep -qF "**Effort:**" "$README"' "README documents Model then Effort on the posted comment"
+
 # This engine CANNOT wire the shared path guard (Codex's hook contract uses
 # Bash/apply_patch tool names and tool_input.command, not Read/Write + a path),
 # so the sandbox is the enforcement boundary. These are its load-bearing
