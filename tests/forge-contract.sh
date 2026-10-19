@@ -35,6 +35,7 @@ check '! grep -qE "^  (issues|pull_request|push|schedule):" "$WF"' \
 
 # --- inputs callers pass by name ------------------------------------------
 for input in issue_number slack_channel slack_thread_ts requested_by \
+             analysis_brief \
              node_version install_command model runner_group engine_ref \
              fast_lane timeout_minutes; do
   check "grep -q '^      ${input}:' \"\$WF\"" "input '${input}' is declared"
@@ -42,6 +43,8 @@ done
 
 check 'awk "/^      issue_number:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: true"' \
   "issue_number stays required"
+check 'awk "/^      analysis_brief:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
+  "input 'analysis_brief' stays optional"
 
 # The lane decides whether a run fits inside timeout_minutes, so it must stay a
 # caller decision. Hardcoding --fast onto the command line would silently strip
