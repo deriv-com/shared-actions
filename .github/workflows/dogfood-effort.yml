@@ -17,7 +17,7 @@ name: DO NOT MERGE — effort dogfood
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 jobs:
   kimi-max:
