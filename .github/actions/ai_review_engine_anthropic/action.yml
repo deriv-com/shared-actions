@@ -55,6 +55,10 @@ inputs:
   api_key:
     description: "API key for base_url (a LiteLLM virtual key with the default base_url). Composite actions cannot read the `secrets` context, so the caller must pass this explicitly."
     required: true
+  effort:
+    description: "[engine-specific: anthropic] Effort level for the review turn. One of low, medium, high, xhigh, max (the Claude Code CLI `--effort` enum / API `output_config.effort`). Empty leaves the model/endpoint default (no `--effort` is sent). ultracode is a Claude Code workflow setting, not an API effort level, so it is not accepted here. Applied ONLY when non-empty. Other engines ignore this input."
+    required: false
+    default: ""
 
 outputs:
   output_path:
@@ -158,9 +162,13 @@ runs:
         #    starts, and the caller gets no review at all. Verified against the
         #    source and against production logs of deriv-api-v2's GLM and
         #    DeepSeek reviews (both `engine: anthropic`), which show that fetch
-        #    running on every PR. How the token is kept out of .git/config
-        #    anyway is explained on the action step below (use_commit_signing
-        #    plus env-only fetch credentials). (HackerOne #4037167)
+        #    running on every PR. How the token is kept out of origin is
+        #    explained on the action step below (use_commit_signing plus
+        #    allowed_non_write_users: _never plus env-only fetch credentials).
+        #    This baseline still requires a credential-free .git/config going
+        #    in; after the review the action may have written a
+        #    credential.helper that points at its own file under _actions/.
+        #    (HackerOne #4037167)
         if ! git remote get-url origin >/dev/null 2>&1; then
           echo "❌ Anthropic engine: the checkout has no origin remote; claude-code-action's base-branch restore fetches through it"
           exit 1
@@ -191,11 +199,40 @@ runs:
         echo "base_url=$BASE_URL" >> "$GITHUB_OUTPUT"
         echo "🔧 Anthropic engine | model=${{ inputs.model }} | base_url=$BASE_URL"
 
+    - name: Resolve effort override
+      id: effort
+      shell: bash
+      env:
+        EFFORT: ${{ inputs.effort }}
+      run: |
+        # Validate effort here, not just in the orchestrator: this engine is
+        # referenced by absolute @master path and can be called directly, so the
+        # value must be checked where it is consumed. Empty means "send no
+        # override" and is the common case.
+        #
+        # The accepted set is the Claude Code CLI --effort enum, which maps to
+        # API output_config.effort: low|medium|high|xhigh|max. ultracode is a
+        # Claude Code workflow setting (extra agent orchestration), not an
+        # API level, so it is not accepted here.
+        FLAG=""
+        if [[ -n "$EFFORT" ]]; then
+          case "$EFFORT" in
+            low|medium|high|xhigh|max) ;;
+            *)
+              echo "❌ Anthropic engine: effort must be one of low|medium|high|xhigh|max (or empty), got '$EFFORT'"
+              exit 1
+              ;;
+          esac
+          FLAG="--effort ${EFFORT}"
+          echo "🔧 Anthropic engine | effort=$EFFORT"
+        fi
+        echo "flag=$FLAG" >> "$GITHUB_OUTPUT"
+
     - name: Claude Code PR review
-      # Not a release tag — this is the SHA claude-pr-review.yml was pinned to
-      # (2026-05-01, "bump Claude Code to 2.1.126"). Carried over unchanged so the
-      # engine behaves identically to the workflow it replaces.
-      uses: anthropics/claude-code-action@fefa07e9c665b7320f08c3b525980457f22f58aa
+      # v1.0.253 (CLI 2.1.303, 2026-10-18). LiteLLM's claude-opus-5-5 alias
+      # requires Claude Code >= 2.1.280; the previous pin (fefa07e, CLI 2.1.126)
+      # failed those reviews with claude_code_version_too_old.
+      uses: anthropics/claude-code-action@5eb090f3c3afd701a0672cd32981197ca27688f6
       env:
         ANTHROPIC_BASE_URL: ${{ steps.resolve.outputs.base_url }}
         ANTHROPIC_AUTH_TOKEN: ${{ inputs.api_key }}
@@ -224,28 +261,31 @@ runs:
         # the model cannot run git (no Bash) or read /proc (path guard). Without
         # it the fetch of a private repo fails and, that call having no
         # try/catch, the action exits before the model runs. The verify step
-        # below fails the job if anything credential-shaped shows up in
-        # .git/config anyway.
+        # below fails the job if origin carries a token or any helper other
+        # than the action's file under _actions/.
         GIT_CONFIG_COUNT: "1"
         GIT_CONFIG_KEY_0: credential.helper
         GIT_CONFIG_VALUE_0: '!f() { cat >/dev/null; echo username=x-access-token; echo "password=${GITHUB_TOKEN:-$OVERRIDE_GITHUB_TOKEN}"; }; f'
       with:
         anthropic_api_key: ${{ inputs.api_key }}
-        # The one branch of agent mode's prepare (src/modes/agent/index.ts at
-        # the pinned SHA) that does NOT call configureGitAuth — the function
-        # that runs
+        # Still skips configureGitAuth (user.name / embedding the token in
+        # origin via that function) and still mounts github_file_ops (denied
+        # below). At this SHA the signing branch of agent-mode prepare
+        # (src/modes/agent/index.ts) ALWAYS calls replaceCheckoutCredentials.
+        # With ALLOWED_NON_WRITE_USERS unset that runs
         #   git remote set-url origin https://x-access-token:<job token>@github.com/<owner>/<repo>.git
-        # and so writes the caller's write-scoped token, in plaintext, into
-        # .git/config, undoing persist-credentials: false and putting it within
-        # reach of any Read or Grep over the checkout. Removing the origin remote
-        # instead is not an option (see the install step). Nothing is signed or
-        # committed here: the model has no commit tool. The one side effect is
-        # that the action mounts its github_file_ops MCP server
-        # (src/mcp/install-mcp-server.ts), whose config — job token included, for
-        # that server's env — travels in the CLI's argv; it is denied by name in
-        # --disallowedTools below and by the path guard, which allows only
-        # Read/Write/Grep/Glob, and argv, like the environment, is reachable only
-        # through /proc, which the guard denies. (HackerOne #4037167)
+        # — plaintext in .git/config, undoing persist-credentials: false and
+        # within reach of Read/Grep over the checkout (HackerOne #4037167).
+        # Removing origin instead is not an option (see the install step).
+        # allowed_non_write_users: "_never" (below) makes that env non-empty so
+        # replaceCheckoutCredentials sets a token-free origin URL and writes
+        # credential.helper to {action path}/.git-credential-gh-token, outside
+        # the checkout. "_never" cannot be a GitHub username (underscore) and
+        # so does not bypass write checks; `*` or a real login would. Nothing
+        # is signed or committed here: the model has no commit tool. The
+        # file-ops MCP server still mounts; denied by name in --disallowedTools
+        # and by the path guard. argv and env holding the token are reachable
+        # only through /proc, which the guard denies.
         use_commit_signing: true
         # PreToolUse hook = the path guard installed above. The action merges
         # this JSON into $HOME/.claude/settings.json (base-action/src/
@@ -286,6 +326,12 @@ runs:
         # sides (src/github/validation/actor.ts at this SHA), so
         # `gh-app-write` matches `github.actor` `gh-app-write[bot]`.
         allowed_bots: gh-app-write
+        # Non-empty so replaceCheckoutCredentials uses the file helper instead
+        # of embedding the token in origin. Not a write-check bypass: GitHub
+        # usernames cannot contain `_`, so this never matches an actor. `*`
+        # would skip write checks for everyone. github_token must be passed
+        # (below) for this input to take effect.
+        allowed_non_write_users: "_never"
         # The action needs a token for its own actor/permission checks and for
         # the base-branch fetch above.
         #
@@ -363,8 +409,12 @@ runs:
         # --setting-sources user: only $HOME/.claude/settings.json (which the
         # action writes from `settings` above) is loaded; project and local
         # settings inside the PR checkout are not, whatever the strip step did.
+        #
+        # --effort sits on the --model line so an empty flag cannot become a
+        # blank line in this block. Tokenization today drops empty tokens; a
+        # later line-split parser would not.
         claude_args: |
-          --model ${{ inputs.model }}
+          --model ${{ inputs.model }} ${{ steps.effort.outputs.flag }}
           --allowedTools "Read,Write"
           --disallowedTools "Bash,WebFetch,WebSearch,mcp__github_comment,mcp__github_inline_comment,mcp__github_file_ops,mcp__github"
           --setting-sources user
@@ -377,25 +427,45 @@ runs:
         OUTPUT_PATH: ${{ inputs.output_path }}
         PATH_GUARD_LOG: ${{ runner.temp }}/ai-review-path-guard/decisions.log
       run: |
-        # 1. The job token must not have reached .git/config. use_commit_signing
-        #    keeps claude-code-action off the code path that runs
-        #    `git remote set-url origin https://x-access-token:...`, and the
-        #    action's base-branch fetch authenticated from env-only git config;
-        #    so the file should be exactly as the caller's persist-credentials:
-        #    false checkout left it (the install step asserted that baseline).
-        #    This re-reads the file the model's Read or Grep could have reached
-        #    and fails if any remote URL carries credentials or any credential
-        #    plumbing (a checkout-style extraheader / includeIf, a credential
-        #    helper, or a token shape) is present. Raw file, not `git config
-        #    --list`, so an include pointing elsewhere is itself visible. A hit
-        #    here means the pinned action's behaviour changed: treat the job
-        #    token as exposed to the model, rotate/inspect, and do not merge the
-        #    SHA bump that did it.
-        if [[ -f .git/config ]] && { git config --local --get-regexp '^remote\..*\.url$' 2>/dev/null | grep -q '@' \
-             || grep -qiE 'x-access-token|extraheader|includeif|credential\.helper|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}' .git/config; }; then
-          echo "❌ Anthropic engine: .git/config carries credentials after the review step. The model's Read or Grep could have reached it — treat the job token as exposed. (HackerOne #4037167)"
-          echo "   claude-code-action at the pinned SHA only rewrites the origin URL with the token outside commit-signing mode, and this engine sets use_commit_signing: true. Check what changed."
-          exit 1
+        # 1. The job token must not have reached origin or checkout-style
+        #    credential plumbing. At this SHA, commit-signing mode still calls
+        #    replaceCheckoutCredentials; allowed_non_write_users: _never makes
+        #    that write a credential.helper pointing at the action's
+        #    .git-credential-gh-token under _actions/, not a token in origin.
+        #    Fail if any remote URL carries credentials, extraheader / includeIf
+        #    is present, or a token shape is in the raw file. Allow only that
+        #    one helper path, and only outside the checkout — any other helper
+        #    is checkout v6 persistence. Raw file for extraheader/includeIf so
+        #    an include pointing elsewhere is itself visible.
+        if [[ -f .git/config ]]; then
+          if git config --local --get-regexp '^remote\..*\.url$' 2>/dev/null | grep -q '@' \
+             || grep -qiE 'x-access-token|extraheader|includeif|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}' .git/config; then
+            echo "❌ Anthropic engine: .git/config carries credentials after the review step. The model's Read or Grep could have reached it — treat the job token as exposed. (HackerOne #4037167)"
+            echo "   origin must stay token-free; extraheader/includeIf/token shapes are never allowed. Check what changed at the pinned SHA."
+            exit 1
+          fi
+          helpers=$(git config --local --get-all credential.helper 2>/dev/null || true)
+          if grep -qiE 'credential\.helper' .git/config && [[ -z "$helpers" ]]; then
+            echo "❌ Anthropic engine: .git/config mentions credential.helper but git config --local cannot read it — treat the job token as exposed. (HackerOne #4037167)"
+            exit 1
+          fi
+          while IFS= read -r helper; do
+            [[ -z "$helper" ]] && continue
+            case "$helper" in
+              "$GITHUB_WORKSPACE"/*)
+                echo "❌ Anthropic engine: credential.helper points inside the checkout: $helper"
+                echo "   The model's Read or Grep could reach it — treat the job token as exposed. (HackerOne #4037167)"
+                exit 1
+                ;;
+              */_actions/anthropics/claude-code-action/*/.git-credential-gh-token)
+                ;;
+              *)
+                echo "❌ Anthropic engine: unexpected credential.helper '$helper' after the review step"
+                echo "   Only the pinned action's helper under _actions/anthropics/claude-code-action/ is allowed. (HackerOne #4037167)"
+                exit 1
+                ;;
+            esac
+          done <<< "$helpers"
         fi
 
         # 2. The review exists?
@@ -421,6 +491,6 @@ runs:
           echo "   Refusing to hand this review to the caller. Check the \`settings\` hook against this claude-code-action SHA. (HackerOne #4037167)"
           exit 1
         fi
-        echo "✅ Anthropic engine: path guard handled $(wc -l < "$PATH_GUARD_LOG" | tr -d ' ') tool call(s), $(grep -c '^deny' "$PATH_GUARD_LOG" || true) denied; .git/config is credential-free"
+        echo "✅ Anthropic engine: path guard handled $(wc -l < "$PATH_GUARD_LOG" | tr -d ' ') tool call(s), $(grep -c '^deny' "$PATH_GUARD_LOG" || true) denied; origin is token-free"
         echo "✅ Anthropic engine: review written ($(wc -c < "$OUTPUT_PATH") bytes)"
         echo "output_path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"

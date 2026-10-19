@@ -18,7 +18,7 @@ engine is pluggable: pick `kimi`, `anthropic`, `grok`, or `codex` with one input
 - 🔄 Follow-up mode — on re-push, feeds the previous review plus an incremental diff so fixed items are not re-reported
 - 🧹 Exactly one review comment per engine per PR — a "working on it" comment is posted first, then **edited** into the finished review (same comment URL). The previous review is deleted only after that edit, so a failed or cancelled run never leaves the PR without its last completed review
 - 🔌 Pluggable engine (`kimi` | `anthropic` | `grok` | `codex`), each a composite action with its own CLI and sandbox
-- 🔒 The model gets **no shell tool** (codex excepted: a sandboxed shell with no network and no GitHub token, see Engines) and no comment tool, and PR-supplied agent config is stripped before it starts. Only same-repo PRs are reviewed (the job is skipped for forks), the checkout keeps no git credentials on disk (`persist-credentials: false`, and the Anthropic engine runs claude-code-action in the one mode that does not write the token back into `.git/config`, then re-checks the file), and a PR that adds or retargets a symlink is refused before any engine runs
+- 🔒 The model gets **no shell tool** (codex excepted: a sandboxed shell with no network and no GitHub token, see Engines) and no comment tool, and PR-supplied agent config is stripped before it starts. Only same-repo PRs are reviewed (the job is skipped for forks), the checkout keeps no git credentials on disk (`persist-credentials: false`, and the Anthropic engine keeps origin token-free then re-checks `.git/config`), and a PR that adds or retargets a symlink is refused before any engine runs
 - 🧱 The Kimi and Anthropic engines confine the model's `Read`/`Grep`/`Glob` to the PR checkout and its `Write` to the single output file with a shared, unit-tested **PreToolUse path guard** (match-all, fail-closed, unknown tools denied), and fail the job if a review was produced while the guard never ran
 - 🛡️ The post step refuses to publish a review containing the LLM API key, the job's GitHub token, anything shaped like a GitHub token, or the on-disk shapes of git credential plumbing (comment bodies are not covered by Actions secret masking; the failure message names the exact pattern that hit), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
@@ -74,10 +74,10 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 | `Read` scope | PR checkout minus `.git/`, plus the context/diff/output files (**PreToolUse path guard**) | same guard, same scope (registered via the action's `settings` input) | **unscoped** (`--sandbox read-only` limits writes, not reads) | **unscoped** (`workspace-write` sandbox limits writes and network, not reads) |
 | `Write` scope | exactly the output file (path guard) | exactly the output file (path guard) | output directory only (`dontAsk`; Grok deny-wins, so no catch-all deny) | checkout + `/tmp` (`workspace-write`, `$TMPDIR` excluded); `CODEX_HOME` sits outside both, and the review must resolve under `/tmp` |
 | GitHub token in the CLI process | none | **yes** — claude-code-action spawns the CLI with `GITHUB_TOKEN`/`GH_TOKEN` in its env for its own MCP servers; the path guard's `/proc` denial and the post-step scan are what stand between that and the PR | none | none |
-| `.git/config` after the run | untouched (`persist-credentials: false`) | untouched: `use_commit_signing: true` keeps the action off the path that rewrites the `origin` URL with the token, its base-branch fetch authenticates from env-only git config, and the file is asserted clean **before** and re-checked **after** | untouched | untouched (`persist-credentials: false`; no token in the step) |
+| `.git/config` after the run | untouched (`persist-credentials: false`) | origin stays token-free: `use_commit_signing: true` plus `allowed_non_write_users: _never` so the action writes a helper under `_actions/` instead of embedding the token in origin; base-branch fetch also authenticates from env-only git config; asserted clean **before**, re-checked **after** (that helper is the only allowed exception) | untouched | untouched (`persist-credentials: false`; no token in the step) |
 | Base-branch config restored | no | **yes** — the action fetches the PR's base branch and restores `.claude/`, `.mcp.json`, `CLAUDE.md`, `.gitmodules`, `.husky`, … from it after the strip step removed the PR's copies (maintainer-merged versions, never the PR's); `.claude/settings.json` from there is still not loaded (`--setting-sources user`) | no | no |
 | Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `.mcp.json` / `.cursorrules`; dirs `.grok/`, `.claude/`, `.claude-plugin/`, `.agents/`, `.cursor/rules/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CODEX.md` / `CLAUDE.md` / `CLAUDE.local.md` / `.cursorrules`; dirs `.codex/`, `.claude/`, `.agents/`, `.cursor/rules/`; plus `$HOME/.codex` on persistent runners |
-| Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type` | all except `max_context_size`, `cli_version`, `provider_type` | all except `provider_type` | all except `max_context_size`, `provider_type`; **only** engine honouring `reasoning_effort` |
+| Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type`; except `effort`, `reasoning_effort` | all except `max_context_size`, `cli_version`, `provider_type`, `reasoning_effort`; **only** engine honouring `effort` | all except `provider_type`, `effort`, `reasoning_effort` | all except `max_context_size`, `provider_type`, `effort`; **only** engine honouring `reasoning_effort` |
 | `agent` reported | `ai_review` | `claude_review` | `grok_review` | `codex_review` |
 | Artifact | `ai-review-summary-*` | `claude-review-summary-*` | `grok-review-summary-*` | `codex-review-summary-*` |
 
@@ -171,24 +171,32 @@ assuming parity:
   other servers plus Bash/WebFetch/WebSearch, so a future SHA bump that changes
   agent-mode defaults fails safe.
   Two things the action does with the job token, both verified in its source at
-  the pinned SHA and both handled: (1) outside commit-signing mode, agent mode
-  calls `configureGitAuth`, which runs `git remote set-url origin` with the
-  token embedded in the URL — plaintext, in `.git/config`, undoing the caller's
-  `persist-credentials: false` and within reach of a `Grep` over the checkout
-  (the guard scopes Grep's `path`, not what ripgrep finds under it). The engine
-  passes `use_commit_signing: true`, the one prepare branch that skips that
-  call. It does **not** remove the `origin` remote — an earlier revision did,
-  and that fails the action outright: on every PR event `run.ts` calls
-  `restoreConfigFromBase`, which runs `git fetch origin <base> --depth=1` with
-  no try/catch and then restores `.claude/`, `.mcp.json`, `CLAUDE.md`,
-  `.gitmodules`, `.husky`, … from `origin/<base>` (verified in the source and
-  in production logs of deriv-api-v2's GLM and DeepSeek reviews). That fetch
-  needs credentials for a private repo, so the engine hands git a credential
-  helper through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` in
-  the step env — it reads the token the action already placed in its process
-  environment, and nothing is written to `.git/config`. The install step asserts
-  `.git/config` is credential-free going in and the verify step re-reads it
-  **after** the model ran, failing the job if any credential got in. (2) The
+  the pinned SHA (v1.0.253, CLI 2.1.303) and both handled: (1) agent-mode
+  prepare always calls `replaceCheckoutCredentials`, even with
+  `use_commit_signing: true`. With `ALLOWED_NON_WRITE_USERS` unset that runs
+  `git remote set-url origin` with the token embedded in the URL — plaintext,
+  in `.git/config`, undoing the caller's `persist-credentials: false` and
+  within reach of a `Grep` over the checkout (the guard scopes Grep's `path`,
+  not what ripgrep finds under it). The engine still passes
+  `use_commit_signing: true` (skips `configureGitAuth` user/email setup; file-ops
+  MCP still mounts and stays denied) and sets `allowed_non_write_users: _never`
+  so that env is non-empty: origin stays a token-free HTTPS URL and
+  `credential.helper` points at the action's `.git-credential-gh-token` under
+  `_actions/`, outside the checkout. `_never` cannot be a GitHub username
+  (underscore) and does not bypass write checks. It does **not** remove the
+  `origin` remote — an earlier revision did, and that fails the action
+  outright: on every PR event `run.ts` calls `restoreConfigFromBase`, which
+  runs `git fetch origin <base> --depth=1` with no try/catch and then restores
+  `.claude/`, `.mcp.json`, `CLAUDE.md`, `.gitmodules`, `.husky`, … from
+  `origin/<base>` (verified in the source and in production logs of
+  deriv-api-v2's GLM and DeepSeek reviews). That fetch needs credentials for a
+  private repo, so the engine also hands git a credential helper through
+  `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` in the step env —
+  it reads the token the action already placed in its process environment.
+  The install step asserts `.git/config` is credential-free going in and the
+  verify step re-reads it **after** the model ran, failing the job if origin
+  carries a token and allowing only that `_actions/anthropics/claude-code-action`
+  helper. (2) The
   CLI is spawned with the token in its environment (`GITHUB_TOKEN`, `GH_TOKEN`,
   `OVERRIDE_GITHUB_TOKEN`, `DEFAULT_WORKFLOW_TOKEN`) and, with commit signing,
   in its argv (the file-ops server's config), so an unconfined `Read` of
@@ -201,6 +209,13 @@ assuming parity:
   unscoped, because path-scoped permission patterns are only documented for
   `Bash` and the workflow this replaced recorded that a scoped `Write(/path)`
   made the tool unavailable entirely; the hook does the scoping instead.
+
+  This engine honours **`effort`** (`--effort`: `low` | `medium` | `high` | `xhigh` | `max`, empty = model default):
+  validated at resolve time and again in the engine, mapped to `--effort` on
+  `claude_args` only when non-empty. The other engines ignore the input.
+  `ultracode` is a Claude Code workflow setting rather than an API
+  `output_config.effort` value, so it is rejected here. The engine pins
+  `anthropics/claude-code-action` v1.0.253 (CLI 2.1.303).
 
 - **Grok** — permissions (`dontAsk`) plus `--tools Read,Grep,Write,Edit` are the
   guarantee; `--sandbox read-only` is extra (cannot write the checkout; temp
@@ -268,7 +283,7 @@ assuming parity:
   sandbox, and a rotatable key. Codex is weaker than Kimi/Anthropic on key
   confidentiality until it can deny `/proc` reads.
 
-  This engine is the only one that honours **`reasoning_effort`**
+  This engine honours **`reasoning_effort`**
   (`minimal` | `low` | `medium` | `high` | `xhigh`, empty = model default):
   validated at resolve time
   and again in the engine, mapped to `-c model_reasoning_effort` only when
@@ -323,6 +338,7 @@ still the same engine, not a new one.
 | `max_context_size` | **[kimi, grok]** Context window in tokens. Must match the model, or the CLI over-packs and the API rejects the request | ❌ | per engine (`1048576` kimi, `500000` grok) |
 | `cli_version` | **[kimi, grok, codex]** Exact CLI version (`@moonshot-ai/kimi-code`, `@xai-official/grok`, or `@openai/codex`) | ❌ | per engine (`0.34.0` kimi, `1.0.5` grok, `0.160.0` codex) |
 | `reasoning_effort` | **[codex]** Reasoning effort for the review turn: `minimal`, `low`, `medium`, `high`, or `xhigh`. Empty sends no override | ❌ | empty (model default) |
+| `effort` | **[anthropic]** Effort for the review turn: `low`, `medium`, `high`, `xhigh`, or `max`. Empty sends no override | ❌ | empty (model default) |
 | `provider_type` | **[kimi]** Wire dialect; must match what `base_url` serves | ❌ | `openai` |
 | `legacy_markers` | Newline-separated markers from superseded workflows to also delete | ❌ | `Claude PR Review Complete` |
 | `prompt_gist_url` | Review prompt template | ❌ | DerivFE gist, **pinned to a revision** |
@@ -331,8 +347,8 @@ An invalid `review_title` still renders verbatim in the Check name at
 workflow-parse time; the run then fails in "Resolve and validate engine".
 The job name is not authoritative until the run succeeds.
 
-Inputs marked **[kimi]** / **[kimi, grok]** / **[kimi, grok, codex]** / **[codex]**
-are ignored by engines that do not use them. Every input except
+Inputs marked **[kimi]** / **[kimi, grok]** / **[kimi, grok, codex]** / **[codex]** /
+**[anthropic]** are ignored by engines that do not use them. Every input except
 `engine` and `legacy_markers` declares `default: ""` and is resolved to the
 values above inside the `Resolve and validate engine` step — so each default
 exists in exactly one place, and that step is where you bump any of them.
@@ -520,10 +536,10 @@ Four edits at minimum:
 
 An engine with its own knob needs more: an `[engine-specific: <name>]` input,
 its validation in the resolve step, a step output, and a row in the Inputs
-table (codex's `reasoning_effort` is the example). An engine whose model gets a
-shell should also review the post step's leak checks, since it widens what the
-model can put in the review text. Extend `tests/ai-pr-review-contract.sh` for
-each of these.
+table (codex's `reasoning_effort` and anthropic's `effort` are the examples).
+An engine whose model gets a shell should also review the post step's leak
+checks, since it widens what the model can put in the review text. Extend
+`tests/ai-pr-review-contract.sh` for each of these.
 
 ### The contract
 
@@ -642,7 +658,7 @@ asserts all of it.
     token shapes, and the exact on-disk shapes of git credential plumbing —
     actions/checkout's `includeIf`/`extraheader`/credentials-file/base64 forms
     and the plaintext `x-access-token:<token>@` remote URL claude-code-action
-    writes outside commit-signing mode (refuse if found, naming the pattern). Those last patterns are
+    writes when it embeds the token in origin (refuse if found, naming the pattern). Those last patterns are
     anchored to what the tools write — not bare words like `includeIf` — so a
     review that *discusses* git config still posts; the contract test holds
     that line with fixtures on both sides. Then truncate over

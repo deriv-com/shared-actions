@@ -80,6 +80,7 @@ check 'grep -qF "$KIMI_EMPTY_GATE" "$WF"' "pre-split legacy marker gated on empt
 check 'grep -qF "$ANTHROPIC_EMPTY_GATE" "$WF"' "pre-split legacy marker gated on empty title (anthropic)"
 
 check 'grep -q "| \`review_title\`" "$README"' "README documents review_title"
+check 'grep -q "| \`effort\`" "$README"' "README documents effort"
 check 'grep -q "GLM PR Review" "$README"' "README shows GLM PR Review as the caller example"
 check 'grep -q "empty title = one slot per engine" "$README"' "README documents empty-title per-engine slots"
 check 'grep -q "set title = concurrent slot" "$README"' "README documents title-scoped concurrent slots"
@@ -204,6 +205,16 @@ check 'grep -q "^  reasoning_effort:" "$CODEX"' "codex engine declares the reaso
 check 'grep -q "model_reasoning_effort" "$CODEX"' "codex engine maps reasoning_effort onto model_reasoning_effort"
 check 'grep -qE "if \[\[ -n \"\\\$REASONING_EFFORT\" \]\]" "$CODEX"' "codex engine applies reasoning_effort only when non-empty"
 
+# effort: anthropic-only, same dual-validation pattern as reasoning_effort.
+check 'grep -q "^      effort:" "$WF"' "effort input is declared"
+check 'awk '\''/^      effort:/{f=1} f && /default:/{print; exit}'\'' "$WF" | grep -c "default: \"\"" >/dev/null' "effort defaults to empty"
+check 'grep -qE "^[[:space:]]+EFFORT_INPUT:" "$WF"' "resolve step reads effort"
+check 'grep -q "echo \"effort=\$EFFORT\"" "$WF"' "resolve step emits effort on the step outputs"
+check 'grep -q "effort: \${{ steps.engine.outputs.effort }}" "$WF"' "anthropic dispatch step passes effort through"
+check 'grep -q "^  effort:" "$ANTH"' "anthropic engine declares the effort input"
+check 'grep -qF -- '"'"'--model ${{ inputs.model }} ${{ steps.effort.outputs.flag }}'"'"' "$ANTH"' "anthropic engine maps effort onto claude_args via the resolve-effort step"
+check 'grep -qE "if \[\[ -n \"\\\$EFFORT\" \]\]" "$ANTH"' "anthropic engine applies effort only when non-empty"
+
 # This engine CANNOT wire the shared path guard (Codex's hook contract uses
 # Bash/apply_patch tool names and tool_input.command, not Read/Write + a path),
 # so the sandbox is the enforcement boundary. These are its load-bearing
@@ -312,32 +323,60 @@ check 'ncgrep "::stop-commands::" "$CODEX"' "codex log dump is wrapped in ::stop
 # The shared prompt no longer tells every engine it has no shell.
 check '! grep -q "You have no shell tool" "$WF"' "shared review procedure does not claim 'no shell tool' (false for codex)"
 check '! grep -q "Exactly three edits" "$ROOT/.github/workflows/AI_PR_REVIEW_README.md"' "README 'Adding an engine' no longer claims exactly three edits"
-# The reasoning_effort enum is duplicated on purpose (the engine can be called
-# directly). Every case-arm copy must be identical, so widening one cannot drift.
-ENUM_WF=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
-ENUM_CODEX=$(grep -vE '^[[:space:]]*#' "$CODEX" | grep -oE '^ +[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
+# The reasoning_effort and effort enums are each duplicated on purpose (the
+# engines can be called directly). Extract Codex arms by the `minimal|` prefix
+# and Claude arms by the trailing `|max`, so a second xhigh case arm cannot
+# make ENUM_WF a two-line string that never equals ENUM_CODEX.
+ENUM_WF=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +minimal\|[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
+ENUM_CODEX=$(grep -vE '^[[:space:]]*#' "$CODEX" | grep -oE '^ +minimal\|[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
 check '[[ -n "$ENUM_WF" && "$ENUM_WF" == "$ENUM_CODEX" ]]' "reasoning_effort case arms match in the orchestrator and the engine ($ENUM_WF)"
 ENUM_LIST="${ENUM_WF//|/, }"
 check 'grep -qF -- "${ENUM_LIST%, *}" "$WF" && grep -qF -- "${ENUM_LIST%, *}" "$CODEX"' "reasoning_effort input descriptions list the same values as the case arms"
+ENUM_WF_ANTH=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +low\|medium\|high\|xhigh\|max\) ;;' | tr -d ' ;)' | sort -u)
+ENUM_ANTH=$(grep -vE '^[[:space:]]*#' "$ANTH" | grep -oE '^ +low\|medium\|high\|xhigh\|max\) ;;' | tr -d ' ;)' | sort -u)
+check '[[ -n "$ENUM_WF_ANTH" && "$ENUM_WF_ANTH" == "$ENUM_ANTH" ]]' "effort case arms match in the orchestrator and the anthropic engine ($ENUM_WF_ANTH)"
+ENUM_ANTH_LIST="${ENUM_WF_ANTH//|/, }"
+check 'grep -qF -- "${ENUM_ANTH_LIST%, *}" "$WF" && grep -qF -- "${ENUM_ANTH_LIST%, *}" "$ANTH"' "effort input descriptions list the same values as the case arms"
 # Every other copy (descriptions, error messages, comments, README) sits on a
-# line that names xhigh. Each such line must name every case-arm value, so a
-# value added to the arms but not to the prose turns this red.
+# line that names xhigh. Case-arm lines are already locked by the extractors
+# above. Remaining xhigh lines are classified as Codex or Claude so the two
+# enums cannot demand each other's values.
+is_case_arm() { [[ "$1" =~ \)[[:space:]]*\;\;[[:space:]]*$ ]]; }
+is_codex_effort_line() {
+  [[ "$1" =~ reasoning_effort ]] || [[ "$1" =~ model_reasoning_effort ]] || [[ "$1" =~ Codex\ CLI ]] || [[ "$1" =~ (^|[^a-z])minimal([^a-z]|$) ]]
+}
+is_claude_effort_line() {
+  [[ "$1" =~ --effort ]] || [[ "$1" =~ output_config ]] || [[ "$1" =~ engine-specific:\ anthropic ]] || [[ "$1" =~ Anthropic\ engine:\ effort ]] || [[ "$1" =~ Invalid\ effort ]] || [[ "$1" =~ \*\*\[anthropic\]\*\* ]]
+}
 enum_prose_ok() {
-  local f line v
-  for f in "$WF" "$CODEX" "$README"; do
+  local f line v enum
+  for f in "$WF" "$CODEX" "$ANTH" "$README"; do
     while IFS= read -r line; do
-      for v in ${ENUM_WF//|/ }; do
+      is_case_arm "$line" && continue
+      if is_codex_effort_line "$line"; then
+        enum="$ENUM_WF"
+      elif is_claude_effort_line "$line"; then
+        enum="$ENUM_WF_ANTH"
+      else
+        echo "  unclassified xhigh line in $(basename "$f"): ${line:0:120}"
+        return 1
+      fi
+      for v in ${enum//|/ }; do
         [[ "$line" =~ (^|[^a-z])$v([^a-z]|$) ]] || { echo "  missing '$v' in $(basename "$f"): ${line:0:100}"; return 1; }
       done
     done < <(grep -E '(^|[^a-z])xhigh([^a-z]|$)' "$f")
   done
 }
-check 'enum_prose_ok' "every reasoning_effort description, error and doc line lists all case-arm values"
-# Behavioural: run the engine's own validation block against good and bad values.
+check 'enum_prose_ok' "every reasoning_effort or effort description, error and doc line lists all of its case-arm values"
+# Behavioural: run each engine's own validation block against good and bad values.
 EFFORT_BLOCK=$(step_body "Run AI PR review (Codex)" "$CODEX" | awk '/REASONING_ARGS=\(\)/{f=1} f{print} f && /^ +fi$/{f=0; done=1} done{next}' | sed 's/^        //')
 effort_ok() { REASONING_EFFORT="$1" bash -c "$EFFORT_BLOCK" >/dev/null 2>&1; }
 check 'effort_ok "" && effort_ok xhigh && effort_ok minimal' "codex engine accepts empty, minimal and xhigh"
 check '! effort_ok max && ! effort_ok ultra && ! effort_ok bogus' "codex engine rejects max, ultra and unknown values"
+CLAUDE_EFFORT_BLOCK=$(step_body "Resolve effort override" "$ANTH" | awk '/FLAG=""/ {f=1} f{print} f && /^ +fi$/{f=0; done=1} done{next}' | sed 's/^        //')
+claude_effort_ok() { EFFORT="$1" bash -c "$CLAUDE_EFFORT_BLOCK" >/dev/null 2>&1; }
+check 'claude_effort_ok "" && claude_effort_ok low && claude_effort_ok max' "anthropic engine accepts empty, low and max"
+check '! claude_effort_ok minimal && ! claude_effort_ok ultracode && ! claude_effort_ok bogus' "anthropic engine rejects minimal, ultracode and unknown values"
 
 # Ako round 3 nits.
 check 'nc_fixed "base_url_re='"'"'^https?://" && nc_fixed "[[ ! \$BASE_URL =~ \$base_url_re ]]"' "codex base_url check uses a quoted pattern variable (no bracket escapes)"
@@ -381,9 +420,12 @@ check 'grep -q "cp \"\$ACTION_PATH/../ai_review_path_guard/path-guard.js\"" <<< 
 check '! grep -q "git remote remove origin" "$ANTH" && ! grep -q "git remote rm origin" "$ANTH"' "Anthropic: the origin remote is NOT removed (the action's base-branch restore fetches through it)"
 check 'grep -q "git remote get-url origin" <<< "$ANTH_INSTALL" && grep -q "x-access-token" <<< "$ANTH_INSTALL"' "Anthropic: install step asserts origin exists and .git/config is credential-free going in"
 ANTH_RUN="$(step_body "Claude Code PR review" "$ANTH")"
+check 'grep -q "uses: anthropics/claude-code-action@5eb090f3c3afd701a0672cd32981197ca27688f6" "$ANTH"' "Anthropic: claude-code-action pinned to v1.0.253 SHA (CLI 2.1.303)"
 check 'grep -qE "^        allowed_bots: gh-app-write[[:space:]]*$" <<< "$ANTH_RUN"' "Anthropic: claude-code-action allowlists gh-app-write (Forge); GLM/DeepSeek use this engine"
 check '! grep -qE "^        allowed_bots: ['\''\"]?\\*" <<< "$ANTH_RUN"' "Anthropic: allowed_bots is not a wildcard (Dependabot must stay out)"
-check 'grep -q "^        use_commit_signing: true" <<< "$ANTH_RUN"' "Anthropic: commit-signing mode, the one prepare branch that never rewrites origin with the token"
+check 'grep -q "^        use_commit_signing: true" <<< "$ANTH_RUN"' "Anthropic: commit-signing mode still set (skips configureGitAuth user/email; file-ops stays denied)"
+check 'grep -q "^        allowed_non_write_users: \"_never\"" <<< "$ANTH_RUN"' "Anthropic: allowed_non_write_users is _never so origin stays token-free"
+check '! grep -qE "^        allowed_non_write_users: ['\''\"]?\\*" <<< "$ANTH_RUN"' "Anthropic: allowed_non_write_users is not a wildcard"
 check 'grep -q "^        GIT_CONFIG_COUNT: \"1\"" <<< "$ANTH_RUN" && grep -q "^        GIT_CONFIG_KEY_0: credential.helper" <<< "$ANTH_RUN" && grep -q "^        GIT_CONFIG_VALUE_0: .*GITHUB_TOKEN" <<< "$ANTH_RUN"' "Anthropic: the action's base-branch fetch authenticates from env-only git config, never .git/config"
 check 'grep -q "mcp__github_file_ops" <<< "$ANTH_RUN"' "Anthropic: the file-ops MCP server that commit-signing mode mounts is denied by name"
 check 'grep -q "\"PreToolUse\"" <<< "$ANTH_RUN" && grep -q "\"matcher\": \".\*\"" <<< "$ANTH_RUN"' "Anthropic: settings registers a match-all PreToolUse hook"
@@ -393,6 +435,7 @@ check 'grep -q -- "--setting-sources user" <<< "$ANTH_RUN"' "Anthropic: only the
 check 'grep -q -- "--disallowedTools \"Bash," <<< "$ANTH_RUN"' "Anthropic: Bash stays disallowed"
 ANTH_VERIFY="$(step_body "Verify the sandbox held and the review was written" "$ANTH")"
 check 'grep -q "x-access-token" <<< "$ANTH_VERIFY" && grep -q "\.git/config" <<< "$ANTH_VERIFY"' "Anthropic: verify step re-reads .git/config for credentials after the model ran"
+check 'grep -q "_actions/anthropics/claude-code-action" <<< "$ANTH_VERIFY"' "Anthropic: verify allows only the pinned action's helper under _actions/"
 check 'grep -q "\[\[ ! -s \"\$PATH_GUARD_LOG\" \]\]" <<< "$ANTH_VERIFY"' "Anthropic: verify step fails if a review was written without the guard ever running"
 check 'grep -q "^        PATH_GUARD_LOG: \${{ runner.temp }}/ai-review-path-guard/decisions.log" <<< "$ANTH_VERIFY"' "Anthropic: verify step reads the same decision log the hook writes"
 
@@ -447,7 +490,8 @@ check 'grep -q "ai_review_path_guard/path-guard.js" "$README"' "README names the
 check 'grep -q "type l" "$README"' "README explains why the scrubs match symlinks"
 check 'grep -q "persist-credentials: false" "$README"' "README documents the credential-free checkout"
 check 'grep -qi "fork" "$README"' "README documents the fork skip"
-check 'grep -q "use_commit_signing" "$README" && grep -q "restoreConfigFromBase" "$README"' "README documents why the Anthropic engine keeps origin and uses commit-signing mode instead"
+check 'grep -q "use_commit_signing" "$README" && grep -q "restoreConfigFromBase" "$README" && grep -q "_never" "$README"' "README documents restoreConfigFromBase, commit-signing, and _never"
+check '! grep -q "the one prepare branch that never rewrites origin" "$README" && ! grep -q "the one prepare branch that skips that" "$README"' "README does not claim signing alone skips origin rewrite"
 check 'grep -q "REVIEW_MARKER_FILTER" "$README"' "README documents why the reap filter is env, not a file"
 check 'grep -q "120000" "$README"' "README documents the tree-based symlink check"
 
