@@ -17,7 +17,8 @@ name: Forge — issue to PR
 #         slack_channel:   { required: false, type: string }
 #         slack_thread_ts: { required: false, type: string }
 #         requested_by:    { required: false, type: string }
-#         analysis_brief:  { required: false, type: string }  # optional; forge-agent truncates to 10000 characters
+#         analysis_brief:  { required: false, type: string }
+#         command:         { required: false, type: string }  # auto (first open) or revise
 #
 #   jobs:
 #     forge:
@@ -29,6 +30,7 @@ name: Forge — issue to PR
 #         slack_thread_ts: ${{ github.event.inputs.slack_thread_ts }}
 #         requested_by:    ${{ github.event.inputs.requested_by }}
 #         analysis_brief:  ${{ github.event.inputs.analysis_brief }}
+#         command:         ${{ github.event.inputs.command || 'auto' }}
 #         install_command: "npm ci"          # whatever your CI runs
 #       secrets:
 #         CLIENT_ID_GHAPP_WRITE:   ${{ secrets.CLIENT_ID_GHAPP_WRITE }}
@@ -72,13 +74,19 @@ on:
         type: string
       analysis_brief:
         description: >-
-          Optional Slack analysis; forge-agent truncates to 10000 characters.
-          When set, it is included in the claim comment so DSTP's issue-URL
-          seed sees it. Empty on the label path. Do not pass this from a
-          caller until this input exists on the reusable workflow ref the
-          caller pins.
+          Optional extra context from Forge. DSTP already reads the issue
+          body and comments (including Forge's analysis comment). Empty on
+          the label path.
         required: false
         default: ""
+        type: string
+      command:
+        description: >-
+          dstp subcommand. `auto` opens the first PR. `revise` applies later
+          changes (AI review findings, CI, or a human Slack note posted as an
+          issue comment). Callers must pass this through from workflow_dispatch.
+        required: false
+        default: "auto"
         type: string
 
       # --- per-repo tuning --------------------------------------------------
@@ -248,7 +256,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.repo-token.outputs.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          # forge-agent already caps this; the slice is defense in depth. Never
+          # The brief is capped HERE (forge-agent no longer caps it). Never
           # echo it — it is model output from the issue.
           ANALYSIS_BRIEF: ${{ inputs.analysis_brief }}
         run: |
@@ -521,30 +529,210 @@ jobs:
           GH_TOKEN: ${{ steps.repo-token.outputs.token }}
           GITHUB_TOKEN: ${{ steps.repo-token.outputs.token }}
           FAST_LANE: ${{ inputs.fast_lane }}
+          FORGE_COMMAND: ${{ inputs.command }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
         run: |
           set -o pipefail
           git config --global user.name  "forge[bot]"
           git config --global user.email "forge@users.noreply.github.com"
 
-          # Built as an array so the optional flag can't word-split, and so the
-          # exact command is echoed in the log — the lane is the single biggest
-          # factor in whether a run finishes inside the timeout, so it should be
-          # readable at the top of the step rather than inferred from behaviour.
-          ARGS=(auto "$ISSUE_URL" --cwd . --unattended --json)
-          if [ "$FAST_LANE" = "true" ]; then
-            ARGS+=(--fast)
+          COMMAND="$FORGE_COMMAND"
+          case "$COMMAND" in
+            revise) COMMAND=revise ;;
+            *) COMMAND=auto ;;
+          esac
+
+          run_dstp() {
+            local sub="$1"
+            local ARGS=("$sub" "$ISSUE_URL" --cwd . --unattended --json)
+            if [ "$FAST_LANE" = "true" ]; then
+              ARGS+=(--fast)
+            fi
+            echo "Running: dstp ${ARGS[*]}"
+            node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || return $?
+            local RESULT
+            RESULT=$(grep -oE '^\{.*\}$' /tmp/forge.log | tail -1 || true)
+            if [ -n "$RESULT" ]; then
+              local pr
+              pr=$(printf '%s' "$RESULT" | jq -r '.pr_url // empty')
+              [ -n "$pr" ] && echo "pr_url=$pr" >> "$GITHUB_OUTPUT"
+            fi
+            return 0
+          }
+
+          SCRIPT_START=$(date -u +%s)
+          RUN_CREATED=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .created_at 2>/dev/null || true)
+          if [ -n "$RUN_CREATED" ] && START_EPOCH=$(date -u -d "$RUN_CREATED" +%s 2>/dev/null); then
+            :
+          else
+            START_EPOCH=$SCRIPT_START
           fi
-          echo "Running: dstp ${ARGS[*]}"
 
-          # `|| STATUS=$?` keeps the default `bash -e` from aborting before we
-          # can salvage the result line and surface the log.
-          node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || STATUS=$?
+          remaining_job_seconds() {
+            local now elapsed timeout buffer
+            now=$(date -u +%s)
+            elapsed=$(( now - START_EPOCH ))
+            timeout=$(( ${TIMEOUT_MINUTES:-55} * 60 ))
+            buffer=180
+            echo $(( timeout - elapsed - buffer ))
+          }
+
+          # Do not treat missing checks as green. Ready when at least one check
+          # has completed and every *PR Review* check has finished. If CI has
+          # completed and no *PR Review* check appears after a few polls (custom
+          # review_title, or reviews skipped on drafts), proceed on CI only.
+          wait_for_rollup() {
+            local pr_url="$1"
+            local i rollup ready noreview_polls
+            noreview_polls=0
+            for i in $(seq 1 40); do
+              rollup=$(gh pr view "$pr_url" --json statusCheckRollup 2>/dev/null || echo '{"statusCheckRollup":[]}')
+              ready=$(printf '%s' "$rollup" | jq -r '
+                def finished:
+                  ((.status // "") | ascii_upcase) == "COMPLETED"
+                  or ((.state // "") | ascii_upcase) as $s
+                    | ($s == "SUCCESS" or $s == "FAILURE" or $s == "ERROR"
+                       or $s == "CANCELLED" or $s == "SKIPPED" or $s == "TIMED_OUT");
+                def pending:
+                  ((.status // "") | ascii_upcase) as $st
+                  | ((.state // "") | ascii_upcase) as $s
+                  | ($st == "QUEUED" or $st == "IN_PROGRESS" or $st == "PENDING"
+                     or $st == "WAITING" or $st == "REQUESTED"
+                     or $s == "PENDING" or $s == "EXPECTED");
+                def is_review:
+                  ((.name // .context // "") | test("PR Review"));
+                def failing:
+                  ((.conclusion // "") | ascii_upcase) as $c
+                  | ((.state // "") | ascii_upcase) as $s
+                  | ($c == "FAILURE" or $c == "ERROR" or $c == "TIMED_OUT" or $c == "CANCELLED"
+                     or $s == "FAILURE" or $s == "ERROR");
+                .statusCheckRollup // []
+                | {
+                    completed: ([.[] | select(finished)] | length),
+                    review_total: ([.[] | select(is_review)] | length),
+                    review_pending: ([.[] | select(is_review) | select(pending or (finished | not))] | length),
+                    failing: ([.[] | select(failing)] | length)
+                  }
+                | if .completed > 0 and .review_total > 0 and .review_pending == 0 then "ready:\(.failing)"
+                  elif .completed > 0 and .review_total == 0 then "ci_only:\(.failing)"
+                  else "wait" end
+              ')
+              case "$ready" in
+                ready:*) printf '%s\n' "$ready"; return 0 ;;
+                ci_only:*)
+                  noreview_polls=$((noreview_polls + 1))
+                  if [ "$noreview_polls" -ge 4 ]; then
+                    printf 'noreview:%s\n' "${ready#ci_only:}"
+                    return 0
+                  fi
+                  ;;
+                *)
+                  noreview_polls=0
+                  ;;
+              esac
+              sleep 15
+            done
+            echo "timeout"
+          }
+
+          latest_review_findings() {
+            local pr_num="$1" out comments
+            # --paginate: per_page=100 is the first page only. Do not use --jq
+            # with a whole-array filter — it applies per page. jq -s 'add // []'
+            # merges the arrays --paginate concatenates.
+            if ! comments=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${pr_num}/comments" --paginate); then
+              echo "unknown"
+              return
+            fi
+            if ! out=$(printf '%s' "$comments" | jq -s 'add // []' | jq '
+              def is_review:
+                ((.body // "") | test("<!-- deriv-pr-review-"))
+                and ((.body // "") | test("<!-- deriv-pr-review-progress-") | not);
+              def is_forge_revise:
+                (.body // "") | test("<!-- forge-revise-instructions -->");
+              sort_by(.created_at)
+              | . as $all
+              | ($all | map(select(is_forge_revise)) | last | .created_at // "") as $since
+              | [$all[] | select(is_review) | select($since == "" or .created_at > $since)]
+              | length
+            '); then
+              echo "unknown"
+              return
+            fi
+            echo "$out"
+          }
+
+          run_dstp "$COMMAND" || STATUS=$?
           STATUS=${STATUS:-0}
+          PR_URL=$(grep -oE '^\{.*\}$' /tmp/forge.log | tail -1 | jq -r '.pr_url // empty' || true)
+          [ -n "$PR_URL" ] && echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
 
-          # --json writes the result as a single JSON line on stdout.
-          RESULT=$(grep -oE '^\{.*\}$' /tmp/forge.log | tail -1 || true)
-          if [ -n "$RESULT" ]; then
-            echo "pr_url=$(printf '%s' "$RESULT" | jq -r '.pr_url // empty')" >> "$GITHUB_OUTPUT"
+          # First dstp failure fails the job. After a PR exists, wait for this
+          # repo's AI PR Review jobs (comments marked <!-- deriv-pr-review- … -->)
+          # plus CI, then dstp revise until they are clean or 8 rounds have run.
+          # Report treats a present PR URL as forge:done even if a later revise
+          # failed — revise_trouble is a note on that same comment, not a rewrite
+          # of STATUS or OUTCOME. First dstp failure (no PR) is forge:failed.
+          # Nits are included; if a nit does not make sense, dstp should reply
+          # with technical reasoning and skip it — no thanks, no "great point".
+          MAX_REVISE=8
+          MIN_CYCLE_SECONDS=720
+          if [ "$STATUS" -eq 0 ] && [ -n "$PR_URL" ]; then
+            ROUND=0
+            UNKNOWN_ROUNDS=0
+            while [ "$ROUND" -lt "$MAX_REVISE" ]; do
+              LEFT=$(remaining_job_seconds)
+              if [ "$LEFT" -lt "$MIN_CYCLE_SECONDS" ]; then
+                echo "Not enough remaining job time (${LEFT}s) for another wait+revise"
+                break
+              fi
+              echo "Waiting for CI and PR Review checks on $PR_URL (round $((ROUND+1))/$MAX_REVISE)"
+              READY=$(wait_for_rollup "$PR_URL")
+              if [[ "$READY" == noreview:* ]]; then
+                echo "No *PR Review* check after bounded polls; proceeding on CI only"
+                FAILING=${READY#noreview:}
+              elif [[ "$READY" == ready:* ]]; then
+                FAILING=${READY#ready:}
+              else
+                echo "Checks not ready yet ($READY); not treating an empty rollup as green"
+                continue
+              fi
+              FINDINGS=$(latest_review_findings "$(basename "$PR_URL")")
+              if [ "$FINDINGS" = "unknown" ]; then
+                echo "Could not read PR review comments; not treating that as clean"
+                UNKNOWN_ROUNDS=$((UNKNOWN_ROUNDS + 1))
+                if [ "$UNKNOWN_ROUNDS" -ge 5 ]; then
+                  echo "Gave up reading PR review comments after 5 attempts"
+                  echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
+                  break
+                fi
+                sleep 60
+                continue
+              fi
+              UNKNOWN_ROUNDS=0
+              if [ "${FAILING:-0}" = "0" ] && [ "$FINDINGS" = "0" ]; then
+                echo "CI green and no remaining AI PR Review findings."
+                break
+              fi
+              LEFT=$(remaining_job_seconds)
+              if [ "$LEFT" -lt "$MIN_CYCLE_SECONDS" ]; then
+                echo "Not enough remaining job time (${LEFT}s) to start dstp revise"
+                break
+              fi
+              gh pr comment "$PR_URL" --body "$(cat <<'EOF'
+          <!-- forge-revise-instructions -->
+          Address remaining CI failures and every latest `<!-- deriv-pr-review-` finding, including Low/nits. If a nit does not make sense, reply on the PR with technical reasoning and skip that finding. No thanks, no "great point".
+          EOF
+          )" || true
+              ROUND=$((ROUND + 1))
+              REVISE_STATUS=0
+              run_dstp revise || REVISE_STATUS=$?
+              if [ "$REVISE_STATUS" -ne 0 ]; then
+                echo "dstp revise failed after a PR already exists; leaving the PR in place"
+                echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
+                break
+              fi
+            done
           fi
           exit $STATUS
 
@@ -555,6 +743,7 @@ jobs:
           GH_TOKEN: ${{ steps.repo-token.outputs.token }}
           COMMENT_ID: ${{ steps.claim.outputs.comment_id }}
           PR_URL: ${{ steps.forge.outputs.pr_url }}
+          REVISE_TROUBLE: ${{ steps.forge.outputs.revise_trouble }}
           OUTCOME: ${{ steps.forge.outcome }}
           ENGINE_TAG: ${{ steps.engine.outputs.engine_tag }}
           ENGINE_SHA: ${{ steps.engine.outputs.engine_sha }}
@@ -569,8 +758,11 @@ jobs:
         run: |
           set -uo pipefail
 
-          if [ "$OUTCOME" = "success" ] && [ -n "${PR_URL:-}" ]; then
+          if [ -n "${PR_URL:-}" ]; then
             BODY=$(printf '🔨 **Forge** opened %s\n\nThe design doc and implementation plan are committed in the PR.' "$PR_URL")
+            if [ "${REVISE_TROUBLE:-}" = "1" ]; then
+              BODY=$(printf '%s\n\nWait/revise did not finish cleanly after the PR opened — see the [run log](%s). The PR is still up for review.' "$BODY" "$RUN_URL")
+            fi
             LABEL="forge:done"
           else
             # The log is the agent's combined stdout/stderr, so scrub anything
@@ -638,7 +830,7 @@ jobs:
           [ -n "${REQUESTED_BY:-}" ] && WHO="<@${REQUESTED_BY}> "
           ISSUE_LINK="<${ISSUE_URL}|#${ISSUE_NUMBER}>"
 
-          if [ "$OUTCOME" = "success" ] && [ -n "${PR_URL:-}" ]; then
+          if [ -n "${PR_URL:-}" ]; then
             SLACK_TEXT="${WHO}✅ *Forge opened a PR* for ${ISSUE_LINK} — <${PR_URL}|review it here>. The design doc and plan are committed in the PR."
           else
             SLACK_TEXT="${WHO}❌ *Forge failed* on ${ISSUE_LINK} — <${RUN_URL}|see the run log>. The error is also on the issue. Ask me to retry when you're ready."
