@@ -76,14 +76,27 @@ for secret in FORGE_SLACK_BOT_TOKEN LITELLM_API_URL DSTP_FORGE_SERVICE_KEY; do
     "secret '${secret}' stays optional"
 done
 
-check 'grep -q "DSTP_FORGE_TRIGGER: forge_ci" "$WF"' \
-  "Run Forge sets DSTP_FORGE_TRIGGER=forge_ci"
-check 'grep -q "DSTP_FORGE_SERVICE_KEY: \${{ secrets.DSTP_FORGE_SERVICE_KEY }}" "$WF"' \
-  "Run Forge passes the CI service key, not FORGE_API_KEY"
+# Scoped to the Run Forge step. The empty-key guard also assigns
+# secrets.DSTP_FORGE_SERVICE_KEY, so a file-wide grep would still pass if
+# the env were dropped from the dstp invocation.
+check 'awk "
+  \$0 ~ /name: Run Forge/ {f=1}
+  f && /DSTP_FORGE_TRIGGER: forge_ci/ {t=1}
+  f && /secrets.DSTP_FORGE_SERVICE_KEY/ {k=1}
+  f && /^      - name:/ && \$0 !~ /Run Forge/ {exit}
+  END {exit (t && k) ? 0 : 1}
+" "$WF"' \
+  "Run Forge sets DSTP_FORGE_TRIGGER=forge_ci and the CI service key"
 check '! grep -q "DSTP_FORGE_API_URL:" "$WF"' \
   "DSTP_FORGE_API_URL is unset — dstp 0.8.0 refuses any override"
 check 'grep -q "DSTP_FORGE_SERVICE_KEY is empty" "$WF"' \
   "empty CI service key fails before dstp starts"
+check 'awk "
+  /name: Claim the issue/ {c=NR}
+  /name: Require the Forge CI service key/ {r=NR}
+  END {exit (c && r && r>c) ? 0 : 1}
+" "$WF"' \
+  "empty-key guard runs after claim so Report can post and free the forge label"
 check 'grep -q "s/fk_\[A-Za-z0-9_-\]{20,}/\*\*\*/g" "$WF"' \
   "failure-log scrub covers Forge CI keys (fk_)"
 

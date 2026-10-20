@@ -226,16 +226,6 @@ jobs:
       REQUESTED_BY: ${{ inputs.requested_by }}
 
     steps:
-      - name: Require the Forge CI service key
-        env:
-          DSTP_FORGE_SERVICE_KEY: ${{ secrets.DSTP_FORGE_SERVICE_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -z "${DSTP_FORGE_SERVICE_KEY:-}" ]; then
-            echo "::error::DSTP_FORGE_SERVICE_KEY is empty. dstp 0.8.0 will not start in GitHub Actions without DSTP_FORGE_TRIGGER=forge_ci and a Forge CI service key (fk_…). Store it as a repo Actions secret named DSTP_FORGE_SERVICE_KEY and pass it from the caller. Do not reuse FORGE_API_KEY (that is LiteLLM)."
-            exit 1
-          fi
-
       # ---- tokens --------------------------------------------------------
       - name: Mint token for the target repo (labels, comments, branch, PR)
         id: repo-token
@@ -340,6 +330,20 @@ jobs:
             --input "$PAYLOAD" --jq '.html_url')
           # .../issues/12#issuecomment-345 -> 345, so we can edit this comment later.
           echo "comment_id=${URL##*issuecomment-}" >> "$GITHUB_OUTPUT"
+
+      # After claim, not before token mint: Report needs the App token and
+      # comment_id to post the failure and swap `forge` → `forge:failed`.
+      # Failing first left `forge` on the issue, so re-applying it could not
+      # retrigger, and the `|| true` cleanup in Report was a silent no-op.
+      - name: Require the Forge CI service key
+        env:
+          DSTP_FORGE_SERVICE_KEY: ${{ secrets.DSTP_FORGE_SERVICE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DSTP_FORGE_SERVICE_KEY:-}" ]; then
+            echo "::error::DSTP_FORGE_SERVICE_KEY is empty. dstp 0.8.0 will not start in GitHub Actions without DSTP_FORGE_TRIGGER=forge_ci and a Forge CI service key (fk_…). Store it as a repo Actions secret named DSTP_FORGE_SERVICE_KEY and pass it from the caller. Do not reuse FORGE_API_KEY (that is LiteLLM)."
+            exit 1
+          fi
 
       # ---- workspace -----------------------------------------------------
       - name: Checkout
