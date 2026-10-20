@@ -37,7 +37,8 @@ name: Forge — issue to PR
 #         PRIVATE_KEY_GHAPP_WRITE: ${{ secrets.PRIVATE_KEY_GHAPP_WRITE }}
 #         CLIENT_ID_GHAPP:         ${{ secrets.CLIENT_ID_GHAPP }}
 #         PRIVATE_KEY_GHAPP:       ${{ secrets.PRIVATE_KEY_GHAPP }}
-#         FORGE_API_KEY:           ${{ secrets.FORGE_API_KEY }}
+#         FORGE_API_KEY:           ${{ secrets.FORGE_API_KEY }}           # LiteLLM, not telemetry
+#         DSTP_FORGE_SERVICE_KEY:  ${{ secrets.DSTP_FORGE_SERVICE_KEY }}  # Forge CI ingest (fk_…)
 #         FORGE_SLACK_BOT_TOKEN:   ${{ secrets.FORGE_SLACK_BOT_TOKEN }}   # Slack path only
 #
 # The four `forge*` labels are created automatically on first run, so a new
@@ -180,13 +181,23 @@ on:
         description: "Private key for CLIENT_ID_GHAPP"
         required: true
       FORGE_API_KEY:
-        description: "LiteLLM gateway key (sent as ANTHROPIC_AUTH_TOKEN)"
+        description: "LiteLLM gateway key (sent as ANTHROPIC_AUTH_TOKEN). Not the Forge telemetry key."
         required: true
       LITELLM_API_URL:
         description: "Gateway base URL. A trailing /v1 is stripped. Defaults to the deriv gateway."
         required: false
       FORGE_SLACK_BOT_TOKEN:
         description: "Slack bot token, so the outcome can be posted to the thread. Only needed for the Slack path."
+        required: false
+      DSTP_FORGE_SERVICE_KEY:
+        description: >-
+          Forge CI service key (fk_…) for dstp 0.8.0 ingest. Optional so
+          existing callers do not 422 before they pass it; an empty value
+          still fails the job, because GitHub Actions without
+          DSTP_FORGE_TRIGGER=forge_ci and this key cannot start dstp.
+          Do not reuse FORGE_API_KEY. Do not set DSTP_FORGE_API_URL —
+          dstp 0.8.0 refuses that override and always uses
+          https://forge.deriv.cloud.
         required: false
 
 jobs:
@@ -215,6 +226,16 @@ jobs:
       REQUESTED_BY: ${{ inputs.requested_by }}
 
     steps:
+      - name: Require the Forge CI service key
+        env:
+          DSTP_FORGE_SERVICE_KEY: ${{ secrets.DSTP_FORGE_SERVICE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DSTP_FORGE_SERVICE_KEY:-}" ]; then
+            echo "::error::DSTP_FORGE_SERVICE_KEY is empty. dstp 0.8.0 will not start in GitHub Actions without DSTP_FORGE_TRIGGER=forge_ci and a Forge CI service key (fk_…). Store it as a repo Actions secret named DSTP_FORGE_SERVICE_KEY and pass it from the caller. Do not reuse FORGE_API_KEY (that is LiteLLM)."
+            exit 1
+          fi
+
       # ---- tokens --------------------------------------------------------
       - name: Mint token for the target repo (labels, comments, branch, PR)
         id: repo-token
@@ -531,6 +552,12 @@ jobs:
           FAST_LANE: ${{ inputs.fast_lane }}
           FORGE_COMMAND: ${{ inputs.command }}
           TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+          # dstp 0.8.0 throws in GitHub Actions without these two. Do not set
+          # DSTP_FORGE_API_URL — that override is refused; production
+          # https://forge.deriv.cloud is the built-in default. Do not reuse
+          # FORGE_API_KEY (LiteLLM) as the service key.
+          DSTP_FORGE_TRIGGER: forge_ci
+          DSTP_FORGE_SERVICE_KEY: ${{ secrets.DSTP_FORGE_SERVICE_KEY }}
         run: |
           set -o pipefail
           git config --global user.name  "forge[bot]"
@@ -775,12 +802,13 @@ jobs:
             #
             # `sk-` is deliberately broad rather than `sk-ant-`: the key actually
             # in the agent's environment on every run is the LiteLLM gateway key,
-            # which has no `ant` infix. `xox*` covers the Slack token this very
-            # step holds.
+            # which has no `ant` infix. `fk_` covers the Forge CI service key.
+            # `xox*` covers the Slack token this very step holds.
             TAIL=$(tail -c 3000 /tmp/forge.log 2>/dev/null | sed -E \
               -e 's/gh[pousr]_[A-Za-z0-9]{20,}/***/g' \
               -e 's/github_pat_[A-Za-z0-9_]{20,}/***/g' \
               -e 's/sk-[A-Za-z0-9_-]{20,}/***/g' \
+              -e 's/fk_[A-Za-z0-9_-]{20,}/***/g' \
               -e 's/xox[abposr]-[A-Za-z0-9-]{10,}/***/g' \
               -e 's#x-access-token:[^@]*@#x-access-token:***@#g' \
               || echo "no output captured")

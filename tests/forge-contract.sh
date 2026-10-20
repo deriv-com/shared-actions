@@ -66,13 +66,26 @@ for secret in CLIENT_ID_GHAPP_WRITE PRIVATE_KEY_GHAPP_WRITE \
     "secret '${secret}' stays required"
 done
 
-# Optional by design: a missing Slack token degrades to a warning, and the
-# gateway URL falls back to the deriv default.
-for secret in FORGE_SLACK_BOT_TOKEN LITELLM_API_URL; do
+# Optional by design: a missing Slack token degrades to a warning, the
+# gateway URL falls back to the deriv default, and DSTP_FORGE_SERVICE_KEY
+# stays optional so existing callers do not 422 before they pass it. dstp
+# 0.8.0 still refuses to start in Actions without the key.
+for secret in FORGE_SLACK_BOT_TOKEN LITELLM_API_URL DSTP_FORGE_SERVICE_KEY; do
   check "grep -q '^      ${secret}:' \"\$WF\"" "secret '${secret}' is declared"
   check "awk '/^      ${secret}:/{f=1} f && /required:/{print; exit}' \"\$WF\" | grep -q 'required: false'" \
     "secret '${secret}' stays optional"
 done
+
+check 'grep -q "DSTP_FORGE_TRIGGER: forge_ci" "$WF"' \
+  "Run Forge sets DSTP_FORGE_TRIGGER=forge_ci"
+check 'grep -q "DSTP_FORGE_SERVICE_KEY: \${{ secrets.DSTP_FORGE_SERVICE_KEY }}" "$WF"' \
+  "Run Forge passes the CI service key, not FORGE_API_KEY"
+check '! grep -q "DSTP_FORGE_API_URL:" "$WF"' \
+  "DSTP_FORGE_API_URL is unset — dstp 0.8.0 refuses any override"
+check 'grep -q "DSTP_FORGE_SERVICE_KEY is empty" "$WF"' \
+  "empty CI service key fails before dstp starts"
+check 'grep -q "s/fk_\[A-Za-z0-9_-\]{20,}/\*\*\*/g" "$WF"' \
+  "failure-log scrub covers Forge CI keys (fk_)"
 
 # --- portability ----------------------------------------------------------
 # A relative `uses:` inside a reusable workflow resolves against the caller, so
