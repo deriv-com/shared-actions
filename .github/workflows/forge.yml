@@ -553,7 +553,9 @@ jobs:
             local RESULT
             RESULT=$(grep -oE '^\{.*\}$' /tmp/forge.log | tail -1 || true)
             if [ -n "$RESULT" ]; then
-              echo "pr_url=$(printf '%s' "$RESULT" | jq -r '.pr_url // empty')" >> "$GITHUB_OUTPUT"
+              local pr
+              pr=$(printf '%s' "$RESULT" | jq -r '.pr_url // empty')
+              [ -n "$pr" ] && echo "pr_url=$pr" >> "$GITHUB_OUTPUT"
             fi
             return 0
           }
@@ -575,11 +577,14 @@ jobs:
             echo $(( timeout - elapsed - buffer ))
           }
 
-          # Do not treat missing checks as green. Ready only when at least one
-          # check has completed and every *PR Review* check has finished.
+          # Do not treat missing checks as green. Ready when at least one check
+          # has completed and every *PR Review* check has finished. If CI has
+          # completed and no *PR Review* check appears after a few polls (custom
+          # review_title, or reviews skipped on drafts), proceed on CI only.
           wait_for_rollup() {
             local pr_url="$1"
-            local i rollup ready
+            local i rollup ready noreview_polls
+            noreview_polls=0
             for i in $(seq 1 40); do
               rollup=$(gh pr view "$pr_url" --json statusCheckRollup 2>/dev/null || echo '{"statusCheckRollup":[]}')
               ready=$(printf '%s' "$rollup" | jq -r '
@@ -608,10 +613,22 @@ jobs:
                     review_pending: ([.[] | select(is_review) | select(pending or (finished | not))] | length),
                     failing: ([.[] | select(failing)] | length)
                   }
-                | if .completed > 0 and .review_total > 0 and .review_pending == 0 then "ready:\(.failing)" else "wait" end
+                | if .completed > 0 and .review_total > 0 and .review_pending == 0 then "ready:\(.failing)"
+                  elif .completed > 0 and .review_total == 0 then "ci_only:\(.failing)"
+                  else "wait" end
               ')
               case "$ready" in
                 ready:*) printf '%s\n' "$ready"; return 0 ;;
+                ci_only:*)
+                  noreview_polls=$((noreview_polls + 1))
+                  if [ "$noreview_polls" -ge 4 ]; then
+                    printf 'noreview:%s\n' "${ready#ci_only:}"
+                    return 0
+                  fi
+                  ;;
+                *)
+                  noreview_polls=0
+                  ;;
               esac
               sleep 15
             done
@@ -619,15 +636,21 @@ jobs:
           }
 
           latest_review_findings() {
-            local pr_num="$1" out
-            if ! out=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${pr_num}/comments?per_page=100" --jq '
+            local pr_num="$1" out comments
+            # --paginate: per_page=100 is the first page only. Do not use --jq
+            # with a whole-array filter — it applies per page. jq -s 'add // []'
+            # merges the arrays --paginate concatenates.
+            if ! comments=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${pr_num}/comments" --paginate); then
+              echo "unknown"
+              return
+            fi
+            if ! out=$(printf '%s' "$comments" | jq -s 'add // []' | jq '
               def is_review:
                 ((.body // "") | test("<!-- deriv-pr-review-"))
                 and ((.body // "") | test("<!-- deriv-pr-review-progress-") | not);
               def is_forge_revise:
                 (.body // "") | test("<!-- forge-revise-instructions -->");
-              (if type == "array" then . else [] end)
-              | sort_by(.created_at)
+              sort_by(.created_at)
               | . as $all
               | ($all | map(select(is_forge_revise)) | last | .created_at // "") as $since
               | [$all[] | select(is_review) | select($since == "" or .created_at > $since)]
@@ -647,13 +670,16 @@ jobs:
           # First dstp failure fails the job. After a PR exists, wait for this
           # repo's AI PR Review jobs (comments marked <!-- deriv-pr-review- … -->)
           # plus CI, then dstp revise until they are clean or 8 rounds have run.
-          # A later revise failure does not rewrite a successful open as forge:failed.
+          # Report treats a present PR URL as forge:done even if a later revise
+          # failed — revise_trouble is a note on that same comment, not a rewrite
+          # of STATUS or OUTCOME. First dstp failure (no PR) is forge:failed.
           # Nits are included; if a nit does not make sense, dstp should reply
           # with technical reasoning and skip it — no thanks, no "great point".
           MAX_REVISE=8
           MIN_CYCLE_SECONDS=720
           if [ "$STATUS" -eq 0 ] && [ -n "$PR_URL" ]; then
             ROUND=0
+            UNKNOWN_ROUNDS=0
             while [ "$ROUND" -lt "$MAX_REVISE" ]; do
               LEFT=$(remaining_job_seconds)
               if [ "$LEFT" -lt "$MIN_CYCLE_SECONDS" ]; then
@@ -662,16 +688,28 @@ jobs:
               fi
               echo "Waiting for CI and PR Review checks on $PR_URL (round $((ROUND+1))/$MAX_REVISE)"
               READY=$(wait_for_rollup "$PR_URL")
-              if [[ "$READY" != ready:* ]]; then
+              if [[ "$READY" == noreview:* ]]; then
+                echo "No *PR Review* check after bounded polls; proceeding on CI only"
+                FAILING=${READY#noreview:}
+              elif [[ "$READY" == ready:* ]]; then
+                FAILING=${READY#ready:}
+              else
                 echo "Checks not ready yet ($READY); not treating an empty rollup as green"
                 continue
               fi
-              FAILING=${READY#ready:}
               FINDINGS=$(latest_review_findings "$(basename "$PR_URL")")
               if [ "$FINDINGS" = "unknown" ]; then
                 echo "Could not read PR review comments; not treating that as clean"
+                UNKNOWN_ROUNDS=$((UNKNOWN_ROUNDS + 1))
+                if [ "$UNKNOWN_ROUNDS" -ge 5 ]; then
+                  echo "Gave up reading PR review comments after 5 attempts"
+                  echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
+                  break
+                fi
+                sleep 60
                 continue
               fi
+              UNKNOWN_ROUNDS=0
               if [ "${FAILING:-0}" = "0" ] && [ "$FINDINGS" = "0" ]; then
                 echo "CI green and no remaining AI PR Review findings."
                 break
