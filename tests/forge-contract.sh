@@ -35,6 +35,7 @@ check '! grep -qE "^  (issues|pull_request|push|schedule):" "$WF"' \
 
 # --- inputs callers pass by name ------------------------------------------
 for input in issue_number slack_channel slack_thread_ts requested_by \
+             slack_message_ts slack_started_at \
              analysis_brief command \
              node_version install_command model runner_group engine_ref \
              fast_lane timeout_minutes; do
@@ -49,6 +50,12 @@ check 'awk "/^      command:/{f=1} f && /required:/{print; exit}" "$WF" | grep -
   "input 'command' stays optional"
 check 'awk "/^      command:/{f=1} f && /default:/{print; exit}" "$WF" | grep -q "default: \"auto\""' \
   "input 'command' defaults to auto"
+check 'awk "/^      slack_message_ts:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
+  "input 'slack_message_ts' stays optional"
+check 'awk "/^      slack_started_at:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
+  "input 'slack_started_at' stays optional"
+check 'awk "/^      model:/{f=1} f && /default:/{print; exit}" "$WF" | grep -q "default: \"claude-sonnet-5-5\""' \
+  "model default is claude-sonnet-5-5"
 
 # The lane decides whether a run fits inside timeout_minutes, so it must stay a
 # caller decision. Hardcoding --fast onto the command line would silently strip
@@ -193,12 +200,37 @@ check 'grep -q "chat.update" "$WF"' \
 check 'grep -q "slack_progress_ts" "$WF"' \
   "the living Slack message ts is passed to Report"
 check 'awk "
-  /SLACK_PROGRESS_TS/ {s=1}
-  s && /chat.update/ {u=1}
-  s && /chat.postMessage/ {p=1}
-  END {exit (u && p) ? 0 : 1}
+  /name: Report outcome/ {r=1}
+  r && /Took / {t=1}
+  r && /chat.postMessage/ {p=1}
+  r && /chat.update/ {u=1}
+  r && /All CI is green/ {g=1}
+  r && /AI reviewers/ {a=1}
+  r && /No code change needed/ {n=1}
+  r && /gh pr checks/ {c=1}
+  END {exit (t && p && u && g && a && n && c) ? 0 : 1}
 " "$WF"' \
-  "Report updates the progress message when a ts exists, otherwise posts once"
+  "Report updates the living card, posts Took + CI/AI facts, and treats empty pr_url success as no-code-change"
+check 'awk "
+  /name: Report outcome/ {r=1}
+  r && /design doc and plan are committed/ {bad=1}
+  r && /I.ll post the PR/ {bad=1}
+  r && /Opened the PR/ {bad=1}
+  END {exit bad ? 1 : 0}
+" "$WF"' \
+  "Report Slack body does not use kill-list templates"
+check 'awk "
+  /wait_for_rollup\\(\\)/ {w=1}
+  w && /fetch_comments\\(\\)/ {exit 0}
+  w && /gh pr checks/ {exit 1}
+" "$WF"' \
+  "wait loop stays on statusCheckRollup — gh pr checks is Report-only"
+check 'awk "
+  /reply_to_reviews\\(\\)/ {r=1}
+  r && /find_open_pr\\(\\)/ {exit (p ? 0 : 1)}
+  r && /chat.postMessage/ {p=1}
+" "$WF"' \
+  "reply_to_reviews also Slack-posts the scrubbed body once"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"

@@ -16,6 +16,8 @@ name: Forge — issue to PR
 #         issue_number:    { required: true,  type: string }
 #         slack_channel:   { required: false, type: string }
 #         slack_thread_ts: { required: false, type: string }
+#         slack_message_ts:{ required: false, type: string }
+#         slack_started_at:{ required: false, type: string }  # unix seconds
 #         requested_by:    { required: false, type: string }
 #         analysis_brief:  { required: false, type: string }
 #         command:         { required: false, type: string }  # auto (first open) or revise
@@ -28,6 +30,8 @@ name: Forge — issue to PR
 #         issue_number:    ${{ github.event.inputs.issue_number || github.event.issue.number }}
 #         slack_channel:   ${{ github.event.inputs.slack_channel }}
 #         slack_thread_ts: ${{ github.event.inputs.slack_thread_ts }}
+#         slack_message_ts:${{ github.event.inputs.slack_message_ts }}
+#         slack_started_at:${{ github.event.inputs.slack_started_at }}
 #         requested_by:    ${{ github.event.inputs.requested_by }}
 #         analysis_brief:  ${{ github.event.inputs.analysis_brief }}
 #         command:         ${{ github.event.inputs.command || 'auto' }}
@@ -67,6 +71,14 @@ on:
         type: string
       slack_thread_ts:
         description: "Slack thread ts to reply into"
+        required: false
+        type: string
+      slack_message_ts:
+        description: "Slack ts of the living progress message to chat.update"
+        required: false
+        type: string
+      slack_started_at:
+        description: "Unix seconds when the living progress message was posted"
         required: false
         type: string
       requested_by:
@@ -110,7 +122,7 @@ on:
           Model alias the LiteLLM gateway fronts. An alias the proxy does not
           serve surfaces as a 500, not a clear "unknown model".
         required: false
-        default: "claude-haiku-4-5"
+        default: "claude-sonnet-5-5"
         type: string
       runner_group:
         description: >-
@@ -225,6 +237,8 @@ jobs:
       ISSUE_URL: ${{ github.server_url }}/${{ github.repository }}/issues/${{ inputs.issue_number }}
       SLACK_CHANNEL: ${{ inputs.slack_channel }}
       SLACK_THREAD_TS: ${{ inputs.slack_thread_ts }}
+      SLACK_MESSAGE_TS: ${{ inputs.slack_message_ts }}
+      SLACK_STARTED_AT: ${{ inputs.slack_started_at }}
       REQUESTED_BY: ${{ inputs.requested_by }}
 
     steps:
@@ -565,6 +579,7 @@ jobs:
           DSTP_FORGE_TRIGGER: forge_ci
           DSTP_FORGE_SERVICE_KEY: ${{ secrets.DSTP_FORGE_SERVICE_KEY }}
           SLACK_BOT_TOKEN: ${{ secrets.FORGE_SLACK_BOT_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -o pipefail
           git config --global user.name  "forge[bot]"
@@ -576,18 +591,67 @@ jobs:
             *) COMMAND=auto ;;
           esac
 
-          SLACK_PROGRESS_TS=""
+          SLACK_PROGRESS_TS="${SLACK_MESSAGE_TS:-}"
+          if [ -n "${SLACK_PROGRESS_TS:-}" ]; then
+            echo "slack_progress_ts=$SLACK_PROGRESS_TS" >> "$GITHUB_OUTPUT"
+          fi
+          echo "ai_reviews_replied=0" >> "$GITHUB_OUTPUT"
+          echo "ai_reviews_remaining=0" >> "$GITHUB_OUTPUT"
+          echo "ai_reviews_replied_count=0" >> "$GITHUB_OUTPUT"
+          AI_REVIEWS_REPLIED_COUNT=0
+          : > /tmp/forge-progress-lines
+
+          format_progress_elapsed() {
+            local sec="$1"
+            [ "$sec" -lt 0 ] && sec=0
+            if [ "$sec" -ge 3600 ]; then
+              printf '%dh %02dm' $((sec / 3600)) $(( (sec % 3600) / 60 ))
+            else
+              printf '%dm%02ds' $((sec / 60)) $((sec % 60))
+            fi
+          }
+
+          slack_progress_payload() {
+            local ts_field="$1"
+            local text="$2"
+            local now elapsed bullets status fallback context
+            now=$(date -u +%s)
+            elapsed=$(format_progress_elapsed $(( now - ${PROGRESS_EPOCH:-now} )))
+            printf '%s\n' "$text" >> /tmp/forge-progress-lines
+            bullets=$(tail -n 3 /tmp/forge-progress-lines | awk '{print "• " $0}')
+            status="⣾ ${text}  ·  \`dstp ${COMMAND}\`  ·  ${elapsed}"
+            fallback="Forge is working on ${GITHUB_REPOSITORY}#${ISSUE_NUMBER}"
+            context="<${ISSUE_URL}|${GITHUB_REPOSITORY}#${ISSUE_NUMBER}>"
+            [ -n "${RUN_URL:-}" ] && context="${context}  ·  <${RUN_URL}|Actions>"
+            jq -n \
+              --arg channel "$SLACK_CHANNEL" \
+              --arg ts "$ts_field" \
+              --arg thread_ts "$SLACK_THREAD_TS" \
+              --arg text "$fallback" \
+              --arg status "$status" \
+              --arg context "$context" \
+              --arg working "$(printf '*Working on*\n%s' "$bullets")" \
+              --argjson with_ts "$([ -n "$ts_field" ] && echo true || echo false)" \
+              '{
+                channel:$channel, text:$text,
+                blocks:[
+                  {type:"section", text:{type:"mrkdwn", text:$status}},
+                  {type:"context", elements:[{type:"mrkdwn", text:$context}]},
+                  {type:"section", text:{type:"mrkdwn", text:$working}}
+                ]
+              } + (if $with_ts then {ts:$ts} else {thread_ts:$thread_ts} end)'
+          }
 
           # One living Slack message in the existing thread. Label-only runs
           # have no channel/thread and stay silent. Failures here never fail Forge.
+          # When slack_message_ts is set, progress is chat.update only.
           slack_progress() {
             local text="$1" payload response ts
             if [ -z "${SLACK_CHANNEL:-}" ] || [ -z "${SLACK_THREAD_TS:-}" ] || [ -z "${SLACK_BOT_TOKEN:-}" ]; then
               return 0
             fi
             if [ -z "${SLACK_PROGRESS_TS:-}" ]; then
-              payload=$(jq -n --arg channel "$SLACK_CHANNEL" --arg thread_ts "$SLACK_THREAD_TS" --arg text "$text" \
-                '{channel:$channel, thread_ts:$thread_ts, text:$text}')
+              payload=$(slack_progress_payload "" "$text")
               response=$(printf '%s' "$payload" | curl -sS --connect-timeout 10 --max-time 30 \
                 -X POST https://slack.com/api/chat.postMessage \
                 -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
@@ -599,8 +663,7 @@ jobs:
                 echo "slack_progress_ts=$ts" >> "$GITHUB_OUTPUT"
               fi
             else
-              payload=$(jq -n --arg channel "$SLACK_CHANNEL" --arg ts "$SLACK_PROGRESS_TS" --arg text "$text" \
-                '{channel:$channel, ts:$ts, text:$text}')
+              payload=$(slack_progress_payload "$SLACK_PROGRESS_TS" "$text")
               printf '%s' "$payload" | curl -sS --connect-timeout 10 --max-time 30 \
                 -X POST https://slack.com/api/chat.update \
                 -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
@@ -661,6 +724,11 @@ jobs:
             :
           else
             START_EPOCH=$SCRIPT_START
+          fi
+          if [[ "${SLACK_STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
+            PROGRESS_EPOCH=$SLACK_STARTED_AT
+          else
+            PROGRESS_EPOCH=$START_EPOCH
           fi
 
           remaining_job_seconds() {
@@ -823,7 +891,7 @@ jobs:
           # Text only — no tools, and write tokens are stripped from its env.
           reply_to_reviews() {
             local reviews_json="$1"
-            local n shas first prompt_file=/tmp/forge-review-reply-prompt.md body_file=/tmp/forge-review-reply.md marked_file=/tmp/forge-review-reply.marked.md
+            local n shas first slack_reply prompt_file=/tmp/forge-review-reply-prompt.md body_file=/tmp/forge-review-reply.md marked_file=/tmp/forge-review-reply.marked.md
             n=$(printf '%s' "$reviews_json" | jq 'length')
             [ "$n" = "0" ] && return 0
             slack_progress "Writing the review reply"
@@ -870,7 +938,23 @@ jobs:
                 -e 's/xox[abposr]-[A-Za-z0-9-]{10,}/***/g' \
                 "$body_file"
             } > "$marked_file"
-            gh pr comment "$PR_URL" --body-file "$marked_file" || echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
+            if gh pr comment "$PR_URL" --body-file "$marked_file"; then
+              AI_REVIEWS_REPLIED_COUNT=$((AI_REVIEWS_REPLIED_COUNT + n))
+              echo "ai_reviews_replied=1" >> "$GITHUB_OUTPUT"
+              echo "ai_reviews_replied_count=$AI_REVIEWS_REPLIED_COUNT" >> "$GITHUB_OUTPUT"
+              if [ -n "${SLACK_CHANNEL:-}" ] && [ -n "${SLACK_THREAD_TS:-}" ] && [ -n "${SLACK_BOT_TOKEN:-}" ]; then
+                slack_reply=$(head -c 3500 "$marked_file")
+                jq -n --arg channel "$SLACK_CHANNEL" --arg thread_ts "$SLACK_THREAD_TS" --arg text "$slack_reply" \
+                  '{channel:$channel, thread_ts:$thread_ts, text:$text}' \
+                  | curl -sS --connect-timeout 10 --max-time 30 \
+                      -X POST https://slack.com/api/chat.postMessage \
+                      -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+                      -H 'Content-type: application/json; charset=utf-8' \
+                      --data @- >/dev/null || true
+              fi
+            else
+              echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
+            fi
           }
 
           find_open_pr() {
@@ -960,6 +1044,7 @@ jobs:
               REVIEWS_JSON=$(filter_reviews "$PR_COMMENTS" "$SINCE")
               SLACK_JSON=$(filter_slack_revise "$ISSUE_COMMENTS" "$SINCE")
               FINDINGS=$(printf '%s' "$REVIEWS_JSON" | jq 'length')
+              echo "ai_reviews_remaining=$FINDINGS" >> "$GITHUB_OUTPUT"
               SLACK_N=$(printf '%s' "$SLACK_JSON" | jq 'length')
               if [ "${FAILING:-0}" = "0" ] && [ "$FINDINGS" = "0" ] && [ "$SLACK_N" = "0" ]; then
                 echo "CI green and no remaining AI PR Review findings or Slack change requests."
@@ -999,41 +1084,93 @@ jobs:
           COMMENT_ID: ${{ steps.claim.outputs.comment_id }}
           PR_URL: ${{ steps.forge.outputs.pr_url }}
           REVISE_TROUBLE: ${{ steps.forge.outputs.revise_trouble }}
-          SLACK_PROGRESS_TS: ${{ steps.forge.outputs.slack_progress_ts }}
+          SLACK_PROGRESS_TS: ${{ steps.forge.outputs.slack_progress_ts || inputs.slack_message_ts }}
+          SLACK_STARTED_AT: ${{ inputs.slack_started_at }}
+          AI_REVIEWS_REMAINING: ${{ steps.forge.outputs.ai_reviews_remaining }}
+          AI_REVIEWS_REPLIED: ${{ steps.forge.outputs.ai_reviews_replied }}
+          AI_REVIEWS_REPLIED_COUNT: ${{ steps.forge.outputs.ai_reviews_replied_count }}
           FORGE_COMMAND: ${{ inputs.command }}
           OUTCOME: ${{ steps.forge.outcome }}
           ENGINE_TAG: ${{ steps.engine.outputs.engine_tag }}
           ENGINE_SHA: ${{ steps.engine.outputs.engine_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          # The same `xoxb-` token deriv-com/forge-agent uses, so the "PR opened"
-          # message comes from the same bot that said "on it" and the thread reads
-          # as one conversation.
-          #
-          # Only needed on the Slack path. Absent ⇒ the Slack post is skipped and
-          # the label flow behaves exactly as before.
+          # Same bot token as forge-agent. Completion is a new thread reply;
+          # the living card is chat.update'd to a quiet done line.
           SLACK_BOT_TOKEN: ${{ secrets.FORGE_SLACK_BOT_TOKEN }}
         run: |
           set -uo pipefail
 
-          if [ -n "${PR_URL:-}" ]; then
-            BODY=$(printf '🔨 **Forge** opened %s\n\nThe design doc and implementation plan are committed in the PR.' "$PR_URL")
-            if [ "${REVISE_TROUBLE:-}" = "1" ]; then
-              BODY=$(printf '%s\n\nWait/revise did not finish cleanly after the PR opened — see the [run log](%s). The PR is still up for review.' "$BODY" "$RUN_URL")
+          format_took() {
+            local sec="$1"
+            [ "$sec" -lt 0 ] && sec=0
+            if [ "$sec" -ge 3600 ]; then
+              printf '%dh %02dm' $((sec / 3600)) $(( (sec % 3600) / 60 ))
+            else
+              printf '%dm %ds' $((sec / 60)) $((sec % 60))
             fi
-            LABEL="forge:done"
+          }
+
+          if [[ "${SLACK_STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
+            PROGRESS_EPOCH=$SLACK_STARTED_AT
+          elif START=$(date -u -d "${GITHUB_RUN_STARTED_AT:-}" +%s 2>/dev/null); then
+            PROGRESS_EPOCH=$START
           else
-            # The log is the agent's combined stdout/stderr, so scrub anything
-            # token-shaped before it lands in an issue comment.
-            #
-            # This is the ONLY protection here: Actions' secret masking applies to
-            # the run log, not to a comment body sent through the API. And tokens
-            # minted at run time are not registered secrets at all, so they are
-            # never masked anywhere.
-            #
-            # `sk-` is deliberately broad rather than `sk-ant-`: the key actually
-            # in the agent's environment on every run is the LiteLLM gateway key,
-            # which has no `ant` infix. `fk_` covers the Forge CI service key.
-            # `xox*` covers the Slack token this very step holds.
+            PROGRESS_EPOCH=$(date -u +%s)
+          fi
+          TOOK=$(format_took $(( $(date -u +%s) - PROGRESS_EPOCH )))
+
+          CI_FAILING=0
+          CI_FAILING_NAMES=""
+          if [ -n "${PR_URL:-}" ]; then
+            CHECKS=$(gh pr checks "$PR_URL" 2>/dev/null || true)
+            CI_FAILING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="fail"{c++} END{print c+0}')
+            CI_FAILING_NAMES=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{sep=""} $2=="fail"{printf "%s%s", sep, $1; sep=", "}')
+          fi
+          echo "ci_failing=$CI_FAILING"
+          echo "ci_failing_names=$CI_FAILING_NAMES"
+          REMAINING="${AI_REVIEWS_REMAINING:-0}"
+          [ -z "$REMAINING" ] && REMAINING=0
+
+          WHO=""
+          [ -n "${REQUESTED_BY:-}" ] && WHO="<@${REQUESTED_BY}> "
+          ISSUE_LINK="<${ISSUE_URL}|#${ISSUE_NUMBER}>"
+
+          FACTS=""
+          QUIET=""
+          SLACK_TEXT=""
+          if [ "$OUTCOME" = "success" ] && [ -z "${PR_URL:-}" ]; then
+            FACTS="No code change needed."
+            QUIET="✅ No code change needed · Took ${TOOK}"
+            BODY=$(printf '🔨 **Forge** — no code change needed.\n\nTook %s.' "$TOOK")
+            LABEL="forge:done"
+            SLACK_TEXT=$(printf '%s✅ %s — No code change needed.\nTook %s.' "$WHO" "$ISSUE_LINK" "$TOOK")
+          elif [ -n "${PR_URL:-}" ]; then
+            if [ "${CI_FAILING:-0}" != "0" ]; then
+              if [ "$REMAINING" != "0" ]; then
+                FACTS="CI still failing: ${CI_FAILING_NAMES}. AI reviewers still have ${REMAINING} comments."
+              else
+                FACTS="CI still failing: ${CI_FAILING_NAMES}. AI reviewers: none remaining."
+              fi
+              EMOJI="⚠️"
+            elif [ "$REMAINING" != "0" ]; then
+              FACTS="All CI is green. AI reviewers still have ${REMAINING} comments — I did not finish wait/revise. See the run log."
+              EMOJI="⚠️"
+            elif [ "${AI_REVIEWS_REPLIED:-}" = "1" ]; then
+              FACTS="All CI is green. Replied on the PR to ${AI_REVIEWS_REPLIED_COUNT:-0} AI review findings."
+              EMOJI="✅"
+            else
+              FACTS="All CI is green. AI reviewers reported no remaining issues."
+              EMOJI="✅"
+            fi
+            if [ "${REVISE_TROUBLE:-}" = "1" ] && [ "$REMAINING" = "0" ] && [ "${CI_FAILING:-0}" = "0" ]; then
+              FACTS="${FACTS} Wait/revise hit trouble — see the run log."
+            fi
+            QUIET="✅ Done · Took ${TOOK}"
+            [ "$EMOJI" = "⚠️" ] && QUIET="⚠️ Done · Took ${TOOK}"
+            BODY=$(printf '🔨 **Forge** — %s is up.\n\n%s\n\nTook %s.' "$PR_URL" "$FACTS" "$TOOK")
+            LABEL="forge:done"
+            SLACK_TEXT=$(printf '%s%s %s — <%s|PR> is up.\n%s\nTook %s.' "$WHO" "$EMOJI" "$ISSUE_LINK" "$PR_URL" "$FACTS" "$TOOK")
+          else
             TAIL=$(tail -c 3000 /tmp/forge.log 2>/dev/null | sed -E \
               -e 's/gh[pousr]_[A-Za-z0-9]{20,}/***/g' \
               -e 's/github_pat_[A-Za-z0-9_]{20,}/***/g' \
@@ -1042,8 +1179,10 @@ jobs:
               -e 's/xox[abposr]-[A-Za-z0-9-]{10,}/***/g' \
               -e 's#x-access-token:[^@]*@#x-access-token:***@#g' \
               || echo "no output captured")
-            BODY=$(printf '🔨 **Forge** failed — [full log](%s)\n\n<details><summary>Last output</summary>\n\n```\n%s\n```\n\n</details>\n\nRe-apply the `forge` label to retry.' "$RUN_URL" "$TAIL")
+            BODY=$(printf '🔨 **Forge** failed — [full log](%s)\n\n<details><summary>Last output</summary>\n\n```\n%s\n```\n\n</details>\n\nRe-apply the `forge` label to retry.\n\nTook %s.' "$RUN_URL" "$TAIL" "$TOOK")
             LABEL="forge:failed"
+            QUIET="❌ Failed · Took ${TOOK}"
+            SLACK_TEXT=$(printf '%s❌ Failed on %s — <%s|see the run log>. The error is also on the issue.\nTook %s.' "$WHO" "$ISSUE_LINK" "$RUN_URL" "$TOOK")
           fi
 
           # Empty when the run failed before the engine was fetched. A SHA input
@@ -1066,14 +1205,7 @@ jobs:
           gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
             --remove-label "forge" --remove-label "forge:running" --add-label "$LABEL" || true
 
-          # ---- answer the Slack thread ------------------------------------
-          # Only the Slack path supplies these. forge-agent already posted "on it".
-          # The Run Forge step keeps one living progress message; this step updates
-          # that same message to the outcome when it exists, otherwise posts once.
-          #
-          # The log tail deliberately does NOT go to Slack: it can be 3 KB of
-          # agent output, and the GitHub comment above already carries it behind
-          # a <details> fold in a private repo. Slack gets a link instead.
+          # Living card: quiet chat.update. Completion: always a new postMessage.
           if [ -z "${SLACK_CHANNEL:-}" ] || [ -z "${SLACK_THREAD_TS:-}" ]; then
             echo "No Slack thread on this run — skipping the Slack post."
             exit 0
@@ -1083,47 +1215,30 @@ jobs:
             exit 0
           fi
 
-          # Notify the person who asked, when we know who that was.
-          WHO=""
-          [ -n "${REQUESTED_BY:-}" ] && WHO="<@${REQUESTED_BY}> "
-          ISSUE_LINK="<${ISSUE_URL}|#${ISSUE_NUMBER}>"
-
-          if [ -n "${PR_URL:-}" ]; then
-            if [ "${FORGE_COMMAND:-}" = "revise" ]; then
-              SLACK_TEXT="${WHO}✅ *Revise finished* for ${ISSUE_LINK} — <${PR_URL}|review it here>."
-            else
-              SLACK_TEXT="${WHO}✅ *Opened the PR* for ${ISSUE_LINK} — <${PR_URL}|review it here>. The design doc and plan are committed in the PR."
-            fi
-          else
-            SLACK_TEXT="${WHO}❌ *Failed* on ${ISSUE_LINK} — <${RUN_URL}|see the run log>. The error is also on the issue. Ask me to retry when you're ready."
-          fi
-
           if [ -n "${SLACK_PROGRESS_TS:-}" ]; then
-            RESPONSE=$(jq -n \
+            jq -n \
               --arg channel "$SLACK_CHANNEL" \
               --arg ts "$SLACK_PROGRESS_TS" \
-              --arg text "$SLACK_TEXT" \
+              --arg text "$QUIET" \
               '{channel: $channel, ts: $ts, text: $text}' \
               | curl -sS --connect-timeout 10 --max-time 30 \
                   -X POST https://slack.com/api/chat.update \
                   -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
                   -H 'Content-type: application/json; charset=utf-8' \
-                  --data @- || echo '{"ok":false,"error":"curl_failed"}')
-          else
-            RESPONSE=$(jq -n \
-              --arg channel "$SLACK_CHANNEL" \
-              --arg thread_ts "$SLACK_THREAD_TS" \
-              --arg text "$SLACK_TEXT" \
-              '{channel: $channel, thread_ts: $thread_ts, text: $text}' \
-              | curl -sS --connect-timeout 10 --max-time 30 \
-                  -X POST https://slack.com/api/chat.postMessage \
-                  -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-                  -H 'Content-type: application/json; charset=utf-8' \
-                  --data @- || echo '{"ok":false,"error":"curl_failed"}')
+                  --data @- >/dev/null || true
           fi
 
-          # Slack answers 200 with {"ok":false,...} on failure, so the HTTP status
-          # alone proves nothing — check the body.
+          RESPONSE=$(jq -n \
+            --arg channel "$SLACK_CHANNEL" \
+            --arg thread_ts "$SLACK_THREAD_TS" \
+            --arg text "$SLACK_TEXT" \
+            '{channel: $channel, thread_ts: $thread_ts, text: $text}' \
+            | curl -sS --connect-timeout 10 --max-time 30 \
+                -X POST https://slack.com/api/chat.postMessage \
+                -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+                -H 'Content-type: application/json; charset=utf-8' \
+                --data @- || echo '{"ok":false,"error":"curl_failed"}')
+
           if [ "$(printf '%s' "$RESPONSE" | jq -r '.ok')" = "true" ]; then
             echo "Posted the outcome to Slack."
           else
