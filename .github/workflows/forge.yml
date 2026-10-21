@@ -1124,7 +1124,7 @@ jobs:
           if [ -n "${PR_URL:-}" ]; then
             CHECKS=$(gh pr checks "$PR_URL" 2>/dev/null || true)
             CI_FAILING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="fail"{c++} END{print c+0}')
-            CI_FAILING_NAMES=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{sep=""} $2=="fail"{printf "%s%s", sep, $1; sep=", "}')
+            CI_FAILING_NAMES=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{sep=""} $2=="fail" && n<5 {printf "%s%s", sep, $1; sep=", "; n++}')
           fi
           echo "ci_failing=$CI_FAILING"
           echo "ci_failing_names=$CI_FAILING_NAMES"
@@ -1220,7 +1220,14 @@ jobs:
               --arg channel "$SLACK_CHANNEL" \
               --arg ts "$SLACK_PROGRESS_TS" \
               --arg text "$QUIET" \
-              '{channel: $channel, ts: $ts, text: $text}' \
+              '{
+                channel: $channel,
+                ts: $ts,
+                text: $text,
+                blocks: [
+                  {type:"section", text:{type:"mrkdwn", text:$text}}
+                ]
+              }' \
               | curl -sS --connect-timeout 10 --max-time 30 \
                   -X POST https://slack.com/api/chat.update \
                   -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \

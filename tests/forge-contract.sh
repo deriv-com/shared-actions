@@ -213,6 +213,20 @@ check 'awk "
   "Report updates the living card, posts Took + CI/AI facts, and treats empty pr_url success as no-code-change"
 check 'awk "
   /name: Report outcome/ {r=1}
+  r && /Living card: quiet chat.update/ {q=1}
+  q && /chat.postMessage/ {exit (b ? 0 : 1)}
+  q && /blocks:/ {b=1}
+" "$WF"' \
+  "Report quiet chat.update replaces living Block Kit with blocks"
+check 'awk "
+  /name: Report outcome/ {r=1}
+  r && /ci_failing_names/ {n=1}
+  r && /n<5|n < 5|head -n 5/ {c=1}
+  END {exit (n && c) ? 0 : 1}
+" "$WF"' \
+  "ci_failing_names is capped at 5 check names from gh pr checks"
+check 'awk "
+  /name: Report outcome/ {r=1}
   r && /design doc and plan are committed/ {bad=1}
   r && /I.ll post the PR/ {bad=1}
   r && /Opened the PR/ {bad=1}
