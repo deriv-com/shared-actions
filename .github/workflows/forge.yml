@@ -84,8 +84,10 @@ on:
       command:
         description: >-
           dstp subcommand. `auto` opens the first PR. `revise` applies later
-          changes (AI review findings, CI, or a human Slack note posted as an
-          issue comment). Callers must pass this through from workflow_dispatch.
+          changes: AI PR Review comments (`<!-- deriv-pr-review-`), CI
+          failures, and human Slack notes posted on the issue as
+          `<!-- forge-slack-revise -->`. Callers must pass this through
+          from workflow_dispatch.
         required: false
         default: "auto"
         type: string
@@ -628,11 +630,20 @@ jobs:
           }
 
           # Branch form so the instruction is used. Issue-URL revise reads QA
-          # sub-issues and refuses PR comments.
+          # sub-issues and refuses PR comments. dstp 0.8.0 takes the instruction
+          # as one argv string (MAX_ARG_STRLEN is 128KiB).
           run_branch_revise() {
             local instruction_file="$1"
-            local branch
-            branch=$(gh pr view "$PR_URL" --json headRefName --jq .headRefName)
+            local branch size
+            size=$(wc -c < "$instruction_file")
+            if [ "$size" -gt 120000 ]; then
+              echo "Revise instruction is ${size} bytes; refusing to pass it as argv (Linux MAX_ARG_STRLEN is 128KiB)"
+              return 1
+            fi
+            if ! branch=$(gh pr view "$PR_URL" --json headRefName --jq .headRefName) || [ -z "$branch" ]; then
+              echo "Could not resolve the head branch for $PR_URL"
+              return 1
+            fi
             echo "Running: dstp revise $branch <instruction> --cwd . --unattended --json"
             node "$FORGE_CLI" revise "$branch" "$(cat "$instruction_file")" --cwd . --unattended --json 2>&1 | tee /tmp/forge.log || return $?
             local RESULT pr
@@ -719,44 +730,53 @@ jobs:
             echo "timeout"
           }
 
-          review_comments_json() {
-            local pr_num="$1" comments
-            if ! comments=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${pr_num}/comments" --paginate); then
+          fetch_comments() {
+            local num="$1" comments
+            if ! comments=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${num}/comments" --paginate); then
               echo "unknown"
               return
             fi
-            if ! printf '%s' "$comments" | jq -s 'add // []' | jq '
-              def is_review:
-                ((.body // "") | test("<!-- deriv-pr-review-"))
-                and ((.body // "") | test("<!-- deriv-pr-review-progress-") | not);
-              def is_forge_revise:
-                (.body // "") | test("<!-- forge-revise-instructions -->");
-              sort_by(.created_at)
-              | . as $all
-              | ($all | map(select(is_forge_revise)) | last | .created_at // "") as $since
-              | [$all[] | select(is_review) | select($since == "" or .created_at > $since)]
-            '; then
+            if ! printf '%s' "$comments" | jq -s 'add // []'; then
               echo "unknown"
             fi
           }
 
-          latest_review_findings() {
-            local json
-            json=$(review_comments_json "$1")
-            if [ "$json" = "unknown" ]; then
-              echo "unknown"
-              return
-            fi
-            printf '%s' "$json" | jq 'length'
+          watermark_since() {
+            printf '%s' "$1" | jq -r '
+              sort_by(.created_at)
+              | map(select((.body // "") | test("<!-- forge-revise-instructions -->")))
+              | last | .created_at // ""
+            '
+          }
+
+          filter_reviews() {
+            local comments="$1" since="$2"
+            printf '%s' "$comments" | jq --arg since "$since" '
+              def is_review:
+                ((.body // "") | test("<!-- deriv-pr-review-"))
+                and ((.body // "") | test("<!-- deriv-pr-review-progress-") | not)
+                and ((.body // "") | test("<!-- forge-revise-reply -->") | not);
+              [sort_by(.created_at)[] | select(is_review) | select($since == "" or .created_at > $since)]
+            '
+          }
+
+          filter_slack_revise() {
+            local comments="$1" since="$2"
+            printf '%s' "$comments" | jq --arg since "$since" '
+              def is_slack:
+                (.body // "") | test("<!-- forge-slack-revise -->");
+              [sort_by(.created_at)[] | select(is_slack) | select($since == "" or .created_at > $since)]
+            '
           }
 
           write_revise_instruction() {
             local reviews_json="$1"
             local dest="$2"
             local failing="$3"
+            local slack_json="$4"
             {
               cat <<'TRUSTED'
-            Address remaining CI failures and every numbered finding in every AI PR Review comment below. There may be one review comment or several; cover all of them. Severity does not force a fix: if a Low, Medium, or High finding does not hold, skip it. If it holds, fix it. Do not post a GitHub comment yourself — a later step writes the reply. No thanks, no "great point".
+            Address remaining CI failures, every numbered finding in every AI PR Review comment below, and every Slack change request below. There may be one review comment or several; cover all of them. Severity does not force a fix: if a Low, Medium, or High finding does not hold, skip it. If it holds, fix it. Do not post a GitHub comment yourself — a later step writes the reply. No thanks, no "great point".
 
           TRUSTED
               cat <<'PREAMBLE'
@@ -771,8 +791,18 @@ jobs:
                 else
                   .[]
                   | (.body // "") as $b
-                  | ($b | split("\n") | map(select(test("[^[:space:]]"))) | .[0] // "") as $first
-                  | "\n### \(.html_url // "review") — \($first)\n\n\($b)\n"
+                  | ($b[0:40000]) as $capped
+                  | ($capped | split("\n") | map(select(test("[^[:space:]]"))) | .[0] // "") as $first
+                  | "\n### \(.html_url // "review") — \($first)\n\n\($capped)\n"
+                end
+              '
+              printf '%s' "$slack_json" | jq -r '
+                if length == 0 then "\nNo new Slack change requests.\n"
+                else
+                  .[]
+                  | (.body // "") as $b
+                  | ($b[0:40000]) as $capped
+                  | "\n### Slack change request \(.html_url // "issue-comment")\n\n\($capped)\n"
                 end
               '
             } > "$dest"
@@ -790,14 +820,15 @@ jobs:
           }
 
           # Second model call: DSTP changes code; this writes the PR reply.
+          # Text only — no tools, and write tokens are stripped from its env.
           reply_to_reviews() {
             local reviews_json="$1"
-            local n shas first prompt_file=/tmp/forge-review-reply-prompt.md body_file=/tmp/forge-review-reply.md
+            local n shas first prompt_file=/tmp/forge-review-reply-prompt.md body_file=/tmp/forge-review-reply.md marked_file=/tmp/forge-review-reply.marked.md
             n=$(printf '%s' "$reviews_json" | jq 'length')
             [ "$n" = "0" ] && return 0
             slack_progress "Writing the review reply"
             gh pr checkout "$PR_URL" >/dev/null 2>&1 || true
-            shas=$(printf '%s' "$reviews_json" | jq -r '[.[].body // "" | capture("reviewed-commit:\\s*(?<s>[0-9a-f]{7,40})"; "i") | .s] | unique | .[]' || true)
+            shas=$(printf '%s' "$reviews_json" | jq -r '[.[].body // "" | (capture("reviewed-commit:\\s*(?<s>[0-9a-f]{7,40})"; "i")? | .s)] | map(select(. != null and . != "")) | unique | .[]' || true)
             {
               cat <<'EOF'
               Write ONE GitHub pull-request comment. For each AI PR Review comment in the untrusted data, add a heading (reviewer or model if present) and one bullet per numbered finding: Fixed (short commit SHA) or Skipped (technical reason). Cover every finding, including ones the working tree already fixed and ones it skipped. Severity does not force a fix. No thanks, no "great point". Output ONLY the markdown body.
@@ -823,12 +854,23 @@ jobs:
               echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
               return 0
             fi
-            if ! "$CLAUDE_BIN" -p --output-format text --dangerously-skip-permissions < "$prompt_file" > "$body_file"; then
+            if ! env -u GH_TOKEN -u GITHUB_TOKEN -u SLACK_BOT_TOKEN -u DSTP_FORGE_SERVICE_KEY \
+              "$CLAUDE_BIN" -p --output-format text < "$prompt_file" > "$body_file"; then
               echo "AI review reply failed"
               echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
               return 0
             fi
-            gh pr comment "$PR_URL" --body-file "$body_file" || echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
+            {
+              printf '%s\n' '<!-- forge-revise-reply -->'
+              sed -E \
+                -e 's/gh[pousr]_[A-Za-z0-9]{20,}/***/g' \
+                -e 's/github_pat_[A-Za-z0-9_]{20,}/***/g' \
+                -e 's/sk-[A-Za-z0-9_-]{20,}/***/g' \
+                -e 's/fk_[A-Za-z0-9_-]{20,}/***/g' \
+                -e 's/xox[abposr]-[A-Za-z0-9-]{10,}/***/g' \
+                "$body_file"
+            } > "$marked_file"
+            gh pr comment "$PR_URL" --body-file "$marked_file" || echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
           }
 
           find_open_pr() {
@@ -870,7 +912,8 @@ jobs:
 
           # First dstp failure fails the job. After a PR exists, wait for this
           # repo's AI PR Review jobs (comments marked <!-- deriv-pr-review- … -->;
-          # any number of engines) plus CI, then dstp revise until they are clean
+          # any number of engines) plus CI and Slack notes marked
+          # <!-- forge-slack-revise -->, then dstp revise until they are clean
           # or 8 rounds have run. Report treats a present PR URL as forge:done even
           # if a later revise failed. First dstp failure (no PR) is forge:failed.
           # If a Low, Medium, or High finding does not hold, skip it and the AI
@@ -899,12 +942,13 @@ jobs:
                 continue
               fi
               PR_NUM=$(basename "$PR_URL")
-              REVIEWS_JSON=$(review_comments_json "$PR_NUM")
-              if [ "$REVIEWS_JSON" = "unknown" ]; then
-                echo "Could not read PR review comments; not treating that as clean"
+              PR_COMMENTS=$(fetch_comments "$PR_NUM")
+              ISSUE_COMMENTS=$(fetch_comments "$ISSUE_NUMBER")
+              if [ "$PR_COMMENTS" = "unknown" ] || [ "$ISSUE_COMMENTS" = "unknown" ]; then
+                echo "Could not read PR or issue comments; not treating that as clean"
                 UNKNOWN_ROUNDS=$((UNKNOWN_ROUNDS + 1))
                 if [ "$UNKNOWN_ROUNDS" -ge 5 ]; then
-                  echo "Gave up reading PR review comments after 5 attempts"
+                  echo "Gave up reading comments after 5 attempts"
                   echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
                   break
                 fi
@@ -912,9 +956,13 @@ jobs:
                 continue
               fi
               UNKNOWN_ROUNDS=0
+              SINCE=$(watermark_since "$PR_COMMENTS")
+              REVIEWS_JSON=$(filter_reviews "$PR_COMMENTS" "$SINCE")
+              SLACK_JSON=$(filter_slack_revise "$ISSUE_COMMENTS" "$SINCE")
               FINDINGS=$(printf '%s' "$REVIEWS_JSON" | jq 'length')
-              if [ "${FAILING:-0}" = "0" ] && [ "$FINDINGS" = "0" ]; then
-                echo "CI green and no remaining AI PR Review findings."
+              SLACK_N=$(printf '%s' "$SLACK_JSON" | jq 'length')
+              if [ "${FAILING:-0}" = "0" ] && [ "$FINDINGS" = "0" ] && [ "$SLACK_N" = "0" ]; then
+                echo "CI green and no remaining AI PR Review findings or Slack change requests."
                 break
               fi
               LEFT=$(remaining_job_seconds)
@@ -927,9 +975,8 @@ jobs:
               elif [ "$FINDINGS" != "0" ]; then
                 slack_progress "Found ${FINDINGS} AI review comments"
               fi
-              post_silent_watermark "$PR_NUM"
               ROUND=$((ROUND + 1))
-              write_revise_instruction "$REVIEWS_JSON" /tmp/forge-revise-instruction.md "${FAILING:-0}"
+              write_revise_instruction "$REVIEWS_JSON" /tmp/forge-revise-instruction.md "${FAILING:-0}" "$SLACK_JSON"
               slack_progress "Revising round ${ROUND} of ${MAX_REVISE}"
               REVISE_STATUS=0
               run_branch_revise /tmp/forge-revise-instruction.md || REVISE_STATUS=$?
@@ -939,6 +986,7 @@ jobs:
                 break
               fi
               reply_to_reviews "$REVIEWS_JSON"
+              post_silent_watermark "$PR_NUM"
             done
           fi
           exit $STATUS

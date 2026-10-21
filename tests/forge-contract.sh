@@ -147,13 +147,32 @@ check 'grep -q "run_branch_revise" "$WF"' \
   "review loop uses branch-form dstp revise"
 check 'grep -q "reply_to_reviews" "$WF"' \
   "a second claude pass replies to AI reviews after revise"
-check 'grep -q '\''"$CLAUDE_BIN" -p --output-format text --dangerously-skip-permissions'\'' "$WF"' \
+check 'grep -q '\''"$CLAUDE_BIN" -p --output-format text'\'' "$WF"' \
   "review reply uses the same claude binary as the engine"
+check '! awk "/reply_to_reviews\\(\\)/,/find_open_pr\\(\\)/" "$WF" | grep -q "dangerously-skip-permissions"' \
+  "the reply pass does not skip Claude permissions"
+check 'grep -q "env -u GH_TOKEN -u GITHUB_TOKEN -u SLACK_BOT_TOKEN -u DSTP_FORGE_SERVICE_KEY" "$WF"' \
+  "the reply pass unsets write tokens and secrets"
+check 'grep -q "<!-- forge-revise-reply -->" "$WF"' \
+  "AI replies are tagged so they are not re-ingested as findings"
+check 'grep -q "<!-- forge-slack-revise -->" "$WF"' \
+  "human Slack notes on the issue are included in the revise instruction"
+check 'grep -q "120000" "$WF"' \
+  "an oversized instruction fails loudly instead of E2BIG"
+check 'grep -q "capture(\"reviewed-commit" "$WF"' \
+  "reviewed-commit SHA extraction uses per-body capture"
+check 'awk "
+  /while \\[ \"\\\$ROUND\"/ {l=1}
+  l && /run_branch_revise/ {r=NR}
+  l && /post_silent_watermark/ {w=NR}
+  END {exit (r && w && r<w) ? 0 : 1}
+" "$WF"' \
+  "watermark is posted only after a successful dstp revise"
 check 'grep -q "gh pr comment \"\$PR_URL\" --body-file" "$WF"' \
   "AI reply is posted from a file, not an inline prompt"
 check '! grep -q "gh pr comment \"\$PR_URL\" --body \"\$(cat <<" "$WF"' \
   "the revise instruction is never a gh pr comment body"
-check '! awk "/gh pr comment/{c=1} c{print} /EOF/{if(c){c=0}}" "$WF" | grep -q "Address remaining CI failures"' \
+check '! awk "/gh pr comment/{c=1} c && /^[[:space:]]*EOF[[:space:]]*$/{c=0; next} c{print}" "$WF" | grep -q "Address remaining CI failures"' \
   "Address remaining CI failures is not posted as a gh pr comment"
 check 'grep -q "sub\" = \"auto\"" "$WF" && grep -q "ARGS+=(--fast)" "$WF"' \
   "--fast is appended only when dstp subcommand is auto"
