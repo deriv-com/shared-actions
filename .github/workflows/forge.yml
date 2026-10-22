@@ -945,9 +945,9 @@ jobs:
               echo "ai_reviews_replied=1" >> "$GITHUB_OUTPUT"
               echo "ai_reviews_replied_count=$AI_REVIEWS_REPLIED_COUNT" >> "$GITHUB_OUTPUT"
               if [ -n "${SLACK_CHANNEL:-}" ] && [ -n "${SLACK_THREAD_TS:-}" ] && [ -n "${SLACK_BOT_TOKEN:-}" ]; then
-                slack_reply=$(head -c 3500 "$marked_file")
+                slack_reply=$(tail -n +2 "$marked_file" | head -c 3500)
                 jq -n --arg channel "$SLACK_CHANNEL" --arg thread_ts "$SLACK_THREAD_TS" --arg text "$slack_reply" \
-                  '{channel:$channel, thread_ts:$thread_ts, text:$text}' \
+                  '{channel:$channel, thread_ts:$thread_ts, text:$text, parse:"none"}' \
                   | curl -sS --connect-timeout 10 --max-time 30 \
                       -X POST https://slack.com/api/chat.postMessage \
                       -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
@@ -1048,6 +1048,7 @@ jobs:
               FINDINGS=$(printf '%s' "$REVIEWS_JSON" | jq 'length')
               echo "ai_reviews_remaining=$FINDINGS" >> "$GITHUB_OUTPUT"
               SLACK_N=$(printf '%s' "$SLACK_JSON" | jq 'length')
+              echo "slack_requests_remaining=$SLACK_N" >> "$GITHUB_OUTPUT"
               if [ "${FAILING:-0}" = "0" ] && [ "$FINDINGS" = "0" ] && [ "$SLACK_N" = "0" ]; then
                 echo "CI green and no remaining AI PR Review findings or Slack change requests."
                 break
@@ -1092,6 +1093,7 @@ jobs:
           AI_REVIEWS_REMAINING: ${{ steps.forge.outputs.ai_reviews_remaining }}
           AI_REVIEWS_REPLIED: ${{ steps.forge.outputs.ai_reviews_replied }}
           AI_REVIEWS_REPLIED_COUNT: ${{ steps.forge.outputs.ai_reviews_replied_count }}
+          SLACK_REQUESTS_REMAINING: ${{ steps.forge.outputs.slack_requests_remaining }}
           FORGE_COMMAND: ${{ inputs.command }}
           OUTCOME: ${{ steps.forge.outcome }}
           ENGINE_TAG: ${{ steps.engine.outputs.engine_tag }}
@@ -1170,11 +1172,14 @@ jobs:
             elif [ "${CI_PENDING:-0}" != "0" ]; then
               FACTS="CI still running: ${CI_PENDING} checks pending — see the run log."
               EMOJI="⚠️"
+            elif [ "$SLACK_REMAINING" != "0" ]; then
+              FACTS="All CI is green, but ${SLACK_REMAINING} Slack change requests were not addressed — see the run log."
+              EMOJI="⚠️"
             elif [ "$REMAINING" != "0" ]; then
               FACTS="All CI is green. AI reviewers still have ${REMAINING} comments — I did not finish wait/revise. See the run log."
               EMOJI="⚠️"
             elif [ "${AI_REVIEWS_REPLIED:-}" = "1" ]; then
-              FACTS="All CI is green. Replied on the PR to ${AI_REVIEWS_REPLIED_COUNT:-0} AI review findings."
+              FACTS="All CI is green. Replied on the PR to ${AI_REVIEWS_REPLIED_COUNT:-0} AI review comments."
               EMOJI="✅"
             else
               FACTS="All CI is green. AI reviewers reported no remaining issues."
@@ -1189,6 +1194,10 @@ jobs:
             LABEL="forge:done"
             SLACK_TEXT=$(printf '%s%s %s — <%s|PR> is up.\n%s\nTook %s.' "$WHO" "$EMOJI" "$ISSUE_LINK" "$PR_URL" "$FACTS" "$TOOK")
           else
+            # The log tail goes into an issue comment via the API, where Actions' secret
+            # masking does NOT apply — this scrub is the only protection. `sk-` is broad on
+            # purpose (the LiteLLM gateway key has no `ant` infix); `fk_` covers the Forge
+            # CI service key; `xox*` covers the Slack token this step holds.
             TAIL=$(tail -c 3000 /tmp/forge.log 2>/dev/null | sed -E \
               -e 's/gh[pousr]_[A-Za-z0-9]{20,}/***/g' \
               -e 's/github_pat_[A-Za-z0-9_]{20,}/***/g' \

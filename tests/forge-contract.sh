@@ -272,6 +272,23 @@ check 'awk "
   END {exit (s && p && u && n) ? 0 : 1}
 " "$WF"' \
   "Report fails closed on pending or unreadable checks"
+check 'awk "
+  /reply_to_reviews\\(\\)/ {r=1}
+  r && /find_open_pr\\(\\)/ {exit (p && n ? 0 : 1)}
+  r && /parse:\\\"none\\\"/ {p=1}
+  r && /tail -n \\+2/ {n=1}
+" "$WF"' \
+  "Slack copy of AI replies uses parse none and skips the marker line"
+check 'grep -q "slack_requests_remaining" "$WF"' \
+  "outstanding Slack change requests are exported for Report"
+check 'awk "
+  /name: Report outcome/ {r=1}
+  r && /The log tail goes into an issue comment/ {c=1}
+  END {exit c ? 0 : 1}
+" "$WF"' \
+  "failure-log scrub keeps its security rationale"
+check 'grep -q "Replied on the PR to .* AI review comments" "$WF"' \
+  "completion copy counts comments, not findings"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"
