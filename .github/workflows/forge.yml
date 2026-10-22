@@ -1129,7 +1129,12 @@ jobs:
           CI_FAILING_NAMES=""
           CI_STATE="unknown"
           if [ -n "${PR_URL:-}" ]; then
-            if CHECKS=$(gh pr checks "$PR_URL" 2>/dev/null); then
+            CHECKS=$(gh pr checks "$PR_URL" 2>/dev/null)
+            rc=$?
+            # gh pr checks prints the table to stdout but exits 8 whenever any
+            # check is failing or pending. A non-zero exit can still be a
+            # successful read.
+            if [ "$rc" -eq 0 ] || { [ "$rc" -eq 8 ] && [ -n "$CHECKS" ]; }; then
               CI_STATE="ok"
               CI_FAILING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="fail"{c++} END{print c+0}')
               CI_PENDING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="pending"{c++} END{print c+0}')

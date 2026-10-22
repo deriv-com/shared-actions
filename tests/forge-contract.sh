@@ -273,6 +273,19 @@ check 'awk "
 " "$WF"' \
   "Report fails closed on pending or unreadable checks"
 check 'awk "
+  /name: Report outcome/ {r=1}
+  r && /if CHECKS=/ {bad=1}
+  END {exit bad ? 1 : 0}
+" "$WF"' \
+  "Report does not treat gh pr checks non-zero as unread"
+check 'awk "
+  /name: Report outcome/ {r=1}
+  r && /-eq 8/ {e=1}
+  r && /successful read/ {s=1}
+  END {exit (e && s) ? 0 : 1}
+" "$WF"' \
+  "Report treats gh pr checks exit 8 as a successful read"
+check 'awk "
   /reply_to_reviews\\(\\)/ {r=1}
   r && /find_open_pr\\(\\)/ {exit (p && n ? 0 : 1)}
   r && /parse:\\\"none\\\"/ {p=1}
