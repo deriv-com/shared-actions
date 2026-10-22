@@ -254,6 +254,7 @@ jobs:
           permission-contents: write
           permission-issues: write
           permission-pull-requests: write
+          permission-checks: read
 
       # No authorization gate, by design. Forge only opens a PR — it cannot merge
       # or edit anything, the target repos are private (so anyone who can see the
@@ -1122,16 +1123,25 @@ jobs:
           TOOK=$(format_took $(( $(date -u +%s) - PROGRESS_EPOCH )))
 
           CI_FAILING=0
+          CI_PENDING=0
           CI_FAILING_NAMES=""
+          CI_STATE="unknown"
           if [ -n "${PR_URL:-}" ]; then
-            CHECKS=$(gh pr checks "$PR_URL" 2>/dev/null || true)
-            CI_FAILING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="fail"{c++} END{print c+0}')
-            CI_FAILING_NAMES=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{sep=""} $2=="fail" && n<5 {printf "%s%s", sep, $1; sep=", "; n++}')
+            if CHECKS=$(gh pr checks "$PR_URL" 2>/dev/null); then
+              CI_STATE="ok"
+              CI_FAILING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="fail"{c++} END{print c+0}')
+              CI_PENDING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="pending"{c++} END{print c+0}')
+              CI_FAILING_NAMES=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{sep=""} $2=="fail" && n<5 {printf "%s%s", sep, $1; sep=", "; n++}')
+            fi
           fi
           echo "ci_failing=$CI_FAILING"
+          echo "ci_pending=$CI_PENDING"
+          echo "ci_state=$CI_STATE"
           echo "ci_failing_names=$CI_FAILING_NAMES"
           REMAINING="${AI_REVIEWS_REMAINING:-0}"
           [ -z "$REMAINING" ] && REMAINING=0
+          SLACK_REMAINING="${SLACK_REQUESTS_REMAINING:-0}"
+          [ -z "$SLACK_REMAINING" ] && SLACK_REMAINING=0
 
           WHO=""
           [ -n "${REQUESTED_BY:-}" ] && WHO="<@${REQUESTED_BY}> "
@@ -1147,12 +1157,18 @@ jobs:
             LABEL="forge:done"
             SLACK_TEXT=$(printf '%s✅ %s — No code change needed.\nTook %s.' "$WHO" "$ISSUE_LINK" "$TOOK")
           elif [ -n "${PR_URL:-}" ]; then
-            if [ "${CI_FAILING:-0}" != "0" ]; then
+            if [ "$CI_STATE" != "ok" ]; then
+              FACTS="CI state unknown — could not read the checks. See the PR checks."
+              EMOJI="⚠️"
+            elif [ "${CI_FAILING:-0}" != "0" ]; then
               if [ "$REMAINING" != "0" ]; then
                 FACTS="CI still failing: ${CI_FAILING_NAMES}. AI reviewers still have ${REMAINING} comments."
               else
                 FACTS="CI still failing: ${CI_FAILING_NAMES}. AI reviewers: none remaining."
               fi
+              EMOJI="⚠️"
+            elif [ "${CI_PENDING:-0}" != "0" ]; then
+              FACTS="CI still running: ${CI_PENDING} checks pending — see the run log."
               EMOJI="⚠️"
             elif [ "$REMAINING" != "0" ]; then
               FACTS="All CI is green. AI reviewers still have ${REMAINING} comments — I did not finish wait/revise. See the run log."
@@ -1164,7 +1180,7 @@ jobs:
               FACTS="All CI is green. AI reviewers reported no remaining issues."
               EMOJI="✅"
             fi
-            if [ "${REVISE_TROUBLE:-}" = "1" ] && [ "$REMAINING" = "0" ] && [ "${CI_FAILING:-0}" = "0" ]; then
+            if [ "${REVISE_TROUBLE:-}" = "1" ] && [ "$REMAINING" = "0" ] && [ "${CI_FAILING:-0}" = "0" ] && [ "${CI_PENDING:-0}" = "0" ] && [ "$CI_STATE" = "ok" ]; then
               FACTS="${FACTS} Wait/revise hit trouble — see the run log."
             fi
             QUIET="✅ Done · Took ${TOOK}"

@@ -261,6 +261,17 @@ check 'awk "
   END {exit (e && u) ? 0 : 1}
 " "$WF"' \
   "Report prefers FORGE_STARTED_AT over a fake env var"
+check 'grep -q "permission-checks: read" "$WF"' \
+  "minted App token can read check runs"
+check 'awk "
+  /name: Report outcome/ {r=1}
+  r && /CI_STATE=/ {s=1}
+  r && /CI_PENDING=/ {p=1}
+  r && /CI state unknown/ {u=1}
+  r && /CI still running/ {n=1}
+  END {exit (s && p && u && n) ? 0 : 1}
+" "$WF"' \
+  "Report fails closed on pending or unreadable checks"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"
