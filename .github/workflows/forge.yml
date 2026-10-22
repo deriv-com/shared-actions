@@ -160,25 +160,18 @@ on:
           Pass --fast: ONE agent takes the change from analysis to a verified
           diff, with no planner/reviewer stage and no OpenSpec files.
 
-          Default true because the alternative is not "the full pipeline", it is
-          "an LLM guesses which pipeline". Without --fast the engine makes a
-          separate classification call per issue and anything ambiguous falls
-          back to the full pipeline, which does not fit inside timeout_minutes —
-          derivatives-trader runs were cancelled at the 55-minute cap twice, and
-          the same issue was classified differently locally and in CI. Forcing
-          the lane makes the run time predictable and skips that call entirely.
-
-          Set false for a large or cross-cutting change that genuinely needs the
-          planner and reviewer — and raise timeout_minutes with it.
+          Default false: full DSTP (plan + OpenSpec). Slack asks before auto
+          whether to use --fast. Callers may still pass true.
         required: false
-        default: true
+        default: false
         type: boolean
       timeout_minutes:
         description: >-
-          Job timeout. App installation tokens expire after 1 hour, so stay
-          inside that window or the final push cannot authenticate.
+          Job timeout. App installation tokens expire after ~1 hour; Run Forge
+          remints the write token around minute 45, and Report mints a fresh
+          token so the wrap-up can still authenticate.
         required: false
-        default: 55
+        default: 90
         type: number
 
     secrets:
@@ -570,6 +563,9 @@ jobs:
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.FORGE_API_KEY }}
           GH_TOKEN: ${{ steps.repo-token.outputs.token }}
           GITHUB_TOKEN: ${{ steps.repo-token.outputs.token }}
+          WRITE_APP_ID: ${{ secrets.CLIENT_ID_GHAPP_WRITE }}
+          WRITE_APP_KEY: ${{ secrets.PRIVATE_KEY_GHAPP_WRITE }}
+          WRITE_INSTALLATION_ID: ${{ steps.repo-token.outputs.installation-id }}
           FAST_LANE: ${{ inputs.fast_lane }}
           FORGE_COMMAND: ${{ inputs.command }}
           TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
@@ -583,6 +579,8 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -o pipefail
+          APP_KEY="$WRITE_APP_KEY"
+          unset WRITE_APP_KEY
           git config --global user.name  "forge[bot]"
           git config --global user.email "forge@users.noreply.github.com"
 
@@ -612,6 +610,49 @@ jobs:
             fi
           }
 
+          # App installation tokens last ~1 hour. Remint after 45 minutes so
+          # a 90-minute job can still push and comment.
+          remint_write_token() {
+            local elapsed now jwt token
+            now=$(date -u +%s)
+            elapsed=$(( now - ${PROGRESS_EPOCH:-now} ))
+            if [ "$elapsed" -lt 2700 ]; then
+              return 0
+            fi
+            if [ -z "${WRITE_APP_ID:-}" ] || [ -z "${APP_KEY:-}" ] || [ -z "${WRITE_INSTALLATION_ID:-}" ]; then
+              echo "Write-app credentials missing; skipping token remint"
+              return 0
+            fi
+            jwt=$(WRITE_APP_ID="$WRITE_APP_ID" WRITE_APP_KEY="$APP_KEY" node -e '
+              const crypto = require("crypto");
+              const appId = process.env.WRITE_APP_ID;
+              const pem = process.env.WRITE_APP_KEY.replace(/\\n/g, "\n");
+              const now = Math.floor(Date.now() / 1000);
+              const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
+              const payload = Buffer.from(JSON.stringify({ iat: now - 60, exp: now + 540, iss: appId })).toString("base64url");
+              const sign = crypto.createSign("RSA-SHA256").update(`${header}.${payload}`).sign(pem, "base64url");
+              process.stdout.write(`${header}.${payload}.${sign}`);
+            ') || return 0
+            token=$(curl -sS --connect-timeout 10 --max-time 30 \
+              -X POST "https://api.github.com/app/installations/${WRITE_INSTALLATION_ID}/access_tokens" \
+              -H "Authorization: Bearer ${jwt}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              | jq -r '.token // empty') || true
+            if [ -n "$token" ]; then
+              export GH_TOKEN="$token"
+              export GITHUB_TOKEN="$token"
+              auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
+              git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+              git config --global http.https://github.com/.extraheader "$auth"
+              git config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+              git config --local http.https://github.com/.extraheader "$auth"
+              echo "Reminted the write App token"
+            else
+              echo "::warning::Write App token remint returned no token; continuing with the existing token"
+            fi
+          }
+
           slack_progress_payload() {
             local ts_field="$1"
             local text="$2"
@@ -623,6 +664,7 @@ jobs:
             status="⣾ ${text}  ·  \`dstp ${COMMAND}\`  ·  ${elapsed}"
             fallback="Forge is working on ${GITHUB_REPOSITORY}#${ISSUE_NUMBER}"
             context="<${ISSUE_URL}|${GITHUB_REPOSITORY}#${ISSUE_NUMBER}>"
+            [ -n "${PR_URL:-}" ] && context="${context}  ·  <${PR_URL}|PR>"
             [ -n "${RUN_URL:-}" ] && context="${context}  ·  <${RUN_URL}|Actions>"
             jq -n \
               --arg channel "$SLACK_CHANNEL" \
@@ -737,7 +779,7 @@ jobs:
             local now elapsed timeout buffer
             now=$(date -u +%s)
             elapsed=$(( now - START_EPOCH ))
-            timeout=$(( ${TIMEOUT_MINUTES:-55} * 60 ))
+            timeout=$(( ${TIMEOUT_MINUTES:-90} * 60 ))
             buffer=180
             echo $(( timeout - elapsed - buffer ))
           }
@@ -766,10 +808,13 @@ jobs:
                      or $s == "PENDING" or $s == "EXPECTED");
                 def is_review:
                   ((.name // .context // "") | test("PR Review"));
+                def is_trivy:
+                  ((.name // .context // "") | test("trivy"; "i"));
                 def failing:
                   ((.conclusion // "") | ascii_upcase) as $c
                   | ((.state // "") | ascii_upcase) as $s
-                  | ($c == "FAILURE" or $c == "ERROR" or $c == "TIMED_OUT" or $c == "CANCELLED"
+                  | (is_trivy | not)
+                  and ($c == "FAILURE" or $c == "ERROR" or $c == "TIMED_OUT" or $c == "CANCELLED"
                      or $s == "FAILURE" or $s == "ERROR");
                 .statusCheckRollup // []
                 | {
@@ -854,7 +899,7 @@ jobs:
 
           PREAMBLE
               if [ "$failing" != "0" ]; then
-                printf 'CI is still failing on this PR. Fix those failures.\n'
+                printf 'CI is still failing on this PR (non-Trivy). Fix those failures. Trivy SCA is not a dstp fix.\n'
               fi
               printf '%s' "$reviews_json" | jq -r '
                 if length == 0 then "\nNo new AI PR Review comments.\n"
@@ -893,7 +938,7 @@ jobs:
           # Text only — no tools, and write tokens are stripped from its env.
           reply_to_reviews() {
             local reviews_json="$1"
-            local n shas first slack_reply prompt_file=/tmp/forge-review-reply-prompt.md body_file=/tmp/forge-review-reply.md marked_file=/tmp/forge-review-reply.marked.md
+            local n shas first prompt_file=/tmp/forge-review-reply-prompt.md body_file=/tmp/forge-review-reply.md marked_file=/tmp/forge-review-reply.marked.md
             n=$(printf '%s' "$reviews_json" | jq 'length')
             [ "$n" = "0" ] && return 0
             slack_progress "Writing the review reply"
@@ -925,6 +970,7 @@ jobs:
               return 0
             fi
             if ! env -u GH_TOKEN -u GITHUB_TOKEN -u SLACK_BOT_TOKEN -u DSTP_FORGE_SERVICE_KEY \
+              -u WRITE_APP_KEY -u WRITE_APP_ID \
               "$CLAUDE_BIN" -p --output-format text < "$prompt_file" > "$body_file"; then
               echo "AI review reply failed"
               echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
@@ -944,16 +990,6 @@ jobs:
               AI_REVIEWS_REPLIED_COUNT=$((AI_REVIEWS_REPLIED_COUNT + n))
               echo "ai_reviews_replied=1" >> "$GITHUB_OUTPUT"
               echo "ai_reviews_replied_count=$AI_REVIEWS_REPLIED_COUNT" >> "$GITHUB_OUTPUT"
-              if [ -n "${SLACK_CHANNEL:-}" ] && [ -n "${SLACK_THREAD_TS:-}" ] && [ -n "${SLACK_BOT_TOKEN:-}" ]; then
-                slack_reply=$(tail -n +2 "$marked_file" | head -c 3500)
-                jq -n --arg channel "$SLACK_CHANNEL" --arg thread_ts "$SLACK_THREAD_TS" --arg text "$slack_reply" \
-                  '{channel:$channel, thread_ts:$thread_ts, text:$text, parse:"none"}' \
-                  | curl -sS --connect-timeout 10 --max-time 30 \
-                      -X POST https://slack.com/api/chat.postMessage \
-                      -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-                      -H 'Content-type: application/json; charset=utf-8' \
-                      --data @- >/dev/null || true
-              fi
             else
               echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
             fi
@@ -990,6 +1026,8 @@ jobs:
             fi
           else
             slack_progress "Opening the PR"
+            # Remint cannot change a child already running; dstp still holds the token it inherited at spawn.
+            remint_write_token
             run_dstp "$COMMAND" || STATUS=$?
             STATUS=${STATUS:-0}
             PR_URL=$(grep -oE '^\{.*\}$' /tmp/forge.log | tail -1 | jq -r '.pr_url // empty' || true)
@@ -1010,6 +1048,7 @@ jobs:
             ROUND=0
             UNKNOWN_ROUNDS=0
             while [ "$ROUND" -lt "$MAX_REVISE" ]; do
+              remint_write_token
               LEFT=$(remaining_job_seconds)
               if [ "$LEFT" -lt "$MIN_CYCLE_SECONDS" ]; then
                 echo "Not enough remaining job time (${LEFT}s) for another wait+revise"
@@ -1079,11 +1118,25 @@ jobs:
           fi
           exit $STATUS
 
+      - name: Mint token for Report
+        if: always()
+        id: report-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.CLIENT_ID_GHAPP_WRITE }}
+          private-key: ${{ secrets.PRIVATE_KEY_GHAPP_WRITE }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-checks: read
+
       # ---- report ---------------------------------------------------------
       - name: Report outcome
         if: always()
         env:
-          GH_TOKEN: ${{ steps.repo-token.outputs.token }}
+          GH_TOKEN: ${{ steps.report-token.outputs.token }}
           COMMENT_ID: ${{ steps.claim.outputs.comment_id }}
           PR_URL: ${{ steps.forge.outputs.pr_url }}
           REVISE_TROUBLE: ${{ steps.forge.outputs.revise_trouble }}
@@ -1129,16 +1182,18 @@ jobs:
           CI_FAILING_NAMES=""
           CI_STATE="unknown"
           if [ -n "${PR_URL:-}" ]; then
+            # GitHub Actions runs this script with bash -e. gh pr checks exits 8
+            # when any check is failing or pending, so turn -e off around the read.
+            set +e
             CHECKS=$(gh pr checks "$PR_URL" 2>/dev/null)
             rc=$?
-            # gh pr checks prints the table to stdout but exits 8 whenever any
-            # check is failing or pending. A non-zero exit can still be a
-            # successful read.
+            set -e
+            # A non-zero exit can still be a successful read.
             if [ "$rc" -eq 0 ] || { [ "$rc" -eq 8 ] && [ -n "$CHECKS" ]; }; then
               CI_STATE="ok"
-              CI_FAILING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="fail"{c++} END{print c+0}')
+              CI_FAILING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="fail" && tolower($1) !~ /trivy/ {c++} END{print c+0}')
               CI_PENDING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="pending"{c++} END{print c+0}')
-              CI_FAILING_NAMES=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{sep=""} $2=="fail" && n<5 {printf "%s%s", sep, $1; sep=", "; n++}')
+              CI_FAILING_NAMES=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{sep=""} $2=="fail" && tolower($1) !~ /trivy/ && n<5 {printf "%s%s", sep, $1; sep=", "; n++}')
             fi
           fi
           echo "ci_failing=$CI_FAILING"

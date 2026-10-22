@@ -241,10 +241,10 @@ check 'awk "
   "wait loop stays on statusCheckRollup — gh pr checks is Report-only"
 check 'awk "
   /reply_to_reviews\\(\\)/ {r=1}
-  r && /find_open_pr\\(\\)/ {exit (p ? 0 : 1)}
+  r && /find_open_pr\\(\\)/ {exit (p ? 1 : 0)}
   r && /chat.postMessage/ {p=1}
 " "$WF"' \
-  "reply_to_reviews also Slack-posts the scrubbed body once"
+  "reply_to_reviews stays on GitHub only — no Slack dump of review markdown"
 check '! grep -q "GITHUB_RUN_STARTED_AT" "$WF"' \
   "Report does not use nonexistent GITHUB_RUN_STARTED_AT"
 check 'awk "
@@ -285,13 +285,6 @@ check 'awk "
   END {exit (e && s) ? 0 : 1}
 " "$WF"' \
   "Report treats gh pr checks exit 8 as a successful read"
-check 'awk "
-  /reply_to_reviews\\(\\)/ {r=1}
-  r && /find_open_pr\\(\\)/ {exit (p && n ? 0 : 1)}
-  r && /parse:\\\"none\\\"/ {p=1}
-  r && /tail -n \\+2/ {n=1}
-" "$WF"' \
-  "Slack copy of AI replies uses parse none and skips the marker line"
 check 'grep -q "slack_requests_remaining" "$WF"' \
   "outstanding Slack change requests are exported for Report"
 check 'awk "
@@ -302,6 +295,55 @@ check 'awk "
   "failure-log scrub keeps its security rationale"
 check 'grep -q "Replied on the PR to .* AI review comments" "$WF"' \
   "completion copy counts comments, not findings"
+check 'awk "
+  /name: Run Forge/ {r=1}
+  r && /APP_KEY=\"\\\$WRITE_APP_KEY\"/ {c=1}
+  r && /unset WRITE_APP_KEY/ {u=1}
+  r && /^      - name:/ && \$0 !~ /Run Forge/ {exit}
+  END {exit (c && u) ? 0 : 1}
+" "$WF"' \
+  "Run Forge copies WRITE_APP_KEY then unsets it before any child"
+check 'awk "
+  /reply_to_reviews\\(\\)/ {r=1}
+  r && /find_open_pr\\(\\)/ {exit (k ? 0 : 1)}
+  r && /-u WRITE_APP_KEY/ {k=1}
+" "$WF"' \
+  "reply pass also unsets WRITE_APP_KEY"
+check 'awk "
+  /while \\[ \"\\\$ROUND\"/ {l=1}
+  l && /remint_write_token/ {r=1}
+  l && /run_branch_revise|wait_for_rollup/ {exit (r ? 0 : 1)}
+" "$WF"' \
+  "remint_write_token runs at the top of every wait+revise round"
+check 'awk "
+  /slack_progress \"Opening the PR\"/ {s=1}
+  s && /remint_write_token/ {r=1}
+  s && /run_dstp/ {exit (r ? 0 : 1)}
+" "$WF"' \
+  "remint_write_token runs immediately before the initial run_dstp"
+check 'grep -q "http.https://github.com/.extraheader" "$WF"' \
+  "remint refreshes git extraheader so git push uses the new token"
+check 'awk "
+  /remint_write_token\\(\\)/ {r=1}
+  r && /git config --local/ && /extraheader/ {l=1}
+  r && /slack_progress_payload\\(\\)/ {exit (l ? 0 : 1)}
+" "$WF"' \
+  "remint refreshes repo-local extraheader from actions/checkout"
+check 'awk "
+  /name: Mint token for Report/ {m=1}
+  m && /if: always\\(\\)/ {a=1}
+  m && /id: report-token/ {i=1}
+  END {exit (a && i) ? 0 : 1}
+" "$WF"' \
+  "Report mints its own token with if: always()"
+check 'grep -q "GH_TOKEN: \${{ steps.report-token.outputs.token }}" "$WF"' \
+  "Report uses the freshly minted token, not the job-start token"
+check 'awk "
+  /name: Report outcome/ {r=1}
+  r && /tolower\(\\\$1\) !~ \/trivy\// {t=1}
+  END {exit t ? 0 : 1}
+" "$WF"' \
+  "Report does not count Trivy as blocking CI"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"
