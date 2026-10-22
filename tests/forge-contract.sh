@@ -241,10 +241,10 @@ check 'awk "
   "wait loop stays on statusCheckRollup — gh pr checks is Report-only"
 check 'awk "
   /reply_to_reviews\\(\\)/ {r=1}
-  r && /find_open_pr\\(\\)/ {exit (p ? 0 : 1)}
+  r && /find_open_pr\\(\\)/ {exit (p ? 1 : 0)}
   r && /chat.postMessage/ {p=1}
 " "$WF"' \
-  "reply_to_reviews also Slack-posts the scrubbed body once"
+  "reply_to_reviews stays on GitHub only — no Slack dump of review markdown"
 check '! grep -q "GITHUB_RUN_STARTED_AT" "$WF"' \
   "Report does not use nonexistent GITHUB_RUN_STARTED_AT"
 check 'awk "
@@ -285,13 +285,6 @@ check 'awk "
   END {exit (e && s) ? 0 : 1}
 " "$WF"' \
   "Report treats gh pr checks exit 8 as a successful read"
-check 'awk "
-  /reply_to_reviews\\(\\)/ {r=1}
-  r && /find_open_pr\\(\\)/ {exit (p && n ? 0 : 1)}
-  r && /parse:\\\"none\\\"/ {p=1}
-  r && /tail -n \\+2/ {n=1}
-" "$WF"' \
-  "Slack copy of AI replies uses parse none and skips the marker line"
 check 'grep -q "slack_requests_remaining" "$WF"' \
   "outstanding Slack change requests are exported for Report"
 check 'awk "
