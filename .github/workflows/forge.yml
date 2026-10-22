@@ -642,9 +642,11 @@ jobs:
             if [ -n "$token" ]; then
               export GH_TOKEN="$token"
               export GITHUB_TOKEN="$token"
+              auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
               git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
-              git config --global http.https://github.com/.extraheader \
-                "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
+              git config --global http.https://github.com/.extraheader "$auth"
+              git config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+              git config --local http.https://github.com/.extraheader "$auth"
               echo "Reminted the write App token"
             else
               echo "::warning::Write App token remint returned no token; continuing with the existing token"

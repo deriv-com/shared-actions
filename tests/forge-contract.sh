@@ -324,6 +324,12 @@ check 'awk "
 check 'grep -q "http.https://github.com/.extraheader" "$WF"' \
   "remint refreshes git extraheader so git push uses the new token"
 check 'awk "
+  /remint_write_token\\(\\)/ {r=1}
+  r && /git config --local/ && /extraheader/ {l=1}
+  r && /slack_progress_payload\\(\\)/ {exit (l ? 0 : 1)}
+" "$WF"' \
+  "remint refreshes repo-local extraheader from actions/checkout"
+check 'awk "
   /name: Mint token for Report/ {m=1}
   m && /if: always\\(\\)/ {a=1}
   m && /id: report-token/ {i=1}
