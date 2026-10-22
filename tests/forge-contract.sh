@@ -295,6 +295,20 @@ check 'awk "
   "failure-log scrub keeps its security rationale"
 check 'grep -q "Replied on the PR to .* AI review comments" "$WF"' \
   "completion copy counts comments, not findings"
+check 'awk "
+  /name: Run Forge/ {r=1}
+  r && /APP_KEY=\"\\\$WRITE_APP_KEY\"/ {c=1}
+  r && /unset WRITE_APP_KEY/ {u=1}
+  r && /^      - name:/ && \$0 !~ /Run Forge/ {exit}
+  END {exit (c && u) ? 0 : 1}
+" "$WF"' \
+  "Run Forge copies WRITE_APP_KEY then unsets it before any child"
+check 'awk "
+  /reply_to_reviews\\(\\)/ {r=1}
+  r && /find_open_pr\\(\\)/ {exit (k ? 0 : 1)}
+  r && /-u WRITE_APP_KEY/ {k=1}
+" "$WF"' \
+  "reply pass also unsets WRITE_APP_KEY"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"

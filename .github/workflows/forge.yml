@@ -579,6 +579,8 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -o pipefail
+          APP_KEY="$WRITE_APP_KEY"
+          unset WRITE_APP_KEY
           git config --global user.name  "forge[bot]"
           git config --global user.email "forge@users.noreply.github.com"
 
@@ -617,11 +619,11 @@ jobs:
             if [ "$elapsed" -lt 2700 ]; then
               return 0
             fi
-            if [ -z "${WRITE_APP_ID:-}" ] || [ -z "${WRITE_APP_KEY:-}" ] || [ -z "${WRITE_INSTALLATION_ID:-}" ]; then
+            if [ -z "${WRITE_APP_ID:-}" ] || [ -z "${APP_KEY:-}" ] || [ -z "${WRITE_INSTALLATION_ID:-}" ]; then
               echo "Write-app credentials missing; skipping token remint"
               return 0
             fi
-            jwt=$(WRITE_APP_ID="$WRITE_APP_ID" WRITE_APP_KEY="$WRITE_APP_KEY" node -e '
+            jwt=$(WRITE_APP_ID="$WRITE_APP_ID" WRITE_APP_KEY="$APP_KEY" node -e '
               const crypto = require("crypto");
               const appId = process.env.WRITE_APP_ID;
               const pem = process.env.WRITE_APP_KEY.replace(/\\n/g, "\n");
@@ -961,6 +963,7 @@ jobs:
               return 0
             fi
             if ! env -u GH_TOKEN -u GITHUB_TOKEN -u SLACK_BOT_TOKEN -u DSTP_FORGE_SERVICE_KEY \
+              -u WRITE_APP_KEY -u WRITE_APP_ID \
               "$CLAUDE_BIN" -p --output-format text < "$prompt_file" > "$body_file"; then
               echo "AI review reply failed"
               echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
