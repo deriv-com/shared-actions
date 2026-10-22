@@ -245,6 +245,22 @@ check 'awk "
   r && /chat.postMessage/ {p=1}
 " "$WF"' \
   "reply_to_reviews also Slack-posts the scrubbed body once"
+check '! grep -q "GITHUB_RUN_STARTED_AT" "$WF"' \
+  "Report does not use nonexistent GITHUB_RUN_STARTED_AT"
+check 'awk "
+  /name: Run Forge/ {f=1}
+  f && /echo \"started_at=/ {s=1}
+  f && /^      - name:/ && \$0 !~ /Run Forge/ {exit}
+  END {exit s ? 0 : 1}
+" "$WF"' \
+  "Run Forge exports started_at to GITHUB_OUTPUT"
+check 'awk "
+  /name: Report outcome/ {r=1}
+  r && /FORGE_STARTED_AT:/ {e=1}
+  r && /FORGE_STARTED_AT:-/ {u=1}
+  END {exit (e && u) ? 0 : 1}
+" "$WF"' \
+  "Report prefers FORGE_STARTED_AT over a fake env var"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"

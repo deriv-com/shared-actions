@@ -730,6 +730,7 @@ jobs:
           else
             PROGRESS_EPOCH=$START_EPOCH
           fi
+          echo "started_at=$PROGRESS_EPOCH" >> "$GITHUB_OUTPUT"
 
           remaining_job_seconds() {
             local now elapsed timeout buffer
@@ -1086,6 +1087,7 @@ jobs:
           REVISE_TROUBLE: ${{ steps.forge.outputs.revise_trouble }}
           SLACK_PROGRESS_TS: ${{ steps.forge.outputs.slack_progress_ts || inputs.slack_message_ts }}
           SLACK_STARTED_AT: ${{ inputs.slack_started_at }}
+          FORGE_STARTED_AT: ${{ steps.forge.outputs.started_at }}
           AI_REVIEWS_REMAINING: ${{ steps.forge.outputs.ai_reviews_remaining }}
           AI_REVIEWS_REPLIED: ${{ steps.forge.outputs.ai_reviews_replied }}
           AI_REVIEWS_REPLIED_COUNT: ${{ steps.forge.outputs.ai_reviews_replied_count }}
@@ -1112,8 +1114,8 @@ jobs:
 
           if [[ "${SLACK_STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
             PROGRESS_EPOCH=$SLACK_STARTED_AT
-          elif START=$(date -u -d "${GITHUB_RUN_STARTED_AT:-}" +%s 2>/dev/null); then
-            PROGRESS_EPOCH=$START
+          elif [[ "${FORGE_STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
+            PROGRESS_EPOCH=$FORGE_STARTED_AT
           else
             PROGRESS_EPOCH=$(date -u +%s)
           fi
