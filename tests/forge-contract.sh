@@ -309,6 +309,35 @@ check 'awk "
   r && /-u WRITE_APP_KEY/ {k=1}
 " "$WF"' \
   "reply pass also unsets WRITE_APP_KEY"
+check 'awk "
+  /while \\[ \"\\\$ROUND\"/ {l=1}
+  l && /remint_write_token/ {r=1}
+  l && /run_branch_revise|wait_for_rollup/ {exit (r ? 0 : 1)}
+" "$WF"' \
+  "remint_write_token runs at the top of every wait+revise round"
+check 'awk "
+  /slack_progress \"Opening the PR\"/ {s=1}
+  s && /remint_write_token/ {r=1}
+  s && /run_dstp/ {exit (r ? 0 : 1)}
+" "$WF"' \
+  "remint_write_token runs immediately before the initial run_dstp"
+check 'grep -q "http.https://github.com/.extraheader" "$WF"' \
+  "remint refreshes git extraheader so git push uses the new token"
+check 'awk "
+  /name: Mint token for Report/ {m=1}
+  m && /if: always\\(\\)/ {a=1}
+  m && /id: report-token/ {i=1}
+  END {exit (a && i) ? 0 : 1}
+" "$WF"' \
+  "Report mints its own token with if: always()"
+check 'grep -q "GH_TOKEN: \${{ steps.report-token.outputs.token }}" "$WF"' \
+  "Report uses the freshly minted token, not the job-start token"
+check 'awk "
+  /name: Report outcome/ {r=1}
+  r && /tolower\(\\\$1\) !~ \/trivy\// {t=1}
+  END {exit t ? 0 : 1}
+" "$WF"' \
+  "Report does not count Trivy as blocking CI"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"
