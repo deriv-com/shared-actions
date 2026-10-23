@@ -56,26 +56,43 @@ check 'awk "/^      slack_started_at:/{f=1} f && /required:/{print; exit}" "$WF"
   "input 'slack_started_at' stays optional"
 check 'awk "/^      model:/{f=1} f && /default:/{print; exit}" "$WF" | grep -q "default: \"claude-sonnet-5-5\""' \
   "model default is claude-sonnet-5-5"
-# Keep the workflow input as the LiteLLM gateway alias. Claude Code's native
-# catalog does not list claude-sonnet-5-5 and logs unrecognized_model; map at
-# GHA export to a catalog id the same gateway fronts.
+# Pass the LiteLLM alias through. Rewriting it to an older catalog id would
+# send a different model id to the gateway. END fails closed if the Resolve
+# or Preflight step names change (no vacuous pass).
 check 'awk "
   /name: Resolve the LLM gateway/ {r=1}
-  r && /name: Preflight/ {exit (m && c) ? 0 : 1}
-  r && /claude-sonnet-5-5\\|claude-sonnet-5\\) MODEL=\"claude-sonnet-4-5\"/ {m=1}
-  r && /unrecognized_model|native catalog/ {c=1}
+  r && /MODEL=..FORGE_MODEL/ {m=1}
+  r && /echo .ANTHROPIC_MODEL=.MODEL/ {e=1}
+  r && /MODEL=.claude-sonnet-4-5/ {old=1}
+  r && /name: Preflight/ {p=1; exit}
+  END {exit (r && p && m && e && !old) ? 0 : 1}
 " "$WF"' \
-  "gateway export maps LiteLLM claude-sonnet-5-5 to Claude Code catalog id claude-sonnet-4-5"
+  "gateway export passes the LiteLLM alias through as ANTHROPIC_MODEL"
 check 'awk "
   /name: Report outcome/ {r=1}
   r && /FAIL_SNIPPET=/ {f=1}
-  r && /spec-coverage/ {s=1}
+  r && /spec-coverage \[\(\]/ {s=1}
   r && /Verify failed/ {v=1}
   r && /unrecognized_model/ {u=1}
   r && /QUIET=.*FAIL_SNIPPET/ {q=1}
-  END {exit (f && s && v && u && q) ? 0 : 1}
+  r && /\&amp;/ {esc=1}
+  END {exit (r && f && s && v && u && q && esc) ? 0 : 1}
 " "$WF"' \
   "Report Failed Slack copy includes spec-coverage or Verify failed from the log"
+
+# Run the FAIL_SNIPPET pipeline from Report outcome against a fixture log.
+SNIPPET_LINE=$(awk '
+  /name: Report outcome/ {r=1}
+  r && /FAIL_SNIPPET=\$\(/ { sub(/^ +/, ""); print; exit }
+' "$WF")
+check '[ -n "$SNIPPET_LINE" ]' "FAIL_SNIPPET assignment exists in Report outcome"
+TAIL=$'noise\n\033[31mVerify failed: spec-coverage (3/40 files) ping <!channel> & more\033[0m\nmore'
+export TAIL
+GOT=$(bash -c "${SNIPPET_LINE}"$'\n'"printf '%s' \"\$FAIL_SNIPPET\"")
+check '[[ "$GOT" == *"spec-coverage (3/40 files)"* ]]' "FAIL_SNIPPET extracts the verify line"
+check '[[ "$GOT" == *"&lt;!channel&gt;"* ]]' "FAIL_SNIPPET Slack-escapes angle brackets"
+check '[[ "$GOT" == *"&amp; more"* ]]' "FAIL_SNIPPET Slack-escapes ampersand"
+check '[[ "$GOT" != *"<!channel>"* ]]' "FAIL_SNIPPET does not leave raw <!channel>"
 
 # The lane decides whether a run fits inside timeout_minutes, so it must stay a
 # caller decision. Hardcoding --fast onto the command line would silently strip
