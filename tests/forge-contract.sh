@@ -56,6 +56,26 @@ check 'awk "/^      slack_started_at:/{f=1} f && /required:/{print; exit}" "$WF"
   "input 'slack_started_at' stays optional"
 check 'awk "/^      model:/{f=1} f && /default:/{print; exit}" "$WF" | grep -q "default: \"claude-sonnet-5-5\""' \
   "model default is claude-sonnet-5-5"
+# Keep the workflow input as the LiteLLM gateway alias. Claude Code's native
+# catalog does not list claude-sonnet-5-5 and logs unrecognized_model; map at
+# GHA export to a catalog id the same gateway fronts.
+check 'awk "
+  /name: Resolve the LLM gateway/ {r=1}
+  r && /name: Preflight/ {exit (m && c) ? 0 : 1}
+  r && /claude-sonnet-5-5\\|claude-sonnet-5\\) MODEL=\"claude-sonnet-4-5\"/ {m=1}
+  r && /unrecognized_model|native catalog/ {c=1}
+" "$WF"' \
+  "gateway export maps LiteLLM claude-sonnet-5-5 to Claude Code catalog id claude-sonnet-4-5"
+check 'awk "
+  /name: Report outcome/ {r=1}
+  r && /FAIL_SNIPPET=/ {f=1}
+  r && /spec-coverage/ {s=1}
+  r && /Verify failed/ {v=1}
+  r && /unrecognized_model/ {u=1}
+  r && /QUIET=.*FAIL_SNIPPET/ {q=1}
+  END {exit (f && s && v && u && q) ? 0 : 1}
+" "$WF"' \
+  "Report Failed Slack copy includes spec-coverage or Verify failed from the log"
 
 # The lane decides whether a run fits inside timeout_minutes, so it must stay a
 # caller decision. Hardcoding --fast onto the command line would silently strip

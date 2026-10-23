@@ -494,7 +494,15 @@ jobs:
           BASE="${BASE%/v1}"
           echo "ANTHROPIC_BASE_URL=$BASE" >> "$GITHUB_ENV"
           # Exported once so the preflight and the real run can never disagree.
+          # Keep the workflow input as the LiteLLM gateway alias (default
+          # claude-sonnet-5-5). Claude Code's native catalog does not list that
+          # alias and logs unrecognized_model; map known aliases to the catalog
+          # id the same gateway fronts. If preflight 500s, add that catalog id
+          # to the gateway model_list as an alias of the same backend.
           MODEL="$FORGE_MODEL"
+          case "$FORGE_MODEL" in
+            claude-sonnet-5-5|claude-sonnet-5) MODEL="claude-sonnet-4-5" ;;
+          esac
           echo "ANTHROPIC_MODEL=$MODEL" >> "$GITHUB_ENV"
 
           # Claude Code also makes background calls with a small/fast model. The
@@ -1268,8 +1276,14 @@ jobs:
               || echo "no output captured")
             BODY=$(printf '🔨 **Forge** failed — [full log](%s)\n\n<details><summary>Last output</summary>\n\n```\n%s\n```\n\n</details>\n\nRe-apply the `forge` label to retry.\n\nTook %s.' "$RUN_URL" "$TAIL" "$TOOK")
             LABEL="forge:failed"
-            QUIET="❌ Failed · Took ${TOOK}"
-            SLACK_TEXT=$(printf '%s❌ Failed on %s — <%s|see the run log>. The error is also on the issue.\nTook %s.' "$WHO" "$ISSUE_LINK" "$RUN_URL" "$TOOK")
+            FAIL_SNIPPET=$(printf '%s\n' "$TAIL" | sed $'s/\x1b\\[[0-9;]*[A-Za-z]//g' | grep -E 'Verify failed:|spec-coverage \\(|unrecognized_model' | tail -n 1 | tr -d '\r`$\\' | sed -E 's/^[[:space:]]+//' | cut -c1-180 || true)
+            if [ -n "$FAIL_SNIPPET" ]; then
+              QUIET="❌ Failed · ${FAIL_SNIPPET} · Took ${TOOK}"
+              SLACK_TEXT=$(printf '%s❌ Failed on %s — %s\n<%s|see the run log>. The error is also on the issue.\nTook %s.' "$WHO" "$ISSUE_LINK" "$FAIL_SNIPPET" "$RUN_URL" "$TOOK")
+            else
+              QUIET="❌ Failed · Took ${TOOK}"
+              SLACK_TEXT=$(printf '%s❌ Failed on %s — <%s|see the run log>. The error is also on the issue.\nTook %s.' "$WHO" "$ISSUE_LINK" "$RUN_URL" "$TOOK")
+            fi
           fi
 
           # Empty when the run failed before the engine was fetched. A SHA input
