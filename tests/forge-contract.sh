@@ -201,6 +201,22 @@ check 'grep -q "<!-- forge-revise-reply -->" "$WF"' \
   "AI replies are tagged so they are not re-ingested as findings"
 check 'grep -q "<!-- forge-slack-revise -->" "$WF"' \
   "human Slack notes on the issue are included in the revise instruction"
+check 'grep -q "reviewThreads" "$WF"' \
+  "unresolved human review threads go in the revise instruction"
+check 'grep -q "github_pr_url" "$WF"' \
+  "PR_URL is kept only when it is a GitHub pull URL"
+check 'grep -q "produced no changes" "$WF"' \
+  "dstp no-change is detected and stops the wait loop"
+check 'grep -q "Nothing was committed" "$WF"' \
+  "Report no-change completion does not say the PR is up"
+check 'grep -q "could not be resolved" "$WF"' \
+  "a non-URL PR_URL is reported as unresolved, not PR is up"
+check 'awk "
+  /wait_for_rollup\\(\\)/ {w=1}
+  w && /fetch_comments\\(\\)/ {exit (s ? 0 : 1)}
+  w && /slack_progress/ {s=1}
+" "$WF"' \
+  "wait_for_rollup chat.update the living card each 15s poll"
 check 'grep -q "120000" "$WF"' \
   "an oversized instruction fails loudly instead of E2BIG"
 check 'grep -q "capture(\"reviewed-commit" "$WF"' \
