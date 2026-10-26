@@ -226,6 +226,8 @@ check 'grep -q "\"\$ALL_THREADS\" = \"unknown\"" "$WF"' \
   "an unreadable review-thread query is not treated as zero threads"
 check 'grep -q "dstp revise reported an error" "$WF"' \
   "a dstp revise error other than no-change fails the revise"
+check 'grep -q "tee /tmp/forge.log || rc=\$?" "$WF" && grep -q "read_revise_result /tmp/forge.log || return 1" "$WF"' \
+  "dstp exits 1 on no-change, so its JSON is read before the exit code is used"
 check 'grep -q "REASON_SLACK=" "$WF"' \
   "the no-change reason is Slack-escaped before it is posted"
 check 'grep -q "120000" "$WF"' \
