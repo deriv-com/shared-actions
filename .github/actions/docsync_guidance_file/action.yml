@@ -1,0 +1,32 @@
+name: docsync_guidance_file
+description: >
+  Resolve which file DocSync AI edits for AI-agent guidance. Returns CLAUDE.md
+  when it holds the guidance itself, or the file a CLAUDE.md import shim
+  (`@AGENTS.md`) or symlink points to, so DocSync never writes into the shim.
+  Runs in the checked-out repository root.
+inputs:
+  guidance_file:
+    description: >
+      Repo-relative Markdown file to edit instead of auto-detecting from
+      CLAUDE.md (e.g. AGENTS.md). Empty means auto-detect.
+    required: false
+    default: ""
+outputs:
+  file:
+    description: Repo-relative path to edit, or empty when there is none
+    value: ${{ steps.resolve.outputs.file }}
+  source:
+    description: "How it was chosen: input | claude | import | symlink | none"
+    value: ${{ steps.resolve.outputs.source }}
+  reason:
+    description: One-line explanation, for step summaries
+    value: ${{ steps.resolve.outputs.reason }}
+runs:
+  using: composite
+  steps:
+    - name: Resolve agent guidance file
+      id: resolve
+      shell: bash
+      env:
+        GUIDANCE_FILE_INPUT: ${{ inputs.guidance_file }}
+      run: node "${{ github.action_path }}/resolve-guidance-file.js"

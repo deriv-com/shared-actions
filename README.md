@@ -15,7 +15,7 @@ Everything here is consumed at `@master`, so **changes are live for every consum
 |---|---|---|---|
 | [`ai-pr-review.yml`](.github/workflows/ai-pr-review.yml) | LLM PR review; engine selectable (`kimi` \| `anthropic` \| `grok` \| `codex`) | [AI_PR_REVIEW_README.md](.github/workflows/AI_PR_REVIEW_README.md) | ✅ active |
 | [`claude-pr-review.yml`](.github/workflows/claude-pr-review.yml) | Claude PR review | — | ⚠️ **deprecated** → use `ai-pr-review.yml` with `engine: anthropic` |
-| [`docsync-ai.yml`](.github/workflows/docsync-ai.yml) | Keeps docs in sync with code; scheduled + comment-triggered | — | ✅ active |
+| [`docsync-ai.yml`](.github/workflows/docsync-ai.yml) | Keeps docs in sync with code; scheduled + comment-triggered | [Agent guidance file](#docsync-ai-agent-guidance-file) | ✅ active |
 | [`dependonme-bot.yml`](.github/workflows/dependonme-bot.yml) | Auto-fixes Dependabot security alerts | [DEPENDONME_BOT_README.md](.github/workflows/DEPENDONME_BOT_README.md) | ✅ active |
 | [`qa-checklist.yml`](.github/workflows/qa-checklist.yml) | Generates a QA checklist for a PR when someone comments `@checkmaite` | [QA_CHECKLIST_README.md](.github/workflows/QA_CHECKLIST_README.md) | ✅ active |
 
@@ -37,6 +37,43 @@ Add a row here when deprecating anything. With no CHANGELOG and no release proce
           issue_number: ${{steps.pr_information.outputs.issue_number}}
           head_sha: ${{github.event.workflow_run.head_sha}}
 ```
+
+### DocSync AI: agent guidance file
+
+DocSync AI updates root `README.md` plus one AI-agent guidance file. All three
+triggers (`scheduled`, `comment`, `claude_md_refresh`) pick that file the same
+way, through [`docsync_guidance_file`](.github/actions/docsync_guidance_file/):
+
+| Repository has | DocSync edits |
+|---|---|
+| A `CLAUDE.md` with real content | `CLAUDE.md` (unchanged behaviour) |
+| A `CLAUDE.md` whose only content is one import line, e.g. `@AGENTS.md` | The imported file. The shim is never edited. |
+| A `CLAUDE.md` symlink | The file it links to, if that file is inside the repository |
+| No `CLAUDE.md` | No guidance file (unchanged), unless `guidance_file` is set |
+| A shim with several imports, or one whose target is missing or outside the repo | No guidance file. DocSync never falls back to the shim. |
+
+Optional inputs on `docsync-ai.yml`:
+
+- `guidance_file` sets the file explicitly, e.g. `AGENTS.md` in a repository
+  with no `CLAUDE.md`. The file must already exist and must not be a shim.
+- `guidance_max_bytes` sets a byte budget for that file. The model is told the
+  budget, and an update or refresh over it is dropped rather than opened as a
+  PR that the repository's own CI would reject. `0` (the default) means no limit.
+
+```yaml
+    uses: deriv-com/shared-actions/.github/workflows/docsync-ai.yml@master
+    with:
+      trigger_type: "scheduled"
+      base_branch: "master"
+      guidance_max_bytes: 16384 # optional: match the repo's own size check
+```
+
+`@docbot update only claude.md …` (or `… agents.md …`) targets the resolved file.
+
+**Limitation:** DocSync has no second, detailed-reference target. If a repository
+keeps `AGENTS.md` short and moves detail to a file such as
+`docs/agent-reference.md`, DocSync does not edit that file. Under a byte budget it
+skips updates that do not fit.
 
 ### App info (version stamp)
 

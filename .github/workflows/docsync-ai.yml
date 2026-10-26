@@ -33,6 +33,16 @@ on:
         required: false
         default: ""
         type: string
+      guidance_file:
+        description: 'Repo-relative AI-agent guidance file DocSync edits instead of CLAUDE.md (e.g. "AGENTS.md"). Empty auto-detects: CLAUDE.md, or the file a CLAUDE.md import shim ("@AGENTS.md") or symlink points to; the shim itself is never edited'
+        required: false
+        default: ""
+        type: string
+      guidance_max_bytes:
+        description: "Byte budget for the guidance file (e.g. 16384). An update or refresh that would exceed it is dropped instead of opening a PR. 0 means no limit"
+        required: false
+        default: 0
+        type: number
     secrets:
       DOCSYNC_GITHUB_TOKEN:
         description: "GitHub PAT for PR creation (repo-specific, needs repo and pull_requests permissions)"
@@ -129,6 +139,8 @@ jobs:
           repository: ${{ github.repository }}
           base_branch: ${{ inputs.base_branch }}
           pr_labels: ${{ inputs.pr_labels }}
+          guidance_file: ${{ inputs.guidance_file }}
+          guidance_max_bytes: ${{ inputs.guidance_max_bytes }}
 
       - name: Send Slack Notification - Documentation PR Created
         if: steps.docsync.outputs.doc_pr_created == 'true' && env.SLACK_TOKEN != '' && env.SLACK_CHANNEL != ''
@@ -450,6 +462,8 @@ jobs:
           comment_body: ${{ inputs.comment_body }}
           comment_id: ${{ inputs.comment_id }}
           base_branch: ${{ inputs.base_branch }}
+          guidance_file: ${{ inputs.guidance_file }}
+          guidance_max_bytes: ${{ inputs.guidance_max_bytes }}
 
       - name: Send Slack Notification - Documentation Updated
         if: steps.docsync-comment.outputs.updated == 'true' && env.SLACK_TOKEN != '' && env.SLACK_CHANNEL != ''
@@ -742,32 +756,39 @@ jobs:
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
 
+      - name: Resolve Agent Guidance File
+        id: guidance
+        uses: deriv-com/shared-actions/.github/actions/docsync_guidance_file@master
+        with:
+          guidance_file: ${{ inputs.guidance_file }}
+
       - name: Locate and Validate CLAUDE.md
         id: locate-claude-md
         shell: bash
+        env:
+          # CLAUDE.md itself, or the file its import shim / symlink points to;
+          # never the shim, so refreshing cannot break an `@AGENTS.md` import.
+          CLAUDE_FILE: ${{ steps.guidance.outputs.file }}
+          GUIDANCE_REASON: ${{ steps.guidance.outputs.reason }}
         run: |
           echo "## CLAUDE.md Detection" >> $GITHUB_STEP_SUMMARY
 
-          CLAUDE_FILE=$(find . -maxdepth 1 -type f -iname "claude.md" -print -quit 2>/dev/null)
-
           if [ -z "$CLAUDE_FILE" ]; then
-            echo "No CLAUDE.md found in repository root — nothing to refresh." >> $GITHUB_STEP_SUMMARY
+            echo "No agent guidance file to refresh: $GUIDANCE_REASON" >> $GITHUB_STEP_SUMMARY
             echo "found=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          CLAUDE_FILE="${CLAUDE_FILE#./}"
-
           REALPATH=$(realpath "$CLAUDE_FILE" 2>/dev/null || echo "")
           WORKDIR=$(realpath . 2>/dev/null || echo "")
           if [[ -L "$CLAUDE_FILE" ]] || [[ ! "$REALPATH" == "$WORKDIR"/* ]]; then
-            echo "Invalid CLAUDE.md path detected — skipping." >> $GITHUB_STEP_SUMMARY
+            echo "Invalid guidance file path detected — skipping." >> $GITHUB_STEP_SUMMARY
             echo "found=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
           CLAUDE_SIZE=$(wc -c < "$CLAUDE_FILE" | tr -d ' ')
-          echo "Found: $CLAUDE_FILE ($CLAUDE_SIZE bytes)" >> $GITHUB_STEP_SUMMARY
+          echo "Found: $CLAUDE_FILE ($CLAUDE_SIZE bytes) — $GUIDANCE_REASON" >> $GITHUB_STEP_SUMMARY
           echo "found=true" >> $GITHUB_OUTPUT
           echo "claude_file=$CLAUDE_FILE" >> $GITHUB_OUTPUT
 
@@ -779,6 +800,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.DOCSYNC_ANTHROPIC_API_KEY }}
           CLAUDE_FILE: ${{ steps.locate-claude-md.outputs.claude_file }}
           REPO_NAME: ${{ github.repository }}
+          GUIDANCE_MAX_BYTES: ${{ inputs.guidance_max_bytes }}
         run: |
           set -e
 
@@ -790,6 +812,7 @@ jobs:
 
           TEMP_DIR=$(mktemp -d -t claude-refresh-XXXXXXXXXX)
           PROMPT_FILE="$TEMP_DIR/prompt.txt"
+          [[ "$GUIDANCE_MAX_BYTES" =~ ^[0-9]+$ ]] || GUIDANCE_MAX_BYTES=0
 
           {
             printf '%s\n' "You are an expert in Claude Code (Anthropic's AI coding CLI). Your job is to reformat an existing CLAUDE.md file so it follows the OFFICIAL Claude Code best practices (https://code.claude.com/docs/en/best-practices) AND preserves every piece of information in it. This is a make-it-more-efficient pass, not a prune-it-down pass."
@@ -861,6 +884,16 @@ jobs:
             printf '%s\n' "6. Returns the file UNCHANGED if it already follows this structure."
             printf '%s\n' "7. Outputs ONLY the final file content. No preamble, no explanation, no commentary. Start directly with the markdown."
             printf '%s\n' ""
+            if [ "$(basename "$CLAUDE_FILE" | tr '[:upper:]' '[:lower:]')" != "claude.md" ]; then
+              printf '%s\n' "## Guidance file: $CLAUDE_FILE"
+              printf '%s\n' "In this repository the guidance lives in $CLAUDE_FILE; CLAUDE.md, where present, only points to it. Everything above about CLAUDE.md applies to $CLAUDE_FILE. Never add an @-import of $CLAUDE_FILE to $CLAUDE_FILE itself."
+              printf '%s\n' ""
+            fi
+            if [ "$GUIDANCE_MAX_BYTES" -gt 0 ]; then
+              printf '%s\n' "## Size budget"
+              printf '%s\n' "The output must be at or under $GUIDANCE_MAX_BYTES bytes. A result over the budget is discarded."
+              printf '%s\n' ""
+            fi
             printf '%s\n' "## Current CLAUDE.md Content"
             printf '%s\n' '```markdown'
             printf '%s\n' "$CURRENT_CONTENT"
@@ -922,6 +955,16 @@ jobs:
           echo "Input tokens: $IN_TOKENS | Output tokens: $OUT_TOKENS | Latency: ${CALL_LATENCY}ms" >> $GITHUB_STEP_SUMMARY
           echo "New size: $NEW_CHARS chars" >> $GITHUB_STEP_SUMMARY
 
+          if [ "$GUIDANCE_MAX_BYTES" -gt 0 ]; then
+            NEW_BYTES=$(printf '%s' "$NEW_CONTENT" | wc -c | tr -d ' ')
+            if [ "$NEW_BYTES" -gt "$GUIDANCE_MAX_BYTES" ]; then
+              echo "Refreshed $CLAUDE_FILE is $NEW_BYTES bytes, over its $GUIDANCE_MAX_BYTES-byte budget — not opening a PR." >> $GITHUB_STEP_SUMMARY
+              echo "has_changes=false" >> $GITHUB_OUTPUT
+              rm -rf "$TEMP_DIR"
+              exit 0
+            fi
+          fi
+
           printf '%s' "$NEW_CONTENT" > "$CLAUDE_FILE"
 
           git add "$CLAUDE_FILE"
@@ -954,9 +997,9 @@ jobs:
 
           git checkout -b "$BRANCH"
           git add "$CLAUDE_FILE"
-          git commit -m "DocSync AI: Refresh CLAUDE.md to best practices
+          git commit -m "DocSync AI: Refresh $CLAUDE_FILE to best practices
 
-          Reformatted CLAUDE.md to match Claude Code best practices.
+          Reformatted $CLAUDE_FILE to match Claude Code best practices.
           All existing information preserved; structure and conciseness improved.
 
           Triggered manually by: ${{ github.actor }}
@@ -969,7 +1012,7 @@ jobs:
           This PR was triggered manually by **${{ github.actor }}** via the DocSync AI \`claude_md_refresh\` workflow.
 
           ### What changed
-          The existing \`CLAUDE.md\` was reformatted to match Claude Code best practices for AI-assisted development:
+          The existing \`$CLAUDE_FILE\` was reformatted to match Claude Code best practices for AI-assisted development:
           - Consistent \`##\` section headings
           - Commands in fenced code blocks
           - Concise bullet points
@@ -988,7 +1031,7 @@ jobs:
           *Automated by DocSync AI (Manual — claude_md_refresh)*"
 
           PR_URL=$(gh pr create \
-            --title "DocSync AI: Refresh CLAUDE.md to best practices" \
+            --title "DocSync AI: Refresh $CLAUDE_FILE to best practices" \
             --body "$PR_BODY" \
             --base "$BASE_BRANCH" \
             --head "$BRANCH")
