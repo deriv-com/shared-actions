@@ -209,14 +209,25 @@ check 'grep -q "produced no changes" "$WF"' \
   "dstp no-change is detected and stops the wait loop"
 check 'grep -q "Nothing was committed" "$WF"' \
   "Report no-change completion does not say the PR is up"
-check 'grep -q "could not be resolved" "$WF"' \
-  "a non-URL PR_URL is reported as unresolved, not PR is up"
+check 'grep -q "No open PR is linked to this issue" "$WF"' \
+  "a non-URL PR_URL tells the user to link an open PR, not PR is up"
 check 'awk "
   /wait_for_rollup\\(\\)/ {w=1}
   w && /fetch_comments\\(\\)/ {exit (s ? 0 : 1)}
   w && /slack_progress/ {s=1}
+  END { if (!w) exit 1 }
 " "$WF"' \
   "wait_for_rollup chat.update the living card each 15s poll"
+check 'grep -q "unsent_threads \"\$ALL_THREADS\" \"\$SENT_THREADS\"" "$WF"' \
+  "a human review thread is sent to dstp once per run, not every round"
+check 'grep -q "threads_remaining=\$THREAD_N" "$WF" && grep -q "human review threads were not addressed" "$WF"' \
+  "Report warns about human review threads that were not addressed"
+check 'grep -q "\"\$ALL_THREADS\" = \"unknown\"" "$WF"' \
+  "an unreadable review-thread query is not treated as zero threads"
+check 'grep -q "dstp revise reported an error" "$WF"' \
+  "a dstp revise error other than no-change fails the revise"
+check 'grep -q "REASON_SLACK=" "$WF"' \
+  "the no-change reason is Slack-escaped before it is posted"
 check 'grep -q "120000" "$WF"' \
   "an oversized instruction fails loudly instead of E2BIG"
 check 'grep -q "capture(\"reviewed-commit" "$WF"' \

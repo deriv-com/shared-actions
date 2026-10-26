@@ -603,6 +603,7 @@ jobs:
           echo "ai_reviews_replied_count=0" >> "$GITHUB_OUTPUT"
           AI_REVIEWS_REPLIED_COUNT=0
           : > /tmp/forge-progress-lines
+          : > /tmp/forge-progress-ticks
 
           format_progress_elapsed() {
             local sec="$1"
@@ -660,15 +661,22 @@ jobs:
           slack_progress_payload() {
             local ts_field="$1"
             local text="$2"
-            local now elapsed bullets status fallback context sec frames spin
+            local now elapsed bullets status fallback context sec frames spin tick
             now=$(date -u +%s)
             sec=$(( now - ${PROGRESS_EPOCH:-now} ))
             [ "$sec" -lt 0 ] && sec=0
             elapsed=$(format_progress_elapsed "$sec")
-            printf '%s\n' "$text" >> /tmp/forge-progress-lines
+            # The rollup poll repeats one line every 15s; keep the bullets distinct.
+            if [ "$(tail -n 1 /tmp/forge-progress-lines 2>/dev/null)" != "$text" ]; then
+              printf '%s\n' "$text" >> /tmp/forge-progress-lines
+            fi
             bullets=$(tail -n 3 /tmp/forge-progress-lines | awk '{print "• " $0}')
+            # Callers use $(...), so the tick count lives in a file.
+            tick=$(cat /tmp/forge-progress-ticks 2>/dev/null)
+            tick=$(( ${tick:-0} + 1 ))
+            printf '%s\n' "$tick" > /tmp/forge-progress-ticks
             frames=(⣾ ⣽ ⣻ ⢿ ⡿ ⣟ ⣯ ⣷)
-            spin="${frames[$(( sec % 8 ))]}"
+            spin="${frames[$(( tick % ${#frames[@]} ))]}"
             status="${spin} ${text}  ·  \`dstp ${COMMAND}\`  ·  ${elapsed}"
             fallback="Forge is working on ${GITHUB_REPOSITORY}#${ISSUE_NUMBER}"
             context="<${ISSUE_URL}|${GITHUB_REPOSITORY}#${ISSUE_NUMBER}>"
@@ -743,6 +751,30 @@ jobs:
             return 0
           }
 
+          # dstp revise can exit 0 with {"error": ...}. "produced no changes" is a
+          # no-change result; any other error is a failed revise, so no "Fixed"
+          # reply or watermark follows it. The reason is one GITHUB_OUTPUT line.
+          read_revise_result() {
+            local log="$1" RESULT pr err
+            RESULT=$(grep -oE '^\{.*\}$' "$log" | tail -1 || true)
+            [ -z "$RESULT" ] && return 0
+            err=$(printf '%s' "$RESULT" | jq -r '.error // empty' | tr '\r\n' '  ' | sed 's/[[:space:]]*$//' | cut -c1-500)
+            if printf '%s' "$err" | grep -qi 'produced no changes'; then
+              NO_CHANGE=1
+              NO_CHANGE_REASON="$err"
+              echo "no_change=1" >> "$GITHUB_OUTPUT"
+              echo "no_change_reason=$err" >> "$GITHUB_OUTPUT"
+              return 0
+            fi
+            if [ -n "$err" ]; then
+              echo "dstp revise reported an error: $err"
+              return 1
+            fi
+            pr=$(github_pr_url "$(printf '%s' "$RESULT" | jq -r '.pr_url // empty')")
+            [ -n "$pr" ] && echo "pr_url=$pr" >> "$GITHUB_OUTPUT"
+            return 0
+          }
+
           # Branch form so the instruction is used. Issue-URL revise reads QA
           # sub-issues and refuses PR comments. dstp 0.8.0 takes the instruction
           # as one argv string (MAX_ARG_STRLEN is 128KiB).
@@ -760,21 +792,7 @@ jobs:
             fi
             echo "Running: dstp revise $branch <instruction> --cwd . --unattended --json"
             node "$FORGE_CLI" revise "$branch" "$(cat "$instruction_file")" --cwd . --unattended --json 2>&1 | tee /tmp/forge.log || return $?
-            local RESULT pr err
-            RESULT=$(grep -oE '^\{.*\}$' /tmp/forge.log | tail -1 || true)
-            if [ -n "$RESULT" ]; then
-              err=$(printf '%s' "$RESULT" | jq -r '.error // empty')
-              if printf '%s' "$err" | grep -qi 'produced no changes'; then
-                NO_CHANGE=1
-                NO_CHANGE_REASON="$err"
-                echo "no_change=1" >> "$GITHUB_OUTPUT"
-                echo "no_change_reason=$err" >> "$GITHUB_OUTPUT"
-                return 0
-              fi
-              pr=$(github_pr_url "$(printf '%s' "$RESULT" | jq -r '.pr_url // empty')")
-              [ -n "$pr" ] && echo "pr_url=$pr" >> "$GITHUB_OUTPUT"
-            fi
-            return 0
+            read_revise_result /tmp/forge.log
           }
 
           SCRIPT_START=$(date -u +%s)
@@ -916,12 +934,22 @@ jobs:
               -F number="$num" \
               -f query='query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){ pullRequest(number:$number){ reviewThreads(first:100){ nodes { isResolved comments(first:1){ nodes { url author { login } body path line } } } } } } } }' \
               --jq '[.data.repository.pullRequest.reviewThreads.nodes[]? | select(.isResolved|not) | .comments.nodes[0] | select(.) | {html_url:(.url // ""), author:(.author.login // ""), path:(.path // ""), line:(.line // 0), body:(.body // "")}]' \
-              2>/dev/null || true)
+              2>/dev/null) || { echo "unknown"; return; }
             if ! printf '%s' "$json" | jq -e 'type == "array"' >/dev/null 2>&1; then
-              echo "[]"
+              echo "unknown"
               return
             fi
             printf '%s' "$json"
+          }
+
+          # A thread sent to dstp once in this run is not sent again. dstp cannot
+          # resolve GitHub threads, so otherwise one open thread forces every round.
+          unsent_threads() {
+            local threads_json="$1" sent="$2"
+            printf '%s' "$threads_json" | jq --arg sent "$sent" '
+              ($sent | split("\n") | map(select(length > 0))) as $s
+              | [.[] | select((.html_url // "") as $u | ($s | any(.[]; . == $u)) | not)]
+            '
           }
 
           write_revise_instruction() {
@@ -966,7 +994,7 @@ jobs:
                 else
                   .[]
                   | (.body // "") as $b
-                  | ($b[0:40000]) as $capped
+                  | ($b[0:4000]) as $capped
                   | "\n### Human review \(.html_url // "thread") — \(.author // "") \(.path // ""):\(.line // "")\n\n\($capped)\n"
                 end
               '
@@ -1104,6 +1132,7 @@ jobs:
           MIN_CYCLE_SECONDS=720
           NO_CHANGE=0
           NO_CHANGE_REASON=""
+          SENT_THREADS=""
           if [ "$STATUS" -eq 0 ] && [ -n "$PR_URL" ]; then
             ROUND=0
             UNKNOWN_ROUNDS=0
@@ -1129,8 +1158,9 @@ jobs:
               PR_NUM=$(basename "$PR_URL")
               PR_COMMENTS=$(fetch_comments "$PR_NUM")
               ISSUE_COMMENTS=$(fetch_comments "$ISSUE_NUMBER")
-              if [ "$PR_COMMENTS" = "unknown" ] || [ "$ISSUE_COMMENTS" = "unknown" ]; then
-                echo "Could not read PR or issue comments; not treating that as clean"
+              ALL_THREADS=$(fetch_review_threads "$PR_URL")
+              if [ "$PR_COMMENTS" = "unknown" ] || [ "$ISSUE_COMMENTS" = "unknown" ] || [ "$ALL_THREADS" = "unknown" ]; then
+                echo "Could not read PR comments, issue comments, or review threads; not treating that as clean"
                 UNKNOWN_ROUNDS=$((UNKNOWN_ROUNDS + 1))
                 if [ "$UNKNOWN_ROUNDS" -ge 5 ]; then
                   echo "Gave up reading comments after 5 attempts"
@@ -1144,12 +1174,13 @@ jobs:
               SINCE=$(watermark_since "$PR_COMMENTS")
               REVIEWS_JSON=$(filter_reviews "$PR_COMMENTS" "$SINCE")
               SLACK_JSON=$(filter_slack_revise "$ISSUE_COMMENTS" "$SINCE")
-              THREADS_JSON=$(fetch_review_threads "$PR_URL")
+              THREADS_JSON=$(unsent_threads "$ALL_THREADS" "$SENT_THREADS")
               FINDINGS=$(printf '%s' "$REVIEWS_JSON" | jq 'length')
               echo "ai_reviews_remaining=$FINDINGS" >> "$GITHUB_OUTPUT"
               SLACK_N=$(printf '%s' "$SLACK_JSON" | jq 'length')
               echo "slack_requests_remaining=$SLACK_N" >> "$GITHUB_OUTPUT"
               THREAD_N=$(printf '%s' "$THREADS_JSON" | jq 'length')
+              echo "threads_remaining=$THREAD_N" >> "$GITHUB_OUTPUT"
               if [ "${FAILING:-0}" = "0" ] && [ "$FINDINGS" = "0" ] && [ "$SLACK_N" = "0" ] && [ "$THREAD_N" = "0" ]; then
                 echo "CI green and no remaining AI PR Review findings, Slack change requests, or human review threads."
                 break
@@ -1180,6 +1211,7 @@ jobs:
               fi
               reply_to_reviews "$REVIEWS_JSON"
               post_silent_watermark "$PR_NUM"
+              SENT_THREADS=$(printf '%s\n%s' "$SENT_THREADS" "$(printf '%s' "$THREADS_JSON" | jq -r '.[].html_url // empty')")
             done
           fi
           exit $STATUS
@@ -1216,6 +1248,7 @@ jobs:
           AI_REVIEWS_REPLIED: ${{ steps.forge.outputs.ai_reviews_replied }}
           AI_REVIEWS_REPLIED_COUNT: ${{ steps.forge.outputs.ai_reviews_replied_count }}
           SLACK_REQUESTS_REMAINING: ${{ steps.forge.outputs.slack_requests_remaining }}
+          THREADS_REMAINING: ${{ steps.forge.outputs.threads_remaining }}
           FORGE_COMMAND: ${{ inputs.command }}
           OUTCOME: ${{ steps.forge.outcome }}
           ENGINE_TAG: ${{ steps.engine.outputs.engine_tag }}
@@ -1273,6 +1306,8 @@ jobs:
           [ -z "$REMAINING" ] && REMAINING=0
           SLACK_REMAINING="${SLACK_REQUESTS_REMAINING:-0}"
           [ -z "$SLACK_REMAINING" ] && SLACK_REMAINING=0
+          THREADS_LEFT="${THREADS_REMAINING:-0}"
+          [ -z "$THREADS_LEFT" ] && THREADS_LEFT=0
 
           WHO=""
           [ -n "${REQUESTED_BY:-}" ] && WHO="<@${REQUESTED_BY}> "
@@ -1282,18 +1317,19 @@ jobs:
           QUIET=""
           SLACK_TEXT=""
           if [ "${PR_UNRESOLVED:-}" = "1" ]; then
-            FACTS="The PR could not be resolved."
-            QUIET="⚠️ The PR could not be resolved · Took ${TOOK}"
-            BODY=$(printf '🔨 **Forge** — the PR could not be resolved.\n\nTook %s.' "$TOOK")
+            FACTS="No open PR is linked to this issue. Link it with Closes #${ISSUE_NUMBER} in the PR body and ask again."
+            QUIET="⚠️ No open PR linked · Took ${TOOK}"
+            BODY=$(printf '🔨 **Forge** — no open PR is linked to this issue, so there is nothing to revise.\n\nAdd `Closes #%s` to the PR body and ask again.\n\nTook %s.' "$ISSUE_NUMBER" "$TOOK")
             LABEL="forge:failed"
-            SLACK_TEXT=$(printf '%s⚠️ %s — the PR could not be resolved.\nTook %s.' "$WHO" "$ISSUE_LINK" "$TOOK")
+            SLACK_TEXT=$(printf '%s⚠️ %s — no open PR is linked to this issue. Add Closes #%s to the PR body and ask again.\nTook %s.' "$WHO" "$ISSUE_LINK" "$ISSUE_NUMBER" "$TOOK")
           elif [ "${NO_CHANGE:-}" = "1" ]; then
             REASON="${NO_CHANGE_REASON:-The revision produced no changes}"
+            REASON_SLACK=$(printf '%s' "$REASON" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' | cut -c1-500)
             FACTS="Nothing was committed. ${REASON}"
             QUIET="✅ No change · Took ${TOOK}"
             BODY=$(printf '🔨 **Forge** — nothing was committed.\n\n%s\n\nTook %s.' "$REASON" "$TOOK")
             LABEL="forge:done"
-            SLACK_TEXT=$(printf '%s✅ %s — nothing was committed.\n%s\nTook %s.' "$WHO" "$ISSUE_LINK" "$REASON" "$TOOK")
+            SLACK_TEXT=$(printf '%s✅ %s — nothing was committed.\n%s\nTook %s.' "$WHO" "$ISSUE_LINK" "$REASON_SLACK" "$TOOK")
           elif [ "$OUTCOME" = "success" ] && [ -z "${PR_URL:-}" ]; then
             FACTS="No code change needed."
             QUIET="✅ No code change needed · Took ${TOOK}"
@@ -1313,6 +1349,9 @@ jobs:
               EMOJI="⚠️"
             elif [ "${CI_PENDING:-0}" != "0" ]; then
               FACTS="CI still running: ${CI_PENDING} checks pending — see the run log."
+              EMOJI="⚠️"
+            elif [ "$THREADS_LEFT" != "0" ]; then
+              FACTS="All CI is green, but ${THREADS_LEFT} human review threads were not addressed — see the run log."
               EMOJI="⚠️"
             elif [ "$SLACK_REMAINING" != "0" ]; then
               FACTS="All CI is green, but ${SLACK_REMAINING} Slack change requests were not addressed — see the run log."
