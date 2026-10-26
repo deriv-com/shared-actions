@@ -936,7 +936,7 @@ jobs:
               -F owner="$owner" \
               -F name="$name" \
               -F number="$num" \
-              -f query='query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){ pullRequest(number:$number){ reviewThreads(first:100){ nodes { isResolved comments(first:1){ nodes { url author { login } body path line } } } } } } } }' \
+              -f query='query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){ pullRequest(number:$number){ reviewThreads(first:100){ nodes { isResolved comments(first:1){ nodes { url author { login } body path line } } } } } } }' \
               --jq '[.data.repository.pullRequest.reviewThreads.nodes[]? | select(.isResolved|not) | .comments.nodes[0] | select(.) | {html_url:(.url // ""), author:(.author.login // ""), path:(.path // ""), line:(.line // 0), body:(.body // "")}]' \
               2>/dev/null) || { echo "unknown"; return; }
             if ! printf '%s' "$json" | jq -e 'type == "array"' >/dev/null 2>&1; then
@@ -1283,24 +1283,35 @@ jobs:
           fi
           TOOK=$(format_took $(( $(date -u +%s) - PROGRESS_EPOCH )))
 
-          CI_FAILING=0
-          CI_PENDING=0
-          CI_FAILING_NAMES=""
-          CI_STATE="unknown"
-          if [ -n "${PR_URL:-}" ]; then
-            # GitHub Actions runs this script with bash -e. gh pr checks exits 8
-            # when any check is failing or pending, so turn -e off around the read.
+          read_pr_checks() {
+            local pr_url="$1" rc
+            CI_FAILING=0
+            CI_PENDING=0
+            CI_FAILING_NAMES=""
+            CI_STATE="unknown"
+            # GitHub Actions runs this script with bash -e. gh pr checks exits 1
+            # when a check failed and 8 when one is pending, so turn -e off
+            # around the read.
             set +e
-            CHECKS=$(gh pr checks "$PR_URL" 2>/dev/null)
+            CHECKS=$(gh pr checks "$pr_url" 2>/dev/null)
             rc=$?
             set -e
-            # A non-zero exit can still be a successful read.
-            if [ "$rc" -eq 0 ] || { [ "$rc" -eq 8 ] && [ -n "$CHECKS" ]; }; then
+            # Exit 1 or 8 with output is a successful read. Exit 1 with no
+            # output is a real error (or no checks at all).
+            if [ "$rc" -eq 0 ] || { { [ "$rc" -eq 1 ] || [ "$rc" -eq 8 ]; } && [ -n "$CHECKS" ]; }; then
               CI_STATE="ok"
               CI_FAILING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="fail" && tolower($1) !~ /trivy/ {c++} END{print c+0}')
               CI_PENDING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="pending"{c++} END{print c+0}')
               CI_FAILING_NAMES=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{sep=""} $2=="fail" && tolower($1) !~ /trivy/ && n<5 {printf "%s%s", sep, $1; sep=", "; n++}')
             fi
+          }
+
+          CI_FAILING=0
+          CI_PENDING=0
+          CI_FAILING_NAMES=""
+          CI_STATE="unknown"
+          if [ -n "${PR_URL:-}" ]; then
+            read_pr_checks "$PR_URL"
           fi
           echo "ci_failing=$CI_FAILING"
           echo "ci_pending=$CI_PENDING"

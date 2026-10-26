@@ -411,6 +411,71 @@ check 'awk "
 " "$WF"' \
   "Report does not count Trivy as blocking CI"
 
+# --- GraphQL queries must parse ---------------------------------------------
+# String matches let a query GitHub cannot parse ship (8 `{`, 9 `}` in the
+# review-thread query). No GraphQL parser is installed here, so this checks
+# that brackets balance; forge-agent parses the same file with graphql-js.
+QUERY_REPORT=$(python3 - "$WF" <<'PY'
+import re, sys
+src = open(sys.argv[1]).read()
+queries = re.findall(r"-f query='([^']*)'", src)
+bad = []
+for q in queries:
+    depth = {"{": 0, "(": 0}
+    pairs = {"}": "{", ")": "("}
+    ok = True
+    for ch in q:
+        if ch in depth:
+            depth[ch] += 1
+        elif ch in pairs:
+            depth[pairs[ch]] -= 1
+            if depth[pairs[ch]] < 0:
+                ok = False
+    if not ok or any(depth.values()):
+        bad.append(q[:80])
+print(len(queries))
+for b in bad:
+    print("UNBALANCED: " + b)
+PY
+)
+check '[ "$(printf "%s\n" "$QUERY_REPORT" | head -1)" -ge 3 ]' \
+  "found the workflow's GraphQL queries"
+check '! printf "%s\n" "$QUERY_REPORT" | grep -q UNBALANCED' \
+  "every GraphQL query has balanced braces and parentheses"
+
+# --- behavioral: workflow functions against a fake gh -----------------------
+# Each function is cut from forge.yml verbatim (10-space run-block indent).
+extract_fn() {
+  awk -v name="$1" '
+    $0 == "          " name "() {" {f=1}
+    f { end = ($0 == "          }"); sub(/^          /, ""); print; if (end) exit }
+  ' "$WF"
+}
+TMP_BEHAVIOR=$(mktemp -d)
+trap 'rm -rf "$TMP_BEHAVIOR"' EXIT
+
+READ_PR_CHECKS=$(extract_fn read_pr_checks)
+check '[ -n "$READ_PR_CHECKS" ]' "Report reads checks through read_pr_checks"
+pr_checks_case() {  # pr_checks_case <gh exit> <gh stdout>
+  GH_RC="$1" GH_OUT="$2" bash -c "
+    gh() { [ -n \"\$GH_OUT\" ] && printf '%s\n' \"\$GH_OUT\"; return \"\$GH_RC\"; }
+    $READ_PR_CHECKS
+    read_pr_checks https://github.com/o/r/pull/1
+    printf '%s %s %s %s\n' \"\$CI_STATE\" \"\$CI_FAILING\" \"\$CI_PENDING\" \"\$CI_FAILING_NAMES\"
+  "
+}
+CHECKS_FAIL=$'E2E smoke\tfail\t4s\thttps://x/1\t\nTrivy SCA\tfail\t1s\thttps://x/2\t\ntest\tpass\t4m\thttps://x/3\t\nlint\tfail\t9s\thttps://x/4\t'
+CHECKS_PENDING=$'test\tpending\t0\thttps://x/3\t\nlint\tpass\t9s\thttps://x/4\t'
+check '[ "$(pr_checks_case 1 "$CHECKS_FAIL")" = "ok 2 0 E2E smoke, lint" ]' \
+  "gh pr checks exit 1 with output is a read with failures, not CI state unknown"
+check '[ "$(pr_checks_case 8 "$CHECKS_PENDING")" = "ok 0 1 " ]' \
+  "gh pr checks exit 8 with output is a read with pending checks"
+CHECKS_GREEN=$'test\tpass\t4m\thttps://x/3\t'
+check '[ "$(pr_checks_case 0 "$CHECKS_GREEN")" = "ok 0 0 " ]' \
+  "gh pr checks exit 0 is a green read"
+check '[ "$(pr_checks_case 1 "")" = "unknown 0 0 " ]' \
+  "gh pr checks exit 1 with no output stays CI state unknown"
+
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"
   exit 1
