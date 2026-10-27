@@ -385,12 +385,14 @@ check 'awk "
   l && /run_branch_revise|wait_for_rollup/ {exit (r ? 0 : 1)}
 " "$WF"' \
   "remint_write_token runs at the top of every wait+revise round"
-check 'awk "
-  /slack_progress \"Opening the PR\"/ {s=1}
-  s && /remint_write_token/ {r=1}
-  s && /run_dstp/ {exit (r ? 0 : 1)}
-" "$WF"' \
-  "remint_write_token runs immediately before the initial run_dstp"
+for fn in run_dstp run_branch_revise; do
+  check 'awk -v fn="$fn" "
+    \$0 == \"          \" fn \"() {\" {f=1}
+    f && /remint_write_token 0\$/ {r=1}
+    f && /node \"\\\$FORGE_CLI\"/ {exit (r ? 0 : 1)}
+  " "$WF"' \
+    "$fn remints the write token right before it spawns dstp"
+done
 check 'grep -q "http.https://github.com/.extraheader" "$WF"' \
   "remint refreshes git extraheader so git push uses the new token"
 check 'awk "
@@ -889,6 +891,27 @@ BIG_OUT=$(B="$BIG" GITHUB_REPOSITORY=o/r bash -c "
 " 2>&1)
 check '[ "$BIG_OUT" = "[{\"name\":\"lint\",\"base\":\"failing\"},{\"name\":\"E2E\",\"base\":\"none\"},{\"name\":\"Playwright Mobile Landscape\",\"base\":\"none\"}]" ]' \
   "base check runs over the argument size limit still classify the PR's failing checks, skipping the SCA scan but not a name that only contains sca (got ${BIG_OUT:0:200})"
+
+# remint_write_token mints by token age: 45 minutes by default, always with 0.
+REMINT=$(extract_fn remint_write_token)
+REMINT_OUT=$(bash -c "
+  node() { printf jwt; }
+  curl() { echo mint >&2; printf '{\"token\":\"fresh\"}'; }
+  git() { :; }
+  $REMINT
+  WRITE_APP_ID=1 APP_KEY=k WRITE_INSTALLATION_ID=2 GH_TOKEN=old
+  now=\$(date -u +%s)
+  WRITE_TOKEN_EPOCH=\$((now - 600)); remint_write_token >/dev/null
+  printf 'young=%s ' \"\$GH_TOKEN\"
+  remint_write_token 0 >/dev/null
+  printf 'forced=%s ' \"\$GH_TOKEN\"
+  GH_TOKEN=old; remint_write_token >/dev/null
+  printf 'after=%s ' \"\$GH_TOKEN\"
+  WRITE_TOKEN_EPOCH=\$((now - 2800)); remint_write_token >/dev/null
+  printf 'old=%s' \"\$GH_TOKEN\"
+" 2>/dev/null)
+check '[ "$REMINT_OUT" = "young=old forced=fresh after=old old=fresh" ]' \
+  "remint_write_token skips a token younger than 45 minutes, always mints with 0, and restarts the age on success (got $REMINT_OUT)"
 
 # edit_pr keeps the issue link: added once, after a blank line and a rule,
 # only when the new description does not already close the issue.

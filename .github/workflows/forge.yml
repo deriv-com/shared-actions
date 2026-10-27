@@ -173,8 +173,10 @@ on:
         type: boolean
       timeout_minutes:
         description: >-
-          Job timeout. App installation tokens expire after ~1 hour; Run Forge
-          remints the write token around minute 45, and Report mints a fresh
+          Job timeout. App installation tokens expire after ~1 hour. Run Forge
+          remints the write token before every dstp run (a running dstp keeps
+          its token, so one run longer than an hour can still fail its push)
+          and once it is 45 minutes old between runs. Report mints a fresh
           token so the wrap-up can still authenticate.
         required: false
         default: 90
@@ -621,13 +623,16 @@ jobs:
             fi
           }
 
-          # App installation tokens last ~1 hour. Remint after 45 minutes so
-          # a 90-minute job can still push and comment.
+          # App installation tokens last ~1 hour, and a running dstp keeps the
+          # token it was spawned with. So every dstp spawn remints first
+          # (`remint_write_token 0`), giving each run a full hour, and the
+          # workflow's own gh/git calls remint once the token is 45 minutes old.
+          # One dstp run longer than an hour can still fail its push.
+          # remint_write_token [max token age in seconds, default 2700]
           remint_write_token() {
-            local elapsed now jwt token
+            local max_age="${1:-2700}" now jwt token
             now=$(date -u +%s)
-            elapsed=$(( now - ${PROGRESS_EPOCH:-now} ))
-            if [ "$elapsed" -lt 2700 ]; then
+            if [ $(( now - ${WRITE_TOKEN_EPOCH:-0} )) -lt "$max_age" ]; then
               return 0
             fi
             if [ -z "${WRITE_APP_ID:-}" ] || [ -z "${APP_KEY:-}" ] || [ -z "${WRITE_INSTALLATION_ID:-}" ]; then
@@ -651,6 +656,7 @@ jobs:
               -H "X-GitHub-Api-Version: 2022-11-28" \
               | jq -r '.token // empty') || true
             if [ -n "$token" ]; then
+              WRITE_TOKEN_EPOCH=$now
               export GH_TOKEN="$token"
               export GITHUB_TOKEN="$token"
               auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
@@ -746,6 +752,7 @@ jobs:
               ARGS+=(--fast)
             fi
             echo "Running: dstp ${ARGS[*]}"
+            remint_write_token 0
             node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || return $?
             local RESULT
             RESULT=$(grep -oE '^\{.*\}$' /tmp/forge.log | tail -1 || true)
@@ -799,6 +806,7 @@ jobs:
             fi
             echo "Running: dstp revise $branch <instruction> --cwd . --unattended --json"
             local rc=0
+            remint_write_token 0
             node "$FORGE_CLI" revise "$branch" "$(cat "$instruction_file")" --cwd . --unattended --json 2>&1 | tee /tmp/forge.log || rc=$?
             read_revise_result /tmp/forge.log || return 1
             [ "${NO_CHANGE:-0}" = "1" ] && return 0
@@ -812,6 +820,9 @@ jobs:
           else
             START_EPOCH=$SCRIPT_START
           fi
+          # The job-start token was minted after the run was created, so this
+          # overstates its age and reminting errs early.
+          WRITE_TOKEN_EPOCH=$START_EPOCH
           if [[ "${SLACK_STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
             PROGRESS_EPOCH=$SLACK_STARTED_AT
           else
@@ -1494,8 +1505,6 @@ jobs:
             fi
           else
             slack_progress "Opening the PR"
-            # Remint cannot change a child already running; dstp still holds the token it inherited at spawn.
-            remint_write_token
             run_dstp "$COMMAND" || STATUS=$?
             STATUS=${STATUS:-0}
             PR_URL=$(github_pr_url "$(grep -oE '^\{.*\}$' /tmp/forge.log | tail -1 | jq -r '.pr_url // empty' || true)")
