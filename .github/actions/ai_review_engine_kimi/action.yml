@@ -68,13 +68,13 @@ inputs:
     required: false
     default: ""
   cli_version:
-    description: "Exact @moonshot-ai/kimi-code version to install. Pinned deliberately — the package ships frequent releases (2.3.3 was announced 2026-10-26 but is not yet installable from npm, so the pin stays on 2.3.2 until it is), so `latest` risks both breaking changes and unreviewed code in a privileged job. Bump via PR."
+    description: "Exact @moonshot-ai/kimi-code version to install. Pinned deliberately — the package ships frequent releases, so `latest` risks both breaking changes and unreviewed code in a privileged job. Bump via PR."
     required: false
     default: "2.3.2"
   node_version:
-    description: "Node.js version used to install and run the CLI."
+    description: "Node.js version used to install and run the CLI. Must satisfy the CLI's minimum (kimi-code 2.3.2 requires Node >=22.19.0); the default pins the 22.19 line so a stale cached 22.x on a persistent runner cannot satisfy it."
     required: false
-    default: "22"
+    default: "22.19"
 
 outputs:
   output_path:
@@ -149,8 +149,9 @@ runs:
         #      below are not applied in `-p` mode at all — a config with a bare
         #      `deny Read` still read files and `deny Write` still wrote into the
         #      checkout (verified against a mock model endpoint while fixing
-        #      HackerOne #4037167; the `deny Write` half re-verified on 2.3.2).
-        #      They stay as a statement of intent, and for the version that
+        #      HackerOne #4037167; both halves re-verified the same way on
+        #      kimi-code 2.3.2). They stay as a statement of intent, and for
+        #      the version that
         #      honours them; never treat them as enforcement.
         #
         # $HOME/.kimi-code is recreated rather than merged: on a persistent
@@ -222,8 +223,11 @@ runs:
 
         # Load-bearing, not a smoke test. When a section of config.toml fails
         # schema validation, the CLI's config loader (salvageConfigData in
-        # kimi-code 2.3.2) DROPS that whole section and carries on, so a
-        # `[[hooks]]` entry that stopped validating after a cli_version bump
+        # kimi-code 2.3.2 — still present in that build, and the drop itself
+        # re-verified against a mock endpoint: the CLI prints "Ignored invalid
+        # config section 'hooks'" and runs on without it) DROPS that whole
+        # section and carries on, so a `[[hooks]]` entry that stopped
+        # validating after a cli_version bump
         # would remove the path guard with no error and the review would run
         # unconfined. `kimi doctor config` validates the same file against the
         # same schemas and exits 1 on any failing section, which fails this step

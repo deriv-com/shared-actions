@@ -190,14 +190,18 @@ check 'grep -qF "inputs.claude_model || '\''${ANTH_DEFAULT_MODEL}'\''" "$DEPRECA
 # Kimi CLI version. Every live copy of the pin must match, so a bump that
 # misses one fails here instead of shipping to every consumer. The copies:
 # the resolve-step arm in ai-pr-review.yml, the engine action's own default,
-# and the README inputs table. (2.3.3 was announced 2026-10-26 but is not yet
-# installable from npm; the pin targets 2.3.2 until it is.)
+# and the README inputs table. Each check is scoped to its own copy (the kimi
+# arm, the cli_version input block, the kimi cell) with fixed-string matches,
+# so another engine's copy, a commented-out line, or a near-miss version
+# cannot satisfy it.
 KIMI_CLI_VERSION="2.3.2"
-check 'grep -q "DEFAULT_CLI_VERSION=\"${KIMI_CLI_VERSION}\"" "$WF"' "kimi arm pins DEFAULT_CLI_VERSION=${KIMI_CLI_VERSION}"
-check 'grep -qF "default: \"${KIMI_CLI_VERSION}\"" "$KIMI"' "kimi engine action defaults cli_version to ${KIMI_CLI_VERSION}"
+KIMI_ARM="$(awk '/^            kimi\)/{f=1} f{print} f && /;;/{exit}' "$WF")"
+check 'grep -qF "              DEFAULT_CLI_VERSION=\"${KIMI_CLI_VERSION}\"" <<< "$KIMI_ARM"' "kimi arm pins DEFAULT_CLI_VERSION=${KIMI_CLI_VERSION}"
+KIMI_CLI_INPUT="$(awk '/^  cli_version:/{f=1; next} f && /^  [a-z_]+:/{exit} f' "$KIMI")"
+check 'grep -qF "default: \"${KIMI_CLI_VERSION}\"" <<< "$KIMI_CLI_INPUT"' "kimi engine action defaults cli_version to ${KIMI_CLI_VERSION}"
 # Match only the kimi cell (first column of the per-engine list), so a grok or
 # codex bump cannot satisfy or fail it.
-check 'grep -qE "per engine \(\`${KIMI_CLI_VERSION}\` kimi," "$README"' "README inputs table lists ${KIMI_CLI_VERSION} for kimi"
+check 'grep -qF "per engine (\`${KIMI_CLI_VERSION}\` kimi," "$README"' "README inputs table lists ${KIMI_CLI_VERSION} for kimi"
 
 # Dispatch: an if-gated step referencing the codex engine by absolute @master path.
 check 'grep -q "if: steps.engine.outputs.engine == '\''codex'\''" "$WF"' "codex dispatch step is if-gated on the engine output"
