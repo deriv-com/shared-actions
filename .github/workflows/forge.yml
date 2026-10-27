@@ -259,6 +259,11 @@ jobs:
       IGNORED_SCAN_JQ: 'def is_ignored_scan: ($ENV.IGNORED_CHECKS_RE // "") as $re | ($re != "" and ((.name // .context // "") | test($re; "i")));'
 
     steps:
+      # Before any token is minted: Run Forge measures job time and token age
+      # from here, so the token's age is overstated and never understated.
+      - name: Record job start
+        run: echo "FORGE_JOB_START=$(date -u +%s)" >> "$GITHUB_ENV"
+
       # ---- tokens --------------------------------------------------------
       - name: Mint token for the target repo (labels, comments, branch, PR)
         id: repo-token
@@ -272,6 +277,8 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
           permission-checks: read
+          # gh run view --log-failed, for the failed-check logs sent to dstp.
+          permission-actions: read
 
       # No authorization gate, by design. Forge only opens a PR — it cannot merge
       # or edit anything, the target repos are private (so anyone who can see the
@@ -647,10 +654,12 @@ jobs:
           # token it was spawned with. So each dstp spawn gets a token at most
           # 5 minutes old (`remint_write_token 300`), and the workflow's own
           # gh/git calls remint once the token is 30 minutes old: at the top of
-          # every round and after every revise, before the reply pass. One dstp
-          # run longer than ~55 minutes can still fail its push.
+          # every round and after every revise. The replies are posted with a
+          # token at most 5 minutes old, since the reply pass has no time limit.
+          # One dstp run longer than ~55 minutes can still fail its push.
           # A remint is scoped like the job-start token (this repo, the same
-          # permissions); a POST with no body returns an installation-wide
+          # permissions, including actions read for the failed-check logs);
+          # a POST with no body returns an installation-wide
           # token. The token it replaces is revoked, and the last one on exit.
           # remint_write_token [max token age in seconds, default 1800]
           remint_write_token() {
@@ -674,7 +683,7 @@ jobs:
               process.stdout.write(`${header}.${payload}.${sign}`);
             ') || return 0
             scope=$(jq -nc --arg repo "${GITHUB_REPOSITORY#*/}" \
-              '{repositories: [$repo], permissions: {contents: "write", issues: "write", pull_requests: "write", checks: "read"}}')
+              '{repositories: [$repo], permissions: {contents: "write", issues: "write", pull_requests: "write", checks: "read", actions: "read"}}')
             token=$(printf '%s' "$scope" | curl -sS --connect-timeout 10 --max-time 30 \
               -X POST "https://api.github.com/app/installations/${WRITE_INSTALLATION_ID}/access_tokens" \
               -H "Authorization: Bearer ${jwt}" \
@@ -859,17 +868,17 @@ jobs:
           }
 
           SCRIPT_START=$(date -u +%s)
-          # run_started_at resets on each attempt; created_at would make a
-          # "Re-run jobs" hours later start with no job time left.
-          RUN_STARTED=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .run_started_at 2>/dev/null || true)
-          if [ -n "$RUN_STARTED" ] && START_EPOCH=$(date -u -d "$RUN_STARTED" +%s 2>/dev/null); then
-            :
+          # timeout-minutes counts from the job's start, which resets on
+          # "Re-run jobs". The job-start token was minted after it, so its age
+          # is overstated and reminting errs early. Without the record its age
+          # is unknown, so WRITE_TOKEN_EPOCH=0 makes the first dstp spawn remint.
+          if [[ "${FORGE_JOB_START:-}" =~ ^[0-9]+$ ]]; then
+            START_EPOCH=$FORGE_JOB_START
+            WRITE_TOKEN_EPOCH=$FORGE_JOB_START
           else
             START_EPOCH=$SCRIPT_START
+            WRITE_TOKEN_EPOCH=0
           fi
-          # The job-start token was minted after the attempt started, so this
-          # overstates its age and reminting errs early.
-          WRITE_TOKEN_EPOCH=$START_EPOCH
           if [[ "${SLACK_STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
             PROGRESS_EPOCH=$SLACK_STARTED_AT
           else
@@ -960,8 +969,8 @@ jobs:
           }
 
           # Reads go through gh_read. It prints the body and returns 0, 1 for an
-          # HTTP 4xx (a retry cannot help), or 2 for anything else (5xx, network
-          # error or timeout). Any
+          # HTTP 4xx other than a rate limit (a retry cannot help), or 2 for
+          # anything else (rate limit, 5xx, network error or timeout). Any
           # GraphQL errors[] is fatal: a query GitHub cannot parse never will.
           gh_read() {
             local out err rc=0 msg
@@ -978,7 +987,11 @@ jobs:
               rm -f "$err"
               echo "GitHub API error: ${msg:-gh exited $rc}" >&2
               # Decided by the error alone: a --paginate read that drops on a
-              # later page has already printed the earlier pages.
+              # later page has already printed the earlier pages. Rate limits
+              # (429, or a 403 that says so) pass with time.
+              if printf '%s' "$msg" | grep -qiE 'HTTP 429|rate limit'; then
+                return 2
+              fi
               if printf '%s' "$msg" | grep -qE 'HTTP 4[0-9][0-9]'; then
                 return 1
               fi
@@ -1499,6 +1512,9 @@ jobs:
               fi
             fi
             THREADS_TOTAL=$((THREADS_TOTAL + $(jq '.threads | length' "$items")))
+            # The reply pass has no time limit, so the token from before it may
+            # have expired.
+            remint_write_token 300 >/dev/null
             post_thread_replies "$items" "$reply_file"
             post_pr_comment "$items" "$reply_file"
             [ -n "$ask" ] && edit_pr "$ask" "$reply_file" "$items"
@@ -1670,8 +1686,9 @@ jobs:
               slack_progress "Revising round ${ROUND} of ${MAX_REVISE}"
               REVISE_STATUS=0
               run_branch_revise /tmp/forge-revise-instruction.md || REVISE_STATUS=$?
-              # The token dstp ran with may be nearly an hour old; the reply
-              # pass, replies and watermark must not post with it.
+              # The token dstp ran with may be nearly an hour old; the reads
+              # before the reply pass must not use it. reply_to_reviews remints
+              # again before it posts.
               remint_write_token
               if [ "$REVISE_STATUS" -ne 0 ] && [ "${NO_CHANGE:-0}" != "1" ]; then
                 echo "dstp revise failed after a PR already exists; leaving the PR in place"

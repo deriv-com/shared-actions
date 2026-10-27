@@ -395,14 +395,41 @@ for fn in run_dstp run_branch_revise; do
 done
 check 'awk "
   /run_branch_revise \/tmp\/forge-revise-instruction.md \|\| REVISE_STATUS/ {f=1; next}
+  f && /^ *#/ {next}
   f && /remint_write_token\$/ {exit 0}
   f && /reply_to_reviews|post_review_replies|REVISE_STATUS\" -ne 0/ {exit 1}
 " "$WF"' \
   "the write token is reminted after every revise, before the reply pass posts"
 check 'grep -q "^          trap revoke_reminted_token EXIT\$" "$WF"' \
   "the last reminted token is revoked when Run Forge exits"
-check 'grep -q -- "--jq .run_started_at" "$WF" && ! grep -q -- "--jq .created_at" "$WF"' \
-  "job time is measured from this attempt's run_started_at, not the run's created_at"
+check 'awk "
+  /^    steps:\$/ {s=1; next}
+  s && /^      - name: / {exit (\$0 == \"      - name: Record job start\" ? 0 : 1)}
+" "$WF" && grep -q "^        run: echo \"FORGE_JOB_START=\$(date -u +%s)\" >> \"\$GITHUB_ENV\"\$" "$WF"' \
+  "the job's first step records its start, before any token is minted"
+check 'awk "
+  /SCRIPT_START=\\\$\\(date -u \\+%s\\)/ {f=1}
+  f && /START_EPOCH=\\\$FORGE_JOB_START/ {j=1}
+  f && /WRITE_TOKEN_EPOCH=\\\$FORGE_JOB_START/ {t=1}
+  f && /WRITE_TOKEN_EPOCH=0\$/ {z=1}
+  f && /remaining_job_seconds\\(\\)/ {exit (j && t && z ? 0 : 1)}
+" "$WF"' \
+  "job time and token age count from the recorded job start; without it the first dstp spawn remints"
+check '! grep -q "actions/runs/\${GITHUB_RUN_ID}" "$WF"' \
+  "the start time does not depend on an Actions API read"
+check 'awk "
+  /^          reply_to_reviews\\(\\) \\{/ {f=1}
+  f && /CLAUDE_BIN\" -p/ {c=1}
+  f && /remint_write_token 300/ {r=c}
+  f && /^            post_thread_replies / {exit (r ? 0 : 1)}
+" "$WF"' \
+  "reply_to_reviews remints right before posting, after the reply pass"
+check 'awk "
+  /id: repo-token/ {f=1}
+  f && /permission-actions: read/ {exit 0}
+  f && /^      - name: / {exit 1}
+" "$WF"' \
+  "the job-start token can read failed-check logs (actions read)"
 check 'grep -q "http.https://github.com/.extraheader" "$WF"' \
   "remint refreshes git extraheader so git push uses the new token"
 check 'awk "
@@ -989,7 +1016,7 @@ REMINT_OUT=$(REMINT_DIR="$REMINT_DIR" bash -c "
   WRITE_TOKEN_EPOCH=\$((now - 1900)); remint_write_token >/dev/null
   printf 'old=%s' \"\$GH_TOKEN\"
 " 2>/dev/null)
-REMINT_SCOPE='{"repositories":["r"],"permissions":{"contents":"write","issues":"write","pull_requests":"write","checks":"read"}}'
+REMINT_SCOPE='{"repositories":["r"],"permissions":{"contents":"write","issues":"write","pull_requests":"write","checks":"read","actions":"read"}}'
 REMINT_LOG=$(cat "$REMINT_DIR/log" 2>/dev/null)
 check '[ "$REMINT_OUT" = "young=start spawn=t1 again=t1 old=t2" ]' \
   "remint_write_token keeps a token younger than 30 minutes, mints before a spawn once it is 5 minutes old, and restarts the age on success (got $REMINT_OUT)"
@@ -1006,9 +1033,9 @@ gh_read_rc() {  # gh_read_rc <gh stdout> <gh stderr>  -> prints gh_read's status
     gh_read api x >/dev/null 2>&1; echo \$?
   "
 }
-GH_READ_RCS="$(gh_read_rc '[{"name":"a"}]' 'read: connection reset by peer') $(gh_read_rc '[{"name":"a"}]' 'HTTP 502: Bad Gateway') $(gh_read_rc '' 'HTTP 404: Not Found') $(gh_read_rc '[{"name":"a"}]' 'HTTP 422: Unprocessable Entity')"
-check '[ "$GH_READ_RCS" = "2 2 1 1" ]' \
-  "gh_read retries a partial paginated read on a network error or 5xx, and gives up only on a 4xx (got $GH_READ_RCS)"
+GH_READ_RCS="$(gh_read_rc '[{"name":"a"}]' 'read: connection reset by peer') $(gh_read_rc '[{"name":"a"}]' 'HTTP 502: Bad Gateway') $(gh_read_rc '' 'HTTP 404: Not Found') $(gh_read_rc '[{"name":"a"}]' 'HTTP 422: Unprocessable Entity') $(gh_read_rc '' 'HTTP 429: Too Many Requests') $(gh_read_rc '[{"name":"a"}]' 'HTTP 403: You have exceeded a secondary rate limit') $(gh_read_rc '' 'HTTP 403: Resource not accessible by integration')"
+check '[ "$GH_READ_RCS" = "2 2 1 1 2 2 1" ]' \
+  "gh_read retries a partial paginated read on a network error, 5xx or rate limit, and gives up only on another 4xx (got $GH_READ_RCS)"
 
 # edit_pr keeps the issue link: added once, after a blank line and a rule,
 # only when the new description does not already close the issue.
