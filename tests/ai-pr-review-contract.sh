@@ -542,9 +542,20 @@ check '[[ -f "$PROMPT" ]]' "review prompt file exists"
 check 'grep -q "If that text contradicts the code in the same diff, or two parts of it contradict each other, that is a Change." "$PROMPT"' "prompt treats a spec contradiction in the diff as a Change"
 check 'grep -q "{{AUTO_FIX_URL}}" "$PROMPT"' "prompt leaves the Click2Fix placeholder"
 check 'grep -q "Under 500 words." "$PROMPT"' "prompt caps the review at 500 words"
-check 'grep -q "github.workflow_ref" "$WF"' "workflow fetches the prompt from the called workflow ref"
-check '! grep -q "github.workflow_sha" "$WF"' "workflow does not fetch the prompt at the caller merge SHA"
-check 'grep -q ".github/prompts/ai-pr-review.md" "$WF"' "workflow default URL points at the prompt file"
+check 'grep -q ".github/prompts/ai-pr-review.md" "$WF"' "workflow names the in-repo prompt file"
+if python3 - "$WF" "$PROMPT" <<'PY'
+import base64, pathlib, re, sys
+wf = pathlib.Path(sys.argv[1]).read_text()
+m = re.search(r"^          PROMPT_B64: (\S+)\s*$", wf, re.M)
+if not m:
+    sys.exit(1)
+got = base64.b64decode(m.group(1))
+want = pathlib.Path(sys.argv[2]).read_bytes()
+sys.exit(0 if got == want else 1)
+PY
+then echo "PASS: inlined prompt matches .github/prompts/ai-pr-review.md"
+else echo "FAIL: inlined prompt matches .github/prompts/ai-pr-review.md"; fail=1
+fi
 check '! grep -q "Read its dependencies" "$WF"' "procedure does not tell the model to read every dependency"
 check 'grep -q "When the diff edits a spec or design doc" "$WF"' "procedure includes the spec-doc step"
 check '! grep -q "it was not touched" "$WF"' "incremental diff does not treat an absent pattern as untouched"
