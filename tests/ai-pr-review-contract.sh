@@ -196,9 +196,9 @@ check 'grep -qF "inputs.claude_model || '\''${ANTH_DEFAULT_MODEL}'\''" "$DEPRECA
 # cannot satisfy it.
 KIMI_CLI_VERSION="2.3.2"
 KIMI_ARM="$(awk '/^            kimi\)/{f=1} f{print} f && /;;/{exit}' "$WF")"
-check 'grep -qF "              DEFAULT_CLI_VERSION=\"${KIMI_CLI_VERSION}\"" <<< "$KIMI_ARM"' "kimi arm pins DEFAULT_CLI_VERSION=${KIMI_CLI_VERSION}"
+check 'grep -qxF "              DEFAULT_CLI_VERSION=\"${KIMI_CLI_VERSION}\"" <<< "$KIMI_ARM"' "kimi arm pins DEFAULT_CLI_VERSION=${KIMI_CLI_VERSION}"
 KIMI_CLI_INPUT="$(awk '/^  cli_version:/{f=1; next} f && /^  [a-z_]+:/{exit} f' "$KIMI")"
-check 'grep -qF "default: \"${KIMI_CLI_VERSION}\"" <<< "$KIMI_CLI_INPUT"' "kimi engine action defaults cli_version to ${KIMI_CLI_VERSION}"
+check 'grep -qxF "    default: \"${KIMI_CLI_VERSION}\"" <<< "$KIMI_CLI_INPUT"' "kimi engine action defaults cli_version to ${KIMI_CLI_VERSION}"
 # Match only the kimi cell (first column of the per-engine list), so a grok or
 # codex bump cannot satisfy or fail it.
 check 'grep -qF "per engine (\`${KIMI_CLI_VERSION}\` kimi," "$README"' "README inputs table lists ${KIMI_CLI_VERSION} for kimi"

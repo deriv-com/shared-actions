@@ -11,12 +11,13 @@
 // Exit 0 allows the call. Exit 2 denies it and hands stderr to the model as the
 // reason. Anything unexpected also exits 2: this guard fails closed.
 //
-// Why a hook at all: kimi-code 2.3.2 does not apply `[[permission.rules]]`
-// when run as `kimi -p` (verified against a mock model endpoint while fixing
-// HackerOne #4037167; re-verified on 2.3.2 — a bare `deny Read` still read
-// files and a bare `deny Write` still wrote into the checkout), and Claude
-// Code's `--allowedTools` has no path scope for Read at all. In both engines
-// this is the only thing confining paths, and the
+// Why a hook at all: kimi-code does not apply `[[permission.rules]]`
+// when run as `kimi -p` (found on kimi-code 0.34.0 against a mock model
+// endpoint while fixing HackerOne #4037167; re-verified on kimi-code 2.3.2 —
+// a bare `deny Read` still read files and a bare `deny Write` still wrote
+// into the checkout), and Claude Code's `--allowedTools` has no path scope
+// for Read at all. In both engines this is the only thing confining paths,
+// and the
 // CLI process's own environment (readable through /proc without it) carries
 // the LLM key — and, for Claude Code, the job's GitHub token.
 //

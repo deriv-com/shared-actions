@@ -72,9 +72,9 @@ inputs:
     required: false
     default: "2.3.2"
   node_version:
-    description: "Node.js version used to install and run the CLI. Must satisfy the CLI's minimum (kimi-code 2.3.2 requires Node >=22.19.0); the default pins the 22.19 line so a stale cached 22.x on a persistent runner cannot satisfy it."
+    description: "Node.js version used to install and run the CLI, as a setup-node version spec. kimi-code 2.3.2 requires Node >=22.19.0; the default range enforces that minimum without capping later 22.x releases, and a stale cached 22.x below it on a persistent runner cannot satisfy it."
     required: false
-    default: "22.19"
+    default: "^22.19.0"
 
 outputs:
   output_path:
@@ -148,10 +148,12 @@ runs:
         #      ONLY path control: in kimi-code 2.3.2 the `[[permission.rules]]`
         #      below are not applied in `-p` mode at all — a config with a bare
         #      `deny Read` still read files and `deny Write` still wrote into the
-        #      checkout (verified against a mock model endpoint while fixing
-        #      HackerOne #4037167; both halves re-verified the same way on
-        #      kimi-code 2.3.2). They stay as a statement of intent, and for
-        #      the version that honours them; never treat them as enforcement.
+        #      checkout (found on kimi-code 0.34.0 against a mock model endpoint
+        #      while fixing HackerOne #4037167; re-verified on kimi-code 2.3.2 —
+        #      a bare `deny Read` still read files and a bare `deny Write` still
+        #      wrote into the checkout). They stay as a statement of intent, and
+        #      for the version that honours them; never treat them as
+        #      enforcement.
         #
         # $HOME/.kimi-code is recreated rather than merged: on a persistent
         # self-hosted runner a previous run's config could otherwise survive

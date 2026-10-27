@@ -142,8 +142,9 @@ assuming parity:
 - **Kimi** — Bash is absent from `[tools] enabled`, which is what removes it;
   the guard denies it independently. The guard is copied into `$HOME/.kimi-code`
   by the configure step. The `[[permission.rules]]` in the same config are **not
-  enforcement**: kimi-code 2.3.2 ignores them in `-p` mode (a bare `deny Read`
-  still read files — verified against a mock model while fixing HackerOne
+  enforcement**: kimi-code ignores them in `-p` mode (a bare `deny Read`
+  still read files and a bare `deny Write` still wrote into the checkout —
+  found on kimi-code 0.34.0 against a mock model while fixing HackerOne
   #4037167; both halves re-verified the same way on kimi-code 2.3.2). Do not
   remove the hook because "the rules already cover it"; they do not.
   `kimi doctor config` in the configure step is load-bearing: the CLI's
