@@ -1,0 +1,1 @@
+Throwaway file for the kimi CLI 2.3.2 smoke test. Never merged.
