@@ -21,3 +21,5 @@ jobs:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
       AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
+
+# smoke follow-up tweak
