@@ -1,0 +1,26 @@
+name: Prompt Check
+
+# Throwaway caller. Do not merge. pull_request_target on master always runs
+# ai-review.yml at @master, so this pull_request workflow is what runs the
+# prompt from the unmerged commit.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  ai-review:
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@4b7c7b3febdd81e0b86ab40955f072a85aa8993c
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    with:
+      engine: kimi
+      model: kimi-k3
+      provider_type: openai
+      review_title: Prompt Check PR Review
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+      AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
