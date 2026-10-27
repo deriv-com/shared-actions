@@ -18,6 +18,7 @@ name: Forge — issue to PR
 #         slack_thread_ts: { required: false, type: string }
 #         slack_message_ts:{ required: false, type: string }
 #         slack_started_at:{ required: false, type: string }  # unix seconds
+#         slack_mention_ts:{ required: false, type: string }  # requester's message
 #         requested_by:    { required: false, type: string }
 #         analysis_brief:  { required: false, type: string }
 #         command:         { required: false, type: string }  # auto (first open) or revise
@@ -32,6 +33,7 @@ name: Forge — issue to PR
 #         slack_thread_ts: ${{ github.event.inputs.slack_thread_ts }}
 #         slack_message_ts:${{ github.event.inputs.slack_message_ts }}
 #         slack_started_at:${{ github.event.inputs.slack_started_at }}
+#         slack_mention_ts:${{ github.event.inputs.slack_mention_ts }}
 #         requested_by:    ${{ github.event.inputs.requested_by }}
 #         analysis_brief:  ${{ github.event.inputs.analysis_brief }}
 #         command:         ${{ github.event.inputs.command || 'auto' }}
@@ -79,6 +81,10 @@ on:
         type: string
       slack_started_at:
         description: "Unix seconds when the living progress message was posted"
+        required: false
+        type: string
+      slack_mention_ts:
+        description: "Slack ts of the requester's message; Report swaps its status reaction"
         required: false
         type: string
       requested_by:
@@ -1660,6 +1666,7 @@ jobs:
           REVISE_TROUBLE: ${{ steps.forge.outputs.revise_trouble }}
           SLACK_PROGRESS_TS: ${{ steps.forge.outputs.slack_progress_ts || inputs.slack_message_ts }}
           SLACK_STARTED_AT: ${{ inputs.slack_started_at }}
+          SLACK_MENTION_TS: ${{ inputs.slack_mention_ts }}
           FORGE_STARTED_AT: ${{ steps.forge.outputs.started_at }}
           AI_REVIEWS_REMAINING: ${{ steps.forge.outputs.ai_reviews_remaining }}
           AI_REVIEWS_REPLIED: ${{ steps.forge.outputs.ai_reviews_replied }}
@@ -1807,10 +1814,12 @@ jobs:
 
           FACTS=""
           QUIET=""
+          REACTION=""
           SLACK_TEXT=""
           if [ "${PR_UNRESOLVED:-}" = "1" ]; then
             FACTS="No open PR is linked to this issue. Link it with Closes #${ISSUE_NUMBER} in the PR body and ask again."
             QUIET="⚠️ No open PR linked · Took ${TOOK}"
+            REACTION="warning"
             BODY=$(printf '🔨 **Forge** — no open PR is linked to this issue, so there is nothing to revise.\n\nAdd `Closes #%s` to the PR body and ask again.\n\nTook %s.' "$ISSUE_NUMBER" "$TOOK")
             LABEL="forge:failed"
             SLACK_TEXT=$(printf '%s⚠️ %s — no open PR is linked to this issue. Add Closes #%s to the PR body and ask again.\nTook %s.' "$WHO" "$ISSUE_LINK" "$ISSUE_NUMBER" "$TOOK")
@@ -1819,6 +1828,7 @@ jobs:
             REASON_SLACK=$(printf '%s' "$REASON" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' | cut -c1-500)
             FACTS="Nothing was committed. ${REASON}"
             QUIET="✅ No change · Took ${TOOK}"
+            REACTION="shrug"
             DETAILS=$(detail_lines "$DONE" "$NOT_OURS" "$TROUBLE")
             NL=$'\n'
             BODY=$(printf '🔨 **Forge** — nothing was committed.\n\n%s\n\n%s\nTook %s.' "$REASON" "${DETAILS:+$DETAILS$NL}" "$TOOK")
@@ -1827,6 +1837,7 @@ jobs:
           elif [ "$OUTCOME" = "success" ] && [ -z "${PR_URL:-}" ]; then
             FACTS="No code change needed."
             QUIET="✅ No code change needed · Took ${TOOK}"
+            REACTION="shrug"
             BODY=$(printf '🔨 **Forge** — no code change needed.\n\nTook %s.' "$TOOK")
             LABEL="forge:done"
             SLACK_TEXT=$(printf '%s✅ %s — No code change needed.\nTook %s.' "$WHO" "$ISSUE_LINK" "$TOOK")
@@ -1873,6 +1884,8 @@ jobs:
             fi
             QUIET="✅ Done · Took ${TOOK}"
             [ "$EMOJI" = "⚠️" ] && QUIET="⚠️ Done · Took ${TOOK}"
+            REACTION="white_check_mark"
+            [ "$EMOJI" = "⚠️" ] && REACTION="warning"
             LABEL="forge:done"
           else
             # The log tail goes into an issue comment via the API, where Actions' secret
@@ -1889,6 +1902,8 @@ jobs:
               || echo "no output captured")
             BODY=$(printf '🔨 **Forge** failed — [full log](%s)\n\n<details><summary>Last output</summary>\n\n```\n%s\n```\n\n</details>\n\nRe-apply the `forge` label to retry.\n\nTook %s.' "$RUN_URL" "$TAIL" "$TOOK")
             LABEL="forge:failed"
+            REACTION="x"
+            [ "${OUTCOME:-}" = "cancelled" ] && REACTION="octagonal_sign"
             FAIL_SNIPPET=$(printf '%s\n' "$TAIL" | sed $'s/\x1b\\[[0-9;]*[A-Za-z]//g' | grep -E 'Verify failed:|spec-coverage [(]|unrecognized_model' | tail -n 1 | tr -d '\r`$\\' | sed -E 's/^[[:space:]]+//' | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' | cut -c1-180 || true)
             if [ -n "$FAIL_SNIPPET" ]; then
               QUIET="❌ Failed · ${FAIL_SNIPPET} · Took ${TOOK}"
@@ -1965,3 +1980,32 @@ jobs:
           else
             echo "::warning::Slack post failed: $(printf '%s' "$RESPONSE" | jq -r '.error // "unknown"')"
           fi
+
+          # Swap Forge's status emoji on the requester's message. Best effort:
+          # names come from a fixed list, ts and channel must look like Slack's.
+          slack_react() {
+            local name="$1" item method err
+            [[ "${SLACK_MENTION_TS:-}" =~ ^[0-9]+\.[0-9]+$ ]] || return 0
+            [[ "${SLACK_CHANNEL:-}" =~ ^[CDG][A-Z0-9]+$ ]] || return 0
+            case "$name" in
+              white_check_mark|warning|shrug|octagonal_sign|x) ;;
+              *) return 0 ;;
+            esac
+            for item in "reactions.add:$name" "reactions.remove:hammer" "reactions.remove:eyes"; do
+              method="${item%%:*}"
+              err=$(jq -n --arg channel "$SLACK_CHANNEL" --arg ts "$SLACK_MENTION_TS" --arg name "${item#*:}" \
+                  '{channel: $channel, timestamp: $ts, name: $name}' \
+                | curl -sS --connect-timeout 10 --max-time 30 \
+                    -X POST "https://slack.com/api/${method}" \
+                    -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+                    -H 'Content-type: application/json; charset=utf-8' \
+                    --data @- \
+                | jq -r '.error // empty' 2>/dev/null | tr -cd 'a-z_' | cut -c1-60) || err="curl_failed"
+              case "$err" in
+                ""|already_reacted|no_reaction) ;;
+                *) echo "::warning::Slack ${method} failed: ${err}" ;;
+              esac
+            done
+            return 0
+          }
+          slack_react "$REACTION"
