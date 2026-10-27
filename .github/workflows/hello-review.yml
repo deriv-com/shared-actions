@@ -1,0 +1,24 @@
+name: Hello Review
+
+# Posts a second review from the shared AI PR review workflow at a pinned commit.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  ai-review:
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@b7ab8ad442b51418c654150e9e53e26dfe61c370
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    with:
+      engine: kimi
+      model: kimi-k3
+      provider_type: openai
+      review_title: Hello Review PR Review
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+      AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
