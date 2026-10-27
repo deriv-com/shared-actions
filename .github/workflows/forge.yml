@@ -1061,7 +1061,7 @@ jobs:
             '
           }
 
-          # Failing non-Trivy checks on the PR. Each is compared with the
+          # Failing checks on the PR, other than Trivy/SCA scans. Each is compared with the
           # same-name check runs on the base branch head: base is "failing"
           # (unrelated to this PR, not sent to dstp), "passing", or "none" (no
           # run there to compare, so it counts as this PR's).
@@ -1173,9 +1173,9 @@ jobs:
               jq -r '
                 def cap($n): (. // "") | tostring | .[0:$n];
                 ([.checks[] | select(.base != "failing")]) as $ours
-                | (if ($ours | length) == 0 then "\nNo failing CI checks for this PR. Trivy SCA is not a dstp fix.\n"
+                | (if ($ours | length) == 0 then "\nNo failing CI checks for this PR. Trivy/SCA scans are not a dstp fix.\n"
                    else
-                     "\nCI is still failing on this PR (non-Trivy). Fix those failures. Trivy SCA is not a dstp fix.\n",
+                     "\nCI is still failing on this PR (excluding Trivy/SCA scans). Fix those failures. Trivy/SCA scans are not a dstp fix.\n",
                      ($ours[]
                       | "\n### Failing check: \(.name)\n\n"
                         + (if .base == "none" then "No run of this check on `\(.base_ref)` head to compare.\n\n" else "" end)
