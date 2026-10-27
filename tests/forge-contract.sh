@@ -499,7 +499,7 @@ printf '%s\n' "$*" >> "$S/gh.log"
 args="$*"
 body_arg() { local a; for a in "$@"; do case "$a" in body=*) printf '%s' "${a#body=}"; return;; esac; done; }
 case "$args" in
-  "api repos/o/r/actions/runs/"*) echo "2026-10-26T13:23:57Z" ;;
+  "api repos/o/r/actions/runs/"*) date -u +%Y-%m-%dT%H:%M:%SZ ;;
   *closedByPullRequestsReferences*) echo "https://github.com/o/r/pull/7" ;;
   *minimizeComment*) echo '{}' ;;
   *resolveReviewThread*|*unresolveReviewThread*) echo "$args" >> "$S/resolved.log"; echo '{}' ;;
