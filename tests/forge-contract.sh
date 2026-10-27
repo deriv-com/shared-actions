@@ -52,6 +52,10 @@ check 'awk "/^      command:/{f=1} f && /default:/{print; exit}" "$WF" | grep -q
   "input 'command' defaults to auto"
 check 'awk "/^      slack_message_ts:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
   "input 'slack_message_ts' stays optional"
+check 'awk "/^      slack_mention_ts:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
+  "slack_mention_ts is an optional input"
+check 'grep -q "SLACK_MENTION_TS: \${{ inputs.slack_mention_ts }}" "$WF"' \
+  "Report reads slack_mention_ts"
 check 'awk "/^      slack_started_at:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
   "input 'slack_started_at' stays optional"
 check 'awk "/^      model:/{f=1} f && /default:/{print; exit}" "$WF" | grep -q "default: \"claude-sonnet-5-5\""' \
@@ -569,6 +573,9 @@ cat > "$FAKE_BIN/curl" <<'FAKE'
 url=""; for a in "$@"; do case "$a" in https://*) url="$a";; esac; done
 payload=$(cat)
 jq -nc --arg url "$url" --argjson p "$payload" '{url: $url, p: $p}' >> "$FAKE_STATE/slack.jsonl"
+case "$url" in
+  *reactions.*) [ -n "${FAKE_SLACK_ERROR:-}" ] && { printf '{"ok":false,"error":"%s"}\n' "$FAKE_SLACK_ERROR"; exit 0; } ;;
+esac
 echo '{"ok":true,"ts":"9.9"}'
 FAKE
 cat > "$FAKE_BIN/git" <<'FAKE'
@@ -713,7 +720,7 @@ run_case() {  # run_case <case dir>
   env -i PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
     GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
     GH_TOKEN=ghs_faketoken COMMENT_ID=55 OUTCOME=success FORGE_COMMAND=revise \
-    SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake \
+    SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake SLACK_MENTION_TS=3.3 \
     RUN_URL=https://github.com/o/r/actions/runs/1 \
     "${renv[@]}" PR_URL=https://github.com/o/r/pull/7 \
     bash -e "$c/report.sh" > "$c/report.log" 2>&1 || true
@@ -722,6 +729,9 @@ run_case() {  # run_case <case dir>
 }
 has() { grep -qF -- "$2" "$1"; }
 reply_for() { jq -r --arg id "$2" 'select(.id == $id) | .body' "$1/replies.jsonl"; }
+reactions() {  # reactions <case dir> <add|remove>  -> comma-joined emoji names
+  jq -rs --arg m "reactions.$2" '[.[] | select(.url | endswith($m)) | .p.name] | join(",")' "$1/slack.jsonl" 2>/dev/null || true
+}
 
 # Happy path: every "Done when" item that a fake GitHub can show.
 C=$(new_case happy)
@@ -787,6 +797,10 @@ check 'grep -q "lint.*master\|master.*lint" "$C/completion.txt" && has "$C/compl
   "Slack completion says which checks also fail on the base head"
 check 'has "$C/completion.txt" "Updated the PR description"' "Slack completion says the PR description was updated"
 check '! has "$C/completion.txt" "CI state unknown"' "Slack completion does not say CI state unknown when checks were read"
+check '[ "$(reactions "$C" add)" = white_check_mark ] && [ "$(reactions "$C" remove)" = hammer,eyes ]' \
+  "a clean revise swaps hammer and eyes for white_check_mark on the mention"
+check 'jq -s "[.[] | select(.url | endswith(\"reactions.add\"))][0].p | .channel == \"C1\" and .timestamp == \"3.3\"" "$C/slack.jsonl" | grep -qx true' \
+  "the reaction goes on the requester's message in the run's channel"
 
 # A GraphQL error body is fatal: logged, shown on the card, no 60s retries.
 C=$(new_case graphql_error)
@@ -799,6 +813,7 @@ check 'grep -q "^read_failed=review threads$" "$C/out" && grep -q "^revise_troub
 check 'has "$C/card.txt" "Could not read review threads"' "the card shows the read failure"
 check 'head -1 "$C/completion.txt" | grep -q "Could not read review threads" && ! head -1 "$C/completion.txt" | grep -q "is up"' \
   "Slack completion leads with the read failure, not PR is up"
+check '[ "$(reactions "$C" add)" = warning ]' "a read failure reacts warning"
 
 # Running out of job time before the work is done is reported, not a clean "PR is up".
 C=$(new_case out_of_time)
@@ -806,6 +821,7 @@ echo 5 > "$C/timeout_minutes"
 run_case "$C"
 check '[ ! -f "$C/instruction.1.md" ] && grep -q "^revise_trouble=1$" "$C/out" && has "$C/completion.txt" "hit trouble"' \
   "stopping for the job time budget is reported as revise trouble"
+check '[ "$(reactions "$C" add)" = warning ]' "running out of time reacts warning"
 
 # Run Forge helpers from scrub_secrets up to github_pr_url, dedented as
 # Actions runs them, for function-level cases.
@@ -888,6 +904,7 @@ check 'grep "POST" "$C/gh.log" | grep -q "forge-revise-instructions"' "a no-chan
 check '[ ! -f "$C/pr_edit.log" ]' "the PR description is not edited without an ask"
 check 'has "$C/completion.txt" "nothing was committed" && has "$C/completion.txt" "replied on all 4"' \
   "a no-change completion says nothing changed and what was replied"
+check '[ "$(reactions "$C" add)" = shrug ]' "a no-change revise reacts shrug"
 
 # REVISE_TROUBLE always shows, whatever the CI state.
 C=$(new_case trouble)
@@ -895,9 +912,45 @@ step_script "Report outcome" "$C" > "$C/report.sh"
 env -i PATH="$FAKE_BIN:$PATH" HOME="$C/home" FAKE_STATE="$C" \
   GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
   GH_TOKEN=ghs_faketoken OUTCOME=success PR_URL=https://github.com/o/r/pull/7 REVISE_TROUBLE=1 \
-  SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake \
+  SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake SLACK_MENTION_TS=3.3 \
   bash -e "$C/report.sh" > "$C/report.log" 2>&1 || true
-check 'jq -rs "last | .p.text" "$C/slack.jsonl" | grep -q "hit trouble"' "REVISE_TROUBLE shows even while CI is failing"
+check 'jq -rs "[.[] | select(.url | endswith(\"chat.postMessage\"))] | last | .p.text" "$C/slack.jsonl" | grep -q "hit trouble"' "REVISE_TROUBLE shows even while CI is failing"
+check '[ "$(reactions "$C" add)" = warning ]' "revise trouble reacts warning"
+
+# Report alone, for outcomes a revise run does not reach.
+report_only() {  # report_only <case name> <VAR=value...>  -> prints the case dir
+  local c; c=$(new_case "$1"); shift
+  step_script "Report outcome" "$c" > "$c/report.sh"
+  env -i PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
+    GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
+    GH_TOKEN=ghs_faketoken RUN_URL=https://github.com/o/r/actions/runs/1 \
+    SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake \
+    "$@" bash -e "$c/report.sh" > "$c/report.log" 2>&1 || true
+  printf '%s' "$c"
+}
+C=$(report_only failed OUTCOME=failure SLACK_MENTION_TS=3.3)
+check '[ "$(reactions "$C" add)" = x ] && [ "$(reactions "$C" remove)" = hammer,eyes ]' "a failed run reacts x"
+check '! has "$C/report.log" "xoxb-fake"' "the Slack token is not printed"
+C=$(report_only cancelled OUTCOME=cancelled SLACK_MENTION_TS=3.3)
+check '[ "$(reactions "$C" add)" = octagonal_sign ]' "a cancelled run reacts octagonal_sign"
+C=$(report_only no_pr OUTCOME=success SLACK_MENTION_TS=3.3)
+check '[ "$(reactions "$C" add)" = shrug ]' "success with no PR reacts shrug"
+C=$(report_only unresolved OUTCOME=success PR_UNRESOLVED=1 SLACK_MENTION_TS=3.3)
+check '[ "$(reactions "$C" add)" = warning ]' "no linked PR reacts warning"
+C=$(report_only no_ts OUTCOME=failure)
+check '[ -z "$(reactions "$C" add)$(reactions "$C" remove)" ] && has "$C/slack.jsonl" "chat.postMessage"' \
+  "no slack_mention_ts means no reaction calls, and the completion still posts"
+C=$(report_only bad_ts OUTCOME=failure "SLACK_MENTION_TS=3.3;id")
+check '[ -z "$(reactions "$C" add)" ]' "a malformed mention ts is ignored"
+C=$(report_only bad_channel OUTCOME=failure SLACK_MENTION_TS=3.3 "SLACK_CHANNEL=#general")
+check '[ -z "$(reactions "$C" add)" ]' "a malformed channel is ignored"
+C=$(report_only slack_error OUTCOME=failure SLACK_MENTION_TS=3.3 FAKE_SLACK_ERROR=missing_scope)
+check 'has "$C/report.log" "Slack reactions.add failed: missing_scope" && ! has "$C/report.log" "xoxb-fake"' \
+  "a Slack reaction error is a warning with only the error code"
+C=$(report_only already_reacted OUTCOME=failure SLACK_MENTION_TS=3.3 FAKE_SLACK_ERROR=already_reacted)
+check '! has "$C/report.log" "::warning::Slack reactions"' "already_reacted is tolerated without a warning"
+C=$(report_only no_reaction OUTCOME=failure SLACK_MENTION_TS=3.3 FAKE_SLACK_ERROR=no_reaction)
+check '! has "$C/report.log" "::warning::Slack reactions"' "no_reaction is tolerated without a warning"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"
