@@ -189,13 +189,17 @@ runs:
         MUSE_NO_MODIFY_PATH: "1"
         MUSE_NO_AUTO_UPDATE: "1"
       run: |
-        # Wipe BOTH directories first: a previous job's settings, catalog
-        # cache, stored credentials or a newer self-updated binary must not
-        # leak into this run. Also clear Muse Code state in the REAL home —
-        # no step points Muse Code there, but a persistent runner should not
-        # accumulate it either.
-        rm -rf "$MUSE_ENGINE_BIN" "$MUSE_ENGINE_HOME" \
+        # Wipe the home and install dirs first: a previous job's settings,
+        # catalog cache, stored credentials or a newer self-updated binary
+        # must not leak into this run. Also clear Muse Code state in the
+        # REAL home — no step points Muse Code there, but a persistent
+        # runner should not accumulate it either. MUSE_ENGINE_BIN itself is
+        # NOT wiped: the strip step already wrote the strip script there,
+        # and the run step hash-checks that exact file. Only the stale
+        # run artifacts beside it are removed.
+        rm -rf "$MUSE_ENGINE_HOME" "${MUSE_ENGINE_BIN}-cli" \
           "$HOME/.config/muse" "$HOME/.local/share/muse"
+        rm -f "$MUSE_ENGINE_BIN/review-stdout.txt" "$MUSE_ENGINE_BIN/cli.log"
         # The installer's launcher lands in MUSE_INSTALL_DIR; the strip
         # script already lives in MUSE_ENGINE_BIN, so install elsewhere.
         mkdir -p "$MUSE_ENGINE_HOME" "${MUSE_ENGINE_BIN}-cli"

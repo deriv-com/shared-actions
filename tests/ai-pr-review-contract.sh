@@ -395,6 +395,7 @@ check 'grep -q "MUSE_NO_AUTO_UPDATE" "$MUSE"' "muse engine freezes the launcher 
 check 'grep -q "installer delivered Muse Code" "$MUSE" && grep -q "cli_version pins" "$MUSE"' "muse engine asserts the installed version equals cli_version"
 check 'grep -q "no review written to \$OUTPUT_PATH" "$MUSE"' "muse engine fails if no review was written"
 check 'ncgrep "strip script changed since the strip step" "$MUSE"' "muse verifies the strip script hash before each attempt"
+check '! step_body "Install review CLI (Muse Code)" "$MUSE" | grep -c "rm -rf \"\$MUSE_ENGINE_BIN\"" >/dev/null' "muse install step does not wipe the strip script's directory"
 check 'grep -qF "`muse` (Meta Muse Code CLI)" "$WF"' "engine input description names muse"
 check 'grep -qF "meta-muse-wonder-1.0" "$README" && grep -qF "muse_review" "$README" && grep -qF "muse-review-summary-" "$README"' "README documents the muse engine"
 check 'grep -qE "^\| \`muse_reasoning_effort\`" "$README"' "README inputs table documents muse_reasoning_effort"
