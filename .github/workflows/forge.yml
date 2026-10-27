@@ -1002,10 +1002,11 @@ jobs:
             '
           }
 
-          # Unresolved threads with their whole conversation. A thread whose
-          # latest comment is Forge's reply is already answered by Forge and
-          # waits for the reviewer. `answered` means someone other than the
-          # thread's author replied last (for example "Fixed in cdf5936e").
+          # Unresolved threads with their whole conversation. A thread where
+          # nothing but a bare acknowledgement (thanks, ok, lgtm, an emoji)
+          # follows Forge's latest reply waits for the reviewer. `answered`
+          # means someone other than the thread's author replied last (for
+          # example "Fixed in cdf5936e").
           fetch_review_threads() {
             local pr_url="$1" owner name num json
             owner="${GITHUB_REPOSITORY%%/*}"
@@ -1021,11 +1022,16 @@ jobs:
               -F number="$num" \
               -f query='query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){ pullRequest(number:$number){ reviewThreads(first:100){ nodes { isResolved path line originalLine comments(first:100){ nodes { databaseId url author { login } body createdAt } } } } } } }') || return $?
             printf '%s' "$json" | jq '
+              def forge_reply: (.body // "") | test("<!-- forge-revise-reply -->");
+              def bare_ack:
+                (.body // "") | ascii_downcase | gsub("[^a-z0-9]+"; " ") | gsub("^ +| +$"; "")
+                | IN("", "thanks", "thank you", "thanks a lot", "thx", "ty", "ok", "okay", "lgtm", "done", "great", "nice", "perfect", "looks good", "sounds good");
               [.data.repository.pullRequest.reviewThreads.nodes[]?
                | select(.isResolved | not)
                | (.comments.nodes // []) as $c
                | select(($c | length) > 0 and (($c[0].databaseId // 0) > 0))
-               | select(($c | last | .body // "") | test("<!-- forge-revise-reply -->") | not)
+               | ([range(0; $c | length) | select($c[.] | forge_reply)] | last // -1) as $forge_last
+               | select($forge_last < 0 or ([$c[($forge_last + 1):][] | select(bare_ack | not)] | length) > 0)
                | {
                    comment_id: $c[0].databaseId,
                    html_url: ($c[0].url // ""),
@@ -1324,7 +1330,7 @@ jobs:
                 | scrub_secrets > "$body_file"
               if grep -q '[^[:space:]]' "$body_file"; then
                 if ! grep -qiE "(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#${ISSUE_NUMBER}([^0-9]|$)" "$body_file"; then
-                  printf '\nCloses #%s\n' "$ISSUE_NUMBER" >> "$body_file"
+                  printf '\n---\nCloses #%s\n' "$ISSUE_NUMBER" >> "$body_file"
                 fi
                 if gh pr edit "$PR_URL" --body-file "$body_file" >/dev/null; then
                   PR_EDITED="${PR_EDITED:+$PR_EDITED }body"

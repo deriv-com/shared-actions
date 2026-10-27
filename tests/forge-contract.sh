@@ -807,6 +807,68 @@ run_case "$C"
 check '[ ! -f "$C/instruction.1.md" ] && grep -q "^revise_trouble=1$" "$C/out" && has "$C/completion.txt" "hit trouble"' \
   "stopping for the job time budget is reported as revise trouble"
 
+# Run Forge helpers from scrub_secrets up to github_pr_url, dedented as
+# Actions runs them, for function-level cases.
+HELPERS=$(awk '
+  $0 == "          scrub_secrets() {" {f=1}
+  $0 == "          github_pr_url() {" {exit}
+  f { sub(/^          /, ""); print }
+' "$WF")
+check '[ -n "$HELPERS" ]' "Run Forge helpers can be cut from forge.yml"
+
+# Only a bare thanks or 👍 after Forge's reply leaves the thread waiting for
+# the reviewer. A real follow-up reopens it.
+ack_threads_json() {
+  jq -n --arg m '<!-- forge-revise-reply -->' '
+    def c($id; $who; $body): {databaseId: $id, url: "https://github.com/o/r/pull/7#discussion_r\($id)", author: {login: $who}, body: $body, createdAt: "2026-10-26T10:00:\($id)Z"};
+    {data: {repository: {pullRequest: {reviewThreads: {nodes: [
+      {isResolved: false, path: "a.ts", line: 1, comments: {nodes: [
+        c(11; "ako"; "Add a test."), c(12; "gh-app-write"; ($m + "\nFixed in abc1234: added.")), c(13; "ako"; "Thanks! 👍")]}},
+      {isResolved: false, path: "b.ts", line: 2, comments: {nodes: [
+        c(21; "ako"; "Rename this."), c(22; "gh-app-write"; ($m + "\nSkipped: the name is public API.")), c(23; "ako"; "It still fails on Safari.")]}},
+      {isResolved: false, path: "c.ts", line: 3, comments: {nodes: [
+        c(31; "ako"; "Use a const."), c(32; "gh-app-write"; ($m + "\nFixed in abc1234: done."))]}},
+      {isResolved: false, path: "d.ts", line: 4, comments: {nodes: [
+        c(41; "ako"; "Thanks")]}},
+      {isResolved: false, path: "e.ts", line: 5, comments: {nodes: [
+        c(51; "ako"; "Split this."), c(52; "gh-app-write"; ($m + "\nFixed in abc1234: split.")), c(53; "ako"; "👍")]}}
+    ]}}}}}'
+}
+ACK_OUT=$(T="$(ack_threads_json)" GITHUB_REPOSITORY=o/r bash -c "
+  gh() { printf '%s' \"\$T\"; }
+  $HELPERS
+  fetch_review_threads https://github.com/o/r/pull/7 | jq -c '[.[].comment_id]'
+" 2>&1)
+check '[ "$ACK_OUT" = "[21,41]" ]' \
+  "a bare thanks or 👍 after Forge's reply does not reopen a thread; a real follow-up does (got $ACK_OUT)"
+
+# edit_pr keeps the issue link: added once, after a blank line and a rule,
+# only when the new description does not already close the issue.
+edit_case() {  # edit_case <name> <model pr_body>  -> prints the body given to gh pr edit
+  local d="$TMP_BEHAVIOR/edit_$1"
+  mkdir -p "$d"
+  jq -n --arg b "$2" '{pr_body: $b, pr_title: null}' > "$d/reply.json"
+  echo '{"comments": [], "reviews": [], "threads": [], "slack": []}' > "$d/items.json"
+  D="$d" ISSUE_NUMBER=1213 PR_URL=https://github.com/o/r/pull/7 GITHUB_OUTPUT="$d/out" bash -c "
+    gh() { local prev='' a; for a in \"\$@\"; do [ \"\$prev\" = --body-file ] && cp \"\$a\" \"\$D/edited.md\"; prev=\"\$a\"; done; }
+    ${HELPERS//\/tmp\//$d/}
+    edit_pr body \"\$D/reply.json\" \"\$D/items.json\"
+  " >/dev/null 2>&1
+  cat "$d/edited.md" 2>/dev/null
+}
+EDIT_ADDED=$(edit_case added "Formats the example amounts per language.")
+check '[ "$(grep -c "Closes #1213" <<< "$EDIT_ADDED")" = 1 ] && [ "$(grep -B1 -x -- "---" <<< "$EDIT_ADDED" | head -1)" = "" ] && grep -qx -- "---" <<< "$EDIT_ADDED"' \
+  "edit_pr adds Closes #N after a blank line and a rule when the new description lacks it"
+EDIT_LINKED=$(edit_case linked $'Formats the example amounts.\n\nCloses #1213')
+check '[ "$(grep -c "#1213" <<< "$EDIT_LINKED")" = 1 ] && ! grep -qx -- "---" <<< "$EDIT_LINKED"' \
+  "edit_pr does not add a second link when the new description already closes the issue"
+EDIT_FIXES=$(edit_case fixes $'Formats the example amounts.\n\nFixes #1213')
+check '! grep -q "Closes #1213" <<< "$EDIT_FIXES" && grep -q "Fixes #1213" <<< "$EDIT_FIXES"' \
+  "edit_pr accepts Fixes #N as the issue link"
+EDIT_OTHER=$(edit_case other $'Formats the example amounts.\n\nCloses #12130')
+check 'grep -qx "Closes #1213" <<< "$EDIT_OTHER"' \
+  "edit_pr does not mistake a link to another issue for this one"
+
 # A 5xx is retried, and the card says so.
 C=$(new_case retry_502)
 touch "$C/threads_502"
