@@ -171,6 +171,15 @@ on:
         required: false
         default: false
         type: boolean
+      ignored_checks_regex:
+        description: >-
+          Checks whose name matches this regex (case-insensitive) never count
+          as failing CI and are never sent to dstp. The default covers Trivy
+          and the org-wide "SCA Vulnerability Scan" job. Narrow it if this repo
+          has a blocking SCA check; pass "" to ignore nothing.
+        required: false
+        default: 'trivy|\bsca\b'
+        type: string
       timeout_minutes:
         description: >-
           Job timeout. App installation tokens expire after ~1 hour. Run Forge
@@ -241,10 +250,13 @@ jobs:
       SLACK_MESSAGE_TS: ${{ inputs.slack_message_ts }}
       SLACK_STARTED_AT: ${{ inputs.slack_started_at }}
       REQUESTED_BY: ${{ inputs.requested_by }}
-      # Trivy/SCA scans are never dstp targets and never count as failing CI.
-      # The one definition for Run Forge and Report. Check name only: matching
-      # a workflow name such as "Security (SCA, SAST)" would skip its other jobs.
-      IS_TRIVY_JQ: 'def is_trivy: ((.name // .context // "") | test("trivy|\\bsca\\b"; "i"));'
+      # Ignored scans never count as failing CI and are never dstp targets.
+      # The one definition for Run Forge and Report. The caller's regex reaches
+      # jq as data ($ENV), never as program text, and is matched on the check
+      # name only: a workflow name such as "Security (SCA, SAST)" would skip
+      # its other jobs. An empty regex ignores nothing.
+      IGNORED_CHECKS_RE: ${{ inputs.ignored_checks_regex }}
+      IGNORED_SCAN_JQ: 'def is_ignored_scan: ($ENV.IGNORED_CHECKS_RE // "") as $re | ($re != "" and ((.name // .context // "") | test($re; "i")));'
 
     steps:
       # ---- tokens --------------------------------------------------------
@@ -597,6 +609,10 @@ jobs:
           set -o pipefail
           APP_KEY="$WRITE_APP_KEY"
           unset WRITE_APP_KEY
+          if ! jq -n "${IGNORED_SCAN_JQ}"' {name: ""} | is_ignored_scan' >/dev/null 2>&1; then
+            echo "::error::ignored_checks_regex is not a valid regular expression"
+            exit 1
+          fi
           git config --global user.name  "forge[bot]"
           git config --global user.email "forge@users.noreply.github.com"
 
@@ -628,13 +644,17 @@ jobs:
           }
 
           # App installation tokens last ~1 hour, and a running dstp keeps the
-          # token it was spawned with. So every dstp spawn remints first
-          # (`remint_write_token 0`), giving each run a full hour, and the
-          # workflow's own gh/git calls remint once the token is 45 minutes old.
-          # One dstp run longer than an hour can still fail its push.
-          # remint_write_token [max token age in seconds, default 2700]
+          # token it was spawned with. So each dstp spawn gets a token at most
+          # 5 minutes old (`remint_write_token 300`), and the workflow's own
+          # gh/git calls remint once the token is 30 minutes old: at the top of
+          # every round and after every revise, before the reply pass. One dstp
+          # run longer than ~55 minutes can still fail its push.
+          # A remint is scoped like the job-start token (this repo, the same
+          # permissions); a POST with no body returns an installation-wide
+          # token. The token it replaces is revoked, and the last one on exit.
+          # remint_write_token [max token age in seconds, default 1800]
           remint_write_token() {
-            local max_age="${1:-2700}" now jwt token
+            local max_age="${1:-1800}" now jwt token scope
             now=$(date -u +%s)
             if [ $(( now - ${WRITE_TOKEN_EPOCH:-0} )) -lt "$max_age" ]; then
               return 0
@@ -653,13 +673,20 @@ jobs:
               const sign = crypto.createSign("RSA-SHA256").update(`${header}.${payload}`).sign(pem, "base64url");
               process.stdout.write(`${header}.${payload}.${sign}`);
             ') || return 0
-            token=$(curl -sS --connect-timeout 10 --max-time 30 \
+            scope=$(jq -nc --arg repo "${GITHUB_REPOSITORY#*/}" \
+              '{repositories: [$repo], permissions: {contents: "write", issues: "write", pull_requests: "write", checks: "read"}}')
+            token=$(printf '%s' "$scope" | curl -sS --connect-timeout 10 --max-time 30 \
               -X POST "https://api.github.com/app/installations/${WRITE_INSTALLATION_ID}/access_tokens" \
               -H "Authorization: Bearer ${jwt}" \
               -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
+              --data @- \
               | jq -r '.token // empty') || true
             if [ -n "$token" ]; then
+              echo "::add-mask::${token}"
+              revoke_reminted_token
+              REMINTED_TOKEN="$token"
               WRITE_TOKEN_EPOCH=$now
               export GH_TOKEN="$token"
               export GITHUB_TOKEN="$token"
@@ -673,6 +700,20 @@ jobs:
               echo "::warning::Write App token remint returned no token; continuing with the existing token"
             fi
           }
+
+          # Only tokens minted here; actions/create-github-app-token revokes the
+          # job-start token itself. DELETE /installation/token revokes the token
+          # it is called with.
+          revoke_reminted_token() {
+            [ -n "${REMINTED_TOKEN:-}" ] || return 0
+            curl -sS -o /dev/null --connect-timeout 10 --max-time 30 \
+              -X DELETE "https://api.github.com/installation/token" \
+              -H "Authorization: Bearer ${REMINTED_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" || true
+            REMINTED_TOKEN=""
+          }
+          trap revoke_reminted_token EXIT
 
           slack_progress_payload() {
             local ts_field="$1"
@@ -756,7 +797,7 @@ jobs:
               ARGS+=(--fast)
             fi
             echo "Running: dstp ${ARGS[*]}"
-            remint_write_token 0
+            remint_write_token 300
             node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || return $?
             local RESULT
             RESULT=$(grep -oE '^\{.*\}$' /tmp/forge.log | tail -1 || true)
@@ -810,7 +851,7 @@ jobs:
             fi
             echo "Running: dstp revise $branch <instruction> --cwd . --unattended --json"
             local rc=0
-            remint_write_token 0
+            remint_write_token 300
             node "$FORGE_CLI" revise "$branch" "$(cat "$instruction_file")" --cwd . --unattended --json 2>&1 | tee /tmp/forge.log || rc=$?
             read_revise_result /tmp/forge.log || return 1
             [ "${NO_CHANGE:-0}" = "1" ] && return 0
@@ -818,13 +859,15 @@ jobs:
           }
 
           SCRIPT_START=$(date -u +%s)
-          RUN_CREATED=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .created_at 2>/dev/null || true)
-          if [ -n "$RUN_CREATED" ] && START_EPOCH=$(date -u -d "$RUN_CREATED" +%s 2>/dev/null); then
+          # run_started_at resets on each attempt; created_at would make a
+          # "Re-run jobs" hours later start with no job time left.
+          RUN_STARTED=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .run_started_at 2>/dev/null || true)
+          if [ -n "$RUN_STARTED" ] && START_EPOCH=$(date -u -d "$RUN_STARTED" +%s 2>/dev/null); then
             :
           else
             START_EPOCH=$SCRIPT_START
           fi
-          # The job-start token was minted after the run was created, so this
+          # The job-start token was minted after the attempt started, so this
           # overstates its age and reminting errs early.
           WRITE_TOKEN_EPOCH=$START_EPOCH
           if [[ "${SLACK_STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
@@ -854,7 +897,7 @@ jobs:
             for i in $(seq 1 40); do
               slack_progress "Waiting for CI and AI reviews"
               rollup=$(gh pr view "$pr_url" --json statusCheckRollup 2>/dev/null || echo '{"statusCheckRollup":[]}')
-              ready=$(printf '%s' "$rollup" | jq -r "${IS_TRIVY_JQ}"'
+              ready=$(printf '%s' "$rollup" | jq -r "${IGNORED_SCAN_JQ}"'
                 def finished:
                   ((.status // "") | ascii_upcase) == "COMPLETED"
                   or ((.state // "") | ascii_upcase) as $s
@@ -871,7 +914,7 @@ jobs:
                 def failing:
                   ((.conclusion // "") | ascii_upcase) as $c
                   | ((.state // "") | ascii_upcase) as $s
-                  | (is_trivy | not)
+                  | (is_ignored_scan | not)
                   and ($c == "FAILURE" or $c == "ERROR" or $c == "TIMED_OUT" or $c == "CANCELLED"
                      or $s == "FAILURE" or $s == "ERROR");
                 .statusCheckRollup // []
@@ -916,8 +959,9 @@ jobs:
               -e 's#x-access-token:[^@]*@#x-access-token:***@#g'
           }
 
-          # Reads go through gh_read. It prints the body and returns 0, 2 when a
-          # retry can help (network error or HTTP 5xx), or 1 when it cannot. Any
+          # Reads go through gh_read. It prints the body and returns 0, 1 for an
+          # HTTP 4xx (a retry cannot help), or 2 for anything else (5xx, network
+          # error or timeout). Any
           # GraphQL errors[] is fatal: a query GitHub cannot parse never will.
           gh_read() {
             local out err rc=0 msg
@@ -933,10 +977,9 @@ jobs:
               msg=$(tr '\r\n' '  ' < "$err" | cut -c1-500)
               rm -f "$err"
               echo "GitHub API error: ${msg:-gh exited $rc}" >&2
-              if printf '%s' "$msg" | grep -qE 'HTTP 5[0-9][0-9]'; then
-                return 2
-              fi
-              if [ -n "$out" ] || printf '%s' "$msg" | grep -qE 'HTTP 4[0-9][0-9]'; then
+              # Decided by the error alone: a --paginate read that drops on a
+              # later page has already printed the earlier pages.
+              if printf '%s' "$msg" | grep -qE 'HTTP 4[0-9][0-9]'; then
                 return 1
               fi
               return 2
@@ -1074,7 +1117,7 @@ jobs:
             '
           }
 
-          # Failing checks on the PR, other than Trivy/SCA scans. Each is compared with the
+          # Failing checks on the PR, other than ignored scans. Each is compared with the
           # same-name check runs on the base branch head: base is "failing"
           # (unrelated to this PR, not sent to dstp), "passing", or "none" (no
           # run there to compare, so it counts as this PR's).
@@ -1098,11 +1141,11 @@ jobs:
             runs=$(printf '%s' "$runs" | jq -s '.') || return 1
             # Both documents go through stdin: a big repo's check runs exceed the
             # kernel's per-argument limit, so jq fails with "Argument list too long".
-            printf '%s\n%s\n' "$rollup" "$runs" | jq -n --arg base "$base" "${IS_TRIVY_JQ}"'
+            printf '%s\n%s\n' "$rollup" "$runs" | jq -n --arg base "$base" "${IGNORED_SCAN_JQ}"'
               def failing:
                 ((.conclusion // "") | ascii_upcase) as $c
                 | ((.state // "") | ascii_upcase) as $s
-                | (is_trivy | not)
+                | (is_ignored_scan | not)
                 and ($c == "FAILURE" or $c == "ERROR" or $c == "TIMED_OUT" or $c == "CANCELLED"
                    or $s == "FAILURE" or $s == "ERROR");
               input as $rollup | input as $runs
@@ -1188,9 +1231,9 @@ jobs:
               jq -r '
                 def cap($n): (. // "") | tostring | .[0:$n];
                 ([.checks[] | select(.base != "failing")]) as $ours
-                | (if ($ours | length) == 0 then "\nNo failing CI checks for this PR. Trivy/SCA scans are not a dstp fix.\n"
+                | (if ($ours | length) == 0 then "\nNo failing CI checks for this PR. Ignored scans (Trivy/SCA by default) are not a dstp fix.\n"
                    else
-                     "\nCI is still failing on this PR (excluding Trivy/SCA scans). Fix those failures. Trivy/SCA scans are not a dstp fix.\n",
+                     "\nCI is still failing on this PR (excluding ignored scans). Fix those failures. Ignored scans (Trivy/SCA by default) are not a dstp fix.\n",
                      ($ours[]
                       | "\n### Failing check: \(.name)\n\n"
                         + (if .base == "none" then "No run of this check on `\(.base_ref)` head to compare.\n\n" else "" end)
@@ -1627,6 +1670,9 @@ jobs:
               slack_progress "Revising round ${ROUND} of ${MAX_REVISE}"
               REVISE_STATUS=0
               run_branch_revise /tmp/forge-revise-instruction.md || REVISE_STATUS=$?
+              # The token dstp ran with may be nearly an hour old; the reply
+              # pass, replies and watermark must not post with it.
+              remint_write_token
               if [ "$REVISE_STATUS" -ne 0 ] && [ "${NO_CHANGE:-0}" != "1" ]; then
                 echo "dstp revise failed after a PR already exists; leaving the PR in place"
                 echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
@@ -1749,10 +1795,10 @@ jobs:
               # Checks that also fail on the base head are not this PR's.
               local skip failing
               skip=$(printf '%s' "${UNRELATED_CHECKS:-[]}" | jq -c 'if type == "array" then [.[] | strings] else [] end' 2>/dev/null || echo '[]')
-              # Same is_trivy as the revise loop, on gh pr checks' tab-separated name and bucket.
-              if ! failing=$(printf '%s\n' "$CHECKS" | jq -R -n -c --argjson skip "$skip" "${IS_TRIVY_JQ}"'
+              # Same is_ignored_scan as the revise loop, on gh pr checks' tab-separated name and bucket.
+              if ! failing=$(printf '%s\n' "$CHECKS" | jq -R -n -c --argjson skip "$skip" "${IGNORED_SCAN_JQ}"'
                 [inputs | split("\t") | select(length > 1 and .[1] == "fail") | {name: .[0]}
-                 | select((is_trivy | not) and (.name as $n | any($skip[]; . == $n) | not)) | .name]'); then
+                 | select((is_ignored_scan | not) and (.name as $n | any($skip[]; . == $n) | not)) | .name]'); then
                 CI_STATE="unknown"
                 return 0
               fi

@@ -388,11 +388,21 @@ check 'awk "
 for fn in run_dstp run_branch_revise; do
   check 'awk -v fn="$fn" "
     \$0 == \"          \" fn \"() {\" {f=1}
-    f && /remint_write_token 0\$/ {r=1}
+    f && /remint_write_token 300\$/ {r=1}
     f && /node \"\\\$FORGE_CLI\"/ {exit (r ? 0 : 1)}
   " "$WF"' \
     "$fn remints the write token right before it spawns dstp"
 done
+check 'awk "
+  /run_branch_revise \/tmp\/forge-revise-instruction.md \|\| REVISE_STATUS/ {f=1; next}
+  f && /remint_write_token\$/ {exit 0}
+  f && /reply_to_reviews|post_review_replies|REVISE_STATUS\" -ne 0/ {exit 1}
+" "$WF"' \
+  "the write token is reminted after every revise, before the reply pass posts"
+check 'grep -q "^          trap revoke_reminted_token EXIT\$" "$WF"' \
+  "the last reminted token is revoked when Run Forge exits"
+check 'grep -q -- "--jq .run_started_at" "$WF" && ! grep -q -- "--jq .created_at" "$WF"' \
+  "job time is measured from this attempt's run_started_at, not the run's created_at"
 check 'grep -q "http.https://github.com/.extraheader" "$WF"' \
   "remint refreshes git extraheader so git push uses the new token"
 check 'awk "
@@ -410,11 +420,20 @@ check 'awk "
   "Report mints its own token with if: always()"
 check 'grep -q "GH_TOKEN: \${{ steps.report-token.outputs.token }}" "$WF"' \
   "Report uses the freshly minted token, not the job-start token"
-check '[ "$(grep -c "def is_trivy" "$WF")" = 1 ] && [ "$(grep -c "\${IS_TRIVY_JQ}" "$WF")" = 3 ]' \
-  "is_trivy is defined once and used by wait_for_rollup, fetch_failing_checks and the Report"
+check '[ "$(grep -c "def is_ignored_scan" "$WF")" = 1 ] && [ "$(grep -c "\${IGNORED_SCAN_JQ}" "$WF")" = 4 ]' \
+  "is_ignored_scan is defined once and used by the regex check, wait_for_rollup, fetch_failing_checks and the Report"
+check 'grep -q "IGNORED_CHECKS_RE: \${{ inputs.ignored_checks_regex }}" "$WF"' \
+  "the ignored-checks regex comes from the ignored_checks_regex input"
+check 'awk "
+  /APP_KEY=\"\\\$WRITE_APP_KEY\"/ {f=1}
+  f && /is_ignored_scan/ && /jq -n/ {v=1}
+  f && /::error::ignored_checks_regex/ {e=1}
+  f && /git config --global user.name/ {exit (v && e ? 0 : 1)}
+" "$WF"' \
+  "Run Forge rejects an invalid ignored_checks_regex before doing any work"
 check 'awk "
   /name: Report outcome/ {r=1}
-  r && /IS_TRIVY_JQ/ {t=1}
+  r && /IGNORED_SCAN_JQ/ {t=1}
   END {exit t ? 0 : 1}
 " "$WF"' \
   "Report does not count Trivy or the SCA scan as blocking CI"
@@ -463,17 +482,33 @@ TMP_BEHAVIOR=$(mktemp -d)
 # KEEP_TMP=1 keeps the fake runs for debugging.
 trap '[ -n "${KEEP_TMP:-}" ] && echo "kept $TMP_BEHAVIOR" || rm -rf "$TMP_BEHAVIOR"' EXIT
 
-# The job-level is_trivy definition, as the workflow's steps see it.
-IS_TRIVY_JQ=$(sed -n "s/^      IS_TRIVY_JQ: '\(.*\)'\$/\1/p" "$WF")
-export IS_TRIVY_JQ
-check '[ -n "$IS_TRIVY_JQ" ]' "the job env defines IS_TRIVY_JQ"
-TRIVY_NAMES=$(jq -nc "$IS_TRIVY_JQ"'[
+# The job-level is_ignored_scan definition and the input's default regex, as
+# the workflow's steps see them.
+IGNORED_SCAN_JQ=$(sed -n "s/^      IGNORED_SCAN_JQ: '\(.*\)'\$/\1/p" "$WF")
+IGNORED_CHECKS_RE=$(awk '
+  /^      ignored_checks_regex:$/ {f=1}
+  f && /^        default: / {sub(/^        default: \047/, ""); sub(/\047$/, ""); print; exit}
+' "$WF")
+export IGNORED_SCAN_JQ IGNORED_CHECKS_RE
+check '[ -n "$IGNORED_SCAN_JQ" ]' "the job env defines IGNORED_SCAN_JQ"
+check '[ "$IGNORED_CHECKS_RE" = "trivy|\\bsca\\b" ]' \
+  "ignored_checks_regex defaults to Trivy and the word sca (got $IGNORED_CHECKS_RE)"
+IGNORED_NAMES=$(jq -nc "$IGNORED_SCAN_JQ"'[
   {name: "SCA Vulnerability Scan"}, {name: "Trivy"}, {context: "trivy-scan"},
   {name: "npm-sca_audit"}, {name: "SCA2"}, {name: "Mobile Landscape"},
   {name: "SAST", workflowName: "Security (SCA, SAST)"}, {name: "scan", workflowName: "Trivy"}
-] | map(is_trivy)')
-check '[ "$TRIVY_NAMES" = "[true,true,true,false,false,false,false,false]" ]' \
-  "is_trivy matches trivy or the word sca in the check name only, never the workflow name (got $TRIVY_NAMES)"
+] | map(is_ignored_scan)')
+check '[ "$IGNORED_NAMES" = "[true,true,true,false,false,false,false,false]" ]' \
+  "the default regex matches trivy or the word sca in the check name only, never the workflow name (got $IGNORED_NAMES)"
+IGNORED_OTHER=$(IGNORED_CHECKS_RE='^trivy$' jq -nc "$IGNORED_SCAN_JQ"'[{name: "Trivy"}, {name: "SCA Vulnerability Scan"}] | map(is_ignored_scan)')
+IGNORED_NONE=$(IGNORED_CHECKS_RE='' jq -nc "$IGNORED_SCAN_JQ"'[{name: "Trivy"}, {name: "SCA Vulnerability Scan"}, {}] | map(is_ignored_scan)')
+check '[ "$IGNORED_OTHER" = "[true,false]" ] && [ "$IGNORED_NONE" = "[false,false,false]" ]' \
+  "a caller regex replaces the default, and an empty one ignores nothing (got $IGNORED_OTHER $IGNORED_NONE)"
+check '! IGNORED_CHECKS_RE="(" jq -n "$IGNORED_SCAN_JQ"" {name: \"\"} | is_ignored_scan" >/dev/null 2>&1' \
+  "an invalid regex makes the predicate fail, so the early check can reject it"
+IGNORED_DATA=$(IGNORED_CHECKS_RE='"; env; "' jq -nc "$IGNORED_SCAN_JQ"'[{name: "a\"; env; \"b"}, {name: "env"}] | map(is_ignored_scan)')
+check '[ "$IGNORED_DATA" = "[true,false]" ]' \
+  "the regex reaches jq as data, never as program text (got $IGNORED_DATA)"
 
 READ_PR_CHECKS=$(extract_fn read_pr_checks)
 check '[ -n "$READ_PR_CHECKS" ]' "Report reads checks through read_pr_checks"
@@ -498,7 +533,7 @@ check '[ "$(pr_checks_case 1 "")" = "unknown 0 0 " ]' \
   "gh pr checks exit 1 with no output stays CI state unknown"
 CHECKS_SCA=$'SCA Vulnerability Scan\tfail\t40s\thttps://x/5\t\nnpm-sca_audit\tfail\t9s\thttps://x/6\t\nMobile Landscape\tfail\t1m\thttps://x/7\t'
 check '[ "$(pr_checks_case 1 "$CHECKS_SCA")" = "ok 2 0 npm-sca_audit, Mobile Landscape" ]' \
-  "Report skips the SCA scan with the revise loop's is_trivy, so npm-sca_audit still counts"
+  "Report skips the SCA scan with the revise loop's is_ignored_scan, so npm-sca_audit still counts"
 CHECKS_SEVEN=$(for i in 1 2 3 4 5 6 7; do printf 'c%s\tfail\t1s\thttps://x/%s\t\n' "$i" "$i"; done)
 check '[ "$(pr_checks_case 1 "$CHECKS_SEVEN")" = "ok 7 0 c1, c2, c3, c4, c5" ]' \
   "Report counts every failing check but names at most 5"
@@ -730,7 +765,7 @@ run_case() {  # run_case <case dir>
   step_script "Run Forge" "$c" > "$c/run-forge.sh"
   step_script "Report outcome" "$c" > "$c/report.sh"
   : > "$c/out"
-  env -i IS_TRIVY_JQ="$IS_TRIVY_JQ" PATH="$FAKE_BIN:$PATH" HOME="$c/home" GIT_CONFIG_GLOBAL="$c/home/gitconfig" \
+  env -i IGNORED_SCAN_JQ="$IGNORED_SCAN_JQ" IGNORED_CHECKS_RE="$IGNORED_CHECKS_RE" PATH="$FAKE_BIN:$PATH" HOME="$c/home" GIT_CONFIG_GLOBAL="$c/home/gitconfig" \
     FAKE_STATE="$c" GITHUB_OUTPUT="$c/out" GITHUB_ENV="$c/env" \
     GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=1 ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
     FORGE_COMMAND=revise FAST_LANE=false TIMEOUT_MINUTES="$(cat "$c/timeout_minutes" 2>/dev/null || echo 90)" \
@@ -742,7 +777,7 @@ run_case() {  # run_case <case dir>
   echo "$rc" > "$c/run.rc"
   local -a renv=()
   while IFS= read -r kv; do renv+=("$kv"); done < <(report_env_args "$c")
-  env -i IS_TRIVY_JQ="$IS_TRIVY_JQ" PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
+  env -i IGNORED_SCAN_JQ="$IGNORED_SCAN_JQ" IGNORED_CHECKS_RE="$IGNORED_CHECKS_RE" PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
     GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
     GH_TOKEN=ghs_faketoken COMMENT_ID=55 OUTCOME=success FORGE_COMMAND=revise \
     SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake SLACK_MENTION_TS=3.3 \
@@ -915,26 +950,65 @@ BIG_OUT=$(B="$BIG" GITHUB_REPOSITORY=o/r bash -c "
 check '[ "$BIG_OUT" = "[{\"name\":\"lint\",\"base\":\"failing\"},{\"name\":\"E2E\",\"base\":\"none\"},{\"name\":\"Playwright Mobile Landscape\",\"base\":\"none\"},{\"name\":\"SAST\",\"base\":\"none\"}]" ]' \
   "big base check runs, projected by gh --jq, still classify the PR's failing checks: the SCA scan is skipped, but not a name that only contains sca or a job in a workflow named after SCA (got ${BIG_OUT:0:200})"
 
-# remint_write_token mints by token age: 45 minutes by default, always with 0.
+# remint_write_token mints by token age (30 minutes by default, 5 before a
+# dstp spawn), scoped like the job-start token, and revokes what it replaces.
 REMINT=$(extract_fn remint_write_token)
-REMINT_OUT=$(bash -c "
-  node() { printf jwt; }
-  curl() { echo mint >&2; printf '{\"token\":\"fresh\"}'; }
-  git() { :; }
+REVOKE=$(extract_fn revoke_reminted_token)
+REMINT_DIR="$TMP_BEHAVIOR/remint"
+mkdir -p "$REMINT_DIR"
+cat > "$REMINT_DIR/fakes.sh" <<'FAKES'
+node() { printf jwt; }
+git() { :; }
+curl() {
+  local a auth="" n
+  for a in "$@"; do
+    case "$a" in "Authorization: Bearer "*) auth=${a#Authorization: Bearer } ;; esac
+  done
+  case " $* " in
+    *" DELETE "*) echo "revoke $auth" >> "$REMINT_DIR/log" ;;
+    *) n=$(( $(cat "$REMINT_DIR/n" 2>/dev/null || echo 0) + 1 ))
+       echo "$n" > "$REMINT_DIR/n"
+       echo "mint $(cat)" >> "$REMINT_DIR/log"
+       printf '{"token":"t%s"}' "$n" ;;
+  esac
+}
+FAKES
+REMINT_OUT=$(REMINT_DIR="$REMINT_DIR" bash -c "
+  . \"\$REMINT_DIR/fakes.sh\"
   $REMINT
-  WRITE_APP_ID=1 APP_KEY=k WRITE_INSTALLATION_ID=2 GH_TOKEN=old
+  $REVOKE
+  trap revoke_reminted_token EXIT
+  GITHUB_REPOSITORY=o/r WRITE_APP_ID=1 APP_KEY=k WRITE_INSTALLATION_ID=2 GH_TOKEN=start
   now=\$(date -u +%s)
   WRITE_TOKEN_EPOCH=\$((now - 600)); remint_write_token >/dev/null
   printf 'young=%s ' \"\$GH_TOKEN\"
-  remint_write_token 0 >/dev/null
-  printf 'forced=%s ' \"\$GH_TOKEN\"
-  GH_TOKEN=old; remint_write_token >/dev/null
-  printf 'after=%s ' \"\$GH_TOKEN\"
-  WRITE_TOKEN_EPOCH=\$((now - 2800)); remint_write_token >/dev/null
+  remint_write_token 300 >/dev/null
+  printf 'spawn=%s ' \"\$GH_TOKEN\"
+  remint_write_token 300 >/dev/null
+  printf 'again=%s ' \"\$GH_TOKEN\"
+  WRITE_TOKEN_EPOCH=\$((now - 1900)); remint_write_token >/dev/null
   printf 'old=%s' \"\$GH_TOKEN\"
 " 2>/dev/null)
-check '[ "$REMINT_OUT" = "young=old forced=fresh after=old old=fresh" ]' \
-  "remint_write_token skips a token younger than 45 minutes, always mints with 0, and restarts the age on success (got $REMINT_OUT)"
+REMINT_SCOPE='{"repositories":["r"],"permissions":{"contents":"write","issues":"write","pull_requests":"write","checks":"read"}}'
+REMINT_LOG=$(cat "$REMINT_DIR/log" 2>/dev/null)
+check '[ "$REMINT_OUT" = "young=start spawn=t1 again=t1 old=t2" ]' \
+  "remint_write_token keeps a token younger than 30 minutes, mints before a spawn once it is 5 minutes old, and restarts the age on success (got $REMINT_OUT)"
+check '[ "$REMINT_LOG" = "$(printf "mint %s\nmint %s\nrevoke t1\nrevoke t2" "$REMINT_SCOPE" "$REMINT_SCOPE")" ]' \
+  "each remint asks for this repo and the job-start permissions only, revokes the token it replaces and the last one on exit, and never the job-start token (got $REMINT_LOG)"
+
+# gh_read decides on the error alone: earlier pages already on stdout must not
+# turn a dropped connection or a 5xx into a final failure.
+GH_READ=$(extract_fn gh_read)
+gh_read_rc() {  # gh_read_rc <gh stdout> <gh stderr>  -> prints gh_read's status
+  GH_OUT="$1" GH_ERR="$2" bash -c "
+    gh() { printf '%s' \"\$GH_OUT\"; printf '%s\n' \"\$GH_ERR\" >&2; return 1; }
+    $GH_READ
+    gh_read api x >/dev/null 2>&1; echo \$?
+  "
+}
+GH_READ_RCS="$(gh_read_rc '[{"name":"a"}]' 'read: connection reset by peer') $(gh_read_rc '[{"name":"a"}]' 'HTTP 502: Bad Gateway') $(gh_read_rc '' 'HTTP 404: Not Found') $(gh_read_rc '[{"name":"a"}]' 'HTTP 422: Unprocessable Entity')"
+check '[ "$GH_READ_RCS" = "2 2 1 1" ]' \
+  "gh_read retries a partial paginated read on a network error or 5xx, and gives up only on a 4xx (got $GH_READ_RCS)"
 
 # edit_pr keeps the issue link: added once, after a blank line and a rule,
 # only when the new description does not already close the issue.
@@ -987,7 +1061,7 @@ check '[ "$(reactions "$C" add)" = shrug ]' "a no-change revise reacts shrug"
 # REVISE_TROUBLE always shows, whatever the CI state.
 C=$(new_case trouble)
 step_script "Report outcome" "$C" > "$C/report.sh"
-env -i IS_TRIVY_JQ="$IS_TRIVY_JQ" PATH="$FAKE_BIN:$PATH" HOME="$C/home" FAKE_STATE="$C" \
+env -i IGNORED_SCAN_JQ="$IGNORED_SCAN_JQ" IGNORED_CHECKS_RE="$IGNORED_CHECKS_RE" PATH="$FAKE_BIN:$PATH" HOME="$C/home" FAKE_STATE="$C" \
   GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
   GH_TOKEN=ghs_faketoken OUTCOME=success PR_URL=https://github.com/o/r/pull/7 REVISE_TROUBLE=1 \
   SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake SLACK_MENTION_TS=3.3 \
@@ -999,7 +1073,7 @@ check '[ "$(reactions "$C" add)" = warning ]' "revise trouble reacts warning"
 report_only() {  # report_only <case name> <VAR=value...>  -> prints the case dir
   local c; c=$(new_case "$1"); shift
   step_script "Report outcome" "$c" > "$c/report.sh"
-  env -i IS_TRIVY_JQ="$IS_TRIVY_JQ" PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
+  env -i IGNORED_SCAN_JQ="$IGNORED_SCAN_JQ" IGNORED_CHECKS_RE="$IGNORED_CHECKS_RE" PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
     GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
     GH_TOKEN=ghs_faketoken RUN_URL=https://github.com/o/r/actions/runs/1 \
     SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake \
