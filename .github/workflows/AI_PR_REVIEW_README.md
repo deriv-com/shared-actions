@@ -347,7 +347,7 @@ still the same engine, not a new one.
 | `provider_type` | **[kimi]** Wire dialect; must match what `base_url` serves | ❌ | `openai` |
 | `thinking_effort` | **[kimi]** Thinking effort for the review turn: low, high, or max. Empty sends no override | ❌ | empty (model default) |
 | `legacy_markers` | Newline-separated markers from superseded workflows to also delete | ❌ | `Claude PR Review Complete` |
-| `prompt_gist_url` | Review prompt template | ❌ | DerivFE gist, **pinned to a revision** |
+| `prompt_gist_url` | Review prompt template | ❌ | `.github/prompts/ai-pr-review.md`, inlined in the fetch step |
 
 An invalid `review_title` still renders verbatim in the Check name at
 workflow-parse time; the run then fails in "Resolve and validate engine".
@@ -355,14 +355,14 @@ The job name is not authoritative until the run succeeds.
 
 Inputs marked **[kimi]** / **[kimi, grok]** / **[kimi, grok, codex]** / **[codex]** /
 **[anthropic]** are ignored by engines that do not use them. Every input except
-`engine` and `legacy_markers` declares `default: ""` and is resolved to the
-values above inside the `Resolve and validate engine` step — so each default
-exists in exactly one place, and that step is where you bump any of them.
+`engine` and `legacy_markers` declares `default: ""`; all except the prompt are
+resolved in the `Resolve and validate engine` step. The prompt default is inlined
+in the fetch step.
 
-The gist default is pinned to a specific revision on purpose: the bare `raw/`
-URL is mutable, and a gist edit would rewrite the review agent's instructions
-for every consumer live, with no PR and no audit trail. To roll out a new
-prompt, edit the gist, then bump the revision hash in the resolve step via PR.
+The default prompt is `.github/prompts/ai-pr-review.md`, inlined in the fetch
+step so the job does not depend on the caller's checkout. A caller that sets
+`prompt_gist_url` fetches that URL instead. To change the prompt, edit the
+file and the inlined copy together. The contract test fails if they differ.
 
 `cli_version` is pinned deliberately: `@moonshot-ai/kimi-code`,
 `@xai-official/grok` and `@openai/codex` all ship frequently, so `latest`
@@ -639,7 +639,7 @@ asserts all of it.
    PR files API was deliberately avoided because it describes the PR's
    *current* head, which can move between the event and this step. A lookup
    failure counts as "new", never as "fine".
-5. **Fetch prompt** template from the pinned gist revision; inject the Click2Fix URL.
+5. **Fetch prompt** from the copy of `.github/prompts/ai-pr-review.md` inlined in the fetch step (or from `prompt_gist_url` when a caller sets it); inject the Click2Fix URL.
 6. **Capture** the newest prior review comment (canonical + legacy markers,
    paginated) as `PREVIOUS_REVIEW` and extract its `reviewed-commit` SHA.
    Capture only — deletion waits until step 11. Progress comments use a
