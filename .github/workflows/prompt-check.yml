@@ -10,7 +10,7 @@ on:
 jobs:
   ai-review:
     if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
-    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@a726e83dfa9a1f2ba5fdc456e96995d2b72ba69d
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@58dad464528f6fe4cc08a5c7757570048bfda367
     permissions:
       contents: read
       pull-requests: write
