@@ -1,0 +1,23 @@
+name: Muse Engine Smoke Test 2 (throwaway)
+
+# Throwaway caller for smoke-testing the muse engine on
+# feat/muse-code-engine after the ako-review fixes. Not for merge.
+# Deliberately omits muse_reasoning_effort to exercise the empty path.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  ai-review:
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@feat/muse-code-engine
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    with:
+      engine: muse
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+      AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
