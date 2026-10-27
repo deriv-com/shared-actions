@@ -701,7 +701,7 @@ run_case() {  # run_case <case dir>
   env -i PATH="$FAKE_BIN:$PATH" HOME="$c/home" GIT_CONFIG_GLOBAL="$c/home/gitconfig" \
     FAKE_STATE="$c" GITHUB_OUTPUT="$c/out" GITHUB_ENV="$c/env" \
     GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=1 ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
-    FORGE_COMMAND=revise FAST_LANE=false TIMEOUT_MINUTES=90 \
+    FORGE_COMMAND=revise FAST_LANE=false TIMEOUT_MINUTES="$(cat "$c/timeout_minutes" 2>/dev/null || echo 90)" \
     CLAUDE_BIN="$FAKE_BIN/claude" FORGE_CLI="$c/cli.js" \
     GH_TOKEN=ghs_faketoken GITHUB_TOKEN=ghs_faketoken \
     SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_MESSAGE_TS=2.2 SLACK_BOT_TOKEN=xoxb-fake \
@@ -799,6 +799,13 @@ check 'grep -q "^read_failed=review threads$" "$C/out" && grep -q "^revise_troub
 check 'has "$C/card.txt" "Could not read review threads"' "the card shows the read failure"
 check 'head -1 "$C/completion.txt" | grep -q "Could not read review threads" && ! head -1 "$C/completion.txt" | grep -q "is up"' \
   "Slack completion leads with the read failure, not PR is up"
+
+# Running out of job time before the work is done is reported, not a clean "PR is up".
+C=$(new_case out_of_time)
+echo 5 > "$C/timeout_minutes"
+run_case "$C"
+check '[ ! -f "$C/instruction.1.md" ] && grep -q "^revise_trouble=1$" "$C/out" && has "$C/completion.txt" "hit trouble"' \
+  "stopping for the job time budget is reported as revise trouble"
 
 # A 5xx is retried, and the card says so.
 C=$(new_case retry_502)

@@ -1280,8 +1280,8 @@ jobs:
               | [ (if $replyable then ($reply[0].comment // "") else "" end),
                   (if (($unrelated + $unbased) | length) > 0 then
                      "### CI\n"
-                     + ([$unrelated[] | "- Not this PR: `\(.name | gsub("`"; ""))` also fails on `\(.base_ref)`."]
-                        + [$unbased[] | "- `\(.name | gsub("`"; ""))`: no run on `\(.base_ref)` head to compare, so it was treated as this PR'"'"'s."]
+                     + ([$unrelated[] | "- Not this PR: `\(.name | gsub("[`\\r\\n]"; ""))` also fails on `\(.base_ref)`."]
+                        + [$unbased[] | "- `\(.name | gsub("[`\\r\\n]"; ""))`: no run on `\(.base_ref)` head to compare, so it was treated as this PR'"'"'s."]
                         | join("\n"))
                    else "" end) ]
               | map(select(test("[^[:space:]]"))) | join("\n\n") | clean($allowed; 20000)
@@ -1518,6 +1518,7 @@ jobs:
               LEFT=$(remaining_job_seconds)
               if [ "$LEFT" -lt "$MIN_CYCLE_SECONDS" ]; then
                 echo "Not enough remaining job time (${LEFT}s) for another wait+revise"
+                echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
                 break
               fi
               echo "Waiting for CI and PR Review checks on $PR_URL (round $((ROUND+1))/$MAX_REVISE)"
@@ -1581,6 +1582,7 @@ jobs:
               LEFT=$(remaining_job_seconds)
               if [ "$LEFT" -lt "$MIN_CYCLE_SECONDS" ]; then
                 echo "Not enough remaining job time (${LEFT}s) to start dstp revise"
+                echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
                 break
               fi
               if [ "$FINDINGS" = "1" ]; then
