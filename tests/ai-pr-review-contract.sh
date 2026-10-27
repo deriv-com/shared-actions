@@ -101,12 +101,16 @@ KIMI="$ROOT/.github/actions/ai_review_engine_kimi/action.yml"
 ANTH="$ROOT/.github/actions/ai_review_engine_anthropic/action.yml"
 GROK="$ROOT/.github/actions/ai_review_engine_grok/action.yml"
 CODEX="$ROOT/.github/actions/ai_review_engine_codex/action.yml"
+MUSE="$ROOT/.github/actions/ai_review_engine_muse/action.yml"
 GUARD="$ROOT/.github/actions/ai_review_path_guard/path-guard.js"
 GUARD_TEST="$ROOT/.github/actions/ai_review_path_guard/path-guard.test.js"
 
 # Lines of $2 between the step named $1 and the next step, for "this step
 # contains X" checks that must not be satisfied by some other step.
 step_body() { awk -v name="- name: $1" 'index($0, name){f=1; next} f && /^ *- name: /{exit} f' "$2"; }
+# Step body with backslash-continuations joined into single lines, for greps
+# that must see a multi-line command (env prefix + invocation) as one line.
+joined_step_body() { step_body "$1" "$2" | awk '/\\$/ { sub(/\\$/, ""); buf = buf $0 " "; next } { print buf $0; buf = "" }'; }
 
 # This script runs under `set -o pipefail`. A reader that quits early (`head`,
 # `grep -q`, `awk ... {exit}`) can SIGPIPE the writer before it finishes, and
@@ -146,7 +150,7 @@ check 'grep -q "git/trees/" <<< "$SYMLINK_STEP" && grep -qF ".mode == \"120000\"
 check '! grep -q "recursive=1" <<< "$SYMLINK_STEP"' "symlink step walks non-recursive tree listings (the recursive form truncates silently)"
 FILE_SWEEP='-o \( -type f -o -type l \)'
 DIR_SWEEP='-o \( -type d -o -type l \)'
-for engine in "$KIMI" "$ANTH" "$GROK" "$CODEX"; do
+for engine in "$KIMI" "$ANTH" "$GROK" "$CODEX" "$MUSE"; do
   name=$(basename "$(dirname "$engine")")
   check 'grep -qF -- "$FILE_SWEEP" "$engine"' "$name: instruction-file scrub matches symlinks"
   check 'grep -qF -- "$DIR_SWEEP" "$engine"' "$name: config-directory scrub matches symlinks"
@@ -165,7 +169,7 @@ check '[[ -f "$CODEX" ]]' "codex engine action.yml is committed"
 
 # Enum: resolve-step case arm, unknown-engine error list, and job name all name codex.
 check 'grep -qE "^            codex\)" "$WF"' "resolve step has a codex case arm"
-check 'grep -q "kimi, anthropic, grok, codex" "$WF"' "unknown-engine error lists codex"
+check 'grep -q "kimi, anthropic, grok, codex, muse" "$WF"' "unknown-engine error lists codex and muse"
 check 'grep -qF "inputs.engine == '\''codex'\'' && '\''Codex PR Review'\''" "$WF"' "job name resolves codex to Codex PR Review"
 check 'grep -q "DEFAULT_MODEL=\"gpt-6.1-sol\"" "$WF"' "codex arm pins DEFAULT_MODEL=gpt-6.1-sol"
 check 'grep -q "METRICS_AGENT=\"codex_review\"" "$WF"' "codex arm pins METRICS_AGENT=codex_review"
@@ -370,11 +374,57 @@ check 'ncgrep "::stop-commands::" "$CODEX"' "codex log dump is wrapped in ::stop
 # The shared prompt no longer tells every engine it has no shell.
 check '! grep -q "You have no shell tool" "$WF"' "shared review procedure does not claim 'no shell tool' (false for codex)"
 check '! grep -q "Exactly three edits" "$ROOT/.github/workflows/AI_PR_REVIEW_README.md"' "README 'Adding an engine' no longer claims exactly three edits"
+# ---------------------------------------------------------------------------
+# Muse engine — the fifth engine (Meta Muse Code). Same "adding an engine"
+# contract, plus the controls that make a *read-only* toolset safe to run
+# against LiteLLM: no shell/write tools at all (review = captured stdout),
+# settings-pinned endpoint_transport + model_catalog, and a CLI pinned by
+# version assertion because Meta ships no pinnable package.
+# ---------------------------------------------------------------------------
+check '[[ -f "$MUSE" ]]' "muse engine action.yml is committed"
+check 'grep -qE "^            muse\)" "$WF"' "resolve step has a muse case arm"
+check 'grep -qF "inputs.engine == '\''muse'\'' && '\''Muse PR Review'\''" "$WF"' "job name resolves muse to Muse PR Review"
+check 'grep -q "DEFAULT_MODEL=\"meta-muse-wonder-1.0\"" "$WF"' "muse arm pins DEFAULT_MODEL=meta-muse-wonder-1.0"
+check 'grep -q "METRICS_AGENT=\"muse_review\"" "$WF"' "muse arm pins METRICS_AGENT=muse_review"
+check 'grep -q "ARTIFACT_PREFIX=\"muse-review\"" "$WF"' "muse arm pins ARTIFACT_PREFIX=muse-review"
+check 'grep -q "DEFAULT_CLI_VERSION=\"1.4.13\"" "$WF"' "muse arm pins DEFAULT_CLI_VERSION=1.4.13"
+check 'grep -q "if: steps.engine.outputs.engine == '\''muse'\''" "$WF"' "muse dispatch step is if-gated on the engine output"
+check 'grep -q "ai_review_engine_muse@master" "$WF"' "muse dispatch references the engine by absolute @master path"
+check 'awk '\''/if: steps.engine.outputs.engine == .muse./{g=1} g && /timeout-minutes: 60/{print; exit}'\'' "$WF" | grep -c "timeout-minutes: 60" >/dev/null' "muse dispatch step carries timeout-minutes: 60"
+check 'grep -q "^      muse_reasoning_effort:" "$WF"' "muse_reasoning_effort input is declared"
+check 'awk '\''/^      muse_reasoning_effort:/{f=1} f && /default:/{print; exit}'\'' "$WF" | grep -c "default: \"\"" >/dev/null' "muse_reasoning_effort defaults to empty"
+check 'grep -qF "MUSE_REASONING_EFFORT_INPUT: \${{ inputs.muse_reasoning_effort }}" "$WF"' "resolve step reads muse_reasoning_effort from the workflow input"
+check 'grep -q "echo \"muse_reasoning_effort=\$MUSE_REASONING_EFFORT\"" "$WF"' "resolve step emits muse_reasoning_effort on the step outputs"
+check 'grep -q "muse_reasoning_effort: \${{ steps.engine.outputs.muse_reasoning_effort }}" "$WF"' "muse dispatch step passes muse_reasoning_effort through"
+check 'grep -q "^  muse_reasoning_effort:" "$MUSE"' "muse engine declares the muse_reasoning_effort input"
+check 'grep -qF "EFFORT_ARGS=(--reasoning-effort \"\$MUSE_REASONING_EFFORT\")" "$MUSE"' "muse engine maps muse_reasoning_effort onto --reasoning-effort"
+check 'grep -qE "if \[\[ -n \"\\\$MUSE_REASONING_EFFORT\" \]\]" "$MUSE"' "muse engine applies muse_reasoning_effort only when non-empty"
+check 'grep -qF "(default)'\'' high" "$WF"' "muse empty effort display is high (default)"
+# Confinement: the dangerous relaxations must never appear as active flags.
+check '! grep -vE "^[[:space:]]*#" "$MUSE" | grep -cE -- "--yolo|--disable-sandbox|--trust-workspace" >/dev/null' "muse engine never passes --yolo, --disable-sandbox or --trust-workspace"
+check '! step_body "Run AI PR review (Muse Code)" "$MUSE" | grep -vE "^[[:space:]]*#" | grep -cE -- "--base-url" >/dev/null' "muse engine never routes via --base-url (the CLI withholds its key); settings endpoint_transport is the only route"
+for flag in "--disable-shell" "--disable-write" "--disable-web-tools" "--disable-reminders" "--disable-approval" "--contributor-mode off" "--no-session-log" "--sandbox-network restricted" "--max-model-steps 200"; do
+  check 'grep -vE "^[[:space:]]*#" "$MUSE" | grep -cF -- "$flag" >/dev/null' "muse engine passes $flag"
+done
+check 'grep -q "endpoint_transport: { base_url: \$base_url, auth: \"bearer\" }" "$MUSE"' "muse settings pin endpoint_transport with bearer auth"
+check 'grep -q "model_catalog" "$MUSE" && grep -qF "profile_id: \"tbh\"" "$MUSE"' "muse settings register the LiteLLM alias in model_catalog (profile tbh)"
+check 'grep -q "META_API_KEY: \${{ inputs.api_key }}" "$MUSE"' "muse run step maps api_key to META_API_KEY"
+check '! step_body "Run AI PR review (Muse Code)" "$MUSE" | grep -cE "^ *(GITHUB_TOKEN|GH_TOKEN):" >/dev/null' "muse engine run step env holds no GitHub token"
+check 'step_body "Run AI PR review (Muse Code)" "$MUSE" | grep -cE "^ +MUSE_NO_AUTO_UPDATE: \"1\"" >/dev/null' "muse run step freezes the launcher self-update"
+check 'step_body "Install review CLI (Muse Code)" "$MUSE" | grep -cE "^ +MUSE_NO_AUTO_UPDATE: \"1\"" >/dev/null' "muse install step freezes the launcher self-update"
+check 'grep -q "installer delivered Muse Code" "$MUSE" && grep -q "cli_version pins" "$MUSE"' "muse engine asserts the installed version equals cli_version"
+check 'grep -q "no review written to \$OUTPUT_PATH" "$MUSE"' "muse engine fails if no review was written"
+check 'ncgrep "strip script changed since the strip step" "$MUSE"' "muse verifies the strip script hash before each attempt"
+check '! joined_step_body "Install review CLI (Muse Code)" "$MUSE" | grep -cE "rm .*[$][{]?MUSE_ENGINE_WORK[}]?([\";]|/[\";]|:[^\"]*[\";]| |$)" >/dev/null' "muse install step never rm's the strip script's directory (any single command, continuations joined)"
+check 'grep -qF "`muse` (Meta Muse Code CLI)" "$WF"' "engine input description names muse"
+check 'grep -qF "meta-muse-wonder-1.0" "$README" && grep -qF "muse_review" "$README" && grep -qF "muse-review-summary-" "$README"' "README documents the muse engine"
+check 'grep -qE "^\| \`muse_reasoning_effort\`" "$README"' "README inputs table documents muse_reasoning_effort"
+
 # The reasoning_effort, effort and thinking_effort enums are each duplicated
 # on purpose (the engines can be called directly). Extract Codex arms by the
 # `minimal|` prefix, Claude arms by the trailing `|max`, and Kimi arms as the
 # exact `low|high|max` (do not key Kimi on a Codex/Claude-only token).
-ENUM_WF=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +minimal\|[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
+ENUM_WF=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +minimal\|[a-z|]*xhigh[a-z|]*\) ;;' | grep -v '|max' | tr -d ' ;)' | sort -u)
 ENUM_CODEX=$(grep -vE '^[[:space:]]*#' "$CODEX" | grep -oE '^ +minimal\|[a-z|]*xhigh[a-z|]*\) ;;' | tr -d ' ;)' | sort -u)
 check '[[ -n "$ENUM_WF" && "$ENUM_WF" == "$ENUM_CODEX" ]]' "reasoning_effort case arms match in the orchestrator and the engine ($ENUM_WF)"
 ENUM_LIST="${ENUM_WF//|/, }"
@@ -384,6 +434,11 @@ ENUM_ANTH=$(grep -vE '^[[:space:]]*#' "$ANTH" | grep -oE '^ +low\|medium\|high\|
 check '[[ -n "$ENUM_WF_ANTH" && "$ENUM_WF_ANTH" == "$ENUM_ANTH" ]]' "effort case arms match in the orchestrator and the anthropic engine ($ENUM_WF_ANTH)"
 ENUM_ANTH_LIST="${ENUM_WF_ANTH//|/, }"
 check 'grep -qF -- "${ENUM_ANTH_LIST%, *}" "$WF" && grep -qF -- "${ENUM_ANTH_LIST%, *}" "$ANTH"' "effort input descriptions list the same values as the case arms"
+ENUM_WF_MUSE=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +minimal\|low\|medium\|high\|xhigh\|max\) ;;' | tr -d ' ;)' | sort -u)
+ENUM_MUSE=$(grep -vE '^[[:space:]]*#' "$MUSE" | grep -oE '^ +minimal\|low\|medium\|high\|xhigh\|max\) ;;' | tr -d ' ;)' | sort -u)
+check '[[ -n "$ENUM_WF_MUSE" && "$ENUM_WF_MUSE" == "$ENUM_MUSE" ]]' "muse_reasoning_effort case arms match in the orchestrator and the engine ($ENUM_WF_MUSE)"
+ENUM_MUSE_LIST="${ENUM_WF_MUSE//|/, }"
+check 'grep -qF -- "${ENUM_MUSE_LIST%, *}" "$WF" && grep -qF -- "${ENUM_MUSE_LIST%, *}" "$MUSE"' "muse_reasoning_effort input descriptions list the same values as the case arms"
 ENUM_WF_KIMI=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +low\|high\|max\) ;;' | tr -d ' ;)' | sort -u)
 ENUM_KIMI=$(grep -vE '^[[:space:]]*#' "$KIMI" | grep -oE '^ +low\|high\|max\) ;;' | tr -d ' ;)' | sort -u)
 check '[[ -n "$ENUM_WF_KIMI" && "$ENUM_WF_KIMI" == "$ENUM_KIMI" ]]' "thinking_effort case arms match in the orchestrator and the kimi engine ($ENUM_WF_KIMI)"
@@ -400,12 +455,17 @@ is_codex_effort_line() {
 is_claude_effort_line() {
   [[ "$1" =~ --effort ]] || [[ "$1" =~ output_config ]] || [[ "$1" =~ engine-specific:\ anthropic ]] || [[ "$1" =~ Anthropic\ engine:\ effort ]] || [[ "$1" =~ Invalid\ effort ]] || [[ "$1" =~ \*\*\[anthropic\]\*\* ]]
 }
+is_muse_effort_line() {
+  [[ "$1" =~ muse_reasoning_effort ]] || [[ "$1" =~ --reasoning-effort ]] || [[ "$1" =~ MUSE_REASONING_EFFORT ]] || [[ "$1" =~ engine-specific:\ muse ]] || [[ "$1" =~ Muse\ engine:\ muse_reasoning_effort ]] || [[ "$1" =~ \*\*\[muse\]\*\* ]] || [[ "$1" =~ Muse\ Code\ default ]] || [[ "$1" =~ Invalid\ muse_reasoning_effort ]]
+}
 enum_prose_ok() {
   local f line v enum
-  for f in "$WF" "$CODEX" "$ANTH" "$README"; do
+  for f in "$WF" "$CODEX" "$ANTH" "$MUSE" "$README"; do
     while IFS= read -r line; do
       is_case_arm "$line" && continue
-      if is_codex_effort_line "$line"; then
+      if is_muse_effort_line "$line"; then
+        enum="$ENUM_WF_MUSE"
+      elif is_codex_effort_line "$line"; then
         enum="$ENUM_WF"
       elif is_claude_effort_line "$line"; then
         enum="$ENUM_WF_ANTH"
@@ -431,6 +491,24 @@ check 'claude_effort_ok "" && claude_effort_ok low && claude_effort_ok max' "ant
 check '! claude_effort_ok minimal && ! claude_effort_ok ultracode && ! claude_effort_ok bogus' "anthropic engine rejects minimal, ultracode and unknown values"
 KIMI_THINKING_BLOCK=$(step_body "Run AI PR review (Kimi Code)" "$KIMI" | awk '/thinking_effort is dual-validated here/{f=1} f{print} f && /^ +fi$/{f=0; done=1} done{next}' | sed 's/^        //')
 kimi_thinking_ok() { THINKING_EFFORT="$1" bash -c "$KIMI_THINKING_BLOCK" >/dev/null 2>&1; }
+MUSE_EFFORT_BLOCK=$(step_body "Run AI PR review (Muse Code)" "$MUSE" | awk '/EFFORT_ARGS=\(\)/{f=1} f{print} f && /^ +fi$/{f=0; done=1} done{next}' | sed 's/^        //')
+muse_effort_ok() { MUSE_REASONING_EFFORT="$1" bash -c "$MUSE_EFFORT_BLOCK" >/dev/null 2>&1; }
+check 'muse_effort_ok "" && muse_effort_ok minimal && muse_effort_ok max' "muse engine accepts empty, minimal and max"
+check '! muse_effort_ok none && ! muse_effort_ok ultra && ! muse_effort_ok bogus' "muse engine rejects none, ultra and unknown values"
+# The orchestrator's copy of the same validation must behave identically,
+# not just grep-match: run it too.
+WF_MUSE_BLOCK=$(step_body "Resolve and validate engine" "$WF" | awk '/MUSE_REASONING_EFFORT="\$\{MUSE_REASONING_EFFORT_INPUT:-\}"/{f=1} f{print} f && /^ +fi$/{f=0; done=1} done{next}' | sed 's/^ *//')
+wf_muse_effort_ok() { MUSE_REASONING_EFFORT_INPUT="$1" bash -c "$WF_MUSE_BLOCK" >/dev/null 2>&1; }
+check 'wf_muse_effort_ok "" && wf_muse_effort_ok minimal && wf_muse_effort_ok max' "orchestrator muse validation accepts empty, minimal and max"
+check '! wf_muse_effort_ok none && ! wf_muse_effort_ok ultra && ! wf_muse_effort_ok bogus' "orchestrator muse validation rejects none, ultra and unknown values"
+# The strip script only exists as a heredoc until a live run writes it;
+# prove the extracted body at least parses.
+check 'awk "/cat > \"\\\$STRIP_SCRIPT\" <<.STRIP_EOF./{f=1;next} f && /^ *STRIP_EOF/{exit} f" "$MUSE" | sed "s/^ *//" | bash -n' "muse strip script heredoc parses as bash"
+# Installer: never piped into bash, HTTPS-pinned, hash logged.
+check '! grep -vE "^[[:space:]]*#" "$MUSE" | grep -cF "install.sh |" >/dev/null' "muse installer is never piped into bash"
+check 'grep -qF -- "--proto '\''=https'\''" "$MUSE" && grep -q "Muse Code installer sha256" "$MUSE"' "muse installer fetch pins HTTPS and logs the script hash"
+check 'joined_step_body "Install review CLI (Muse Code)" "$MUSE" | grep -F "bash \"\$INSTALLER\"" | grep -cF "HOME=\"\$MUSE_ENGINE_HOME\" XDG_CONFIG_HOME=\"\$MUSE_ENGINE_HOME/.config\"" >/dev/null' "muse installer invocation runs with the isolated HOME/XDG, not the runner's real home"
+check 'grep -qF "MUSE_INSTALLER_DIR: \${{ runner.temp }}/muse-engine-installer" "$MUSE" && grep -qF "INSTALLER=\"\$MUSE_INSTALLER_DIR/install.sh\"" "$MUSE" && joined_step_body "Install review CLI (Muse Code)" "$MUSE" | grep -F "rm -rf" | grep -cF "\"\$MUSE_INSTALLER_DIR\"" >/dev/null' "muse installer script lives in its own wiped directory, not the install dir"
 check 'kimi_thinking_ok "" && kimi_thinking_ok low && kimi_thinking_ok max' "kimi engine accepts empty, low and max"
 check '! kimi_thinking_ok medium && ! kimi_thinking_ok xhigh && ! kimi_thinking_ok bogus' "kimi engine rejects medium, xhigh and unknown values"
 
