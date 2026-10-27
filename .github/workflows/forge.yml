@@ -854,7 +854,7 @@ jobs:
                 def is_review:
                   ((.name // .context // "") | test("PR Review"));
                 def is_trivy:
-                  ((.name // .context // "") | test("trivy"; "i"));
+                  (((.name // .context // "") + " " + (.workflowName // "")) | test("trivy|\\bsca\\b"; "i"));
                 def failing:
                   ((.conclusion // "") | ascii_upcase) as $c
                   | ((.state // "") | ascii_upcase) as $s
@@ -1083,7 +1083,7 @@ jobs:
             # Both documents go through stdin: a big repo's check runs exceed the
             # kernel's per-argument limit, so jq fails with "Argument list too long".
             printf '%s\n%s\n' "$rollup" "$runs" | jq -n --arg base "$base" '
-              def is_trivy: ((.name // .context // "") | test("trivy"; "i"));
+              def is_trivy: (((.name // .context // "") + " " + (.workflowName // "")) | test("trivy|\\bsca\\b"; "i"));
               def failing:
                 ((.conclusion // "") | ascii_upcase) as $c
                 | ((.state // "") | ascii_upcase) as $s
@@ -1736,9 +1736,9 @@ jobs:
               # Checks that also fail on the base head are not this PR's.
               export SKIP_CHECKS
               SKIP_CHECKS=$(printf '%s' "${UNRELATED_CHECKS:-[]}" | jq -r 'if type == "array" then .[] else empty end' 2>/dev/null || true)
-              CI_FAILING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0; n=split(ENVIRON["SKIP_CHECKS"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") s[a[i]] = 1} $2=="fail" && tolower($1) !~ /trivy/ && !($1 in s) {c++} END{print c+0}')
+              CI_FAILING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0; n=split(ENVIRON["SKIP_CHECKS"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") s[a[i]] = 1} $2=="fail" && tolower($1) !~ /trivy|(^|[^a-z])sca([^a-z]|$)/ && !($1 in s) {c++} END{print c+0}')
               CI_PENDING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="pending"{c++} END{print c+0}')
-              CI_FAILING_NAMES=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{sep=""; m=split(ENVIRON["SKIP_CHECKS"], a, "\n"); for (i = 1; i <= m; i++) if (a[i] != "") s[a[i]] = 1} $2=="fail" && tolower($1) !~ /trivy/ && !($1 in s) && n<5 {printf "%s%s", sep, $1; sep=", "; n++}')
+              CI_FAILING_NAMES=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{sep=""; m=split(ENVIRON["SKIP_CHECKS"], a, "\n"); for (i = 1; i <= m; i++) if (a[i] != "") s[a[i]] = 1} $2=="fail" && tolower($1) !~ /trivy|(^|[^a-z])sca([^a-z]|$)/ && !($1 in s) && n<5 {printf "%s%s", sep, $1; sep=", "; n++}')
             fi
           }
 

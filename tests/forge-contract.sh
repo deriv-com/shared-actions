@@ -410,10 +410,10 @@ check 'grep -q "GH_TOKEN: \${{ steps.report-token.outputs.token }}" "$WF"' \
   "Report uses the freshly minted token, not the job-start token"
 check 'awk "
   /name: Report outcome/ {r=1}
-  r && /tolower\(\\\$1\) !~ \/trivy\// {t=1}
+  r && /tolower\(\\\$1\) !~ \/trivy[|].*sca/ {t=1}
   END {exit t ? 0 : 1}
 " "$WF"' \
-  "Report does not count Trivy as blocking CI"
+  "Report does not count Trivy or the SCA scan as blocking CI"
 
 # --- GraphQL queries must parse ---------------------------------------------
 # String matches let a query GitHub cannot parse ship (8 `{`, 9 `}` in the
@@ -650,6 +650,7 @@ JSON
  {"__typename": "CheckRun", "name": "E2E preview smoke", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://github.com/o/r/actions/runs/40327308412/job/121592798637"},
  {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/555"},
  {"__typename": "CheckRun", "name": "Trivy SCA", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/556"},
+ {"__typename": "CheckRun", "name": "SCA Vulnerability Scan", "workflowName": "Trivy SCA Scan", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/558"},
  {"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/557"},
  {"__typename": "CheckRun", "name": "ai-review / Kimi PR Review", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://github.com/o/r/actions/runs/2/job/1"},
  {"__typename": "CheckRun", "name": "ai-review / Claude Opus 5.5 PR Review", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://github.com/o/r/actions/runs/2/job/2"}
@@ -666,7 +667,7 @@ JSON
   { echo "E2E-FIRST-LINE"; for i in $(seq 2 99); do echo "e2e line $i"; done
     echo "Error: preview did not respond ${FAKE_TOKEN_A}"; echo "e2e line 101"; } > "$c/log_121592798637.txt"
   echo "LINT-LOG-LINE" > "$c/log_555.txt"
-  printf 'E2E preview smoke\tpass\t4s\thttps://x/1\t\nlint\tfail\t9s\thttps://x/2\t\nTrivy SCA\tfail\t1s\thttps://x/3\t\ntest\tpass\t4m\thttps://x/4\t\n' > "$c/pr_checks.txt"
+  printf 'E2E preview smoke\tpass\t4s\thttps://x/1\t\nlint\tfail\t9s\thttps://x/2\t\nTrivy SCA\tfail\t1s\thttps://x/3\t\nSCA Vulnerability Scan\tfail\t40s\thttps://x/5\t\ntest\tpass\t4m\thttps://x/4\t\n' > "$c/pr_checks.txt"
   echo '{"title": "fix: format markup guide example amounts", "body": "An earlier version of this change.\n\nCloses #1213"}' > "$c/pr.json"
   jq -n --arg long "$LONG_TEXT" --arg tokb "$FAKE_TOKEN_B" '{
     threads: [
@@ -762,7 +763,9 @@ check 'has "$I" "### Failing check: E2E preview smoke" && has "$I" "e2e line 101
 check '! has "$I" "$FAKE_TOKEN_A" && has "$I" "***"' "failed-log lines are scrubbed of tokens"
 check '! has "$I" "Failing check: lint" && ! has "$I" "LINT-LOG-LINE"' \
   "a check that also fails on the base head is left out of the instruction"
-check '! has "$I" "Failing check: Trivy"' "Trivy is never a dstp target"
+check '! has "$I" "Failing check: Trivy" && ! has "$I" "Failing check: SCA Vulnerability Scan"' \
+  "Trivy is never a dstp target, whether the check or only its workflow is named after it"
+check '! has "$C/completion.txt" "SCA Vulnerability Scan"' "Slack completion does not list the SCA scan as failing CI"
 check '[ "$(wc -l < "$C/replies.jsonl" | tr -d " ")" = 4 ]' "one reply in each of the 4 fetched threads"
 check '! has "$C/replies.jsonl" "INJECTED-REPLY" && ! grep -q "\"id\":\"999\"" "$C/replies.jsonl" && has "$C/run.log" "Dropped a reply for thread 999"' \
   "a model reply naming a thread id that was not fetched is dropped"
@@ -869,6 +872,8 @@ jq -n --rawfile t "$BIG/text" '{total_count: 2, check_runs: [
 jq -n '{statusCheckRollup: [
   {name: "lint", conclusion: "FAILURE", detailsUrl: "https://github.com/o/r/actions/runs/1/job/555"},
   {name: "E2E", conclusion: "FAILURE", detailsUrl: "https://github.com/o/r/actions/runs/1/job/556"},
+  {name: "SCA Vulnerability Scan", workflowName: "Trivy SCA Scan", conclusion: "FAILURE"},
+  {name: "Playwright Mobile Landscape", conclusion: "FAILURE"},
   {name: "test", conclusion: "SUCCESS"}]}' > "$BIG/rollup.json"
 BIG_OUT=$(B="$BIG" GITHUB_REPOSITORY=o/r bash -c "
   gh() {
@@ -882,8 +887,8 @@ BIG_OUT=$(B="$BIG" GITHUB_REPOSITORY=o/r bash -c "
   $HELPERS
   fetch_failing_checks https://github.com/o/r/pull/7 | jq -c '[.[] | {name, base}]'
 " 2>&1)
-check '[ "$BIG_OUT" = "[{\"name\":\"lint\",\"base\":\"failing\"},{\"name\":\"E2E\",\"base\":\"none\"}]" ]' \
-  "base check runs over the argument size limit still classify the PR's failing checks (got ${BIG_OUT:0:200})"
+check '[ "$BIG_OUT" = "[{\"name\":\"lint\",\"base\":\"failing\"},{\"name\":\"E2E\",\"base\":\"none\"},{\"name\":\"Playwright Mobile Landscape\",\"base\":\"none\"}]" ]' \
+  "base check runs over the argument size limit still classify the PR's failing checks, skipping the SCA scan but not a name that only contains sca (got ${BIG_OUT:0:200})"
 
 # edit_pr keeps the issue link: added once, after a blank line and a rule,
 # only when the new description does not already close the issue.
