@@ -90,7 +90,7 @@ on:
         default: "Claude PR Review Complete"
         type: string
       prompt_gist_url:
-        description: "URL to fetch the prompt template from. Empty resolves to the DerivFE gist PINNED TO A REVISION — the unpinned raw/ URL would let a gist edit silently rewrite the review agent's instructions for every consumer, live, with no PR. To roll out a new prompt, update the revision hash in the 'Resolve and validate engine' step via PR."
+        description: "URL to fetch the prompt template from. Empty resolves to .github/prompts/ai-pr-review.md in this repo at the called workflow's commit (github.workflow_sha). Set this only to override that file."
         required: false
         default: ""
         type: string
@@ -363,15 +363,16 @@ jobs:
           # — previously they were duplicated between the input declaration and
           # `||` fallbacks at each use site, which is how defaults drift apart.
           #
-          # The gist URL is pinned to a revision: the bare raw/ URL is mutable,
-          # and whoever edits the gist would rewrite the review agent's
-          # instructions for every consumer with no PR and no audit trail. To
-          # ship a new prompt, edit the gist, then bump this hash via PR.
+          # The prompt is this repo's .github/prompts/ai-pr-review.md, fetched at
+          # the called workflow's commit. github.workflow_sha is that SHA, so a
+          # caller pinned to an older shared-actions ref keeps the prompt from
+          # that ref. A caller that sets prompt_gist_url still fetches that URL.
+          # To change the prompt, edit the file in a PR.
           BASE_URL="${BASE_URL_INPUT:-https://litellmsa.deriv.ai/v1}"
           MAX_CONTEXT="${MAX_CONTEXT_INPUT:-$DEFAULT_MAX_CONTEXT}"
           CLI_VERSION="${CLI_VERSION_INPUT:-$DEFAULT_CLI_VERSION}"
           PROVIDER_TYPE="${PROVIDER_TYPE_INPUT:-openai}"
-          PROMPT_GIST_URL="${PROMPT_GIST_URL_INPUT:-https://gist.githubusercontent.com/DerivFE/048e18e3d2e8c0cddf4c3f434835d57f/raw/2d5131aa058801e99fe77f69db124bf583f7d3ea/claude-review-format.md}"
+          PROMPT_GIST_URL="${PROMPT_GIST_URL_INPUT:-https://raw.githubusercontent.com/deriv-com/shared-actions/${{ github.workflow_sha }}/.github/prompts/ai-pr-review.md}"
 
           # thinking_effort is kimi-only (like provider_type). Empty is the
           # default — KIMI_MODEL_THINKING_EFFORT is left unset, and the model
@@ -696,7 +697,7 @@ jobs:
           fi
           echo "✅ ${#HEAD_LINKS[@]} symlink(s) in the tree, all already in the base branch ($BASE_SHA) unchanged"
 
-      - name: Fetch prompt template from Gist
+      - name: Fetch prompt template
         id: fetch-prompt
         env:
           PROMPT_GIST_URL: ${{ steps.engine.outputs.prompt_gist_url }}
@@ -871,7 +872,7 @@ jobs:
 
           # Build the full context file that the review agent will read
           {
-            # System instructions from gist with click2fix URL injected
+            # System instructions with the Click2Fix URL injected
             sed "s|{{AUTO_FIX_URL}}|${CLICK2FIX_URL}|g" /tmp/prompt_template.txt
             echo ""
 
@@ -906,7 +907,7 @@ jobs:
               if [ -s /tmp/incremental_diff.txt ]; then
                 echo "---INCREMENTAL_DIFF---"
                 echo "The following diff shows ONLY the changes made since the last review. Use this to confirm what was explicitly fixed."
-                echo "If a pattern appears on a \`-\` line here it was removed. If it does not appear here at all, it was not touched."
+                echo "If a pattern appears on a \`-\` line here it was removed. If it does not appear here at all, that means nothing: open the file."
                 echo '```diff'
                 cat /tmp/incremental_diff.txt
                 echo '```'
@@ -958,14 +959,11 @@ jobs:
             echo ""
             echo "Work through these steps in order:"
             echo ""
-            echo "1. Read $PR_DIFF_FILE — the full diff for this PR (changed files and hunks), already fetched for you. You have no network access, so do not try to fetch anything; everything you need is on disk."
-            echo "2. For each changed file, use Read to open the full file — not just the diff hunk. Full file context is required to understand the complete impact of each change."
-            echo "3. For each changed file, identify and Read its dependencies:"
-            echo "   - Imported modules, utilities, or shared helpers referenced in the changed code"
-            echo "   - Type definitions, interfaces, or enums used by the changed code"
-            echo "   - Parent components or callers if the changed file exports something modified"
-            echo "   - Related test files (e.g. *.spec.ts, *.test.ts) to assess coverage gaps"
-            echo "4. After reading ALL files and dependencies, compile your complete review and write the ENTIRE review to $REVIEW_OUTPUT_FILE using the Write tool. Do not post, create, or update any PR or issue comment — writing that file is the whole job; the caller posts it as a single comment."
+            echo "1. Read $PR_DIFF_FILE. You have no network. Do not fetch the PR."
+            echo "2. Read each changed file around the hunks."
+            echo "3. Open another file only to confirm or refute one assumption the new code makes. Then stop."
+            echo "4. When the diff edits a spec or design doc, read that file and the code it describes. A contradiction between them is a finding."
+            echo "5. Write the entire review to $REVIEW_OUTPUT_FILE with the Write tool. Do not post a comment."
             echo ""
 
             # Output format — the visible header is prepended by the post step,

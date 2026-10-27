@@ -535,6 +535,21 @@ check '! grep -q "the one prepare branch that never rewrites origin" "$README" &
 check 'grep -q "REVIEW_MARKER_FILTER" "$README"' "README documents why the reap filter is env, not a file"
 check 'grep -q "120000" "$README"' "README documents the tree-based symlink check"
 
+# The review prompt lives in-repo. The procedure must not tell the model to
+# read every dependency, which overrides the prompt because it is appended last.
+PROMPT="$ROOT/.github/prompts/ai-pr-review.md"
+check '[[ -f "$PROMPT" ]]' "review prompt file exists"
+check 'grep -q "If that text contradicts the code in the same diff, or two parts of it contradict each other, that is a Change." "$PROMPT"' "prompt treats a spec contradiction in the diff as a Change"
+check 'grep -q "{{AUTO_FIX_URL}}" "$PROMPT"' "prompt leaves the Click2Fix placeholder"
+check 'grep -q "Under 500 words." "$PROMPT"' "prompt caps the review at 500 words"
+check 'grep -q "github.workflow_sha" "$WF"' "workflow fetches the prompt at the called workflow SHA"
+check 'grep -q ".github/prompts/ai-pr-review.md" "$WF"' "workflow default URL points at the prompt file"
+check '! grep -q "Read its dependencies" "$WF"' "procedure does not tell the model to read every dependency"
+check 'grep -q "When the diff edits a spec or design doc" "$WF"' "procedure includes the spec-doc step"
+check '! grep -q "it was not touched" "$WF"' "incremental diff does not treat an absent pattern as untouched"
+check 'grep -q ".github/prompts/ai-pr-review.md" "$README"' "README documents the in-repo prompt"
+check '! grep -q "edit the gist" "$README"' "README no longer tells people to edit the gist"
+
 if [[ "$fail" -ne 0 ]]; then
   echo "contract checks failed"
   exit 1
