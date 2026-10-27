@@ -90,7 +90,7 @@ on:
         default: "Claude PR Review Complete"
         type: string
       prompt_gist_url:
-        description: "URL to fetch the prompt template from. Empty resolves to .github/prompts/ai-pr-review.md in this repo at the called workflow's commit (github.workflow_sha). Set this only to override that file."
+        description: "URL to fetch the prompt template from. Empty resolves to .github/prompts/ai-pr-review.md in this repo at the called workflow's ref (the part after @ in github.workflow_ref). Set this only to override that file."
         required: false
         default: ""
         type: string
@@ -364,15 +364,19 @@ jobs:
           # `||` fallbacks at each use site, which is how defaults drift apart.
           #
           # The prompt is this repo's .github/prompts/ai-pr-review.md, fetched at
-          # the called workflow's commit. github.workflow_sha is that SHA, so a
-          # caller pinned to an older shared-actions ref keeps the prompt from
-          # that ref. A caller that sets prompt_gist_url still fetches that URL.
-          # To change the prompt, edit the file in a PR.
+          # the called workflow's ref. The caller's merge commit does not
+          # contain this file, so a URL built from that SHA 404s. workflow_ref
+          # is owner/repo/.github/workflows/ai-pr-review.yml@<ref>, and <ref> is
+          # the SHA or refs/heads/... the caller pinned. A caller that sets
+          # prompt_gist_url still fetches that URL. To change the prompt, edit
+          # the file in a PR.
           BASE_URL="${BASE_URL_INPUT:-https://litellmsa.deriv.ai/v1}"
           MAX_CONTEXT="${MAX_CONTEXT_INPUT:-$DEFAULT_MAX_CONTEXT}"
           CLI_VERSION="${CLI_VERSION_INPUT:-$DEFAULT_CLI_VERSION}"
           PROVIDER_TYPE="${PROVIDER_TYPE_INPUT:-openai}"
-          PROMPT_GIST_URL="${PROMPT_GIST_URL_INPUT:-https://raw.githubusercontent.com/deriv-com/shared-actions/${{ github.workflow_sha }}/.github/prompts/ai-pr-review.md}"
+          WORKFLOW_REF="${{ github.workflow_ref }}"
+          PROMPT_REF="${WORKFLOW_REF##*@}"
+          PROMPT_GIST_URL="${PROMPT_GIST_URL_INPUT:-https://raw.githubusercontent.com/deriv-com/shared-actions/${PROMPT_REF}/.github/prompts/ai-pr-review.md}"
 
           # thinking_effort is kimi-only (like provider_type). Empty is the
           # default — KIMI_MODEL_THINKING_EFFORT is left unset, and the model
