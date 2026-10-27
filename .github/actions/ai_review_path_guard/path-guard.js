@@ -17,9 +17,8 @@
 // a bare `deny Read` still read files and a bare `deny Write` still wrote
 // into the checkout), and Claude Code's `--allowedTools` has no path scope
 // for Read at all. In both engines this is the only thing confining paths,
-// and the
-// CLI process's own environment (readable through /proc without it) carries
-// the LLM key — and, for Claude Code, the job's GitHub token.
+// and the CLI process's own environment (readable through /proc without it)
+// carries the LLM key — and, for Claude Code, the job's GitHub token.
 //
 // Why match-all and an explicit tool allow-list: in both CLIs a hook only
 // blocks on exit 2; a call the matcher does not fire for is simply allowed. If
