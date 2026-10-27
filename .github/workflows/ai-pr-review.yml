@@ -1171,7 +1171,7 @@ jobs:
         id: engine-muse
         if: steps.engine.outputs.engine == 'muse'
         timeout-minutes: 60
-        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_muse@master
+        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_muse@feat/muse-code-engine
         with:
           repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
