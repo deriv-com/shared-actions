@@ -291,7 +291,7 @@ check 'awk "
 check 'awk "
   /name: Report outcome/ {r=1}
   r && /ci_failing_names/ {n=1}
-  r && /n<5|n < 5|head -n 5/ {c=1}
+  r && /n<5|n < 5|head -n 5|\\.\\[0:5\\]/ {c=1}
   END {exit (n && c) ? 0 : 1}
 " "$WF"' \
   "ci_failing_names is capped at 5 check names from gh pr checks"
@@ -385,12 +385,51 @@ check 'awk "
   l && /run_branch_revise|wait_for_rollup/ {exit (r ? 0 : 1)}
 " "$WF"' \
   "remint_write_token runs at the top of every wait+revise round"
+for fn in run_dstp run_branch_revise; do
+  check 'awk -v fn="$fn" "
+    \$0 == \"          \" fn \"() {\" {f=1}
+    f && /remint_write_token 300\$/ {r=1}
+    f && /node \"\\\$FORGE_CLI\"/ {exit (r ? 0 : 1)}
+  " "$WF"' \
+    "$fn remints the write token right before it spawns dstp"
+done
 check 'awk "
-  /slack_progress \"Opening the PR\"/ {s=1}
-  s && /remint_write_token/ {r=1}
-  s && /run_dstp/ {exit (r ? 0 : 1)}
+  /run_branch_revise \/tmp\/forge-revise-instruction.md \|\| REVISE_STATUS/ {f=1; next}
+  f && /^ *#/ {next}
+  f && /remint_write_token\$/ {exit 0}
+  f && /reply_to_reviews|post_review_replies|REVISE_STATUS\" -ne 0/ {exit 1}
 " "$WF"' \
-  "remint_write_token runs immediately before the initial run_dstp"
+  "the write token is reminted after every revise, before the reply pass posts"
+check 'grep -q "^          trap revoke_reminted_token EXIT\$" "$WF"' \
+  "the last reminted token is revoked when Run Forge exits"
+check 'awk "
+  /^    steps:\$/ {s=1; next}
+  s && /^      - name: / {exit (\$0 == \"      - name: Record job start\" ? 0 : 1)}
+" "$WF" && grep -q "^        run: echo \"FORGE_JOB_START=\$(date -u +%s)\" >> \"\$GITHUB_ENV\"\$" "$WF"' \
+  "the job's first step records its start, before any token is minted"
+check 'awk "
+  /SCRIPT_START=\\\$\\(date -u \\+%s\\)/ {f=1}
+  f && /START_EPOCH=\\\$FORGE_JOB_START/ {j=1}
+  f && /WRITE_TOKEN_EPOCH=\\\$FORGE_JOB_START/ {t=1}
+  f && /WRITE_TOKEN_EPOCH=0\$/ {z=1}
+  f && /remaining_job_seconds\\(\\)/ {exit (j && t && z ? 0 : 1)}
+" "$WF"' \
+  "job time and token age count from the recorded job start; without it the first dstp spawn remints"
+check '! grep -q "actions/runs/\${GITHUB_RUN_ID}" "$WF"' \
+  "the start time does not depend on an Actions API read"
+check 'awk "
+  /^          reply_to_reviews\\(\\) \\{/ {f=1}
+  f && /CLAUDE_BIN\" -p/ {c=1}
+  f && /remint_write_token 300/ {r=c}
+  f && /^            post_thread_replies / {exit (r ? 0 : 1)}
+" "$WF"' \
+  "reply_to_reviews remints right before posting, after the reply pass"
+check 'awk "
+  /id: repo-token/ {f=1}
+  f && /permission-actions: read/ {exit 0}
+  f && /^      - name: / {exit 1}
+" "$WF"' \
+  "the job-start token can read failed-check logs (actions read)"
 check 'grep -q "http.https://github.com/.extraheader" "$WF"' \
   "remint refreshes git extraheader so git push uses the new token"
 check 'awk "
@@ -408,12 +447,23 @@ check 'awk "
   "Report mints its own token with if: always()"
 check 'grep -q "GH_TOKEN: \${{ steps.report-token.outputs.token }}" "$WF"' \
   "Report uses the freshly minted token, not the job-start token"
+check '[ "$(grep -c "def is_ignored_scan" "$WF")" = 1 ] && [ "$(grep -c "\${IGNORED_SCAN_JQ}" "$WF")" = 4 ]' \
+  "is_ignored_scan is defined once and used by the regex check, wait_for_rollup, fetch_failing_checks and the Report"
+check 'grep -q "IGNORED_CHECKS_RE: \${{ inputs.ignored_checks_regex }}" "$WF"' \
+  "the ignored-checks regex comes from the ignored_checks_regex input"
+check 'awk "
+  /APP_KEY=\"\\\$WRITE_APP_KEY\"/ {f=1}
+  f && /is_ignored_scan/ && /jq -n/ {v=1}
+  f && /::error::ignored_checks_regex/ {e=1}
+  f && /git config --global user.name/ {exit (v && e ? 0 : 1)}
+" "$WF"' \
+  "Run Forge rejects an invalid ignored_checks_regex before doing any work"
 check 'awk "
   /name: Report outcome/ {r=1}
-  r && /tolower\(\\\$1\) !~ \/trivy\// {t=1}
+  r && /IGNORED_SCAN_JQ/ {t=1}
   END {exit t ? 0 : 1}
 " "$WF"' \
-  "Report does not count Trivy as blocking CI"
+  "Report does not count Trivy or the SCA scan as blocking CI"
 
 # --- GraphQL queries must parse ---------------------------------------------
 # String matches let a query GitHub cannot parse ship (8 `{`, 9 `}` in the
@@ -459,6 +509,34 @@ TMP_BEHAVIOR=$(mktemp -d)
 # KEEP_TMP=1 keeps the fake runs for debugging.
 trap '[ -n "${KEEP_TMP:-}" ] && echo "kept $TMP_BEHAVIOR" || rm -rf "$TMP_BEHAVIOR"' EXIT
 
+# The job-level is_ignored_scan definition and the input's default regex, as
+# the workflow's steps see them.
+IGNORED_SCAN_JQ=$(sed -n "s/^      IGNORED_SCAN_JQ: '\(.*\)'\$/\1/p" "$WF")
+IGNORED_CHECKS_RE=$(awk '
+  /^      ignored_checks_regex:$/ {f=1}
+  f && /^        default: / {sub(/^        default: \047/, ""); sub(/\047$/, ""); print; exit}
+' "$WF")
+export IGNORED_SCAN_JQ IGNORED_CHECKS_RE
+check '[ -n "$IGNORED_SCAN_JQ" ]' "the job env defines IGNORED_SCAN_JQ"
+check '[ "$IGNORED_CHECKS_RE" = "trivy|\\bsca\\b" ]' \
+  "ignored_checks_regex defaults to Trivy and the word sca (got $IGNORED_CHECKS_RE)"
+IGNORED_NAMES=$(jq -nc "$IGNORED_SCAN_JQ"'[
+  {name: "SCA Vulnerability Scan"}, {name: "Trivy"}, {context: "trivy-scan"},
+  {name: "npm-sca_audit"}, {name: "SCA2"}, {name: "Mobile Landscape"},
+  {name: "SAST", workflowName: "Security (SCA, SAST)"}, {name: "scan", workflowName: "Trivy"}
+] | map(is_ignored_scan)')
+check '[ "$IGNORED_NAMES" = "[true,true,true,false,false,false,false,false]" ]' \
+  "the default regex matches trivy or the word sca in the check name only, never the workflow name (got $IGNORED_NAMES)"
+IGNORED_OTHER=$(IGNORED_CHECKS_RE='^trivy$' jq -nc "$IGNORED_SCAN_JQ"'[{name: "Trivy"}, {name: "SCA Vulnerability Scan"}] | map(is_ignored_scan)')
+IGNORED_NONE=$(IGNORED_CHECKS_RE='' jq -nc "$IGNORED_SCAN_JQ"'[{name: "Trivy"}, {name: "SCA Vulnerability Scan"}, {}] | map(is_ignored_scan)')
+check '[ "$IGNORED_OTHER" = "[true,false]" ] && [ "$IGNORED_NONE" = "[false,false,false]" ]' \
+  "a caller regex replaces the default, and an empty one ignores nothing (got $IGNORED_OTHER $IGNORED_NONE)"
+check '! IGNORED_CHECKS_RE="(" jq -n "$IGNORED_SCAN_JQ"" {name: \"\"} | is_ignored_scan" >/dev/null 2>&1' \
+  "an invalid regex makes the predicate fail, so the early check can reject it"
+IGNORED_DATA=$(IGNORED_CHECKS_RE='"; env; "' jq -nc "$IGNORED_SCAN_JQ"'[{name: "a\"; env; \"b"}, {name: "env"}] | map(is_ignored_scan)')
+check '[ "$IGNORED_DATA" = "[true,false]" ]' \
+  "the regex reaches jq as data, never as program text (got $IGNORED_DATA)"
+
 READ_PR_CHECKS=$(extract_fn read_pr_checks)
 check '[ -n "$READ_PR_CHECKS" ]' "Report reads checks through read_pr_checks"
 pr_checks_case() {  # pr_checks_case <gh exit> <gh stdout>
@@ -480,6 +558,14 @@ check '[ "$(pr_checks_case 0 "$CHECKS_GREEN")" = "ok 0 0 " ]' \
   "gh pr checks exit 0 is a green read"
 check '[ "$(pr_checks_case 1 "")" = "unknown 0 0 " ]' \
   "gh pr checks exit 1 with no output stays CI state unknown"
+CHECKS_SCA=$'SCA Vulnerability Scan\tfail\t40s\thttps://x/5\t\nnpm-sca_audit\tfail\t9s\thttps://x/6\t\nMobile Landscape\tfail\t1m\thttps://x/7\t'
+check '[ "$(pr_checks_case 1 "$CHECKS_SCA")" = "ok 2 0 npm-sca_audit, Mobile Landscape" ]' \
+  "Report skips the SCA scan with the revise loop's is_ignored_scan, so npm-sca_audit still counts"
+CHECKS_SEVEN=$(for i in 1 2 3 4 5 6 7; do printf 'c%s\tfail\t1s\thttps://x/%s\t\n' "$i" "$i"; done)
+check '[ "$(pr_checks_case 1 "$CHECKS_SEVEN")" = "ok 7 0 c1, c2, c3, c4, c5" ]' \
+  "Report counts every failing check but names at most 5"
+check '[ "$(UNRELATED_CHECKS="[\"lint\"]" pr_checks_case 1 "$CHECKS_FAIL")" = "ok 1 0 E2E smoke" ]' \
+  "Report leaves out checks that also fail on the base head"
 
 # --- behavioral: a whole revise run against a fake GitHub -------------------
 # Run Forge and Report are cut from forge.yml and executed as-is. gh, node
@@ -526,7 +612,7 @@ case "$args" in
     jq -c --arg id "$id" '{id: $id, body: .body}' >> "$S/replies.jsonl"
     echo '{}' ;;
   "api repos/o/r/git/ref/heads/master --jq .object.sha") echo 1111111111111111111111111111111111111111 ;;
-  "api repos/o/r/commits/1111111111111111111111111111111111111111/check-runs?per_page=100 --paginate") cat "$S/base_checks.json" ;;
+  "api repos/o/r/commits/1111111111111111111111111111111111111111/check-runs?per_page=100 --paginate --jq "*) jq -c "${@: -1}" "$S/base_checks.json" ;;
   "pr view https://github.com/o/r/pull/7 --json statusCheckRollup")
     if [ -f "$S/dstp_ran" ]; then cat "$S/rollup_after.json"; else cat "$S/rollup.json"; fi ;;
   "pr view https://github.com/o/r/pull/7 --json headRefName --jq .headRefName") echo feature ;;
@@ -650,6 +736,7 @@ JSON
  {"__typename": "CheckRun", "name": "E2E preview smoke", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://github.com/o/r/actions/runs/40327308412/job/121592798637"},
  {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/555"},
  {"__typename": "CheckRun", "name": "Trivy SCA", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/556"},
+ {"__typename": "CheckRun", "name": "SCA Vulnerability Scan", "workflowName": "Trivy SCA Scan", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/558"},
  {"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://github.com/o/r/actions/runs/1/job/557"},
  {"__typename": "CheckRun", "name": "ai-review / Kimi PR Review", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://github.com/o/r/actions/runs/2/job/1"},
  {"__typename": "CheckRun", "name": "ai-review / Claude Opus 5.5 PR Review", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://github.com/o/r/actions/runs/2/job/2"}
@@ -666,7 +753,7 @@ JSON
   { echo "E2E-FIRST-LINE"; for i in $(seq 2 99); do echo "e2e line $i"; done
     echo "Error: preview did not respond ${FAKE_TOKEN_A}"; echo "e2e line 101"; } > "$c/log_121592798637.txt"
   echo "LINT-LOG-LINE" > "$c/log_555.txt"
-  printf 'E2E preview smoke\tpass\t4s\thttps://x/1\t\nlint\tfail\t9s\thttps://x/2\t\nTrivy SCA\tfail\t1s\thttps://x/3\t\ntest\tpass\t4m\thttps://x/4\t\n' > "$c/pr_checks.txt"
+  printf 'E2E preview smoke\tpass\t4s\thttps://x/1\t\nlint\tfail\t9s\thttps://x/2\t\nTrivy SCA\tfail\t1s\thttps://x/3\t\nSCA Vulnerability Scan\tfail\t40s\thttps://x/5\t\ntest\tpass\t4m\thttps://x/4\t\n' > "$c/pr_checks.txt"
   echo '{"title": "fix: format markup guide example amounts", "body": "An earlier version of this change.\n\nCloses #1213"}' > "$c/pr.json"
   jq -n --arg long "$LONG_TEXT" --arg tokb "$FAKE_TOKEN_B" '{
     threads: [
@@ -705,7 +792,7 @@ run_case() {  # run_case <case dir>
   step_script "Run Forge" "$c" > "$c/run-forge.sh"
   step_script "Report outcome" "$c" > "$c/report.sh"
   : > "$c/out"
-  env -i PATH="$FAKE_BIN:$PATH" HOME="$c/home" GIT_CONFIG_GLOBAL="$c/home/gitconfig" \
+  env -i IGNORED_SCAN_JQ="$IGNORED_SCAN_JQ" IGNORED_CHECKS_RE="$IGNORED_CHECKS_RE" PATH="$FAKE_BIN:$PATH" HOME="$c/home" GIT_CONFIG_GLOBAL="$c/home/gitconfig" \
     FAKE_STATE="$c" GITHUB_OUTPUT="$c/out" GITHUB_ENV="$c/env" \
     GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=1 ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
     FORGE_COMMAND=revise FAST_LANE=false TIMEOUT_MINUTES="$(cat "$c/timeout_minutes" 2>/dev/null || echo 90)" \
@@ -717,7 +804,7 @@ run_case() {  # run_case <case dir>
   echo "$rc" > "$c/run.rc"
   local -a renv=()
   while IFS= read -r kv; do renv+=("$kv"); done < <(report_env_args "$c")
-  env -i PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
+  env -i IGNORED_SCAN_JQ="$IGNORED_SCAN_JQ" IGNORED_CHECKS_RE="$IGNORED_CHECKS_RE" PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
     GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
     GH_TOKEN=ghs_faketoken COMMENT_ID=55 OUTCOME=success FORGE_COMMAND=revise \
     SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake SLACK_MENTION_TS=3.3 \
@@ -762,7 +849,9 @@ check 'has "$I" "### Failing check: E2E preview smoke" && has "$I" "e2e line 101
 check '! has "$I" "$FAKE_TOKEN_A" && has "$I" "***"' "failed-log lines are scrubbed of tokens"
 check '! has "$I" "Failing check: lint" && ! has "$I" "LINT-LOG-LINE"' \
   "a check that also fails on the base head is left out of the instruction"
-check '! has "$I" "Failing check: Trivy"' "Trivy is never a dstp target"
+check '! has "$I" "Failing check: Trivy" && ! has "$I" "Failing check: SCA Vulnerability Scan"' \
+  "Trivy and the SCA scan are never dstp targets"
+check '! has "$C/completion.txt" "SCA Vulnerability Scan"' "Slack completion does not list the SCA scan as failing CI"
 check '[ "$(wc -l < "$C/replies.jsonl" | tr -d " ")" = 4 ]' "one reply in each of the 4 fetched threads"
 check '! has "$C/replies.jsonl" "INJECTED-REPLY" && ! grep -q "\"id\":\"999\"" "$C/replies.jsonl" && has "$C/run.log" "Dropped a reply for thread 999"' \
   "a model reply naming a thread id that was not fetched is dropped"
@@ -858,6 +947,101 @@ ACK_OUT=$(T="$(ack_threads_json)" GITHUB_REPOSITORY=o/r bash -c "
 check '[ "$ACK_OUT" = "[21,41]" ]' \
   "a bare thanks or 👍 after Forge's reply does not reopen a thread; a real follow-up does (got $ACK_OUT)"
 
+# A big repo's base-head check runs are larger than one command-line argument
+# may be (128 KB on Linux, 1 MB in total on macOS). They must still reach jq.
+BIG="$TMP_BEHAVIOR/big_checks"
+mkdir -p "$BIG"
+head -c 1500000 /dev/zero | tr '\0' a > "$BIG/text"
+jq -n --rawfile t "$BIG/text" '{total_count: 2, check_runs: [
+  {name: "lint", status: "completed", conclusion: "failure", output: {text: $t}},
+  {name: "test", status: "completed", conclusion: "success", output: {text: $t}}]}' > "$BIG/runs.json"
+jq -n '{statusCheckRollup: [
+  {name: "lint", conclusion: "FAILURE", detailsUrl: "https://github.com/o/r/actions/runs/1/job/555"},
+  {name: "E2E", conclusion: "FAILURE", detailsUrl: "https://github.com/o/r/actions/runs/1/job/556"},
+  {name: "SCA Vulnerability Scan", workflowName: "Trivy SCA Scan", conclusion: "FAILURE"},
+  {name: "Playwright Mobile Landscape", conclusion: "FAILURE"},
+  {name: "SAST", workflowName: "Security (SCA, SAST)", conclusion: "FAILURE"},
+  {name: "test", conclusion: "SUCCESS"}]}' > "$BIG/rollup.json"
+BIG_OUT=$(B="$BIG" GITHUB_REPOSITORY=o/r bash -c "
+  gh() {
+    case \"\$*\" in
+      *statusCheckRollup*) cat \"\$B/rollup.json\" ;;
+      *baseRefName*) printf master ;;
+      *git/ref/heads/master*) printf 1111111111111111111111111111111111111111 ;;
+      *check-runs*\" --jq \"*) jq -c \"\${@: -1}\" \"\$B/runs.json\" ;;
+    esac
+  }
+  $HELPERS
+  fetch_failing_checks https://github.com/o/r/pull/7 | jq -c '[.[] | {name, base}]'
+" 2>&1)
+check '[ "$BIG_OUT" = "[{\"name\":\"lint\",\"base\":\"failing\"},{\"name\":\"E2E\",\"base\":\"none\"},{\"name\":\"Playwright Mobile Landscape\",\"base\":\"none\"},{\"name\":\"SAST\",\"base\":\"none\"}]" ]' \
+  "big base check runs, projected by gh --jq, still classify the PR's failing checks: the SCA scan is skipped, but not a name that only contains sca or a job in a workflow named after SCA (got ${BIG_OUT:0:200})"
+
+# remint_write_token mints by token age (30 minutes by default, 5 before a
+# dstp spawn), scoped like the job-start token, and revokes what it replaces.
+REMINT=$(extract_fn remint_write_token)
+REVOKE=$(extract_fn revoke_reminted_token)
+REMINT_DIR="$TMP_BEHAVIOR/remint"
+mkdir -p "$REMINT_DIR"
+cat > "$REMINT_DIR/fakes.sh" <<'FAKES'
+node() { printf jwt; }
+git() { :; }
+curl() {
+  local a auth="" n
+  for a in "$@"; do
+    case "$a" in "Authorization: Bearer "*) auth=${a#Authorization: Bearer } ;; esac
+  done
+  case " $* " in
+    *" DELETE "*) echo "revoke $auth" >> "$REMINT_DIR/log" ;;
+    *) n=$(( $(cat "$REMINT_DIR/n" 2>/dev/null || echo 0) + 1 ))
+       echo "$n" > "$REMINT_DIR/n"
+       echo "mint $(cat)" >> "$REMINT_DIR/log"
+       printf '{"token":"t%s"}' "$n" ;;
+  esac
+}
+FAKES
+REMINT_OUT=$(REMINT_DIR="$REMINT_DIR" bash -c "
+  . \"\$REMINT_DIR/fakes.sh\"
+  $REMINT
+  $REVOKE
+  trap revoke_reminted_token EXIT
+  GITHUB_REPOSITORY=o/r WRITE_APP_ID=1 APP_KEY=k WRITE_INSTALLATION_ID=2 GH_TOKEN=start
+  now=\$(date -u +%s)
+  WRITE_TOKEN_EPOCH=\$((now - 600)); remint_write_token >/dev/null
+  printf 'young=%s ' \"\$GH_TOKEN\"
+  remint_write_token 300 > \"\$REMINT_DIR/stdout\"
+  printf 'spawn=%s ' \"\$GH_TOKEN\"
+  remint_write_token 300 >/dev/null
+  printf 'again=%s ' \"\$GH_TOKEN\"
+  WRITE_TOKEN_EPOCH=\$((now - 1900)); remint_write_token >/dev/null
+  printf 'old=%s' \"\$GH_TOKEN\"
+" 2>/dev/null)
+REMINT_SCOPE='{"repositories":["r"],"permissions":{"contents":"write","issues":"write","pull_requests":"write","checks":"read","actions":"read"}}'
+REMINT_LOG=$(cat "$REMINT_DIR/log" 2>/dev/null)
+check '[ "$REMINT_OUT" = "young=start spawn=t1 again=t1 old=t2" ]' \
+  "remint_write_token keeps a token younger than 30 minutes, mints before a spawn once it is 5 minutes old, and restarts the age on success (got $REMINT_OUT)"
+check '[ "$REMINT_LOG" = "$(printf "mint %s\nmint %s\nrevoke t1\nrevoke t2" "$REMINT_SCOPE" "$REMINT_SCOPE")" ]' \
+  "each remint asks for this repo and the job-start permissions only, revokes the token it replaces and the last one on exit, and never the job-start token (got $REMINT_LOG)"
+check 'grep -qx "::add-mask::t1" "$REMINT_DIR/stdout"' \
+  "a successful remint registers the new token as a secret on stdout"
+REMINT_CALLS=$(grep -E "remint_write_token" "$WF" | grep -vE "^ *#|remint_write_token\(\) \{")
+check '[ -n "$REMINT_CALLS" ] && ! printf "%s\n" "$REMINT_CALLS" | grep -vqE "^ +remint_write_token( [0-9]+)?\$"' \
+  "every remint call is a bare line, so its ::add-mask:: and ::warning:: reach the runner (got $(printf "%s" "$REMINT_CALLS" | grep -vE "^ +remint_write_token( [0-9]+)?\$" | tr -s " "))"
+
+# gh_read decides on the error alone: earlier pages already on stdout must not
+# turn a dropped connection or a 5xx into a final failure.
+GH_READ=$(extract_fn gh_read)
+gh_read_rc() {  # gh_read_rc <gh stdout> <gh stderr>  -> prints gh_read's status
+  GH_OUT="$1" GH_ERR="$2" bash -c "
+    gh() { printf '%s' \"\$GH_OUT\"; printf '%s\n' \"\$GH_ERR\" >&2; return 1; }
+    $GH_READ
+    gh_read api x >/dev/null 2>&1; echo \$?
+  "
+}
+GH_READ_RCS="$(gh_read_rc '[{"name":"a"}]' 'read: connection reset by peer') $(gh_read_rc '[{"name":"a"}]' 'HTTP 502: Bad Gateway') $(gh_read_rc '' 'HTTP 404: Not Found') $(gh_read_rc '[{"name":"a"}]' 'HTTP 422: Unprocessable Entity') $(gh_read_rc '' 'HTTP 429: Too Many Requests') $(gh_read_rc '[{"name":"a"}]' 'HTTP 403: You have exceeded a secondary rate limit') $(gh_read_rc '' 'HTTP 403: Resource not accessible by integration')"
+check '[ "$GH_READ_RCS" = "2 2 1 1 2 2 1" ]' \
+  "gh_read retries a partial paginated read on a network error, 5xx or rate limit, and gives up only on another 4xx (got $GH_READ_RCS)"
+
 # edit_pr keeps the issue link: added once, after a blank line and a rule,
 # only when the new description does not already close the issue.
 edit_case() {  # edit_case <name> <model pr_body>  -> prints the body given to gh pr edit
@@ -909,7 +1093,7 @@ check '[ "$(reactions "$C" add)" = shrug ]' "a no-change revise reacts shrug"
 # REVISE_TROUBLE always shows, whatever the CI state.
 C=$(new_case trouble)
 step_script "Report outcome" "$C" > "$C/report.sh"
-env -i PATH="$FAKE_BIN:$PATH" HOME="$C/home" FAKE_STATE="$C" \
+env -i IGNORED_SCAN_JQ="$IGNORED_SCAN_JQ" IGNORED_CHECKS_RE="$IGNORED_CHECKS_RE" PATH="$FAKE_BIN:$PATH" HOME="$C/home" FAKE_STATE="$C" \
   GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
   GH_TOKEN=ghs_faketoken OUTCOME=success PR_URL=https://github.com/o/r/pull/7 REVISE_TROUBLE=1 \
   SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake SLACK_MENTION_TS=3.3 \
@@ -921,7 +1105,7 @@ check '[ "$(reactions "$C" add)" = warning ]' "revise trouble reacts warning"
 report_only() {  # report_only <case name> <VAR=value...>  -> prints the case dir
   local c; c=$(new_case "$1"); shift
   step_script "Report outcome" "$c" > "$c/report.sh"
-  env -i PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
+  env -i IGNORED_SCAN_JQ="$IGNORED_SCAN_JQ" IGNORED_CHECKS_RE="$IGNORED_CHECKS_RE" PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
     GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
     GH_TOKEN=ghs_faketoken RUN_URL=https://github.com/o/r/actions/runs/1 \
     SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake \
