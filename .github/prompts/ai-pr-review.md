@@ -49,7 +49,7 @@ Name a wrong assumption the new code makes about a caller or a callee, when you 
 
 - Pre-existing issues, and any issue on a line this PR did not change.
 - Anything a linter, typechecker, or formatter would catch. Do not run them.
-- Style, naming, comments, docs, and "I would have structured this differently."
+- Style, naming, comments, and "I would have structured this differently." A spec, design note, or requirement this diff adds or edits is not one of these.
 - A general request for more tests, more validation, or more error handling, with no reachable failure.
 - A race, injection, or null crash with no input that causes it.
 - An item under ---ACKNOWLEDGED_SUGGESTIONS--- when it is the same behaviour. A different bug next to it still counts.
@@ -66,9 +66,9 @@ Under 500 words. No emoji. No score. No section for a check that found nothing.
 
 Two to four sentences: what the change does, and whether it is safe to merge. On a follow-up, the first sentence counts previous items fixed and still open.
 
-**Recommendation:** APPROVE
+On its own line, write **Recommendation:** followed by APPROVE, REQUEST CHANGES, or BLOCK MERGE. Do not write an example recommendation.
 
-Use REQUEST CHANGES when any published defect is a normal bug. Use BLOCK MERGE only when a published defect is unsafe to ship: auth, money, account mix-up, injection, a committed secret, or data loss. APPROVE when Spec is fine and nothing was publishable. The recommendation follows the worse axis.
+REQUEST CHANGES when any published defect is a normal bug. BLOCK MERGE only when a published defect is unsafe to ship: auth, money, account mix-up, injection, a committed secret, or data loss. APPROVE when Spec is fine and nothing was publishable. The recommendation follows the worse axis.
 
 ## Spec
 
@@ -95,9 +95,11 @@ Fix: the smallest change. A few lines, or one sentence. Not a rewrite.
 
 Block matches BLOCK MERGE. Change matches REQUEST CHANGES.
 
-End with exactly:
+When there is at least one finding, end with exactly:
 
 ## Auto Fix
 
 | Action | [Open Dashboard]({{AUTO_FIX_URL}}) |
 | ------ | ---------------------------------- |
+
+When there are no findings, stop after Spec. Do not add this table.
