@@ -151,8 +151,7 @@ runs:
         #      checkout (verified against a mock model endpoint while fixing
         #      HackerOne #4037167; both halves re-verified the same way on
         #      kimi-code 2.3.2). They stay as a statement of intent, and for
-        #      the version that
-        #      honours them; never treat them as enforcement.
+        #      the version that honours them; never treat them as enforcement.
         #
         # $HOME/.kimi-code is recreated rather than merged: on a persistent
         # self-hosted runner a previous run's config could otherwise survive
