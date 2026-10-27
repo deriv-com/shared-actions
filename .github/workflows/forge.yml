@@ -1514,7 +1514,7 @@ jobs:
             THREADS_TOTAL=$((THREADS_TOTAL + $(jq '.threads | length' "$items")))
             # The reply pass has no time limit, so the token from before it may
             # have expired.
-            remint_write_token 300 >/dev/null
+            remint_write_token 300
             post_thread_replies "$items" "$reply_file"
             post_pr_comment "$items" "$reply_file"
             [ -n "$ask" ] && edit_pr "$ask" "$reply_file" "$items"

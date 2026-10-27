@@ -1009,7 +1009,7 @@ REMINT_OUT=$(REMINT_DIR="$REMINT_DIR" bash -c "
   now=\$(date -u +%s)
   WRITE_TOKEN_EPOCH=\$((now - 600)); remint_write_token >/dev/null
   printf 'young=%s ' \"\$GH_TOKEN\"
-  remint_write_token 300 >/dev/null
+  remint_write_token 300 > \"\$REMINT_DIR/stdout\"
   printf 'spawn=%s ' \"\$GH_TOKEN\"
   remint_write_token 300 >/dev/null
   printf 'again=%s ' \"\$GH_TOKEN\"
@@ -1022,6 +1022,11 @@ check '[ "$REMINT_OUT" = "young=start spawn=t1 again=t1 old=t2" ]' \
   "remint_write_token keeps a token younger than 30 minutes, mints before a spawn once it is 5 minutes old, and restarts the age on success (got $REMINT_OUT)"
 check '[ "$REMINT_LOG" = "$(printf "mint %s\nmint %s\nrevoke t1\nrevoke t2" "$REMINT_SCOPE" "$REMINT_SCOPE")" ]' \
   "each remint asks for this repo and the job-start permissions only, revokes the token it replaces and the last one on exit, and never the job-start token (got $REMINT_LOG)"
+check 'grep -qx "::add-mask::t1" "$REMINT_DIR/stdout"' \
+  "a successful remint registers the new token as a secret on stdout"
+REMINT_CALLS=$(grep -E "remint_write_token" "$WF" | grep -vE "^ *#|remint_write_token\(\) \{")
+check '[ -n "$REMINT_CALLS" ] && ! printf "%s\n" "$REMINT_CALLS" | grep -vqE "^ +remint_write_token( [0-9]+)?\$"' \
+  "every remint call is a bare line, so its ::add-mask:: and ::warning:: reach the runner (got $(printf "%s" "$REMINT_CALLS" | grep -vE "^ +remint_write_token( [0-9]+)?\$" | tr -s " "))"
 
 # gh_read decides on the error alone: earlier pages already on stdout must not
 # turn a dropped connection or a 5xx into a final failure.
