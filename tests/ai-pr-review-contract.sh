@@ -475,6 +475,18 @@ MUSE_EFFORT_BLOCK=$(step_body "Run AI PR review (Muse Code)" "$MUSE" | awk '/EFF
 muse_effort_ok() { MUSE_REASONING_EFFORT="$1" bash -c "$MUSE_EFFORT_BLOCK" >/dev/null 2>&1; }
 check 'muse_effort_ok "" && muse_effort_ok minimal && muse_effort_ok max' "muse engine accepts empty, minimal and max"
 check '! muse_effort_ok none && ! muse_effort_ok ultra && ! muse_effort_ok bogus' "muse engine rejects none, ultra and unknown values"
+# The orchestrator's copy of the same validation must behave identically,
+# not just grep-match: run it too.
+WF_MUSE_BLOCK=$(step_body "Resolve and validate engine" "$WF" | awk '/MUSE_REASONING_EFFORT="\$\{MUSE_REASONING_EFFORT_INPUT:-\}"/{f=1} f{print} f && /^ +fi$/{f=0; done=1} done{next}' | sed 's/^ *//')
+wf_muse_effort_ok() { MUSE_REASONING_EFFORT_INPUT="$1" bash -c "$WF_MUSE_BLOCK" >/dev/null 2>&1; }
+check 'wf_muse_effort_ok "" && wf_muse_effort_ok minimal && wf_muse_effort_ok max' "orchestrator muse validation accepts empty, minimal and max"
+check '! wf_muse_effort_ok none && ! wf_muse_effort_ok ultra && ! wf_muse_effort_ok bogus' "orchestrator muse validation rejects none, ultra and unknown values"
+# The strip script only exists as a heredoc until a live run writes it;
+# prove the extracted body at least parses.
+check 'awk "/cat > \"\\\$STRIP_SCRIPT\" <<.STRIP_EOF./{f=1;next} f && /^ *STRIP_EOF/{exit} f" "$MUSE" | sed "s/^ *//" | bash -n' "muse strip script heredoc parses as bash"
+# Installer: never piped into bash, HTTPS-pinned, hash logged.
+check '! grep -vE "^[[:space:]]*#" "$MUSE" | grep -cF "install.sh |" >/dev/null' "muse installer is never piped into bash"
+check 'grep -qF -- "--proto '\''=https'\''" "$MUSE" && grep -q "Muse Code installer sha256" "$MUSE"' "muse installer fetch pins HTTPS and logs the script hash"
 check 'kimi_thinking_ok "" && kimi_thinking_ok low && kimi_thinking_ok max' "kimi engine accepts empty, low and max"
 check '! kimi_thinking_ok medium && ! kimi_thinking_ok xhigh && ! kimi_thinking_ok bogus' "kimi engine rejects medium, xhigh and unknown values"
 

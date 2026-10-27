@@ -68,7 +68,11 @@ description: >
 #      persistent runner's own ~/.config/muse (settings, MCP, skills, stored
 #      credentials) is never read.
 #
-# RESIDUAL RISK, stated plainly. Reads are unscoped: read_file can open any
+# RESIDUAL RISK, stated plainly. The installer script is fetched
+# unauthenticated from dev.meta.ai on every run (Meta publishes no checksum
+# or versioned installer URL); the version assertion covers the installed
+# binary, not the script, and the install step logs the script's SHA-256
+# only for after-the-fact correlation. Reads are unscoped: read_file can open any
 # file the runner user can read (it must — review_context_path and
 # pr_diff_path live in /tmp, outside the workspace). The model could quote
 # what it read in the review text; it has no other egress (no shell, no
@@ -210,7 +214,17 @@ runs:
         # assertion immediately below and the launcher is frozen with
         # MUSE_NO_AUTO_UPDATE=1 (it otherwise replaces its own binary in the
         # background, hourly). Never add MUSE_SYNC_UPDATE here.
-        curl -fsSL https://dev.meta.ai/install.sh | MUSE_INSTALL_DIR="${MUSE_ENGINE_BIN}-cli" bash
+        #
+        # The installer script itself is fetched unauthenticated — Meta
+        # publishes no checksum or versioned installer URL — so download it
+        # to a file (never pipe a remote script into bash), pin the fetch to
+        # HTTPS, and log its SHA-256 so an incident can be correlated after
+        # the fact. The version assertion below covers the binary, not the
+        # script; that gap is stated in this file's RESIDUAL RISK header.
+        INSTALLER="$(mktemp "${MUSE_ENGINE_BIN}-cli/installer.XXXXXX.sh")"
+        curl -fsSL --proto '=https' --tlsv1.2 https://dev.meta.ai/install.sh -o "$INSTALLER"
+        echo "Muse Code installer sha256: $(sha256sum "$INSTALLER" | cut -d' ' -f1)"
+        MUSE_INSTALL_DIR="${MUSE_ENGINE_BIN}-cli" bash "$INSTALLER"
 
         MUSE_BIN="${MUSE_ENGINE_BIN}-cli/muse"
         [[ -x "$MUSE_BIN" ]] || { echo "❌ Muse engine: installer produced no muse binary at $MUSE_BIN"; exit 1; }

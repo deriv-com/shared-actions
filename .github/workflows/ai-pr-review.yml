@@ -1089,11 +1089,13 @@ jobs:
       # supported on steps inside a composite action. Keep the values in sync.
       #
       # Each engine owns: stripping PR-supplied agent config, its own CLI and
-      # sandbox config, and granting the model NO shell tool (codex is the one
-      # exception: a sandboxed shell with no network and no token; see its
-      # header). Each reads
-      # review_context_path + pr_diff_path and writes output_path. None of them
-      # post comments — the post step below is the only thing that can.
+      # sandbox config, and its tool restrictions — no shell tool anywhere
+      # except codex (a sandboxed shell with no network and no token; see its
+      # header), and muse goes further: no write tool either, so the ENGINE
+      # captures the CLI's stdout and writes output_path itself. Each reads
+      # review_context_path + pr_diff_path and lands a review at output_path.
+      # None of them post comments — the post step below is the only thing
+      # that can.
       # =====================================================================
 
       - name: AI review (Kimi Code engine)

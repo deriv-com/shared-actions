@@ -324,10 +324,13 @@ assuming parity:
   reaches the CLI as `META_API_KEY`, only in the run step's env.
 
   **Pinning is by assertion, not by package.** Meta distributes Muse Code
-  only through the `curl -fsSL https://dev.meta.ai/install.sh | bash`
-  installer, whose launcher self-updates hourly. The engine therefore
-  asserts `muse --version` equals `cli_version` right after install and
-  runs every invocation with `MUSE_NO_AUTO_UPDATE=1`. When you bump
+  only through the `dev.meta.ai` installer, whose launcher self-updates
+  hourly. The engine therefore downloads the installer script over pinned
+  HTTPS (never piped into bash), logs its SHA-256, and asserts
+  `muse --version` equals `cli_version` right after install and
+  runs every invocation with `MUSE_NO_AUTO_UPDATE=1`. The script itself is
+  fetched unauthenticated — Meta publishes no checksum — so the assertion
+  covers the binary, not the script. When you bump
   `cli_version`, re-verify the whole paragraph above against the new binary
   (a bump that drops the catalog row, renames a flag, or starts trusting the
   workspace fails closed — catalog error, usage error, or no review — but
