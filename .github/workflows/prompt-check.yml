@@ -10,7 +10,7 @@ on:
 jobs:
   ai-review:
     if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
-    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@58dad464528f6fe4cc08a5c7757570048bfda367
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@b7ab8ad442b51418c654150e9e53e26dfe61c370
     permissions:
       contents: read
       pull-requests: write
@@ -19,7 +19,7 @@ jobs:
       engine: kimi
       model: kimi-k3
       provider_type: openai
-      review_title: Prompt Check PR Review
+      review_title: Prompt Check 2 PR Review
     secrets:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
