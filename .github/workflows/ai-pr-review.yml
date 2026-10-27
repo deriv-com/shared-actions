@@ -300,7 +300,7 @@ jobs:
               METRICS_AGENT="ai_review"
               ARTIFACT_PREFIX="ai-review"
               DEFAULT_MAX_CONTEXT="1048576"
-              DEFAULT_CLI_VERSION="0.34.0"
+              DEFAULT_CLI_VERSION="2.3.2"
               REVIEW_TITLE="Kimi PR Review"
               ;;
             anthropic)
