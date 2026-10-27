@@ -102,4 +102,4 @@ When there is at least one finding, end with exactly:
 | Action | [Open Dashboard]({{AUTO_FIX_URL}}) |
 | ------ | ---------------------------------- |
 
-When there are no findings, stop after Spec. Do not add this table.
+When there are no findings, omit Findings and Auto Fix. On a follow-up, still write Previous issues.

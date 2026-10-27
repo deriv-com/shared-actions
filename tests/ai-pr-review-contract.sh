@@ -542,22 +542,15 @@ check '[[ -f "$PROMPT" ]]' "review prompt file exists"
 check 'grep -q "If that text contradicts the code in the same diff, or two parts of it contradict each other, that is a Change." "$PROMPT"' "prompt treats a spec contradiction in the diff as a Change"
 check 'grep -q "{{AUTO_FIX_URL}}" "$PROMPT"' "prompt leaves the Click2Fix placeholder"
 check 'grep -q "Under 500 words." "$PROMPT"' "prompt caps the review at 500 words"
-check 'grep -q ".github/prompts/ai-pr-review.md" "$WF"' "workflow names the in-repo prompt file"
-if python3 - "$WF" "$PROMPT" <<'PY'
-import base64, pathlib, re, sys
-wf = pathlib.Path(sys.argv[1]).read_text()
-m = re.search(r"^          PROMPT_B64: (\S+)\s*$", wf, re.M)
-if not m:
-    sys.exit(1)
-got = base64.b64decode(m.group(1))
-want = pathlib.Path(sys.argv[2]).read_bytes()
-sys.exit(0 if got == want else 1)
-PY
-then echo "PASS: inlined prompt matches .github/prompts/ai-pr-review.md"
-else echo "FAIL: inlined prompt matches .github/prompts/ai-pr-review.md"; fail=1
-fi
+check 'grep -vE "^[[:space:]]*#" "$WF" | grep -qF "printf '\''%s'\'' \"\$PROMPT_B64\" | base64 -d > /tmp/prompt_template.txt"' "fetch step decodes the inlined prompt"
+check 'grep -vE "^[[:space:]]*#" "$WF" | grep -qF "curl -sfL \"\$PROMPT_GIST_URL\""' "override still fetches prompt_gist_url"
+check 'sed -n "s/^          PROMPT_B64: //p" "$WF" | tr -d "[:space:]" | python3 -c "import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))" | cmp -s - "$PROMPT"' "inlined prompt matches .github/prompts/ai-pr-review.md"
+check 'grep -q "When there are no findings, omit Findings and Auto Fix." "$PROMPT"' "prompt keeps Previous issues when there are no findings"
+check '! grep -q "Do not begin with a heading" "$WF"' "output rule does not forbid the Summary heading"
+check 'grep -q "Start with the Summary section." "$WF"' "output rule tells the model to start with Summary"
 check '! grep -q "Read its dependencies" "$WF"' "procedure does not tell the model to read every dependency"
-check 'grep -q "When the diff edits a spec or design doc" "$WF"' "procedure includes the spec-doc step"
+check 'grep -q "A contradiction between them is a Change under Spec." "$WF"' "procedure files a spec contradiction under Spec"
+check 'grep -q "Do not read further for that assumption." "$WF"' "procedure stops extra reading at one assumption"
 check '! grep -q "it was not touched" "$WF"' "incremental diff does not treat an absent pattern as untouched"
 check 'grep -q ".github/prompts/ai-pr-review.md" "$README"' "README documents the in-repo prompt"
 check '! grep -q "edit the gist" "$README"' "README no longer tells people to edit the gist"
