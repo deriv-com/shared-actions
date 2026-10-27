@@ -68,9 +68,9 @@ inputs:
     required: false
     default: ""
   cli_version:
-    description: "Exact @moonshot-ai/kimi-code version to install. Pinned deliberately — the package is pre-1.0 and ships minor releases weekly, so `latest` risks both breaking changes and unreviewed code in a privileged job. Bump via PR."
+    description: "Exact @moonshot-ai/kimi-code version to install. Pinned deliberately — the package ships frequent releases (2.3.3 was announced 2026-10-26 but is not yet installable from npm, so the pin stays on 2.3.2 until it is), so `latest` risks both breaking changes and unreviewed code in a privileged job. Bump via PR."
     required: false
-    default: "0.34.0"
+    default: "2.3.2"
   node_version:
     description: "Node.js version used to install and run the CLI."
     required: false
@@ -140,16 +140,18 @@ runs:
         #
         # Two controls:
         #   1. `[tools] enabled` is what removes Bash (enforced by the CLI's
-        #      tool-call guard, verified in the 0.34.0 source).
+        #      tool-call guard, verified against a mock model endpoint on
+        #      kimi-code 2.3.2: only Read/Write/Grep/Glob were offered).
         #   2. The PreToolUse hook is what confines paths, and it independently
         #      denies any tool other than Read/Grep/Glob/Write, so the tool
         #      surface holds even if one of the two regresses. The hook is the
-        #      ONLY path control: in kimi-code 0.34.0 the `[[permission.rules]]`
+        #      ONLY path control: in kimi-code 2.3.2 the `[[permission.rules]]`
         #      below are not applied in `-p` mode at all — a config with a bare
         #      `deny Read` still read files and `deny Write` still wrote into the
         #      checkout (verified against a mock model endpoint while fixing
-        #      HackerOne #4037167). They stay as a statement of intent, and for
-        #      the version that honours them; never treat them as enforcement.
+        #      HackerOne #4037167; the `deny Write` half re-verified on 2.3.2).
+        #      They stay as a statement of intent, and for the version that
+        #      honours them; never treat them as enforcement.
         #
         # $HOME/.kimi-code is recreated rather than merged: on a persistent
         # self-hosted runner a previous run's config could otherwise survive
@@ -220,7 +222,7 @@ runs:
 
         # Load-bearing, not a smoke test. When a section of config.toml fails
         # schema validation, the CLI's config loader (salvageConfigData in
-        # kimi-code 0.34.0) DROPS that whole section and carries on, so a
+        # kimi-code 2.3.2) DROPS that whole section and carries on, so a
         # `[[hooks]]` entry that stopped validating after a cli_version bump
         # would remove the path guard with no error and the review would run
         # unconfined. `kimi doctor config` validates the same file against the
@@ -440,7 +442,7 @@ runs:
         # The review exists, so the model made at least one tool call (the Write
         # that produced it), so the match-all PreToolUse hook must have logged at
         # least one decision. An empty or missing log means the hook never ran:
-        # config.toml validated but the CLI no longer honours it the way 0.34.0
+        # config.toml validated but the CLI no longer honours it the way 2.3.2
         # does. That review was produced with no path confinement, so it is not
         # posted. Fail closed; do not downgrade this to a warning.
         if [[ ! -s "$PATH_GUARD_LOG" ]]; then

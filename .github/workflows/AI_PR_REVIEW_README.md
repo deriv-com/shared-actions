@@ -142,10 +142,11 @@ assuming parity:
 - **Kimi** — Bash is absent from `[tools] enabled`, which is what removes it;
   the guard denies it independently. The guard is copied into `$HOME/.kimi-code`
   by the configure step. The `[[permission.rules]]` in the same config are **not
-  enforcement**: kimi-code 0.34.0 ignores them in `-p` mode (a bare `deny Read`
+  enforcement**: kimi-code 2.3.2 ignores them in `-p` mode (a bare `deny Read`
   still read files — verified against a mock model while fixing HackerOne
-  #4037167). Do not remove the hook because "the rules already cover it"; they
-  do not. `kimi doctor config` in the configure step is load-bearing: the CLI's
+  #4037167; the `deny Write` half re-verified on 2.3.2). Do not remove the hook
+  because "the rules already cover it"; they do not. `kimi doctor config` in
+  the configure step is load-bearing: the CLI's
   config loader drops a section that fails schema validation and carries on,
   so a `[[hooks]]` entry that stopped validating after a version bump would
   silently remove the guard; `doctor` fails on the same condition, before the
@@ -339,7 +340,7 @@ still the same engine, not a new one.
 | `model` | Model ID; resolved per engine when empty | ❌ | per engine |
 | `base_url` | LLM API endpoint; `/v1` added or stripped per engine | ❌ | `https://litellmsa.deriv.ai/v1` |
 | `max_context_size` | **[kimi, grok]** Context window in tokens. Must match the model, or the CLI over-packs and the API rejects the request | ❌ | per engine (`1048576` kimi, `500000` grok) |
-| `cli_version` | **[kimi, grok, codex]** Exact CLI version (`@moonshot-ai/kimi-code`, `@xai-official/grok`, or `@openai/codex`) | ❌ | per engine (`0.34.0` kimi, `1.0.5` grok, `0.160.0` codex) |
+| `cli_version` | **[kimi, grok, codex]** Exact CLI version (`@moonshot-ai/kimi-code`, `@xai-official/grok`, or `@openai/codex`) | ❌ | per engine (`2.3.2` kimi, `1.0.5` grok, `0.160.0` codex) |
 | `reasoning_effort` | **[codex]** Reasoning effort for the review turn: `minimal`, `low`, `medium`, `high`, or `xhigh`. Empty sends no override | ❌ | empty (model default) |
 | `effort` | **[anthropic]** Effort for the review turn: `low`, `medium`, `high`, `xhigh`, or `max`. Empty sends no override | ❌ | empty (model default) |
 | `provider_type` | **[kimi]** Wire dialect; must match what `base_url` serves | ❌ | `openai` |

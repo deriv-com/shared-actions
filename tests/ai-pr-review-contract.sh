@@ -187,6 +187,18 @@ check 'grep -qE "^\| Default model \|[^|]*\| \`${ANTH_DEFAULT_MODEL}\` \|" "$REA
 check 'grep -qF "default: \"${ANTH_DEFAULT_MODEL}\"" "$DEPRECATED_WF"' "deprecated claude-pr-review.yml defaults claude_model to ${ANTH_DEFAULT_MODEL}"
 check 'grep -qF "inputs.claude_model || '\''${ANTH_DEFAULT_MODEL}'\''" "$DEPRECATED_WF"' "deprecated claude-pr-review.yml falls back to ${ANTH_DEFAULT_MODEL}"
 
+# Kimi CLI version. Every live copy of the pin must match, so a bump that
+# misses one fails here instead of shipping to every consumer. The copies:
+# the resolve-step arm in ai-pr-review.yml, the engine action's own default,
+# and the README inputs table. (2.3.3 was announced 2026-10-26 but is not yet
+# installable from npm; the pin targets 2.3.2 until it is.)
+KIMI_CLI_VERSION="2.3.2"
+check 'grep -q "DEFAULT_CLI_VERSION=\"${KIMI_CLI_VERSION}\"" "$WF"' "kimi arm pins DEFAULT_CLI_VERSION=${KIMI_CLI_VERSION}"
+check 'grep -qF "default: \"${KIMI_CLI_VERSION}\"" "$KIMI"' "kimi engine action defaults cli_version to ${KIMI_CLI_VERSION}"
+# Match only the kimi cell (first column of the per-engine list), so a grok or
+# codex bump cannot satisfy or fail it.
+check 'grep -qE "per engine \(\`${KIMI_CLI_VERSION}\` kimi," "$README"' "README inputs table lists ${KIMI_CLI_VERSION} for kimi"
+
 # Dispatch: an if-gated step referencing the codex engine by absolute @master path.
 check 'grep -q "if: steps.engine.outputs.engine == '\''codex'\''" "$WF"' "codex dispatch step is if-gated on the engine output"
 check 'grep -q "ai_review_engine_codex@master" "$WF"' "codex dispatch references the engine by absolute @master path"

@@ -11,7 +11,7 @@
 // Exit 0 allows the call. Exit 2 denies it and hands stderr to the model as the
 // reason. Anything unexpected also exits 2: this guard fails closed.
 //
-// Why a hook at all: kimi-code 0.34.0 does not apply `[[permission.rules]]`
+// Why a hook at all: kimi-code 2.3.2 does not apply `[[permission.rules]]`
 // when run as `kimi -p` (verified against a mock model endpoint while fixing
 // HackerOne #4037167), and Claude Code's `--allowedTools` has no path scope for
 // Read at all. In both engines this is the only thing confining paths, and the
