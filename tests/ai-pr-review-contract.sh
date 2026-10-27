@@ -108,6 +108,9 @@ GUARD_TEST="$ROOT/.github/actions/ai_review_path_guard/path-guard.test.js"
 # Lines of $2 between the step named $1 and the next step, for "this step
 # contains X" checks that must not be satisfied by some other step.
 step_body() { awk -v name="- name: $1" 'index($0, name){f=1; next} f && /^ *- name: /{exit} f' "$2"; }
+# Step body with backslash-continuations joined into single lines, for greps
+# that must see a multi-line command (env prefix + invocation) as one line.
+joined_step_body() { step_body "$1" "$2" | awk '/\\$/ { sub(/\\$/, ""); buf = buf $0 " "; next } { print buf $0; buf = "" }'; }
 
 # This script runs under `set -o pipefail`. A reader that quits early (`head`,
 # `grep -q`, `awk ... {exit}`) can SIGPIPE the writer before it finishes, and
@@ -396,7 +399,7 @@ check 'step_body "Install review CLI (Muse Code)" "$MUSE" | grep -cE "^ +MUSE_NO
 check 'grep -q "installer delivered Muse Code" "$MUSE" && grep -q "cli_version pins" "$MUSE"' "muse engine asserts the installed version equals cli_version"
 check 'grep -q "no review written to \$OUTPUT_PATH" "$MUSE"' "muse engine fails if no review was written"
 check 'ncgrep "strip script changed since the strip step" "$MUSE"' "muse verifies the strip script hash before each attempt"
-check '! step_body "Install review CLI (Muse Code)" "$MUSE" | grep -cE "rm .*[$][{]?MUSE_ENGINE_WORK[}]?\"( |$)" >/dev/null' "muse install step never rm's the strip script's directory, in any argument shape"
+check '! joined_step_body "Install review CLI (Muse Code)" "$MUSE" | grep -cE "rm .*[$][{]?MUSE_ENGINE_WORK[}]?([\";]|/[\";]|:[^\"]*[\";]| |$)" >/dev/null' "muse install step never rm's the strip script's directory (any single command, continuations joined)"
 check 'grep -qF "`muse` (Meta Muse Code CLI)" "$WF"' "engine input description names muse"
 check 'grep -qF "meta-muse-wonder-1.0" "$README" && grep -qF "muse_review" "$README" && grep -qF "muse-review-summary-" "$README"' "README documents the muse engine"
 check 'grep -qE "^\| \`muse_reasoning_effort\`" "$README"' "README inputs table documents muse_reasoning_effort"
@@ -488,8 +491,8 @@ check 'awk "/cat > \"\\\$STRIP_SCRIPT\" <<.STRIP_EOF./{f=1;next} f && /^ *STRIP_
 # Installer: never piped into bash, HTTPS-pinned, hash logged.
 check '! grep -vE "^[[:space:]]*#" "$MUSE" | grep -cF "install.sh |" >/dev/null' "muse installer is never piped into bash"
 check 'grep -qF -- "--proto '\''=https'\''" "$MUSE" && grep -q "Muse Code installer sha256" "$MUSE"' "muse installer fetch pins HTTPS and logs the script hash"
-check 'step_body "Install review CLI (Muse Code)" "$MUSE" | grep -cF "HOME=\"\$MUSE_ENGINE_HOME\" XDG_CONFIG_HOME=\"\$MUSE_ENGINE_HOME/.config\"" >/dev/null' "muse installer runs with the isolated HOME/XDG, not the runner's real home"
-check 'grep -qF "MUSE_INSTALLER_DIR: \${{ runner.temp }}/muse-engine-installer" "$MUSE" && grep -qF "INSTALLER=\"\$MUSE_INSTALLER_DIR/install.sh\"" "$MUSE"' "muse installer script lives in its own wiped directory, not the install dir"
+check 'joined_step_body "Install review CLI (Muse Code)" "$MUSE" | grep -F "bash \"\$INSTALLER\"" | grep -cF "HOME=\"\$MUSE_ENGINE_HOME\" XDG_CONFIG_HOME=\"\$MUSE_ENGINE_HOME/.config\"" >/dev/null' "muse installer invocation runs with the isolated HOME/XDG, not the runner's real home"
+check 'grep -qF "MUSE_INSTALLER_DIR: \${{ runner.temp }}/muse-engine-installer" "$MUSE" && grep -qF "INSTALLER=\"\$MUSE_INSTALLER_DIR/install.sh\"" "$MUSE" && joined_step_body "Install review CLI (Muse Code)" "$MUSE" | grep -F "rm -rf" | grep -cF "\"\$MUSE_INSTALLER_DIR\"" >/dev/null' "muse installer script lives in its own wiped directory, not the install dir"
 check 'kimi_thinking_ok "" && kimi_thinking_ok low && kimi_thinking_ok max' "kimi engine accepts empty, low and max"
 check '! kimi_thinking_ok medium && ! kimi_thinking_ok xhigh && ! kimi_thinking_ok bogus' "kimi engine rejects medium, xhigh and unknown values"
 

@@ -343,9 +343,12 @@ assuming parity:
   The post step's leak scan (literal key + base64) is the last line, as with
   Codex.
 
-  The run is capped at `--max-model-steps 200` (the CLI exits 1 past the
-  cap, and the engine's two attempts and `/tmp` output gate treat that as
-  no review). This engine honours **`muse_reasoning_effort`**
+  The run is capped at `--max-model-steps 200`. Past the cap the CLI
+  exits 1: if it printed nothing, the attempt counts as no review (one
+  retry, then the `/tmp` output gate fails the run); if it printed a
+  reply — partial or not — the engine keeps it, logs a warning with the
+  CLI log, and continues, exactly as for any non-zero exit that produced
+  output. This engine honours **`muse_reasoning_effort`**
   (`minimal` | `low` | `medium` | `high` | `xhigh` | `max`, empty = CLI
   default `high` — verified by capturing the request against 1.4.13 with
   this engine's settings file: with no override the CLI sends
@@ -603,8 +606,8 @@ Four edits at minimum:
 
 An engine with its own knob needs more: an `[engine-specific: <name>]` input,
 its validation in the resolve step, a step output, and a row in the Inputs
-table (codex's `reasoning_effort`, anthropic's `effort`, and kimi's
-`thinking_effort` are the examples).
+table (codex's `reasoning_effort`, anthropic's `effort`, kimi's
+`thinking_effort`, and muse's `muse_reasoning_effort` are the examples).
 An engine whose model gets a shell should also review the post step's leak
 checks, since it widens what the model can put in the review text. Extend
 `tests/ai-pr-review-contract.sh` for each of these.
@@ -617,7 +620,9 @@ the access gate has passed.
 
 An engine **must** strip PR-supplied agent config as its *first* step, grant the
 model no shell tool, read the context and diff, write the review to
-`output_path`, and fail with an engine-named message if it wrote nothing. The
+`output_path`, and fail with an engine-named message if it wrote nothing; muse
+is the delivery exception: the model never writes, the engine captures the
+CLI's stdout and writes `output_path` itself. The
 one allowed exception to the shell rule is a shell that runs inside a sandbox
 with no network and no GitHub token, where the CLI's own config sits outside
 everything the sandbox can write; codex is that exception, and its residual
