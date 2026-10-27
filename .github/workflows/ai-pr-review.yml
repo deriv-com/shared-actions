@@ -85,7 +85,7 @@ on:
         default: ""
         type: string
       muse_reasoning_effort:
-        description: "[engine-specific: muse] Reasoning effort for the Muse review turn: minimal, low, medium, high, xhigh, or max (the levels muse-wonder-1.0 supports). Empty sends no override and leaves the Muse Code CLI default, which is high. `none` is not accepted (the Meta provider rejects it) and `ultra` is not accepted (a Muse Code client-side alias, not a model level). Validated in the 'Resolve and validate engine' step and passed to the muse dispatch step as `--reasoning-effort`. Ignored when engine is not `muse` (the other engines take no such input)."
+        description: "[engine-specific: muse] Reasoning effort for the Muse review turn: minimal, low, medium, high, xhigh, or max (the levels muse-wonder-1.0 supports). Empty sends no override and leaves the Muse Code CLI default, which is high. `none` is not accepted (the Meta provider rejects it) and `ultra` is not accepted (a Muse Code client-side alias, not a model level). Validated in the 'Resolve and validate engine' step and passed to the muse engine as `muse_reasoning_effort` (the engine sends it as `--reasoning-effort`). Ignored when engine is not `muse` (the other engines take no such input)."
         required: false
         default: ""
         type: string
@@ -470,7 +470,7 @@ jobs:
               minimal|low|medium|high|xhigh|max) ;;
               *)
                 echo "❌ Invalid muse_reasoning_effort '$MUSE_REASONING_EFFORT'"
-                echo "   Use one of --reasoning-effort: minimal, low, medium, high, xhigh, max (or leave empty for the CLI default)."
+                echo "   Use one of muse_reasoning_effort: minimal, low, medium, high, xhigh, max (or leave empty for the CLI default)."
                 exit 1
                 ;;
             esac

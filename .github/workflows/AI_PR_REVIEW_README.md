@@ -343,9 +343,13 @@ assuming parity:
   The post step's leak scan (literal key + base64) is the last line, as with
   Codex.
 
-  This engine honours **`muse_reasoning_effort`**
+  The run is capped at `--max-model-steps 200` (the CLI exits 1 past the
+  cap, and the engine's two attempts and `/tmp` output gate treat that as
+  no review). This engine honours **`muse_reasoning_effort`**
   (`minimal` | `low` | `medium` | `high` | `xhigh` | `max`, empty = CLI
-  default `high`): validated at resolve time and again in the engine, mapped
+  default `high` — verified by capturing the request against 1.4.13 with
+  this engine's settings file: with no override the CLI sends
+  `reasoning.effort: "high"` on the wire): validated at resolve time and again in the engine, mapped
   to `--reasoning-effort` only when non-empty. The other engines ignore the
   input. `none` is rejected because the Meta provider does not accept it,
   and `ultra` because it is a Muse Code client-side alias (it can delegate

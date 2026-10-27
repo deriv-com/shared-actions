@@ -188,8 +188,9 @@ runs:
         # or writes may come from (or survive in) the runner's real home on a
         # persistent self-hosted runner. runner.temp, not /tmp, so nothing
         # below ever sits in a shared scratch directory.
-        MUSE_ENGINE_BIN: ${{ runner.temp }}/muse-engine-bin
+        MUSE_ENGINE_WORK: ${{ runner.temp }}/muse-engine-bin
         MUSE_ENGINE_HOME: ${{ runner.temp }}/muse-engine-home
+        MUSE_INSTALLER_DIR: ${{ runner.temp }}/muse-engine-installer
         MUSE_NO_MODIFY_PATH: "1"
         MUSE_NO_AUTO_UPDATE: "1"
       run: |
@@ -197,16 +198,16 @@ runs:
         # catalog cache, stored credentials or a newer self-updated binary
         # must not leak into this run. Also clear Muse Code state in the
         # REAL home — no step points Muse Code there, but a persistent
-        # runner should not accumulate it either. MUSE_ENGINE_BIN itself is
+        # runner should not accumulate it either. MUSE_ENGINE_WORK itself is
         # NOT wiped: the strip step already wrote the strip script there,
         # and the run step hash-checks that exact file. Only the stale
         # run artifacts beside it are removed.
-        rm -rf "$MUSE_ENGINE_HOME" "${MUSE_ENGINE_BIN}-cli" \
+        rm -rf "$MUSE_ENGINE_HOME" "${MUSE_ENGINE_WORK}-cli" "$MUSE_INSTALLER_DIR" \
           "$HOME/.config/muse" "$HOME/.local/share/muse"
-        rm -f "$MUSE_ENGINE_BIN/review-stdout.txt" "$MUSE_ENGINE_BIN/cli.log"
+        rm -f "$MUSE_ENGINE_WORK/review-stdout.txt" "$MUSE_ENGINE_WORK/cli.log"
         # The installer's launcher lands in MUSE_INSTALL_DIR; the strip
-        # script already lives in MUSE_ENGINE_BIN, so install elsewhere.
-        mkdir -p "$MUSE_ENGINE_HOME" "${MUSE_ENGINE_BIN}-cli"
+        # script already lives in MUSE_ENGINE_WORK, so install elsewhere.
+        mkdir -p "$MUSE_ENGINE_HOME" "${MUSE_ENGINE_WORK}-cli" "$MUSE_INSTALLER_DIR"
 
         # Meta's only distribution channel (dev.meta.ai/docs/muse-code):
         # a one-line installer that drops a native `muse` launcher. There is
@@ -221,14 +222,22 @@ runs:
         # HTTPS, and log its SHA-256 so an incident can be correlated after
         # the fact. The version assertion below covers the binary, not the
         # script; that gap is stated in this file's RESIDUAL RISK header.
-        INSTALLER="$(mktemp "${MUSE_ENGINE_BIN}-cli/installer.XXXXXX.sh")"
+        # The installer script lives in its own wiped directory, never in
+        # the install dir (which should only ever hold the CLI), and both
+        # the installer and the version probe below run with the isolated
+        # HOME/XDG — not the runner's real home — so no Muse Code state
+        # lands in a persistent runner's real home. HOME is prefixed per
+        # invocation, not set in the step env, so the real-home cleanup
+        # above still targets the real $HOME.
+        INSTALLER="$MUSE_INSTALLER_DIR/install.sh"
         curl -fsSL --proto '=https' --tlsv1.2 https://dev.meta.ai/install.sh -o "$INSTALLER"
         echo "Muse Code installer sha256: $(sha256sum "$INSTALLER" | cut -d' ' -f1)"
-        MUSE_INSTALL_DIR="${MUSE_ENGINE_BIN}-cli" bash "$INSTALLER"
+        HOME="$MUSE_ENGINE_HOME" XDG_CONFIG_HOME="$MUSE_ENGINE_HOME/.config" XDG_DATA_HOME="$MUSE_ENGINE_HOME/.local/share" \
+          MUSE_INSTALL_DIR="${MUSE_ENGINE_WORK}-cli" bash "$INSTALLER"
 
-        MUSE_BIN="${MUSE_ENGINE_BIN}-cli/muse"
+        MUSE_BIN="${MUSE_ENGINE_WORK}-cli/muse"
         [[ -x "$MUSE_BIN" ]] || { echo "❌ Muse engine: installer produced no muse binary at $MUSE_BIN"; exit 1; }
-        VERSION_OUT="$("$MUSE_BIN" --version)"
+        VERSION_OUT="$(HOME="$MUSE_ENGINE_HOME" XDG_CONFIG_HOME="$MUSE_ENGINE_HOME/.config" XDG_DATA_HOME="$MUSE_ENGINE_HOME/.local/share" "$MUSE_BIN" --version)"
         echo "Muse Code installed: $VERSION_OUT"
         # `muse --version` prints e.g. "Muse Code 1.4.13 (1.4.13-R6996.1)".
         INSTALLED_VERSION="$(printf '%s' "$VERSION_OUT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | awk 'NR==1')"
