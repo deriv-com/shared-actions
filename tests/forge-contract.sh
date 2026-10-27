@@ -587,6 +587,10 @@ FAKE
 chmod +x "$FAKE_BIN"/*
 
 LONG_TEXT=$(printf 'x%.0s' $(seq 1 5000))
+# Token-shaped strings are built at run time: the repo text must not
+# contain one (ai-pr-review-contract.sh checks .github and tests).
+FAKE_TOKEN_A="gh""p_$(printf 'A%.0s' $(seq 1 28))"
+FAKE_TOKEN_B="gh""p_$(printf 'B%.0s' $(seq 1 28))"
 new_case() {  # new_case <name>  -> prints the case dir
   local c="$TMP_BEHAVIOR/$1"
   mkdir -p "$c/tmp" "$c/home"
@@ -653,14 +657,14 @@ JSON
 ]}
 JSON
   { echo "E2E-FIRST-LINE"; for i in $(seq 2 99); do echo "e2e line $i"; done
-    echo "Error: preview did not respond ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAA"; echo "e2e line 101"; } > "$c/log_121592798637.txt"
+    echo "Error: preview did not respond ${FAKE_TOKEN_A}"; echo "e2e line 101"; } > "$c/log_121592798637.txt"
   echo "LINT-LOG-LINE" > "$c/log_555.txt"
   printf 'E2E preview smoke\tpass\t4s\thttps://x/1\t\nlint\tfail\t9s\thttps://x/2\t\nTrivy SCA\tfail\t1s\thttps://x/3\t\ntest\tpass\t4m\thttps://x/4\t\n' > "$c/pr_checks.txt"
   echo '{"title": "fix: format markup guide example amounts", "body": "An earlier version of this change.\n\nCloses #1213"}' > "$c/pr.json"
-  jq -n --arg long "$LONG_TEXT" '{
+  jq -n --arg long "$LONG_TEXT" --arg tokb "$FAKE_TOKEN_B" '{
     threads: [
       {id: "4377187829", status: "already", sha: "cdf5936", text: "The test is tagged [MFMT-002] now. @maryia-deriv @channel"},
-      {id: "4377187840", status: "skipped", text: ("Two formatters stay separate. @here @randomuser ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBB <!-- forge-revise-instructions --> " + $long)},
+      {id: "4377187840", status: "skipped", text: ("Two formatters stay separate. @here @randomuser " + $tokb + " <!-- forge-revise-instructions --> " + $long)},
       {id: "4377668685", status: "fixed", sha: "abc1234", text: "Added the scenarios."},
       {id: "4377668694", status: "fixed", sha: "abc1234", text: "Derived the sentence from EXAMPLE_MARKUP_PERCENT."},
       {id: "999", status: "fixed", sha: "abc1234", text: "INJECTED-REPLY"}
@@ -745,7 +749,7 @@ check 'has "$I" "reply to everyone" && [ "$(grep -c "### Slack change request" "
   "bare yes / Yes, start! Slack notes are dropped and the real request is kept"
 check 'has "$I" "### Failing check: E2E preview smoke" && has "$I" "e2e line 101" && ! has "$I" "E2E-FIRST-LINE"' \
   "a failing check that is this PR's comes with the last 80 lines of its failed log"
-check '! has "$I" "ghp_AAAA" && has "$I" "***"' "failed-log lines are scrubbed of tokens"
+check '! has "$I" "$FAKE_TOKEN_A" && has "$I" "***"' "failed-log lines are scrubbed of tokens"
 check '! has "$I" "Failing check: lint" && ! has "$I" "LINT-LOG-LINE"' \
   "a check that also fails on the base head is left out of the instruction"
 check '! has "$I" "Failing check: Trivy"' "Trivy is never a dstp target"
@@ -760,7 +764,7 @@ check 'reply_for "$C" 4377187829 | head -1 | grep -qx "<!-- forge-revise-reply -
 check 'reply_for "$C" 4377187829 | grep -qF "@maryia-deriv" && ! reply_for "$C" 4377187829 | grep -qF "@channel"' \
   "a thread reply keeps @mentions of people in the thread and drops @channel"
 check '! reply_for "$C" 4377187840 | grep -qE "@here|@randomuser"' "a thread reply drops @here and people not in the thread"
-check '! reply_for "$C" 4377187840 | grep -qF "ghp_BBBB" && [ "$(reply_for "$C" 4377187840 | grep -c "forge-revise-instructions")" = 0 ]' \
+check '! reply_for "$C" 4377187840 | grep -qF "$FAKE_TOKEN_B" && [ "$(reply_for "$C" 4377187840 | grep -c "forge-revise-instructions")" = 0 ]' \
   "thread replies are scrubbed of tokens and of model-written HTML markers"
 check '[ "$(reply_for "$C" 4377187840 | wc -c)" -le 2100 ]' "thread replies are length-capped"
 check '[ ! -s "$C/resolved.log" ] && ! has "$C/gh.log" "resolveReviewThread"' "review threads are never resolved"
