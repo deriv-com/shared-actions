@@ -191,6 +191,22 @@ check 'grep -qE "^\| Default model \|[^|]*\| \`${ANTH_DEFAULT_MODEL}\` \|" "$REA
 check 'grep -qF "default: \"${ANTH_DEFAULT_MODEL}\"" "$DEPRECATED_WF"' "deprecated claude-pr-review.yml defaults claude_model to ${ANTH_DEFAULT_MODEL}"
 check 'grep -qF "inputs.claude_model || '\''${ANTH_DEFAULT_MODEL}'\''" "$DEPRECATED_WF"' "deprecated claude-pr-review.yml falls back to ${ANTH_DEFAULT_MODEL}"
 
+# Kimi CLI version. Every live copy of the pin must match, so a bump that
+# misses one fails here instead of shipping to every consumer. The copies:
+# the resolve-step arm in ai-pr-review.yml, the engine action's own default,
+# and the README inputs table. Each check is scoped to its own copy (the kimi
+# arm, the cli_version input block, the kimi cell) with fixed-string matches,
+# so another engine's copy, a commented-out line, or a near-miss version
+# cannot satisfy it.
+KIMI_CLI_VERSION="2.3.2"
+KIMI_ARM="$(awk '/^            kimi\)/{f=1} f{print} f && /;;/{exit}' "$WF")"
+check 'grep -qxF "              DEFAULT_CLI_VERSION=\"${KIMI_CLI_VERSION}\"" <<< "$KIMI_ARM"' "kimi arm pins DEFAULT_CLI_VERSION=${KIMI_CLI_VERSION}"
+KIMI_CLI_INPUT="$(awk '/^  cli_version:/{f=1; next} f && /^  [a-z_]+:/{exit} f' "$KIMI")"
+check 'grep -qxF "    default: \"${KIMI_CLI_VERSION}\"" <<< "$KIMI_CLI_INPUT"' "kimi engine action defaults cli_version to ${KIMI_CLI_VERSION}"
+# Match only the kimi cell (first column of the per-engine list), so a grok or
+# codex bump cannot satisfy or fail it.
+check 'grep -qF "per engine (\`${KIMI_CLI_VERSION}\` kimi," "$README"' "README inputs table lists ${KIMI_CLI_VERSION} for kimi"
+
 # Dispatch: an if-gated step referencing the codex engine by absolute @master path.
 check 'grep -q "if: steps.engine.outputs.engine == '\''codex'\''" "$WF"' "codex dispatch step is if-gated on the engine output"
 check 'grep -q "ai_review_engine_codex@master" "$WF"' "codex dispatch references the engine by absolute @master path"
@@ -612,6 +628,33 @@ check 'grep -q "use_commit_signing" "$README" && grep -q "restoreConfigFromBase"
 check '! grep -q "the one prepare branch that never rewrites origin" "$README" && ! grep -q "the one prepare branch that skips that" "$README"' "README does not claim signing alone skips origin rewrite"
 check 'grep -q "REVIEW_MARKER_FILTER" "$README"' "README documents why the reap filter is env, not a file"
 check 'grep -q "120000" "$README"' "README documents the tree-based symlink check"
+
+# The review prompt lives in-repo. The procedure must not tell the model to
+# read every dependency, which overrides the prompt because it is appended last.
+PROMPT="$ROOT/.github/prompts/ai-pr-review.md"
+check '[[ -f "$PROMPT" ]]' "review prompt file exists"
+check 'grep -q "If that text contradicts the code in the same diff, or two parts of it contradict each other, that is a Change." "$PROMPT"' "prompt treats a spec contradiction in the diff as a Change"
+check 'grep -q "{{AUTO_FIX_URL}}" "$PROMPT"' "prompt leaves the Click2Fix placeholder"
+check 'grep -q "Under 500 words." "$PROMPT"' "prompt caps the review at 500 words"
+# grep -q must not be the reader on a pipe. The workflow is larger than a
+# pipe buffer, so an early exit SIGPIPEs the writer and pipefail fails the check.
+WF_CODE="$(grep -vE '^[[:space:]]*#' "$WF")"
+# The fetch-step labels must be satisfied by that step, not by another copy
+# of the same command elsewhere in the workflow.
+FETCH_BODY="$(step_body "Fetch prompt template" "$WF" | grep -vE '^[[:space:]]*#')"
+check 'grep -qF "printf '\''%s'\'' \"\$PROMPT_B64\" | base64 -d > /tmp/prompt_template.txt" <<< "$FETCH_BODY"' "fetch step decodes the inlined prompt"
+check 'grep -qF "curl -sfL \"\$PROMPT_GIST_URL\"" <<< "$FETCH_BODY"' "override still fetches prompt_gist_url"
+check 'sed -n "s/^          PROMPT_B64: //p" "$WF" | tr -d "[:space:]" | python3 -c "import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))" | cmp -s - "$PROMPT"' "inlined prompt matches .github/prompts/ai-pr-review.md"
+check 'grep -qF "When there are no findings, omit Findings and Auto Fix. On a follow-up, still write Previous issues." "$PROMPT"' "prompt keeps Previous issues when there are no findings"
+check 'grep -qF "List each Spec Change under Findings as well, marked Change." "$PROMPT"' "a Spec Change is also listed under Findings"
+check '! grep -q "Do not begin with a heading" "$WF"' "output rule does not forbid the Summary heading"
+check 'grep -q "Start with the Summary section." <<< "$WF_CODE"' "output rule tells the model to start with Summary"
+check '! grep -q "Read its dependencies" "$WF"' "procedure does not tell the model to read every dependency"
+check 'grep -q "A contradiction between them is a Change under Spec." <<< "$WF_CODE"' "procedure files a spec contradiction under Spec"
+check 'grep -q "Do not read further for that assumption." <<< "$WF_CODE"' "procedure stops extra reading at one assumption"
+check '! grep -q "it was not touched" "$WF"' "incremental diff does not treat an absent pattern as untouched"
+check 'grep -q ".github/prompts/ai-pr-review.md" "$README"' "README documents the in-repo prompt"
+check '! grep -q "edit the gist" "$README"' "README no longer tells people to edit the gist"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "contract checks failed"
