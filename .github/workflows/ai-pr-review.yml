@@ -35,17 +35,17 @@ on:
   workflow_call:
     inputs:
       engine:
-        description: "Review engine: `kimi` (Kimi Code CLI), `anthropic` (Claude Code Action), `grok` (Grok Build CLI), or `codex` (OpenAI Codex CLI). Each is a composite action under .github/actions/ai_review_engine_<engine>/. Set this explicitly — the default is `kimi`, so an omitted value on a repo migrating from claude-pr-review.yml would switch LLM vendor."
+        description: "Review engine: `kimi` (Kimi Code CLI), `anthropic` (Claude Code Action), `grok` (Grok Build CLI), `codex` (OpenAI Codex CLI), or `muse` (Meta Muse Code CLI). Each is a composite action under .github/actions/ai_review_engine_<engine>/. Set this explicitly — the default is `kimi`, so an omitted value on a repo migrating from claude-pr-review.yml would switch LLM vendor."
         required: false
         default: "kimi"
         type: string
       review_title:
-        description: "Visible Checks name and comment heading (the post step appends ' Complete'). Empty keeps the engine default (Kimi PR Review / Claude PR Review / Grok PR Review / Codex PR Review) and one slot per engine. Set this to run a second caller on the same engine as a concurrent slot — e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review. Must end in ' PR Review' so follow-up header strip stays in lockstep. Concurrency, the canonical HTML marker, and the progress marker include the title when set. An invalid value still appears in the Check name at parse time; the job name is not authoritative until the run succeeds."
+        description: "Visible Checks name and comment heading (the post step appends ' Complete'). Empty keeps the engine default (Kimi PR Review / Claude PR Review / Grok PR Review / Codex PR Review / Muse PR Review) and one slot per engine. Set this to run a second caller on the same engine as a concurrent slot — e.g. engine: anthropic, model: glm-5.3, review_title: GLM PR Review. Must end in ' PR Review' so follow-up header strip stays in lockstep. Concurrency, the canonical HTML marker, and the progress marker include the title when set. An invalid value still appears in the Check name at parse time; the job name is not authoritative until the run succeeds."
         required: false
         default: ""
         type: string
       model:
-        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5-5, grok -> grok-4.6, codex -> gpt-6.1-sol). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
+        description: "Model ID to use for review, as the endpoint in `base_url` names it. Defaults per engine (kimi -> kimi-k3, anthropic -> claude-sonnet-5-5, grok -> grok-4.6, codex -> gpt-6.1-sol, muse -> meta-muse-wonder-1.0). With the default LiteLLM base_url this must be a proxy alias — list them with `curl -H \"Authorization: Bearer $LLM_API_KEY\" https://litellmsa.deriv.ai/v1/models`. Kimi-platform ids such as `k3` only resolve against api.kimi.com/coding/v1."
         required: false
         default: ""
         type: string
@@ -55,12 +55,12 @@ on:
         default: ""
         type: string
       max_context_size:
-        description: "[engine-specific: kimi, grok] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; grok-4.6 is 500000; the 256k Kimi variants are 262144. Empty resolves per engine. Ignored when engine is `anthropic` or `codex`."
+        description: "[engine-specific: kimi, grok] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; grok-4.6 is 500000; the 256k Kimi variants are 262144. Empty resolves per engine. Ignored when engine is `anthropic`, `codex` or `muse`."
         required: false
         default: ""
         type: string
       cli_version:
-        description: "[engine-specific: kimi, grok, codex] Exact CLI version to install (`@moonshot-ai/kimi-code` for kimi, `@xai-official/grok` for grok, `@openai/codex` for codex). Pinned deliberately — `latest` risks both breaking changes and unreviewed code in a privileged job. Empty resolves to the per-engine pin in the 'Resolve and validate engine' step; bump it there via PR. Ignored when engine is `anthropic`."
+        description: "[engine-specific: kimi, grok, codex, muse] Exact CLI version to install (`@moonshot-ai/kimi-code` for kimi, `@xai-official/grok` for grok, `@openai/codex` for codex, Muse Code for muse — Meta distributes it only via the dev.meta.ai installer, so the muse engine pins by asserting `muse --version` after install). Pinned deliberately — `latest` risks both breaking changes and unreviewed code in a privileged job. Empty resolves to the per-engine pin in the 'Resolve and validate engine' step; bump it there via PR. Ignored when engine is `anthropic`."
         required: false
         default: ""
         type: string
@@ -81,6 +81,11 @@ on:
         type: string
       effort:
         description: "[engine-specific: anthropic] Effort level for the Claude review turn: low, medium, high, xhigh, or max (the Claude Code CLI `--effort` enum and Anthropic API `output_config.effort`). Empty sends no override and leaves the model/endpoint default. Validated in the 'Resolve and validate engine' step and passed to the anthropic dispatch step as `--effort` on `claude_args`. `ultracode` is a Claude Code workflow setting, not an API effort level, so it is not accepted. Ignored when engine is not `anthropic` (the other engines take no such input)."
+        required: false
+        default: ""
+        type: string
+      muse_reasoning_effort:
+        description: "[engine-specific: muse] Reasoning effort for the Muse review turn: minimal, low, medium, high, xhigh, or max (the levels muse-wonder-1.0 supports). Empty sends no override and leaves the Muse Code CLI default, which is high. `none` is not accepted (the Meta provider rejects it) and `ultra` is not accepted (a Muse Code client-side alias, not a model level). Validated in the 'Resolve and validate engine' step and passed to the muse dispatch step as `--reasoning-effort`. Ignored when engine is not `muse` (the other engines take no such input)."
         required: false
         default: ""
         type: string
@@ -107,7 +112,7 @@ on:
 
 jobs:
   ai-review:
-    name: ${{ inputs.review_title != '' && inputs.review_title || (inputs.engine == 'grok' && 'Grok PR Review' || (inputs.engine == 'codex' && 'Codex PR Review' || (inputs.engine == 'anthropic' && 'Claude PR Review' || 'Kimi PR Review'))) }}
+    name: ${{ inputs.review_title != '' && inputs.review_title || (inputs.engine == 'grok' && 'Grok PR Review' || (inputs.engine == 'codex' && 'Codex PR Review' || (inputs.engine == 'muse' && 'Muse PR Review' || (inputs.engine == 'anthropic' && 'Claude PR Review' || 'Kimi PR Review')))) }}
     runs-on:
       group: github_claude_code_reviewer
     # Bot actors are skipped, not failed: dependabot and friends are not org
@@ -272,6 +277,7 @@ jobs:
           THINKING_EFFORT_INPUT: ${{ inputs.thinking_effort }}
           REASONING_EFFORT_INPUT: ${{ inputs.reasoning_effort }}
           EFFORT_INPUT: ${{ inputs.effort }}
+          MUSE_REASONING_EFFORT_INPUT: ${{ inputs.muse_reasoning_effort }}
           PROMPT_GIST_URL_INPUT: ${{ inputs.prompt_gist_url }}
         run: |
           ENGINE="${ENGINE_INPUT:-kimi}"
@@ -333,9 +339,23 @@ jobs:
               DEFAULT_CLI_VERSION="0.160.0"
               REVIEW_TITLE="Codex PR Review"
               ;;
+            muse)
+              # LiteLLM alias for Meta Muse Wonder 1.0, routed via the
+              # Cloudflare AI Gateway and served over the OpenAI Responses
+              # API. The Muse engine ignores max_context_size (Muse Code
+              # manages its own context window); cli_version pins Muse
+              # Code by assertion after install (Meta distributes it only via
+              # the dev.meta.ai installer).
+              DEFAULT_MODEL="meta-muse-wonder-1.0"
+              METRICS_AGENT="muse_review"
+              ARTIFACT_PREFIX="muse-review"
+              DEFAULT_MAX_CONTEXT=""
+              DEFAULT_CLI_VERSION="1.4.13"
+              REVIEW_TITLE="Muse PR Review"
+              ;;
             *)
               echo "❌ Unknown engine: '$ENGINE'"
-              echo "   Supported values for the \`engine\` input: kimi, anthropic, grok, codex"
+              echo "   Supported values for the \`engine\` input: kimi, anthropic, grok, codex, muse"
               exit 1
               ;;
           esac
@@ -434,13 +454,36 @@ jobs:
             esac
           fi
 
+          # muse_reasoning_effort is muse-only (like effort is
+          # anthropic-only). Empty is the default — no --reasoning-effort
+          # flag is sent, and Muse Code leaves its own default (high)
+          # untouched. Validate a non-empty value here so a typo fails at
+          # resolve time with a clear message rather than inside the engine
+          # an hour later. The other engines ignore it. The set is what
+          # muse-wonder-1.0 supports: minimal|low|medium|high|xhigh|max.
+          # `none` is rejected (the Meta provider does not accept it) and
+          # `ultra` is a Muse Code client-side alias, not a model level
+          # (tests/ai-pr-review-contract.sh checks that all copies match).
+          MUSE_REASONING_EFFORT="${MUSE_REASONING_EFFORT_INPUT:-}"
+          if [[ -n "$MUSE_REASONING_EFFORT" ]]; then
+            case "$MUSE_REASONING_EFFORT" in
+              minimal|low|medium|high|xhigh|max) ;;
+              *)
+                echo "❌ Invalid muse_reasoning_effort '$MUSE_REASONING_EFFORT'"
+                echo "   Use one of --reasoning-effort: minimal, low, medium, high, xhigh, max (or leave empty for the CLI default)."
+                exit 1
+                ;;
+            esac
+          fi
+
           # Posted under **Model:**. Empty knobs show what we print when the
           # env / --effort / -c is omitted. An explicit value omits
           # "(default)" even when it matches. Grok has no knob. Only the
           # active engine's input is used. Display when empty: kimi
           # "model default (no override sent)" (env unset; do not name a
           # value — kimi-code openai chat does not send `high`),
-          # anthropic `medium`, codex `medium`.
+          # anthropic `medium`, codex `medium`, muse `high` (the Muse Code
+          # CLI's documented --reasoning-effort default).
           case "$ENGINE" in
             kimi)
               if [[ -n "$THINKING_EFFORT" ]]; then
@@ -463,6 +506,13 @@ jobs:
                 REVIEW_EFFORT_DISPLAY=$(printf '`%s` (default)' medium)
               fi
               ;;
+            muse)
+              if [[ -n "$MUSE_REASONING_EFFORT" ]]; then
+                REVIEW_EFFORT_DISPLAY=$(printf '`%s`' "$MUSE_REASONING_EFFORT")
+              else
+                REVIEW_EFFORT_DISPLAY=$(printf '`%s` (default)' high)
+              fi
+              ;;
             grok)
               REVIEW_EFFORT_DISPLAY='n/a (this engine has no effort override)'
               ;;
@@ -483,6 +533,7 @@ jobs:
             echo "thinking_effort=$THINKING_EFFORT"
             echo "reasoning_effort=$REASONING_EFFORT"
             echo "effort=$EFFORT"
+            echo "muse_reasoning_effort=$MUSE_REASONING_EFFORT"
             echo "prompt_gist_url=$PROMPT_GIST_URL"
           } >> "$GITHUB_OUTPUT"
 
@@ -1113,6 +1164,23 @@ jobs:
           api_key: ${{ secrets.LLM_API_KEY }}
           cli_version: ${{ steps.engine.outputs.cli_version }}
           reasoning_effort: ${{ steps.engine.outputs.reasoning_effort }}
+
+      - name: AI review (Meta Muse Code engine)
+        id: engine-muse
+        if: steps.engine.outputs.engine == 'muse'
+        timeout-minutes: 60
+        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_muse@master
+        with:
+          repository: ${{ github.repository }}
+          pr_number: ${{ github.event.pull_request.number }}
+          review_context_path: ${{ env.REVIEW_CONTEXT_FILE }}
+          pr_diff_path: ${{ env.PR_DIFF_FILE }}
+          output_path: ${{ env.REVIEW_OUTPUT_FILE }}
+          model: ${{ steps.engine.outputs.model }}
+          base_url: ${{ steps.engine.outputs.base_url }}
+          api_key: ${{ secrets.LLM_API_KEY }}
+          cli_version: ${{ steps.engine.outputs.cli_version }}
+          muse_reasoning_effort: ${{ steps.engine.outputs.muse_reasoning_effort }}
 
       # ====================== END ENGINE DISPATCH ==========================
 

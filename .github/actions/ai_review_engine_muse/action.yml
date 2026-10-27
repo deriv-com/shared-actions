@@ -1,0 +1,552 @@
+name: ai_review_engine_muse
+description: >
+  AI PR review engine — Meta Muse Code CLI. Reads a pre-built review context
+  and a pre-fetched PR diff, reviews the checked-out code, and writes the
+  review markdown to a file. It posts nothing: it is given no GitHub token, no
+  shell tool and no write tool. The calling workflow owns comment posting.
+
+# ENGINE CONTRACT (see .github/workflows/AI_PR_REVIEW_README.md)
+#
+# The caller guarantees: PR head is checked out; review_context_path and
+# pr_diff_path exist and are non-empty; the access gate has passed.
+#
+# This engine must: strip PR-supplied agent config FIRST, grant the model no
+# shell tool and no write tool, write the review to output_path, and fail with
+# an engine-named message if it wrote nothing. It must not post PR comments or
+# reach the GitHub API on the model's behalf.
+#
+# Composite-action gotchas that constrain this file:
+#   - The secrets context is not readable here, so api_key arrives as an input.
+#   - timeout-minutes is invalid on the steps below; the caller's dispatch
+#     step carries it.
+#   - All steps share one log group, so failures must name this engine.
+#
+# HOW THIS ENGINE IS CONFINED (verified against muse 1.4.13 in the spike that
+# introduced this engine; re-verify every point on a cli_version bump, because
+# Muse Code ships no public settings schema for the pieces marked *):
+#   1. Read-only toolset. `muse exec --disable-shell --disable-write` removes
+#      the shell and every file-write tool from the run; the model keeps
+#      read_file / search and prints the review as its final reply. stdout of
+#      `muse exec` is exactly that final reply (status lines go to stderr),
+#      so the ENGINE captures stdout into a staging file under runner.temp —
+#      a directory the model cannot write — and copies it to output_path
+#      itself. The model therefore cannot write anything, anywhere: not the
+#      checkout, not /tmp, not its own config. This is stronger than the
+#      Codex posture and is why this engine needs no path guard and no
+#      bubblewrap probe (there is no shell for the sandbox to contain; the
+#      sandbox stays on for the file tools regardless).
+#   2. Untrusted workspace. The run never passes --trust-workspace or --yolo,
+#      so project-local AGENTS.md / CLAUDE.md, skills and hooks are not loaded
+#      (the CLI states this in its own session banner), and agent delegation
+#      is unavailable. Committed project memory (.agents/memory/) is the one
+#      surface the CLI reads even untrusted, so the strip step removes it.
+#   3. Routing to LiteLLM. Muse Code only sends its bearer to a non-default
+#      base_url when that URL is pinned in settings as
+#      endpoint_transport { base_url, auth = "bearer" } — a --base-url flag
+#      makes it WITHHOLD the key. The same settings file carries a
+#      model_catalog row for the LiteLLM alias: the CLI otherwise fetches
+#      {host}/muse-code/models, which LiteLLM does not serve, and fails
+#      before the first model call. The row needs profile_id "tbh"* (the
+#      Muse Code profile), visibility "visible" and the 1M context limit;
+#      without an accepted row the run fails closed with "failed to fetch
+#      model catalog". With the row accepted the CLI speaks plain OpenAI
+#      Responses streaming to {base_url}/responses with
+#      reasoning.effort plumbed from --reasoning-effort — exactly what the
+#      LiteLLM proxy serves for the meta-muse-* aliases.
+#   4. Version pinning by assertion. Meta distributes Muse Code only through
+#      the https://dev.meta.ai/install.sh installer (a launcher that
+#      self-updates hourly by default); there is no package-manager pin. So
+#      the install step asserts `muse --version` is exactly cli_version and
+#      every invocation runs with MUSE_NO_AUTO_UPDATE=1, freezing the binary
+#      the assertion checked. Bump cli_version via PR after re-running the
+#      verification that introduced this engine.
+#   5. No GitHub token in any step, --contributor-mode off (PR code must not
+#      train Meta models), --disable-reminders (the background reminder /
+#      observer agents would add their own model calls against the LiteLLM
+#      key), --disable-web-tools, --no-session-log and --no-foreign-personal-
+#      context, HOME / XDG isolated under runner.temp and wiped first, so a
+#      persistent runner's own ~/.config/muse (settings, MCP, skills, stored
+#      credentials) is never read.
+#
+# RESIDUAL RISK, stated plainly. Reads are unscoped: read_file can open any
+# file the runner user can read (it must — review_context_path and
+# pr_diff_path live in /tmp, outside the workspace). The model could quote
+# what it read in the review text; it has no other egress (no shell, no
+# write, web tools off, sandbox network restricted). META_API_KEY exists
+# only in the run step's process env, in no file the model can read, and the
+# orchestrator's post step refuses to publish the key (literal or base64).
+# Treat muse like grok on key confidentiality: same-repo PRs only, the
+# org-member access gate, and a rotatable LiteLLM key bound it.
+
+inputs:
+  review_context_path:
+    description: "Path to the pre-built review context markdown (instructions, PR metadata, previous review, acknowledged suggestions, required output format). Built by the caller."
+    required: false
+    default: "/tmp/review_context.md"
+  pr_diff_path:
+    description: "Path to the pre-fetched PR diff. Fetched by the caller with the trusted token so this engine needs neither a shell tool nor network access."
+    required: false
+    default: "/tmp/pr_diff.txt"
+  output_path:
+    description: "Path this engine MUST write the final review markdown to. Must resolve (after realpath, so `..` cannot escape) under /tmp. The model has no write tool; the engine captures the CLI's stdout under runner.temp and copies it here itself, then refuses anything that is not a regular, singly-linked file under /tmp."
+    required: false
+    default: "/tmp/ai_review_output.txt"
+  repository:
+    description: "owner/repo of the PR under review (prompt preamble only)."
+    required: true
+  pr_number:
+    description: "Number of the PR under review (prompt preamble only)."
+    required: true
+  model:
+    description: "Model ID as the endpoint in base_url names it. With the LiteLLM proxy that is a proxy alias, e.g. meta-muse-wonder-1.0 (Meta's Muse Wonder 1.0 routed via the Cloudflare AI Gateway). The upstream id muse-wonder-1.0 only resolves at api.meta.ai directly. Written into the settings model_catalog row and passed as --model."
+    required: false
+    default: "meta-muse-wonder-1.0"
+  base_url:
+    description: "LLM API base URL. A trailing /v1 is appended when absent. Pinned into settings endpoint_transport (with auth bearer) because Muse Code withholds its key from a --base-url flag value; the CLI posts {base_url}/responses."
+    required: false
+    default: "https://litellmsa.deriv.ai/v1"
+  api_key:
+    description: "API key for base_url (the LiteLLM virtual key). Composite actions cannot read the secrets context, so the caller must pass this explicitly. Mapped to META_API_KEY in the run step env (the name Muse Code reads) and never written to disk."
+    required: true
+  muse_reasoning_effort:
+    description: "[engine-specific: muse] Reasoning effort for the review turn. One of minimal, low, medium, high, xhigh, max (the levels muse-wonder-1.0 supports). none is rejected (the Meta provider does not accept it) and ultra is rejected (a Muse Code client-side alias, not a model level). Empty leaves the CLI default, which is high (no override is sent). Maps to --reasoning-effort on the run step, applied ONLY when non-empty. Other engines ignore this input."
+    required: false
+    default: ""
+  cli_version:
+    description: "Exact Muse Code version to install. Meta distributes the CLI only via the dev.meta.ai installer, which always installs the newest release, so the pin is enforced by asserting `muse --version` after install and freezing the binary with MUSE_NO_AUTO_UPDATE=1 (the launcher otherwise self-updates hourly). Bump via PR, re-verifying the confinement notes in this file's header."
+    required: false
+    default: "1.4.13"
+
+outputs:
+  output_path:
+    description: "Path the review markdown was written to."
+    value: ${{ steps.run.outputs.output_path }}
+
+runs:
+  using: composite
+  steps:
+    # Security boundary, not hygiene. Muse Code auto-loads, per directory,
+    # AGENTS.md / CLAUDE.md / .agents/AGENTS.md / .claude/CLAUDE.md, project
+    # skills (.agents/skills/, .codex/skills/, .claude/skills/), project
+    # hooks (.muse/hooks.json — executed OUTSIDE the sandbox once the
+    # workspace is trusted) and committed project memory (.agents/memory/,
+    # which it reads even in an UNTRUSTED workspace). The run never trusts
+    # the workspace, but memory and defence in depth make this sweep
+    # load-bearing. These paths are engine-specific: another engine must
+    # revisit this list, never inherit it.
+    - name: Strip PR-supplied agent config (Muse Code)
+      id: strip
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        # The sweep is written once, to a directory outside the checkout, and
+        # the run step re-runs this same file before each attempt. One copy,
+        # so the two sweeps cannot drift apart.
+        STRIP_SCRIPT: ${{ runner.temp }}/muse-engine-bin/strip-agent-config.sh
+      run: |
+        mkdir -p "$(dirname "$STRIP_SCRIPT")"
+        cat > "$STRIP_SCRIPT" <<'STRIP_EOF'
+        # Sourced with the checkout as the working directory.
+        # Recursive, not root-only. Instruction files are discovered
+        # per-directory as an agent reads files there, and this review's
+        # prompt explicitly tells it to traverse into dependencies. .git is
+        # pruned so the sweep cannot corrupt the checkout.
+        # Both sweeps match symlinks too (-type l): a link named AGENTS.md or
+        # .muse pointing at another file or directory in the PR would
+        # otherwise survive a sweep keyed on -type f / -type d. rm on a link
+        # removes the link only. This is the same sweep shape the contract
+        # test asserts across every engine (FILE_SWEEP / DIR_SWEEP).
+        # -iname: match mixed-case variants (AGENTS.md / Agents.md /
+        # agents.md); a lowercase agents.md would otherwise slip past -name
+        # and reach the model as trusted instructions in a job holding the
+        # LLM API key.
+        find . -name .git -prune -o \( -type f -o -type l \) \
+          \( -iname 'agents.md' -o -iname 'agent.md' \
+             -o -iname 'claude.md' -o -iname 'claude.local.md' \
+             -o -iname 'kimi.md' -o -iname '.mcp.json' -o -iname '.cursorrules' \) \
+          -print0 | xargs -0 -r rm -f
+        find . -name .git -prune -o \( -type d -o -type l \) \
+          \( -iname '.muse' -o -iname '.claude' -o -iname '.claude-plugin' -o -iname '.agents' -o -iname '.codex' \) \
+          -print0 | xargs -0 -r rm -rf
+        find . -name .git -prune -o \( -type d -o -type l \) -ipath '*/.cursor/rules' \
+          -print0 | xargs -0 -r rm -rf
+        STRIP_EOF
+
+        bash -euo pipefail "$STRIP_SCRIPT"
+        echo "strip_sha256=$(sha256sum "$STRIP_SCRIPT" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        echo "✅ Stripped PR-supplied agent config (recursive)"
+
+    - name: Install review CLI (Muse Code)
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli_version }}
+        # Isolated install + home under runner.temp: nothing Muse Code reads
+        # or writes may come from (or survive in) the runner's real home on a
+        # persistent self-hosted runner. runner.temp, not /tmp, so nothing
+        # below ever sits in a shared scratch directory.
+        MUSE_ENGINE_BIN: ${{ runner.temp }}/muse-engine-bin
+        MUSE_ENGINE_HOME: ${{ runner.temp }}/muse-engine-home
+        MUSE_NO_MODIFY_PATH: "1"
+        MUSE_NO_AUTO_UPDATE: "1"
+      run: |
+        # Wipe BOTH directories first: a previous job's settings, catalog
+        # cache, stored credentials or a newer self-updated binary must not
+        # leak into this run. Also clear Muse Code state in the REAL home —
+        # no step points Muse Code there, but a persistent runner should not
+        # accumulate it either.
+        rm -rf "$MUSE_ENGINE_BIN" "$MUSE_ENGINE_HOME" \
+          "$HOME/.config/muse" "$HOME/.local/share/muse"
+        # The installer's launcher lands in MUSE_INSTALL_DIR; the strip
+        # script already lives in MUSE_ENGINE_BIN, so install elsewhere.
+        mkdir -p "$MUSE_ENGINE_HOME" "${MUSE_ENGINE_BIN}-cli"
+
+        # Meta's only distribution channel (dev.meta.ai/docs/muse-code):
+        # a one-line installer that drops a native `muse` launcher. There is
+        # no package manager pin to use instead, so the version is pinned by
+        # assertion immediately below and the launcher is frozen with
+        # MUSE_NO_AUTO_UPDATE=1 (it otherwise replaces its own binary in the
+        # background, hourly). Never add MUSE_SYNC_UPDATE here.
+        curl -fsSL https://dev.meta.ai/install.sh | MUSE_INSTALL_DIR="${MUSE_ENGINE_BIN}-cli" bash
+
+        MUSE_BIN="${MUSE_ENGINE_BIN}-cli/muse"
+        [[ -x "$MUSE_BIN" ]] || { echo "❌ Muse engine: installer produced no muse binary at $MUSE_BIN"; exit 1; }
+        VERSION_OUT="$("$MUSE_BIN" --version)"
+        echo "Muse Code installed: $VERSION_OUT"
+        # `muse --version` prints e.g. "Muse Code 1.4.13 (1.4.13-R6996.1)".
+        INSTALLED_VERSION="$(printf '%s' "$VERSION_OUT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | awk 'NR==1')"
+        if [[ "$INSTALLED_VERSION" != "$CLI_VERSION" ]]; then
+          echo "❌ Muse engine: installer delivered Muse Code $INSTALLED_VERSION, but cli_version pins $CLI_VERSION."
+          echo "   The installer always delivers the newest release; bump cli_version (and re-verify this engine's header notes) in a PR instead of running an unreviewed CLI."
+          exit 1
+        fi
+        echo "✅ Muse engine: Muse Code $CLI_VERSION installed (auto-update disabled)"
+
+    - name: Configure review CLI (Muse Code)
+      id: configure
+      shell: bash
+      env:
+        MUSE_ENGINE_HOME: ${{ runner.temp }}/muse-engine-home
+        OUTPUT_PATH: ${{ inputs.output_path }}
+        MODEL: ${{ inputs.model }}
+        INPUT_BASE_URL: ${{ inputs.base_url }}
+      run: |
+        # Fail closed if a caller pointed output at the checkout: the review
+        # is engine-captured stdout, and a review written into the tree would
+        # be swept as PR-controlled content and could overwrite source. The
+        # review's home is /tmp. Resolve first so `/tmp/../home/...` cannot
+        # pass the glob.
+        OUTPUT_REAL="$(realpath -m -- "$OUTPUT_PATH")"
+        case "$OUTPUT_REAL" in
+          /tmp/*) ;;
+          *)
+            echo "❌ Muse engine: output_path must resolve under /tmp: $OUTPUT_PATH (resolves to $OUTPUT_REAL)"
+            exit 1
+            ;;
+        esac
+
+        BASE_URL="${INPUT_BASE_URL%/}"
+        [[ "$BASE_URL" == */v1 ]] || BASE_URL="${BASE_URL}/v1"
+
+        # MODEL and BASE_URL go into a JSON settings file below (via jq, so
+        # they are escaped) and into a --model flag. A quote, backslash or
+        # control character could still break the flag or the catalog row's
+        # meaning, so refuse anything outside a plain identifier / URL
+        # alphabet. The patterns live in single-quoted variables: backslash
+        # escapes inside an unquoted bracket expression let a literal
+        # backslash through on bash older than 5.2.
+        model_re='^[A-Za-z0-9._:/@-]+$'
+        base_url_re='^https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$'
+        if [[ ! $MODEL =~ $model_re ]]; then
+          echo "❌ Muse engine: model contains characters not allowed in a model id: '$MODEL'"
+          exit 1
+        fi
+        if [[ ! $BASE_URL =~ $base_url_re ]]; then
+          echo "❌ Muse engine: base_url must be an http(s) URL with no quotes, backslashes or whitespace: '$BASE_URL'"
+          exit 1
+        fi
+
+        # The settings file Muse Code reads from the isolated home:
+        #   - schema_version 1 is mandatory (the CLI refuses to start without
+        #     it when a settings file exists).
+        #   - endpoint_transport pins the LiteLLM base_url with auth bearer.
+        #     Without this pin the CLI withholds META_API_KEY from any
+        #     non-default base_url (its own error says so), and a --base-url
+        #     flag does NOT count as a pin.
+        #   - model_catalog registers the LiteLLM alias, or the CLI tries to
+        #     fetch {host}/muse-code/models (LiteLLM 404s it) and fails
+        #     before the first model call. profile_id "tbh", visibility
+        #     "visible" and the model's real 1M window are what the CLI's
+        #     catalog filter accepts — all verified against 1.4.13; if a bump
+        #     drops the row, the run fails closed with a catalog error and no
+        #     review is posted. output_limit 131072 matches what the model
+        #     profile requests.
+        # No credential is written here: the key stays in META_API_KEY on the
+        # run step, and endpoint_transport references it only by auth mode.
+        SETTINGS_DIR="$MUSE_ENGINE_HOME/.config/muse"
+        mkdir -p "$SETTINGS_DIR"
+        jq -n \
+          --arg base_url "$BASE_URL" \
+          --arg model "$MODEL" \
+          '{
+            schema_version: 1,
+            endpoint_transport: { base_url: $base_url, auth: "bearer" },
+            model_catalog: [{
+              model_id: $model,
+              provider_id: "meta",
+              profile_id: "tbh",
+              display_label: $model,
+              visibility: "visible",
+              display_order: 1,
+              is_default: true,
+              context_limit: 1048576,
+              output_limit: 131072,
+              description: "LiteLLM proxy alias registered by the Muse review engine"
+            }]
+          }' > "$SETTINGS_DIR/settings.json"
+
+        echo "🔧 Muse engine | model=$MODEL | base_url=$BASE_URL"
+        {
+          echo "base_url=$BASE_URL"
+          echo "model=$MODEL"
+        } >> "$GITHUB_OUTPUT"
+        echo "✅ Muse engine: settings written (home=$MUSE_ENGINE_HOME)"
+
+    - name: Run AI PR review (Muse Code)
+      id: run
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        MUSE_ENGINE_HOME: ${{ runner.temp }}/muse-engine-home
+        MUSE_BIN: ${{ runner.temp }}/muse-engine-bin-cli/muse
+        # The name Muse Code reads (dev.meta.ai/docs/muse-code/auth). The
+        # caller passes the LiteLLM virtual key as api_key; it is renamed
+        # here, exists only in this step's env, and is never written to disk.
+        META_API_KEY: ${{ inputs.api_key }}
+        # Freeze the exact binary the install step asserted: the launcher
+        # otherwise self-updates in the background, hourly.
+        MUSE_NO_AUTO_UPDATE: "1"
+        CI: "1"
+        CONTEXT_PATH: ${{ inputs.review_context_path }}
+        DIFF_PATH: ${{ inputs.pr_diff_path }}
+        OUTPUT_PATH: ${{ inputs.output_path }}
+        # The value the configure step validated, not the raw input.
+        MODEL: ${{ steps.configure.outputs.model }}
+        MUSE_REASONING_EFFORT: ${{ inputs.muse_reasoning_effort }}
+        STRIP_SCRIPT: ${{ runner.temp }}/muse-engine-bin/strip-agent-config.sh
+        STRIP_SHA256: ${{ steps.strip.outputs.strip_sha256 }}
+        # CLI stdout is captured to the staging file and stderr to the CLI
+        # log, both under runner.temp where (with shell and write tools
+        # disabled) the model has no way to reach them.
+        STAGE_FILE: ${{ runner.temp }}/muse-engine-bin/review-stdout.txt
+        CLI_LOG: ${{ runner.temp }}/muse-engine-bin/cli.log
+      run: |
+        [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Muse engine: missing or empty review context at $CONTEXT_PATH"; exit 1; }
+        [[ -s "$DIFF_PATH"    ]] || { echo "❌ Muse engine: missing or empty PR diff at $DIFF_PATH"; exit 1; }
+        [[ -x "$MUSE_BIN" ]]   || { echo "❌ Muse engine: muse binary missing at $MUSE_BIN (install step did not run?)"; exit 1; }
+
+        # Validate muse_reasoning_effort here, not just in the orchestrator:
+        # this engine is referenced by absolute @master path and can be
+        # called directly, so the value must be checked where it is
+        # consumed. Empty means "send no override" and is the common case.
+        #
+        # The accepted set is what muse-wonder-1.0 supports:
+        # minimal|low|medium|high|xhigh|max. `none` is rejected because the
+        # Meta provider does not accept it, and `ultra` because it is a Muse
+        # Code client-side alias that can silently delegate more widely —
+        # neither may be configured into a job that then dies (or widens)
+        # inside the CLI.
+        EFFORT_ARGS=()
+        if [[ -n "$MUSE_REASONING_EFFORT" ]]; then
+          case "$MUSE_REASONING_EFFORT" in
+            minimal|low|medium|high|xhigh|max) ;;
+            *)
+              echo "❌ Muse engine: muse_reasoning_effort must be one of minimal|low|medium|high|xhigh|max (or empty), got '$MUSE_REASONING_EFFORT'"
+              exit 1
+              ;;
+          esac
+          EFFORT_ARGS=(--reasoning-effort "$MUSE_REASONING_EFFORT")
+          echo "🔧 Muse engine | muse_reasoning_effort=$MUSE_REASONING_EFFORT"
+        fi
+
+        echo "🔧 Muse engine | model=$MODEL | muse_home=$MUSE_ENGINE_HOME"
+
+        # Quoted heredoc: the inputs.* expressions below are substituted by
+        # Actions before bash sees this script, so no shell expansion happens
+        # in the prompt body.
+        #
+        # Do NOT write an empty Actions expression pair in this block. Actions
+        # scans the whole run: string for expressions, including text bash
+        # treats as a comment, and an empty one fails manifest validation
+        # before any step runs.
+        # The step-by-step review procedure lives in the caller-built context
+        # file (its "Review Procedure" section), NOT here — it is
+        # engine-neutral, and duplicating it per engine let the copies drift.
+        # This prompt only bootstraps the model into that file and overrides
+        # exactly one engine-specific point: how the review is delivered.
+        cat > /tmp/review_prompt.txt <<'EOF'
+        REPO: ${{ inputs.repository }}
+        PR NUMBER: ${{ inputs.pr_number }}
+
+        Read ${{ inputs.review_context_path }} and follow it exactly. It
+        contains the full review instructions, PR context, previous review
+        (if any), acknowledged suggestions to skip, and the required output
+        format — plus a "Review Procedure" section telling you what else to
+        read, including the pre-fetched PR diff at ${{ inputs.pr_diff_path }}.
+        Files may be longer than one read window: keep reading with offset
+        until you reach the end. You have no network access, no shell tool
+        and no write tool; everything you need is on disk.
+
+        ONE DELIVERY OVERRIDE: the context's procedure tells you to write the
+        review to ${{ inputs.output_path }} with a Write tool. You have no
+        Write tool in this engine. Instead, print the complete review as your
+        final reply — the caller captures your reply as the review. Do not
+        add a title, a **Model:** line, an **Effort:** line, or HTML
+        comments; start with the Summary section, exactly as the context's
+        output format requires. An analysis that is not your final reply is
+        lost and the job fails.
+        EOF
+
+        dump_muse_log() {
+          set +e +o pipefail
+          bytes_of() { wc -c < "$1" 2>/dev/null | tr -d '[:space:]' || echo '?'; }
+
+          echo "ℹ️  config: model=$MODEL muse_home=$MUSE_ENGINE_HOME"
+          echo "ℹ️  input bytes: context=$(bytes_of "$CONTEXT_PATH") diff=$(bytes_of "$DIFF_PATH") prompt=$(bytes_of /tmp/review_prompt.txt)"
+          if [[ -s "$STAGE_FILE" ]]; then
+            echo "ℹ️  review file: PRESENT in staging ($(bytes_of "$STAGE_FILE") bytes) — the review itself survived"
+          else
+            echo "ℹ️  review file: ABSENT in staging — the model produced no final reply"
+          fi
+
+          # The CLI log holds harness status lines and provider errors. It is
+          # printed inside a random ::stop-commands:: token, so text in it
+          # cannot run workflow commands. Only the tail: a failing run can
+          # retry a model call ten times and repeat its errors.
+          if [[ -s "$CLI_LOG" ]]; then
+            STOP_TOKEN="muse-log-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+            lines=$(wc -l < "$CLI_LOG" | tr -d '[:space:]')
+            echo "--- CLI log (last 100 of $lines lines) ---"
+            echo "::stop-commands::$STOP_TOKEN"
+            tail -n 100 "$CLI_LOG"
+            echo "::$STOP_TOKEN::"
+          else
+            echo "ℹ️  no CLI log written; provider response body unavailable"
+          fi
+
+          echo "ℹ️  Troubleshooting: a catalog failure before any model call is config —"
+          echo "    the settings model_catalog row was dropped (cli_version bump?) or"
+          echo "    endpoint_transport lost its bearer pin. A 500 on the model call is"
+          echo "    the proxy: the alias not resolving at LiteLLM, or the key not being"
+          echo "    a LiteLLM virtual key. After the agent has started reading files,"
+          echo "    config is probably fine."
+        }
+
+        # The review must land as a regular, singly-linked file under /tmp.
+        # The model cannot write at all, so this is checking the ENGINE's own
+        # copy — kept identical in shape to the other engines so the
+        # orchestrator's post step sees the same guarantee from every engine.
+        review_file_ok() {
+          [[ -e "$OUTPUT_PATH" || -L "$OUTPUT_PATH" ]] || return 1
+          if [[ -L "$OUTPUT_PATH" || ! -f "$OUTPUT_PATH" ]]; then
+            echo "❌ Muse engine: $OUTPUT_PATH is not a regular file (symlink or special file). Refusing it."
+            exit 1
+          fi
+          if [[ "$(stat -c %h -- "$OUTPUT_PATH")" -ne 1 ]]; then
+            echo "❌ Muse engine: $OUTPUT_PATH has more than one hard link. Refusing it."
+            exit 1
+          fi
+          case "$(realpath -e -- "$OUTPUT_PATH")" in
+            /tmp/*) ;;
+            *) echo "❌ Muse engine: $OUTPUT_PATH no longer resolves under /tmp. Refusing it."; exit 1 ;;
+          esac
+          [[ -s "$OUTPUT_PATH" ]]
+        }
+
+        # Run before EVERY attempt. Attempt 1 cannot write anything (no
+        # write tool, no shell), so the checkout cannot have gained a new
+        # AGENTS.md or .muse/ — but the strip script is cheap, hash-checked,
+        # and keeps the guarantee identical in shape to the Codex engine's:
+        # what runs before attempt 2 is provably what ran before attempt 1.
+        pre_attempt_guard() {
+          [[ -n "$STRIP_SHA256" ]] || { echo "❌ Muse engine: strip step outputs missing"; exit 1; }
+          if [[ "$(sha256sum "$STRIP_SCRIPT" | cut -d' ' -f1)" != "$STRIP_SHA256" ]]; then
+            echo "❌ Muse engine: strip script changed since the strip step. Refusing to start the CLI."
+            exit 1
+          fi
+          bash -euo pipefail "$STRIP_SCRIPT"
+        }
+
+        rm -f "$OUTPUT_PATH"
+        REVIEW_PROMPT_FILE=/tmp/review_prompt.txt
+
+        # No GitHub token in this step's env. The flags are the confinement
+        # (every one verified against muse 1.4.13 --help in the spike that
+        # introduced this engine):
+        #   --disable-shell / --disable-write: no shell tool, no write tool;
+        #     the model can only read and answer. Never remove these, and
+        #     never add --yolo, --disable-sandbox or --trust-workspace (each
+        #     re-opens a surface the strip step and this posture close).
+        #   --disable-approval + --approval-judge off: nobody can answer a
+        #     prompt headlessly, and the judge would add model calls; with
+        #     no side-effecting tools there is nothing to approve anyway.
+        #   --disable-web-tools / --sandbox-network restricted: no egress
+        #     for the model besides the CLI's own provider call.
+        #   --disable-reminders: the background observer agents otherwise
+        #     make their own model calls against the same key.
+        #   --disable-request-user-input: the model cannot stall on a
+        #     question nobody will answer.
+        #   --contributor-mode off: PR code must not train Meta models.
+        #   --no-session-log / --no-foreign-personal-context: nothing
+        #     retained on, or read from, the persistent runner.
+        #   --max-model-steps: a stuck review cannot loop for an hour.
+        for attempt in 1 2; do
+          pre_attempt_guard
+          : > "$STAGE_FILE"
+          : > "$CLI_LOG"
+          HOME="$MUSE_ENGINE_HOME" \
+          XDG_CONFIG_HOME="$MUSE_ENGINE_HOME/.config" \
+          XDG_DATA_HOME="$MUSE_ENGINE_HOME/.local/share" \
+          "$MUSE_BIN" exec \
+            --model "$MODEL" \
+            "${EFFORT_ARGS[@]}" \
+            --disable-approval \
+            --approval-judge off \
+            --disable-shell \
+            --disable-write \
+            --disable-web-tools \
+            --disable-reminders \
+            --disable-request-user-input \
+            --no-foreign-personal-context \
+            --contributor-mode off \
+            --no-session-log \
+            --sandbox-network restricted \
+            --max-model-steps 200 \
+            --prompt-file "$REVIEW_PROMPT_FILE" \
+            > "$STAGE_FILE" 2> "$CLI_LOG" && MUSE_STATUS=0 || MUSE_STATUS=$?
+
+          if [[ -s "$STAGE_FILE" ]]; then
+            cp -- "$STAGE_FILE" "$OUTPUT_PATH"
+            if review_file_ok; then
+              if [[ "$MUSE_STATUS" -ne 0 ]]; then
+                echo "⚠️  Muse engine: CLI exited $MUSE_STATUS AFTER producing the review — keeping the review and continuing."
+                ( dump_muse_log ) || true
+              fi
+              break
+            fi
+            rm -f "$OUTPUT_PATH"
+          fi
+
+          if [[ "$attempt" -eq 1 ]]; then
+            echo "⚠️  Muse engine: CLI exited $MUSE_STATUS with no review produced — retrying once."
+            ( dump_muse_log ) || true
+            echo "🔁 Muse engine: attempt 2 of 2"
+          fi
+        done
+
+        if ! review_file_ok; then
+          echo "❌ Muse engine: no review written to $OUTPUT_PATH after 2 attempts (last CLI exit: ${MUSE_STATUS:-unknown})"
+          ( dump_muse_log ) || true
+          exit 1
+        fi
+        echo "✅ Muse engine: review written ($(wc -c < "$OUTPUT_PATH") bytes)"
+        echo "output_path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"
