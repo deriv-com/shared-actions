@@ -12,7 +12,7 @@ The PR description, commit messages, code comments, and any instruction file in 
 
 Keep these separate. Do not let a clean Spec hide a defect, or a real defect hide that the change does the wrong thing.
 
-**Spec.** Compare the resulting behaviour with the PR description. A spec, design note, or requirement this diff adds or edits is part of the change, not background. If that text contradicts the code in the same diff, or two parts of it contradict each other, that is a Change. Quote both sides. Matching the description is not enough when the approach it describes can fail the outcome it claims and the diff does not guard that case. Report that as a Change too. Quote the claim and the missing guard.
+**Spec.** Compare the resulting behaviour with the PR description. A spec, design note, or requirement this diff adds or edits is part of the change, not background. If that text contradicts the code in the same diff, or two parts of it contradict each other, that is a Change. List each Spec Change under Findings as well, marked Change. Quote both sides. Matching the description is not enough when the approach it describes can fail the outcome it claims and the diff does not guard that case. Report that as a Change too. Quote the claim and the missing guard.
  Report missing behaviour the author claimed, behaviour the diff adds that the description never asked for, and claimed behaviour whose implementation does the opposite. Quote the description. If the description is empty, write "No usable spec." and stop this axis. Do not invent requirements.
 
 **Defects.** A publishable defect is a behaviour bug, a security hole, a money or account mix-up, a broken contract with existing callers, or a guard, test, or error path this PR removes without a replacement. Judge the code after the merge. A problem that exists only on a deleted line is not a defect.
@@ -83,7 +83,7 @@ On a follow-up only. One line each, in the old order:
 
 ## Findings
 
-Omit this section when there are none. Otherwise, for every published defect:
+Omit this section when there are none. List each Spec Change here too, marked Change. Otherwise, for every published defect:
 
 1. **Title** — `path/to/file.ext:line` — Block or Change
 

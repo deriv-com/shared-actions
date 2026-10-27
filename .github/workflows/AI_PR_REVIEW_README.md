@@ -353,10 +353,9 @@ The job name is not authoritative until the run succeeds.
 
 Inputs marked **[kimi]** / **[kimi, grok]** / **[kimi, grok, codex]** / **[codex]** /
 **[anthropic]** are ignored by engines that do not use them. Every input except
-`engine`, `legacy_markers`, and the prompt declares `default: ""` and is resolved
-to the values above inside the `Resolve and validate engine` step — so each of
-those defaults exists in exactly one place, and that step is where you bump any
-of them. The prompt is inlined in the fetch step.
+`engine` and `legacy_markers` declares `default: ""`; all except the prompt are
+resolved in the `Resolve and validate engine` step. The prompt default is inlined
+in the fetch step.
 
 The default prompt is `.github/prompts/ai-pr-review.md`, inlined in the fetch
 step so the job does not depend on the caller's checkout. A caller that sets
