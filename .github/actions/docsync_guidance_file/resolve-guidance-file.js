@@ -93,6 +93,9 @@ function fromShim(root, shimName, imports) {
   if (target.toLowerCase() === shimName.toLowerCase()) {
     return none(`${shimName} imports itself`);
   }
+  if (parseImportShim(fs.readFileSync(path.join(root, target), "utf8"))) {
+    return none(`${shimName} imports ${target}, which is itself an import shim; point guidance_file at the final file`);
+  }
   return {
     file: target,
     source: "import",
@@ -128,6 +131,9 @@ function resolveGuidanceFile({ root, override = "" }) {
     }
     if (!target) {
       return none(`${claudeName} is a symlink to something other than a Markdown file in the repository`);
+    }
+    if (parseImportShim(fs.readFileSync(path.join(root, target), "utf8"))) {
+      return none(`${claudeName} is a symlink to ${target}, which is itself an import shim; point guidance_file at the final file`);
     }
     return { file: target, source: "symlink", reason: `${claudeName} is a symlink to ${target}` };
   }

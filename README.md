@@ -50,7 +50,7 @@ way, through [`docsync_guidance_file`](.github/actions/docsync_guidance_file/):
 | A `CLAUDE.md` whose only content is one import line, e.g. `@AGENTS.md` | The imported file. The shim is never edited. |
 | A `CLAUDE.md` symlink | The file it links to, if that file is inside the repository |
 | No `CLAUDE.md` | No guidance file (unchanged), unless `guidance_file` is set |
-| A shim with several imports, or one whose target is missing or outside the repo | No guidance file. DocSync never falls back to the shim. |
+| A shim with several imports, or one whose target is missing, outside the repo, or another shim | No guidance file. DocSync never falls back to the shim. |
 
 Optional inputs on `docsync-ai.yml`:
 

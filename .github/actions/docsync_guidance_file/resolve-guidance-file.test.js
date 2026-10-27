@@ -101,6 +101,28 @@ test("a shim never falls back to writing CLAUDE.md", (t) => {
   }
 });
 
+test("an import shim whose target is another shim has no target", (t) => {
+  const root = repo(t, {
+    "CLAUDE.md": "@AGENTS.md\n",
+    "AGENTS.md": "@docs/guide.md\n",
+    "docs/guide.md": "# Guide\n",
+  });
+  const result = resolveGuidanceFile({ root });
+  assert.strictEqual(result.file, "");
+  assert.strictEqual(result.source, "none");
+});
+
+test("a CLAUDE.md symlink to an import shim has no target", (t) => {
+  const root = repo(t, {
+    "AGENTS.md": "@docs/guide.md\n",
+    "docs/guide.md": "# Guide\n",
+  });
+  fs.symlinkSync("AGENTS.md", path.join(root, "CLAUDE.md"));
+  const result = resolveGuidanceFile({ root });
+  assert.strictEqual(result.file, "");
+  assert.strictEqual(result.source, "none");
+});
+
 test("a CLAUDE.md symlink resolves to its target", (t) => {
   const root = repo(t, { "AGENTS.md": "# Project\n" });
   fs.symlinkSync("AGENTS.md", path.join(root, "CLAUDE.md"));
