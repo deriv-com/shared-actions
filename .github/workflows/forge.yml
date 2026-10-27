@@ -1995,12 +1995,12 @@ jobs:
               method="${item%%:*}"
               err=$(jq -n --arg channel "$SLACK_CHANNEL" --arg ts "$SLACK_MENTION_TS" --arg name "${item#*:}" \
                   '{channel: $channel, timestamp: $ts, name: $name}' \
-                | curl -sS --connect-timeout 10 --max-time 30 \
+                | curl -sS --connect-timeout 5 --max-time 10 \
                     -X POST "https://slack.com/api/${method}" \
                     -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
                     -H 'Content-type: application/json; charset=utf-8' \
                     --data @- \
-                | jq -r '.error // empty' 2>/dev/null | tr -cd 'a-z_' | cut -c1-60) || err="curl_failed"
+                | jq -r '.error // empty' 2>/dev/null | tr -cd 'a-z0-9_' | cut -c1-60) || err="request_failed"
               case "$err" in
                 ""|already_reacted|no_reaction) ;;
                 *) echo "::warning::Slack ${method} failed: ${err}" ;;

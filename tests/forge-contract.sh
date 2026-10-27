@@ -947,6 +947,10 @@ check '[ -z "$(reactions "$C" add)" ]' "a malformed channel is ignored"
 C=$(report_only slack_error OUTCOME=failure SLACK_MENTION_TS=3.3 FAKE_SLACK_ERROR=missing_scope)
 check 'has "$C/report.log" "Slack reactions.add failed: missing_scope" && ! has "$C/report.log" "xoxb-fake"' \
   "a Slack reaction error is a warning with only the error code"
+C=$(report_only already_reacted OUTCOME=failure SLACK_MENTION_TS=3.3 FAKE_SLACK_ERROR=already_reacted)
+check '! has "$C/report.log" "::warning::Slack reactions"' "already_reacted is tolerated without a warning"
+C=$(report_only no_reaction OUTCOME=failure SLACK_MENTION_TS=3.3 FAKE_SLACK_ERROR=no_reaction)
+check '! has "$C/report.log" "::warning::Slack reactions"' "no_reaction is tolerated without a warning"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"
