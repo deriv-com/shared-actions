@@ -241,6 +241,10 @@ jobs:
       SLACK_MESSAGE_TS: ${{ inputs.slack_message_ts }}
       SLACK_STARTED_AT: ${{ inputs.slack_started_at }}
       REQUESTED_BY: ${{ inputs.requested_by }}
+      # Trivy/SCA scans are never dstp targets and never count as failing CI.
+      # The one definition for Run Forge and Report. Check name only: matching
+      # a workflow name such as "Security (SCA, SAST)" would skip its other jobs.
+      IS_TRIVY_JQ: 'def is_trivy: ((.name // .context // "") | test("trivy|\\bsca\\b"; "i"));'
 
     steps:
       # ---- tokens --------------------------------------------------------
@@ -850,7 +854,7 @@ jobs:
             for i in $(seq 1 40); do
               slack_progress "Waiting for CI and AI reviews"
               rollup=$(gh pr view "$pr_url" --json statusCheckRollup 2>/dev/null || echo '{"statusCheckRollup":[]}')
-              ready=$(printf '%s' "$rollup" | jq -r '
+              ready=$(printf '%s' "$rollup" | jq -r "${IS_TRIVY_JQ}"'
                 def finished:
                   ((.status // "") | ascii_upcase) == "COMPLETED"
                   or ((.state // "") | ascii_upcase) as $s
@@ -864,8 +868,6 @@ jobs:
                      or $s == "PENDING" or $s == "EXPECTED");
                 def is_review:
                   ((.name // .context // "") | test("PR Review"));
-                def is_trivy:
-                  (((.name // .context // "") + " " + (.workflowName // "")) | test("trivy|\\bsca\\b"; "i"));
                 def failing:
                   ((.conclusion // "") | ascii_upcase) as $c
                   | ((.state // "") | ascii_upcase) as $s
@@ -1089,12 +1091,14 @@ jobs:
               echo "Could not resolve the head of ${base}" >&2
               return 1
             fi
-            runs=$(gh_read api "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs?per_page=100" --paginate) || return $?
-            runs=$(printf '%s' "$runs" | jq -s '[.[].check_runs[]? | {name, conclusion}]') || return 1
+            # Projected per page by gh, so each run's multi-MB output text is
+            # never held in the shell.
+            runs=$(gh_read api "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs?per_page=100" --paginate \
+              --jq '.check_runs[] | {name, conclusion}') || return $?
+            runs=$(printf '%s' "$runs" | jq -s '.') || return 1
             # Both documents go through stdin: a big repo's check runs exceed the
             # kernel's per-argument limit, so jq fails with "Argument list too long".
-            printf '%s\n%s\n' "$rollup" "$runs" | jq -n --arg base "$base" '
-              def is_trivy: (((.name // .context // "") + " " + (.workflowName // "")) | test("trivy|\\bsca\\b"; "i"));
+            printf '%s\n%s\n' "$rollup" "$runs" | jq -n --arg base "$base" "${IS_TRIVY_JQ}"'
               def failing:
                 ((.conclusion // "") | ascii_upcase) as $c
                 | ((.state // "") | ascii_upcase) as $s
@@ -1743,11 +1747,18 @@ jobs:
             if [ "$rc" -eq 0 ] || { { [ "$rc" -eq 1 ] || [ "$rc" -eq 8 ]; } && [ -n "$CHECKS" ]; }; then
               CI_STATE="ok"
               # Checks that also fail on the base head are not this PR's.
-              export SKIP_CHECKS
-              SKIP_CHECKS=$(printf '%s' "${UNRELATED_CHECKS:-[]}" | jq -r 'if type == "array" then .[] else empty end' 2>/dev/null || true)
-              CI_FAILING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0; n=split(ENVIRON["SKIP_CHECKS"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") s[a[i]] = 1} $2=="fail" && tolower($1) !~ /trivy|(^|[^a-z])sca([^a-z]|$)/ && !($1 in s) {c++} END{print c+0}')
+              local skip failing
+              skip=$(printf '%s' "${UNRELATED_CHECKS:-[]}" | jq -c 'if type == "array" then [.[] | strings] else [] end' 2>/dev/null || echo '[]')
+              # Same is_trivy as the revise loop, on gh pr checks' tab-separated name and bucket.
+              if ! failing=$(printf '%s\n' "$CHECKS" | jq -R -n -c --argjson skip "$skip" "${IS_TRIVY_JQ}"'
+                [inputs | split("\t") | select(length > 1 and .[1] == "fail") | {name: .[0]}
+                 | select((is_trivy | not) and (.name as $n | any($skip[]; . == $n) | not)) | .name]'); then
+                CI_STATE="unknown"
+                return 0
+              fi
+              CI_FAILING=$(printf '%s' "$failing" | jq 'length')
               CI_PENDING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="pending"{c++} END{print c+0}')
-              CI_FAILING_NAMES=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{sep=""; m=split(ENVIRON["SKIP_CHECKS"], a, "\n"); for (i = 1; i <= m; i++) if (a[i] != "") s[a[i]] = 1} $2=="fail" && tolower($1) !~ /trivy|(^|[^a-z])sca([^a-z]|$)/ && !($1 in s) && n<5 {printf "%s%s", sep, $1; sep=", "; n++}')
+              CI_FAILING_NAMES=$(printf '%s' "$failing" | jq -r '.[0:5] | join(", ")')
             fi
           }
 

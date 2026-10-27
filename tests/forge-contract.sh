@@ -291,7 +291,7 @@ check 'awk "
 check 'awk "
   /name: Report outcome/ {r=1}
   r && /ci_failing_names/ {n=1}
-  r && /n<5|n < 5|head -n 5/ {c=1}
+  r && /n<5|n < 5|head -n 5|\\.\\[0:5\\]/ {c=1}
   END {exit (n && c) ? 0 : 1}
 " "$WF"' \
   "ci_failing_names is capped at 5 check names from gh pr checks"
@@ -410,9 +410,11 @@ check 'awk "
   "Report mints its own token with if: always()"
 check 'grep -q "GH_TOKEN: \${{ steps.report-token.outputs.token }}" "$WF"' \
   "Report uses the freshly minted token, not the job-start token"
+check '[ "$(grep -c "def is_trivy" "$WF")" = 1 ] && [ "$(grep -c "\${IS_TRIVY_JQ}" "$WF")" = 3 ]' \
+  "is_trivy is defined once and used by wait_for_rollup, fetch_failing_checks and the Report"
 check 'awk "
   /name: Report outcome/ {r=1}
-  r && /tolower\(\\\$1\) !~ \/trivy[|].*sca/ {t=1}
+  r && /IS_TRIVY_JQ/ {t=1}
   END {exit t ? 0 : 1}
 " "$WF"' \
   "Report does not count Trivy or the SCA scan as blocking CI"
@@ -461,6 +463,18 @@ TMP_BEHAVIOR=$(mktemp -d)
 # KEEP_TMP=1 keeps the fake runs for debugging.
 trap '[ -n "${KEEP_TMP:-}" ] && echo "kept $TMP_BEHAVIOR" || rm -rf "$TMP_BEHAVIOR"' EXIT
 
+# The job-level is_trivy definition, as the workflow's steps see it.
+IS_TRIVY_JQ=$(sed -n "s/^      IS_TRIVY_JQ: '\(.*\)'\$/\1/p" "$WF")
+export IS_TRIVY_JQ
+check '[ -n "$IS_TRIVY_JQ" ]' "the job env defines IS_TRIVY_JQ"
+TRIVY_NAMES=$(jq -nc "$IS_TRIVY_JQ"'[
+  {name: "SCA Vulnerability Scan"}, {name: "Trivy"}, {context: "trivy-scan"},
+  {name: "npm-sca_audit"}, {name: "SCA2"}, {name: "Mobile Landscape"},
+  {name: "SAST", workflowName: "Security (SCA, SAST)"}, {name: "scan", workflowName: "Trivy"}
+] | map(is_trivy)')
+check '[ "$TRIVY_NAMES" = "[true,true,true,false,false,false,false,false]" ]' \
+  "is_trivy matches trivy or the word sca in the check name only, never the workflow name (got $TRIVY_NAMES)"
+
 READ_PR_CHECKS=$(extract_fn read_pr_checks)
 check '[ -n "$READ_PR_CHECKS" ]' "Report reads checks through read_pr_checks"
 pr_checks_case() {  # pr_checks_case <gh exit> <gh stdout>
@@ -482,6 +496,14 @@ check '[ "$(pr_checks_case 0 "$CHECKS_GREEN")" = "ok 0 0 " ]' \
   "gh pr checks exit 0 is a green read"
 check '[ "$(pr_checks_case 1 "")" = "unknown 0 0 " ]' \
   "gh pr checks exit 1 with no output stays CI state unknown"
+CHECKS_SCA=$'SCA Vulnerability Scan\tfail\t40s\thttps://x/5\t\nnpm-sca_audit\tfail\t9s\thttps://x/6\t\nMobile Landscape\tfail\t1m\thttps://x/7\t'
+check '[ "$(pr_checks_case 1 "$CHECKS_SCA")" = "ok 2 0 npm-sca_audit, Mobile Landscape" ]' \
+  "Report skips the SCA scan with the revise loop's is_trivy, so npm-sca_audit still counts"
+CHECKS_SEVEN=$(for i in 1 2 3 4 5 6 7; do printf 'c%s\tfail\t1s\thttps://x/%s\t\n' "$i" "$i"; done)
+check '[ "$(pr_checks_case 1 "$CHECKS_SEVEN")" = "ok 7 0 c1, c2, c3, c4, c5" ]' \
+  "Report counts every failing check but names at most 5"
+check '[ "$(UNRELATED_CHECKS="[\"lint\"]" pr_checks_case 1 "$CHECKS_FAIL")" = "ok 1 0 E2E smoke" ]' \
+  "Report leaves out checks that also fail on the base head"
 
 # --- behavioral: a whole revise run against a fake GitHub -------------------
 # Run Forge and Report are cut from forge.yml and executed as-is. gh, node
@@ -528,7 +550,7 @@ case "$args" in
     jq -c --arg id "$id" '{id: $id, body: .body}' >> "$S/replies.jsonl"
     echo '{}' ;;
   "api repos/o/r/git/ref/heads/master --jq .object.sha") echo 1111111111111111111111111111111111111111 ;;
-  "api repos/o/r/commits/1111111111111111111111111111111111111111/check-runs?per_page=100 --paginate") cat "$S/base_checks.json" ;;
+  "api repos/o/r/commits/1111111111111111111111111111111111111111/check-runs?per_page=100 --paginate --jq "*) jq -c "${@: -1}" "$S/base_checks.json" ;;
   "pr view https://github.com/o/r/pull/7 --json statusCheckRollup")
     if [ -f "$S/dstp_ran" ]; then cat "$S/rollup_after.json"; else cat "$S/rollup.json"; fi ;;
   "pr view https://github.com/o/r/pull/7 --json headRefName --jq .headRefName") echo feature ;;
@@ -708,7 +730,7 @@ run_case() {  # run_case <case dir>
   step_script "Run Forge" "$c" > "$c/run-forge.sh"
   step_script "Report outcome" "$c" > "$c/report.sh"
   : > "$c/out"
-  env -i PATH="$FAKE_BIN:$PATH" HOME="$c/home" GIT_CONFIG_GLOBAL="$c/home/gitconfig" \
+  env -i IS_TRIVY_JQ="$IS_TRIVY_JQ" PATH="$FAKE_BIN:$PATH" HOME="$c/home" GIT_CONFIG_GLOBAL="$c/home/gitconfig" \
     FAKE_STATE="$c" GITHUB_OUTPUT="$c/out" GITHUB_ENV="$c/env" \
     GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=1 ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
     FORGE_COMMAND=revise FAST_LANE=false TIMEOUT_MINUTES="$(cat "$c/timeout_minutes" 2>/dev/null || echo 90)" \
@@ -720,7 +742,7 @@ run_case() {  # run_case <case dir>
   echo "$rc" > "$c/run.rc"
   local -a renv=()
   while IFS= read -r kv; do renv+=("$kv"); done < <(report_env_args "$c")
-  env -i PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
+  env -i IS_TRIVY_JQ="$IS_TRIVY_JQ" PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
     GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
     GH_TOKEN=ghs_faketoken COMMENT_ID=55 OUTCOME=success FORGE_COMMAND=revise \
     SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake SLACK_MENTION_TS=3.3 \
@@ -766,7 +788,7 @@ check '! has "$I" "$FAKE_TOKEN_A" && has "$I" "***"' "failed-log lines are scrub
 check '! has "$I" "Failing check: lint" && ! has "$I" "LINT-LOG-LINE"' \
   "a check that also fails on the base head is left out of the instruction"
 check '! has "$I" "Failing check: Trivy" && ! has "$I" "Failing check: SCA Vulnerability Scan"' \
-  "Trivy is never a dstp target, whether the check or only its workflow is named after it"
+  "Trivy and the SCA scan are never dstp targets"
 check '! has "$C/completion.txt" "SCA Vulnerability Scan"' "Slack completion does not list the SCA scan as failing CI"
 check '[ "$(wc -l < "$C/replies.jsonl" | tr -d " ")" = 4 ]' "one reply in each of the 4 fetched threads"
 check '! has "$C/replies.jsonl" "INJECTED-REPLY" && ! grep -q "\"id\":\"999\"" "$C/replies.jsonl" && has "$C/run.log" "Dropped a reply for thread 999"' \
@@ -876,6 +898,7 @@ jq -n '{statusCheckRollup: [
   {name: "E2E", conclusion: "FAILURE", detailsUrl: "https://github.com/o/r/actions/runs/1/job/556"},
   {name: "SCA Vulnerability Scan", workflowName: "Trivy SCA Scan", conclusion: "FAILURE"},
   {name: "Playwright Mobile Landscape", conclusion: "FAILURE"},
+  {name: "SAST", workflowName: "Security (SCA, SAST)", conclusion: "FAILURE"},
   {name: "test", conclusion: "SUCCESS"}]}' > "$BIG/rollup.json"
 BIG_OUT=$(B="$BIG" GITHUB_REPOSITORY=o/r bash -c "
   gh() {
@@ -883,14 +906,14 @@ BIG_OUT=$(B="$BIG" GITHUB_REPOSITORY=o/r bash -c "
       *statusCheckRollup*) cat \"\$B/rollup.json\" ;;
       *baseRefName*) printf master ;;
       *git/ref/heads/master*) printf 1111111111111111111111111111111111111111 ;;
-      *check-runs*) cat \"\$B/runs.json\" ;;
+      *check-runs*\" --jq \"*) jq -c \"\${@: -1}\" \"\$B/runs.json\" ;;
     esac
   }
   $HELPERS
   fetch_failing_checks https://github.com/o/r/pull/7 | jq -c '[.[] | {name, base}]'
 " 2>&1)
-check '[ "$BIG_OUT" = "[{\"name\":\"lint\",\"base\":\"failing\"},{\"name\":\"E2E\",\"base\":\"none\"},{\"name\":\"Playwright Mobile Landscape\",\"base\":\"none\"}]" ]' \
-  "base check runs over the argument size limit still classify the PR's failing checks, skipping the SCA scan but not a name that only contains sca (got ${BIG_OUT:0:200})"
+check '[ "$BIG_OUT" = "[{\"name\":\"lint\",\"base\":\"failing\"},{\"name\":\"E2E\",\"base\":\"none\"},{\"name\":\"Playwright Mobile Landscape\",\"base\":\"none\"},{\"name\":\"SAST\",\"base\":\"none\"}]" ]' \
+  "big base check runs, projected by gh --jq, still classify the PR's failing checks: the SCA scan is skipped, but not a name that only contains sca or a job in a workflow named after SCA (got ${BIG_OUT:0:200})"
 
 # remint_write_token mints by token age: 45 minutes by default, always with 0.
 REMINT=$(extract_fn remint_write_token)
@@ -964,7 +987,7 @@ check '[ "$(reactions "$C" add)" = shrug ]' "a no-change revise reacts shrug"
 # REVISE_TROUBLE always shows, whatever the CI state.
 C=$(new_case trouble)
 step_script "Report outcome" "$C" > "$C/report.sh"
-env -i PATH="$FAKE_BIN:$PATH" HOME="$C/home" FAKE_STATE="$C" \
+env -i IS_TRIVY_JQ="$IS_TRIVY_JQ" PATH="$FAKE_BIN:$PATH" HOME="$C/home" FAKE_STATE="$C" \
   GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
   GH_TOKEN=ghs_faketoken OUTCOME=success PR_URL=https://github.com/o/r/pull/7 REVISE_TROUBLE=1 \
   SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake SLACK_MENTION_TS=3.3 \
@@ -976,7 +999,7 @@ check '[ "$(reactions "$C" add)" = warning ]' "revise trouble reacts warning"
 report_only() {  # report_only <case name> <VAR=value...>  -> prints the case dir
   local c; c=$(new_case "$1"); shift
   step_script "Report outcome" "$c" > "$c/report.sh"
-  env -i PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
+  env -i IS_TRIVY_JQ="$IS_TRIVY_JQ" PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
     GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
     GH_TOKEN=ghs_faketoken RUN_URL=https://github.com/o/r/actions/runs/1 \
     SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake \
