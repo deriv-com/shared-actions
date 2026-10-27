@@ -720,7 +720,7 @@ jobs:
           if-no-files-found: warn
 
   refresh-claude-md:
-    name: Refresh CLAUDE.md to Best Practices (Manual)
+    name: Refresh agent guidance file to Best Practices (Manual)
     runs-on: ubuntu-latest
 
     # Only run when trigger_type is 'claude_md_refresh'
@@ -969,7 +969,7 @@ jobs:
 
           git add "$CLAUDE_FILE"
           if git diff --cached --quiet; then
-            echo "CLAUDE.md is already following best practices — no changes needed." >> $GITHUB_STEP_SUMMARY
+            echo "$CLAUDE_FILE is already following best practices — no changes needed." >> $GITHUB_STEP_SUMMARY
             echo "has_changes=false" >> $GITHUB_OUTPUT
           else
             echo "has_changes=true" >> $GITHUB_OUTPUT
@@ -1007,7 +1007,7 @@ jobs:
 
           git push origin "$BRANCH"
 
-          PR_BODY="## CLAUDE.md Best-Practices Refresh
+          PR_BODY="## ${CLAUDE_FILE} Best-Practices Refresh
 
           This PR was triggered manually by **${{ github.actor }}** via the DocSync AI \`claude_md_refresh\` workflow.
 

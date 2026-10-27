@@ -972,7 +972,9 @@ runs:
           fi
           local basename=$(basename "$file")
           local basename_lower=$(echo "$basename" | tr '[:upper:]' '[:lower:]')
-          if [[ "$basename_lower" != "readme.md" ]] && { [[ -z "$GUIDANCE_FILE" ]] || [[ "$file" != "$GUIDANCE_FILE" ]]; }; then
+          local file_lower=$(echo "$file" | tr '[:upper:]' '[:lower:]')
+          local guidance_lower=$(echo "$GUIDANCE_FILE" | tr '[:upper:]' '[:lower:]')
+          if [[ "$basename_lower" != "readme.md" ]] && { [[ -z "$guidance_lower" ]] || [[ "$file_lower" != "$guidance_lower" ]]; }; then
             return 1
           fi
           local realpath=$(realpath "$file" 2>/dev/null || echo "")
@@ -1155,16 +1157,12 @@ runs:
           # The rules above name CLAUDE.md. When the guidance lives elsewhere (an
           # AGENTS.md behind a CLAUDE.md import shim), say which file they cover.
           if [ "$DOC_FORMAT" = "CLAUDE" ] && [ "$(basename "$DOC_FILE" | tr '[:upper:]' '[:lower:]')" != "claude.md" ]; then
-            FORMAT_INSTRUCTION="${FORMAT_INSTRUCTION}
-
-        ## Guidance file: $DOC_FILE
-        $DOC_FILE is this repository's canonical AI-agent guidance file; CLAUDE.md, where present, only points to it. Every rule above about CLAUDE.md applies to $DOC_FILE. Never add an @-import of $DOC_FILE to $DOC_FILE itself."
+            FORMAT_INSTRUCTION+=$'\n\n## Guidance file: '"$DOC_FILE"$'\n'
+            FORMAT_INSTRUCTION+="$DOC_FILE is this repository's canonical AI-agent guidance file; CLAUDE.md, where present, only points to it. Every rule above about CLAUDE.md applies to $DOC_FILE. Never add an @-import of $DOC_FILE to $DOC_FILE itself."
           fi
           if [ "$DOC_FORMAT" = "CLAUDE" ] && [ "$GUIDANCE_MAX_BYTES" -gt 0 ]; then
-            FORMAT_INSTRUCTION="${FORMAT_INSTRUCTION}
-
-        ## Size budget
-        $DOC_FILE must stay at or under $GUIDANCE_MAX_BYTES bytes; it is $(wc -c < "$DOC_FILE" | tr -d ' ') bytes now. An update over the budget is discarded, so add only the most important lines. If nothing important fits, output NO_UPDATES_NEEDED."
+            FORMAT_INSTRUCTION+=$'\n\n## Size budget\n'
+            FORMAT_INSTRUCTION+="$DOC_FILE must stay at or under $GUIDANCE_MAX_BYTES bytes; it is $(wc -c < "$DOC_FILE" | tr -d ' ') bytes now. An update over the budget is discarded, so add only the most important lines. If nothing important fits, output NO_UPDATES_NEEDED."
           fi
 
           PROMPT_FILE="$TEMP_DIR/claude_prompt_$(openssl rand -hex 8).txt"
@@ -1652,7 +1650,7 @@ runs:
             '{file:$file,before_chars:$bc,after_chars:$ac,before_lines:$bl,after_lines:$al,net_change_chars:$nc}' 2>/dev/null || echo '')
           "
 
-          echo "$CLAUDE_OUTPUT" > "$DOC_FILE"
+          printf '%s\n' "$CLAUDE_OUTPUT" > "$DOC_FILE"
           ANY_UPDATES=true
           UPDATED_FILES_LIST="${UPDATED_FILES_LIST}\"${DOC_FILE}\","
           return 0
