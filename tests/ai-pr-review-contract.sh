@@ -545,16 +545,19 @@ check 'grep -q "Under 500 words." "$PROMPT"' "prompt caps the review at 500 word
 # grep -q must not be the reader on a pipe. The workflow is larger than a
 # pipe buffer, so an early exit SIGPIPEs the writer and pipefail fails the check.
 WF_CODE="$(grep -vE '^[[:space:]]*#' "$WF")"
-check 'grep -qF "printf '\''%s'\'' \"\$PROMPT_B64\" | base64 -d > /tmp/prompt_template.txt" <<< "$WF_CODE"' "fetch step decodes the inlined prompt"
-check 'grep -qF "curl -sfL \"\$PROMPT_GIST_URL\"" <<< "$WF_CODE"' "override still fetches prompt_gist_url"
+# The fetch-step labels must be satisfied by that step, not by another copy
+# of the same command elsewhere in the workflow.
+FETCH_BODY="$(step_body "Fetch prompt template" "$WF" | grep -vE '^[[:space:]]*#')"
+check 'grep -qF "printf '\''%s'\'' \"\$PROMPT_B64\" | base64 -d > /tmp/prompt_template.txt" <<< "$FETCH_BODY"' "fetch step decodes the inlined prompt"
+check 'grep -qF "curl -sfL \"\$PROMPT_GIST_URL\"" <<< "$FETCH_BODY"' "override still fetches prompt_gist_url"
 check 'sed -n "s/^          PROMPT_B64: //p" "$WF" | tr -d "[:space:]" | python3 -c "import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))" | cmp -s - "$PROMPT"' "inlined prompt matches .github/prompts/ai-pr-review.md"
 check 'grep -qF "When there are no findings, omit Findings and Auto Fix. On a follow-up, still write Previous issues." "$PROMPT"' "prompt keeps Previous issues when there are no findings"
 check 'grep -qF "List each Spec Change under Findings as well, marked Change." "$PROMPT"' "a Spec Change is also listed under Findings"
 check '! grep -q "Do not begin with a heading" "$WF"' "output rule does not forbid the Summary heading"
-check 'grep -q "Start with the Summary section." "$WF"' "output rule tells the model to start with Summary"
+check 'grep -q "Start with the Summary section." <<< "$WF_CODE"' "output rule tells the model to start with Summary"
 check '! grep -q "Read its dependencies" "$WF"' "procedure does not tell the model to read every dependency"
-check 'grep -q "A contradiction between them is a Change under Spec." "$WF"' "procedure files a spec contradiction under Spec"
-check 'grep -q "Do not read further for that assumption." "$WF"' "procedure stops extra reading at one assumption"
+check 'grep -q "A contradiction between them is a Change under Spec." <<< "$WF_CODE"' "procedure files a spec contradiction under Spec"
+check 'grep -q "Do not read further for that assumption." <<< "$WF_CODE"' "procedure stops extra reading at one assumption"
 check '! grep -q "it was not touched" "$WF"' "incremental diff does not treat an absent pattern as untouched"
 check 'grep -q ".github/prompts/ai-pr-review.md" "$README"' "README documents the in-repo prompt"
 check '! grep -q "edit the gist" "$README"' "README no longer tells people to edit the gist"
