@@ -25,6 +25,14 @@ inputs:
     description: "Base branch for documentation PR (e.g., master or main)"
     required: false
     default: "master"
+  guidance_file:
+    description: "Repo-relative AI-agent guidance file to update (e.g. AGENTS.md). Empty auto-detects: CLAUDE.md, or the file a CLAUDE.md import shim (@AGENTS.md) or symlink points to"
+    required: false
+    default: ""
+  guidance_max_bytes:
+    description: "Byte budget for the guidance file. An update that would exceed it is dropped. 0 means no limit"
+    required: false
+    default: "0"
 
 outputs:
   updated:
@@ -140,9 +148,11 @@ runs:
           echo "EOF" >> $GITHUB_OUTPUT
           echo "### Command: \`update only readme.md\`" >> $GITHUB_STEP_SUMMARY
 
-        # ─── update only claude.md <instruction> ───
-        elif echo "$INSTRUCTION_LOWER" | grep -qE "^update[[:space:]]+only[[:space:]]+claude(\.md)?([[:space:]]|$)"; then
-          SUGGESTION=$(echo "$INSTRUCTION" | sed -E 's/^[Uu][Pp][Dd][Aa][Tt][Ee][[:space:]]+[Oo][Nn][Ll][Yy][[:space:]]+[Cc][Ll][Aa][Uu][Dd][Ee](\.md)?[[:space:]]*//')
+        # ─── update only claude.md|agents.md <instruction> ───
+        # Both target the resolved guidance file (CLAUDE.md, or the file its
+        # import shim points to).
+        elif echo "$INSTRUCTION_LOWER" | grep -qE "^update[[:space:]]+only[[:space:]]+(claude|agents)(\.md)?([[:space:]]|$)"; then
+          SUGGESTION=$(echo "$INSTRUCTION" | sed -E 's/^[Uu][Pp][Dd][Aa][Tt][Ee][[:space:]]+[Oo][Nn][Ll][Yy][[:space:]]+([Cc][Ll][Aa][Uu][Dd][Ee]|[Aa][Gg][Ee][Nn][Tt][Ss])(\.md)?[[:space:]]*//')
           if [ -z "$SUGGESTION" ]; then
             SUGGESTION="Update and improve the technical documentation"
           fi
@@ -279,6 +289,16 @@ runs:
         ref: ${{ steps.verify-pr.outputs.pr_branch }}
         fetch-depth: 0
 
+    # Sibling script via action_path rather than a nested `uses:` so it always
+    # runs at the same ref as this action.
+    - name: Resolve Agent Guidance File
+      id: guidance
+      if: steps.parse-command.outputs.valid == 'true'
+      shell: bash
+      env:
+        GUIDANCE_FILE_INPUT: ${{ inputs.guidance_file }}
+      run: node "${{ github.action_path }}/../docsync_guidance_file/resolve-guidance-file.js"
+
     # ──────────────────────────────────────────────
     # STEP 5: Handle revert commands
     # ──────────────────────────────────────────────
@@ -292,6 +312,7 @@ runs:
         REPO_NAME: ${{ inputs.repository }}
         COMMAND: ${{ steps.parse-command.outputs.command }}
         TARGET_HASH: ${{ steps.parse-command.outputs.target_hash }}
+        GUIDANCE_FILE: ${{ steps.guidance.outputs.file }}
       run: |
         set -e
 
@@ -365,7 +386,8 @@ runs:
 
           # Find documentation files in the current checkout
           README_FILE=$(find . -maxdepth 1 -type f -iname "readme.md" -print -quit 2>/dev/null)
-          CLAUDE_FILE=$(find . -maxdepth 1 -type f -iname "claude.md" -print -quit 2>/dev/null)
+          # The resolved guidance file, never a CLAUDE.md import shim
+          CLAUDE_FILE="$GUIDANCE_FILE"
 
           RESTORED_FILES=""
 
@@ -378,7 +400,6 @@ runs:
           fi
 
           if [ -n "$CLAUDE_FILE" ]; then
-            CLAUDE_FILE="${CLAUDE_FILE#./}"
             if git checkout "$TARGET_HASH" -- "$CLAUDE_FILE" 2>/dev/null; then
               RESTORED_FILES="$RESTORED_FILES $CLAUDE_FILE"
             fi
@@ -387,16 +408,17 @@ runs:
           if [ -z "$RESTORED_FILES" ]; then
             echo "No documentation files found at commit \`$TARGET_SHORT\`" >> $GITHUB_STEP_SUMMARY
             echo "updated=false" >> $GITHUB_OUTPUT
-            gh pr comment "$PR_NUMBER" --body "**@docbot** No documentation files (README.md / CLAUDE.md) found at commit \`$TARGET_SHORT\`."
+            gh pr comment "$PR_NUMBER" --body "**@docbot** No documentation files (README.md / ${GUIDANCE_FILE:-CLAUDE.md}) found at commit \`$TARGET_SHORT\`."
             exit 0
           fi
 
           # Verify only doc files changed
           git add -A
           CHANGED=$(git diff --cached --name-only)
+          GUIDANCE_LOWER=$(echo "$GUIDANCE_FILE" | tr '[:upper:]' '[:lower:]')
           for file in $CHANGED; do
             FILE_LOWER=$(echo "$file" | tr '[:upper:]' '[:lower:]')
-            if [[ "$FILE_LOWER" != "readme.md" ]] && [[ "$FILE_LOWER" != "claude.md" ]]; then
+            if [[ "$FILE_LOWER" != "readme.md" ]] && { [[ -z "$GUIDANCE_LOWER" ]] || [[ "$FILE_LOWER" != "$GUIDANCE_LOWER" ]]; }; then
               echo "ERROR: Non-documentation file changed: $file" >> $GITHUB_STEP_SUMMARY
               git reset --hard
               echo "updated=false" >> $GITHUB_OUTPUT
@@ -568,6 +590,8 @@ runs:
         PR_TITLE: ${{ steps.verify-pr.outputs.pr_title }}
         DIFF_TEMP_DIR: ${{ steps.fetch-diff.outputs.temp_dir }}
         TARGET_FILE: ${{ steps.parse-command.outputs.target_file }}
+        GUIDANCE_FILE: ${{ steps.guidance.outputs.file }}
+        GUIDANCE_MAX_BYTES: ${{ inputs.guidance_max_bytes }}
       run: |
         set -e
 
@@ -948,7 +972,9 @@ runs:
           fi
           local basename=$(basename "$file")
           local basename_lower=$(echo "$basename" | tr '[:upper:]' '[:lower:]')
-          if [[ "$basename_lower" != "readme.md" ]] && [[ "$basename_lower" != "claude.md" ]]; then
+          local file_lower=$(echo "$file" | tr '[:upper:]' '[:lower:]')
+          local guidance_lower=$(echo "$GUIDANCE_FILE" | tr '[:upper:]' '[:lower:]')
+          if [[ "$basename_lower" != "readme.md" ]] && { [[ -z "$guidance_lower" ]] || [[ "$file_lower" != "$guidance_lower" ]]; }; then
             return 1
           fi
           local realpath=$(realpath "$file" 2>/dev/null || echo "")
@@ -974,9 +1000,12 @@ runs:
           fi
         fi
 
-        CLAUDE_FILE=$(find . -maxdepth 1 -type f -iname "claude.md" -print -quit 2>/dev/null)
+        # Agent guidance file from the Resolve Agent Guidance File step: CLAUDE.md
+        # itself, or the file a CLAUDE.md import shim / symlink points to (never
+        # the shim). CLAUDE_FILE keeps its old name for the code below.
+        CLAUDE_FILE="$GUIDANCE_FILE"
+        [[ "$GUIDANCE_MAX_BYTES" =~ ^[0-9]+$ ]] || GUIDANCE_MAX_BYTES=0
         if [ -n "$CLAUDE_FILE" ]; then
-          CLAUDE_FILE="${CLAUDE_FILE#./}"
           if validate_doc_file "$CLAUDE_FILE"; then
             HAS_CLAUDE=true
           else
@@ -991,7 +1020,7 @@ runs:
           echo "🎯 Target file filter: **README.md only**" >> $GITHUB_STEP_SUMMARY
         elif [ "$TARGET_FILE" = "claude" ]; then
           HAS_README=false
-          echo "🎯 Target file filter: **CLAUDE.md only**" >> $GITHUB_STEP_SUMMARY
+          echo "🎯 Target file filter: **${CLAUDE_FILE:-CLAUDE.md} only**" >> $GITHUB_STEP_SUMMARY
         fi
 
         echo "### Documentation File Detection:" >> $GITHUB_STEP_SUMMARY
@@ -1123,6 +1152,17 @@ runs:
               '- Merge repetitive information; do not duplicate facts across sections.' \
               '- When a new entry does not fit any existing section, add a new section using the SAME heading level as the other sections already in the file.' \
               '- NEVER remove existing content while adding new content.')
+          fi
+
+          # The rules above name CLAUDE.md. When the guidance lives elsewhere (an
+          # AGENTS.md behind a CLAUDE.md import shim), say which file they cover.
+          if [ "$DOC_FORMAT" = "CLAUDE" ] && [ "$(basename "$DOC_FILE" | tr '[:upper:]' '[:lower:]')" != "claude.md" ]; then
+            FORMAT_INSTRUCTION+=$'\n\n## Guidance file: '"$DOC_FILE"$'\n'
+            FORMAT_INSTRUCTION+="$DOC_FILE is this repository's canonical AI-agent guidance file; CLAUDE.md, where present, only points to it. Every rule above about CLAUDE.md applies to $DOC_FILE. Never add an @-import of $DOC_FILE to $DOC_FILE itself."
+          fi
+          if [ "$DOC_FORMAT" = "CLAUDE" ] && [ "$GUIDANCE_MAX_BYTES" -gt 0 ]; then
+            FORMAT_INSTRUCTION+=$'\n\n## Size budget\n'
+            FORMAT_INSTRUCTION+="$DOC_FILE must stay at or under $GUIDANCE_MAX_BYTES bytes; it is $(wc -c < "$DOC_FILE" | tr -d ' ') bytes now. An update over the budget is discarded, so add only the most important lines. If nothing important fits, output NO_UPDATES_NEEDED."
           fi
 
           PROMPT_FILE="$TEMP_DIR/claude_prompt_$(openssl rand -hex 8).txt"
@@ -1572,6 +1612,16 @@ runs:
             return 0
           fi
 
+          # Drop an update that breaks the guidance file's byte budget rather than
+          # open a PR the repository's own CI would reject.
+          if [ "$DOC_FORMAT" = "CLAUDE" ] && [ "$GUIDANCE_MAX_BYTES" -gt 0 ]; then
+            NEW_BYTES=$(printf '%s\n' "$CLAUDE_OUTPUT" | wc -c | tr -d ' ')
+            if [ "$NEW_BYTES" -gt "$GUIDANCE_MAX_BYTES" ]; then
+              echo "  Skipped $DOC_FILE: update is $NEW_BYTES bytes, over its $GUIDANCE_MAX_BYTES-byte budget" >> $GITHUB_STEP_SUMMARY
+              return 0
+            fi
+          fi
+
           INPUT_LENGTH=${#DOC_CONTENT}
           OUTPUT_LENGTH=${#CLAUDE_OUTPUT}
           echo "  Updating $DOC_FILE ($INPUT_LENGTH -> $OUTPUT_LENGTH chars)" >> $GITHUB_STEP_SUMMARY
@@ -1600,7 +1650,7 @@ runs:
             '{file:$file,before_chars:$bc,after_chars:$ac,before_lines:$bl,after_lines:$al,net_change_chars:$nc}' 2>/dev/null || echo '')
           "
 
-          echo "$CLAUDE_OUTPUT" > "$DOC_FILE"
+          printf '%s\n' "$CLAUDE_OUTPUT" > "$DOC_FILE"
           ANY_UPDATES=true
           UPDATED_FILES_LIST="${UPDATED_FILES_LIST}\"${DOC_FILE}\","
           return 0
@@ -1702,6 +1752,7 @@ runs:
         IS_DOCSYNC_PR: ${{ steps.verify-pr.outputs.is_docsync_pr }}
         COMMAND: ${{ steps.parse-command.outputs.command }}
         TARGET_FILE: ${{ steps.parse-command.outputs.target_file }}
+        GUIDANCE_FILE: ${{ steps.guidance.outputs.file }}
       run: |
         set -e
 
@@ -1723,16 +1774,17 @@ runs:
           CHANGED=$(git diff --cached --name-only)
           INVALID_FILES=""
 
+          GUIDANCE_LOWER=$(echo "$GUIDANCE_FILE" | tr '[:upper:]' '[:lower:]')
           for file in $CHANGED; do
             FILE_LOWER=$(echo "$file" | tr '[:upper:]' '[:lower:]')
-            if [[ "$FILE_LOWER" != "readme.md" ]] && [[ "$FILE_LOWER" != "claude.md" ]]; then
+            if [[ "$FILE_LOWER" != "readme.md" ]] && { [[ -z "$GUIDANCE_LOWER" ]] || [[ "$FILE_LOWER" != "$GUIDANCE_LOWER" ]]; }; then
               INVALID_FILES="$INVALID_FILES $file"
             fi
           done
 
           if [ -n "$INVALID_FILES" ]; then
             echo "ERROR: Non-documentation files were modified:$INVALID_FILES" >> $GITHUB_STEP_SUMMARY
-            echo "Only README.md and CLAUDE.md (any casing) should be updated." >> $GITHUB_STEP_SUMMARY
+            echo "Only README.md and the agent guidance file (${GUIDANCE_FILE:-none}) should be updated." >> $GITHUB_STEP_SUMMARY
             git reset --hard
             echo "updated=false" >> $GITHUB_OUTPUT
             exit 1
@@ -1756,7 +1808,7 @@ runs:
           if [ "$TARGET_FILE" = "readme" ]; then
             TARGET_DESC="README.md"
           elif [ "$TARGET_FILE" = "claude" ]; then
-            TARGET_DESC="CLAUDE.md"
+            TARGET_DESC="${GUIDANCE_FILE:-CLAUDE.md}"
           else
             TARGET_DESC="documentation"
           fi
