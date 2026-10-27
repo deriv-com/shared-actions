@@ -858,6 +858,33 @@ ACK_OUT=$(T="$(ack_threads_json)" GITHUB_REPOSITORY=o/r bash -c "
 check '[ "$ACK_OUT" = "[21,41]" ]' \
   "a bare thanks or 👍 after Forge's reply does not reopen a thread; a real follow-up does (got $ACK_OUT)"
 
+# A big repo's base-head check runs are larger than one command-line argument
+# may be (128 KB on Linux, 1 MB in total on macOS). They must still reach jq.
+BIG="$TMP_BEHAVIOR/big_checks"
+mkdir -p "$BIG"
+head -c 1500000 /dev/zero | tr '\0' a > "$BIG/text"
+jq -n --rawfile t "$BIG/text" '{total_count: 2, check_runs: [
+  {name: "lint", status: "completed", conclusion: "failure", output: {text: $t}},
+  {name: "test", status: "completed", conclusion: "success", output: {text: $t}}]}' > "$BIG/runs.json"
+jq -n '{statusCheckRollup: [
+  {name: "lint", conclusion: "FAILURE", detailsUrl: "https://github.com/o/r/actions/runs/1/job/555"},
+  {name: "E2E", conclusion: "FAILURE", detailsUrl: "https://github.com/o/r/actions/runs/1/job/556"},
+  {name: "test", conclusion: "SUCCESS"}]}' > "$BIG/rollup.json"
+BIG_OUT=$(B="$BIG" GITHUB_REPOSITORY=o/r bash -c "
+  gh() {
+    case \"\$*\" in
+      *statusCheckRollup*) cat \"\$B/rollup.json\" ;;
+      *baseRefName*) printf master ;;
+      *git/ref/heads/master*) printf 1111111111111111111111111111111111111111 ;;
+      *check-runs*) cat \"\$B/runs.json\" ;;
+    esac
+  }
+  $HELPERS
+  fetch_failing_checks https://github.com/o/r/pull/7 | jq -c '[.[] | {name, base}]'
+" 2>&1)
+check '[ "$BIG_OUT" = "[{\"name\":\"lint\",\"base\":\"failing\"},{\"name\":\"E2E\",\"base\":\"none\"}]" ]' \
+  "base check runs over the argument size limit still classify the PR's failing checks (got ${BIG_OUT:0:200})"
+
 # edit_pr keeps the issue link: added once, after a blank line and a rule,
 # only when the new description does not already close the issue.
 edit_case() {  # edit_case <name> <model pr_body>  -> prints the body given to gh pr edit

@@ -1079,8 +1079,10 @@ jobs:
               return 1
             fi
             runs=$(gh_read api "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs?per_page=100" --paginate) || return $?
-            runs=$(printf '%s' "$runs" | jq -s '[.[].check_runs[]?]') || return 1
-            printf '%s' "$rollup" | jq --arg base "$base" --argjson runs "$runs" '
+            runs=$(printf '%s' "$runs" | jq -s '[.[].check_runs[]? | {name, conclusion}]') || return 1
+            # Both documents go through stdin: a big repo's check runs exceed the
+            # kernel's per-argument limit, so jq fails with "Argument list too long".
+            printf '%s\n%s\n' "$rollup" "$runs" | jq -n --arg base "$base" '
               def is_trivy: ((.name // .context // "") | test("trivy"; "i"));
               def failing:
                 ((.conclusion // "") | ascii_upcase) as $c
@@ -1088,7 +1090,8 @@ jobs:
                 | (is_trivy | not)
                 and ($c == "FAILURE" or $c == "ERROR" or $c == "TIMED_OUT" or $c == "CANCELLED"
                    or $s == "FAILURE" or $s == "ERROR");
-              [(.statusCheckRollup // [])[] | select(failing)
+              input as $rollup | input as $runs
+              | [($rollup.statusCheckRollup // [])[] | select(failing)
                | (.name // .context // "") as $n
                | select($n != "")
                | [$runs[] | select(.name == $n)] as $same
@@ -1560,7 +1563,7 @@ jobs:
                 if [ "$READ_RC" -eq 2 ]; then
                   echo "Could not read ${READ_WHAT}. Gave up after 5 attempts"
                 else
-                  echo "Could not read ${READ_WHAT}. GitHub rejected the request, so a retry cannot help"
+                  echo "Could not read ${READ_WHAT}, and a retry cannot help"
                 fi
                 slack_progress "Could not read ${READ_WHAT} — stopping"
                 echo "read_failed=${READ_WHAT}" >> "$GITHUB_OUTPUT"
