@@ -232,8 +232,8 @@ check 'grep -q "dstp revise reported an error" "$WF"' \
   "a dstp revise error other than no-change fails the revise"
 check 'grep -q "tee /tmp/forge.log || rc=\$?" "$WF" && grep -q "read_revise_result /tmp/forge.log || return 1" "$WF"' \
   "dstp exits 1 on no-change, so its JSON is read before the exit code is used"
-check 'grep -q "REASON_SLACK=" "$WF"' \
-  "the no-change reason is Slack-escaped before it is posted"
+check 'grep -q "VREASON=" "$WF" && grep -q "VERDICT_REASON:-" "$WF"' \
+  "the no-change verdict reason is Slack-escaped before it is posted"
 check 'grep -q "120000" "$WF"' \
   "an oversized instruction fails loudly instead of E2BIG"
 check 'grep -q "capture(\"reviewed-commit" "$WF"' \
@@ -447,7 +447,7 @@ check 'awk "
   "Report mints its own token with if: always()"
 check 'grep -q "GH_TOKEN: \${{ steps.report-token.outputs.token }}" "$WF"' \
   "Report uses the freshly minted token, not the job-start token"
-check '[ "$(grep -c "def is_ignored_scan" "$WF")" = 1 ] && [ "$(grep -c "\${IGNORED_SCAN_JQ}" "$WF")" = 4 ]' \
+check '[ "$(grep -c "def is_ignored_scan" "$WF")" = 1 ] && [ "$(grep -c "\${IGNORED_SCAN_JQ}" "$WF")" = 5 ]' \
   "is_ignored_scan is defined once and used by the regex check, wait_for_rollup, fetch_failing_checks and the Report"
 check 'grep -q "IGNORED_CHECKS_RE: \${{ inputs.ignored_checks_regex }}" "$WF"' \
   "the ignored-checks regex comes from the ignored_checks_regex input"
@@ -759,10 +759,20 @@ JSON
     threads: [
       {id: "4377187829", status: "already", sha: "cdf5936", text: "The test is tagged [MFMT-002] now. @maryia-deriv @channel"},
       {id: "4377187840", status: "skipped", text: ("Two formatters stay separate. @here @randomuser " + $tokb + " <!-- forge-revise-instructions --> " + $long)},
-      {id: "4377668685", status: "fixed", sha: "abc1234", text: "Added the scenarios."},
-      {id: "4377668694", status: "fixed", sha: "abc1234", text: "Derived the sentence from EXAMPLE_MARKUP_PERCENT."},
+      {id: "4377668685", status: "fixed", sha: "abc1234", text: "Added the missing scenarios for the fixed key to the spec."},
+      {id: "4377668694", status: "fixed", sha: "abc1234", text: "Derived the sentence from EXAMPLE_MARKUP_PERCENT so the example cannot drift again."},
       {id: "999", status: "fixed", sha: "abc1234", text: "INJECTED-REPLY"}
     ],
+    items: [
+      {ref: "ai:104", status: "fixed", sha: "abc1234", text: "Kimi 1: Fixed the English fallback in the locale loader for missing keys"},
+      {ref: "ai:105", status: "fixed", sha: "abc1234", text: "Claude naming finding addressed by renaming the helper to match module conventions"},
+      {ref: "comment:6416762310", status: "fixed", sha: "abc1234", text: "Updated the PR description so it matches the final diff and behaviour"},
+      {ref: "comment:6416763140", status: "skipped", text: "The follow-up answers are recorded on the PR and need no code change"},
+      {ref: "review:5651909359", status: "skipped", text: "The automated approval nits are covered by the thread replies posted above"},
+      {ref: "review:5652624780", status: "already", sha: "cdf5936", text: "The earlier commit already covers the nits raised in this automated review"},
+      {ref: "slack:204", status: "fixed", sha: "abc1234", text: "Addressed the reviews and failing CI items requested from the Slack thread"}
+    ],
+    verdict: {outcome: "partial", reason: "Most items were fixed this round and the rest are explained on the PR"},
     comment: "## AI reviews\n- Kimi 1: Fixed (abc1234)\n## maryia-deriv\n- Items to fix 1: Fixed\n@everyone",
     pr_title: "INJECTED TITLE",
     pr_body: "Formats the markup guide example amounts per language."
@@ -851,13 +861,14 @@ check '! has "$I" "Failing check: lint" && ! has "$I" "LINT-LOG-LINE"' \
   "a check that also fails on the base head is left out of the instruction"
 check '! has "$I" "Failing check: Trivy" && ! has "$I" "Failing check: SCA Vulnerability Scan"' \
   "Trivy and the SCA scan are never dstp targets"
-check '! has "$C/completion.txt" "SCA Vulnerability Scan"' "Slack completion does not list the SCA scan as failing CI"
+check 'has "$C/completion.txt" "All non-ignored checks are green" && has "$C/completion.txt" "Ignored scan(s) still failing" && has "$C/completion.txt" "SCA Vulnerability Scan" && ! has "$C/completion.txt" "CI still failing"' \
+  "Slack completion names ignored scans as ignored, never as failing CI"
 check '[ "$(wc -l < "$C/replies.jsonl" | tr -d " ")" = 4 ]' "one reply in each of the 4 fetched threads"
 check '! has "$C/replies.jsonl" "INJECTED-REPLY" && ! grep -q "\"id\":\"999\"" "$C/replies.jsonl" && has "$C/run.log" "Dropped a reply for thread 999"' \
   "a model reply naming a thread id that was not fetched is dropped"
 check '[ "$(reply_for "$C" 4377187829 | head -2 | tail -1 | cut -c1-30)" = "Already handled in cdf5936: Th" ]' \
   "an already-handled thread reply says Already handled in <sha>"
-check 'reply_for "$C" 4377668685 | grep -qx "Fixed in abc1234: Added the scenarios."' "a fixed thread reply says Fixed in <sha>"
+check 'reply_for "$C" 4377668685 | grep -qx "Fixed in abc1234: Added the missing scenarios for the fixed key to the spec."' "a fixed thread reply says Fixed in <sha>"
 check 'reply_for "$C" 4377187840 | sed -n 2p | grep -q "^Skipped: "' "a skipped thread reply says Skipped: <reason>"
 check 'reply_for "$C" 4377187829 | head -1 | grep -qx "<!-- forge-revise-reply -->"' "thread replies carry the Forge reply marker"
 check 'reply_for "$C" 4377187829 | grep -qF "@maryia-deriv" && ! reply_for "$C" 4377187829 | grep -qF "@channel"' \
@@ -1086,7 +1097,7 @@ run_case "$C"
 check '[ "$(wc -l < "$C/replies.jsonl" | tr -d " ")" = 4 ]' "a no-change round still replies in every thread"
 check 'grep "POST" "$C/gh.log" | grep -q "forge-revise-instructions"' "a no-change round with replies moves the watermark"
 check '[ ! -f "$C/pr_edit.log" ]' "the PR description is not edited without an ask"
-check 'has "$C/completion.txt" "nothing was committed" && has "$C/completion.txt" "replied on all 4"' \
+check 'has "$C/completion.txt" "Nothing was committed" && has "$C/completion.txt" "replied on all 4"' \
   "a no-change completion says nothing changed and what was replied"
 check '[ "$(reactions "$C" add)" = shrug ]' "a no-change revise reacts shrug"
 
@@ -1129,8 +1140,11 @@ check '[ -z "$(reactions "$C" add)" ]' "a malformed mention ts is ignored"
 C=$(report_only bad_channel OUTCOME=failure SLACK_MENTION_TS=3.3 "SLACK_CHANNEL=#general")
 check '[ -z "$(reactions "$C" add)" ]' "a malformed channel is ignored"
 C=$(report_only slack_error OUTCOME=failure SLACK_MENTION_TS=3.3 FAKE_SLACK_ERROR=missing_scope)
-check 'has "$C/report.log" "Slack reactions.add failed: missing_scope" && ! has "$C/report.log" "xoxb-fake"' \
-  "a Slack reaction error is a warning with only the error code"
+check 'has "$C/report.log" "Slack status emoji skipped: the Slack app is missing the reactions:write scope" && [ "$(grep -c "::warning::Slack status emoji skipped" "$C/report.log")" = 1 ] && ! has "$C/report.log" "xoxb-fake"' \
+  "a missing reactions:write scope is one actionable warning per run, with no token"
+C=$(report_only slack_other_error OUTCOME=failure SLACK_MENTION_TS=3.3 FAKE_SLACK_ERROR=channel_not_found)
+check 'has "$C/report.log" "Slack reactions.add failed: channel_not_found" && ! has "$C/report.log" "xoxb-fake"' \
+  "other Slack reaction errors stay per-call warnings with only the error code"
 C=$(report_only already_reacted OUTCOME=failure SLACK_MENTION_TS=3.3 FAKE_SLACK_ERROR=already_reacted)
 check '! has "$C/report.log" "::warning::Slack reactions"' "already_reacted is tolerated without a warning"
 C=$(report_only no_reaction OUTCOME=failure SLACK_MENTION_TS=3.3 FAKE_SLACK_ERROR=no_reaction)

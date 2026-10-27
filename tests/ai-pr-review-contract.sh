@@ -122,6 +122,32 @@ joined_step_body() { step_body "$1" "$2" | awk '/\\$/ { sub(/\\$/, ""); buf = bu
 # (e.g. `grep -q PATTERN "$WF"`, `grep -m1 ... "$WF"`) may exit early, since
 # there is no writer to kill.
 
+# Verdict marker: the post step derives a machine-readable verdict from the
+# mandated Recommendation line and appends it next to the engine marker, so
+# downstream consumers (Forge) never parse prose. Behavioural: run the
+# extracted block against fixture reviews.
+check 'grep -q "deriv-pr-review-verdict: %s; findings=%s" "$WF"' "post step appends the deriv-pr-review-verdict marker"
+check 'grep -qF "gh-app-write[bot]" "$WF"' "acknowledge scan accepts Forge's write-App identity"
+VERDICT_BLOCK=$(step_body "Post review as single PR comment" "$WF" | awk '/verdict_token="unknown"/{f=1} f{print} f && /REVIEW_OUTPUT_FILE/{done=1} done{next}' | sed 's/^ *//')
+verdict_of() {
+  local fixture marker
+  fixture=$(mktemp)
+  printf '%s\n' "$1" > "$fixture"
+  REVIEW_OUTPUT_FILE="$fixture" CURRENT_SHA=abc REVIEW_ENGINE=claude REVIEW_SLOT_SUFFIX="" bash -c "$VERDICT_BLOCK" >/dev/null 2>&1
+  marker=$(grep -o 'deriv-pr-review-verdict: [a-z-]*; findings=[0-9]*' "$fixture" | awk 'NR==1')
+  rm -f "$fixture"
+  printf '%s' "$marker"
+}
+check '[[ "$(verdict_of "**Recommendation:** APPROVE")" == "deriv-pr-review-verdict: approve; findings=0" ]]' "an APPROVE review gets verdict approve with zero findings"
+check '[[ "$(verdict_of "**Recommendation:** REQUEST CHANGES
+
+## Findings
+
+1. **One** — a.ts:1 — Block
+2. **Two** — b.ts:2 — Change")" == "deriv-pr-review-verdict: request-changes; findings=2" ]]' "a REQUEST CHANGES review counts its Findings entries"
+check '[[ "$(verdict_of "**Recommendation:** BLOCK MERGE")" == "deriv-pr-review-verdict: block-merge; findings=0" ]]' "a BLOCK MERGE review gets verdict block-merge"
+check '[[ "$(verdict_of "No recommendation line here.")" == "deriv-pr-review-verdict: unknown; findings=0" ]]' "a review with no readable Recommendation gets verdict unknown, never a silent approval"
+
 # 1. Fork PRs never reach the privileged job. Same-repo Forge
 #    (gh-app-write[bot]) is the only *[bot] exception: wrap the skip, do not
 #    delete it. A bare allow-all-bots if: is a regression. Presence greps
