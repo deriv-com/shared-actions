@@ -845,6 +845,11 @@ jobs:
               (.body | contains("Click2Fix - Acknowledge"))
               and (
                 .user.login == "github-actions[bot]"
+                # Forge's revise loop posts explained-skip acknowledgements
+                # under its write App; name it explicitly rather than
+                # widening this to any bot or any author.
+                or .user.login == "gh-app-write"
+                or .user.login == "gh-app-write[bot]"
                 or (.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
               )
             ))
@@ -1344,10 +1349,25 @@ jobs:
           # instruction-following: one reworded header used to mean the next run
           # could not find its own previous comment, leaving a duplicate forever.
           # (After truncation, so the markers can never be cut off.)
+          #
+          # The verdict marker is the machine-readable half of the review for
+          # downstream consumers (Forge's wait/revise loop): derived here from
+          # the mandated Recommendation line and the Findings list, never from
+          # the model's prose at large. A review with no readable
+          # Recommendation gets "unknown", and consumers must treat that as
+          # actionable rather than swallow the review.
+          verdict_token="unknown"
+          case "$(grep -oE '^\*\*Recommendation:\*\*[[:space:]]+(APPROVE|REQUEST CHANGES|BLOCK MERGE)' "$REVIEW_OUTPUT_FILE" | tail -n 1 | sed -E 's/.*\*\*[[:space:]]+//')" in
+            APPROVE) verdict_token="approve" ;;
+            "REQUEST CHANGES") verdict_token="request-changes" ;;
+            "BLOCK MERGE") verdict_token="block-merge" ;;
+          esac
+          findings_count=$(awk '/^## Findings/{f=1; next} /^## /{if (f) exit} f && /^[0-9]+\. /{c++} END{print c+0}' "$REVIEW_OUTPUT_FILE")
           {
             printf '\n'
             printf '<!-- reviewed-commit: %s -->\n' "$CURRENT_SHA"
             printf '<!-- deriv-pr-review-%s%s -->\n' "$REVIEW_ENGINE" "${REVIEW_SLOT_SUFFIX:-}"
+            printf '<!-- deriv-pr-review-verdict: %s; findings=%s -->\n' "$verdict_token" "${findings_count:-0}"
           } >> "$REVIEW_OUTPUT_FILE"
 
           # Reap-list for prior reviews, captured BEFORE posting — the new
