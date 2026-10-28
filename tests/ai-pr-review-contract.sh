@@ -258,9 +258,37 @@ check 'grep -qE "^[[:space:]]+EFFORT_INPUT:" "$WF"' "resolve step reads effort"
 check 'grep -q "echo \"effort=\$EFFORT\"" "$WF"' "resolve step emits effort on the step outputs"
 check 'grep -q "effort: \${{ steps.engine.outputs.effort }}" "$WF"' "anthropic dispatch step passes effort through"
 check 'grep -q "^  effort:" "$ANTH"' "anthropic engine declares the effort input"
-check 'grep -q "Recover the review from the session transcript" "$ANTH"' "anthropic engine recovers a chat-answered review from the session transcript"
-check 'grep -q "steps.recover.outputs.still_missing == '"'"'true'"'"'" "$ANTH"' "anthropic engine retries once when the first attempt wrote nothing"
-check 'grep -q "claude-code-action finished but wrote no review" "$ANTH"' "anthropic engine still fails closed when no review can be recovered or retried into existence"
+
+# --- Anthropic recover/retry: behaviour pins, scoped to the step or script
+# that owns them so a comment elsewhere cannot satisfy them. ---
+ANTH_RECOVER="$ROOT/.github/actions/ai_review_engine_anthropic/recover-review.sh"
+check '[[ -f "$ANTH_RECOVER" ]]' "the recovery logic ships as one script in the anthropic engine"
+check '[[ $(grep -c "bash \"\$ACTION_PATH/recover-review.sh\"" "$ANTH") -eq 2 ]]' "both recovery steps call the shared recovery script"
+check 'grep -qF "select(.type == \"assistant\")" "$ANTH_RECOVER"' "recovery extracts the final assistant text from the session transcript"
+check 'grep -qE "APPROVE\|REQUEST CHANGES\|BLOCK MERGE" "$ANTH_RECOVER" && grep -qF "> \"\$OUTPUT_PATH\"" "$ANTH_RECOVER" && grep -qF "still_missing=" "$ANTH_RECOVER"' "recovery only writes a complete review (anchored Recommendation verdict) and reports still_missing"
+check 'step_body "Recover the retry'"'"'s review from the session transcript" "$ANTH" | grep -c "recover-review.sh" >/dev/null' "the retry recovery step has its own name and calls the same script"
+check 'grep -qF "steps.claude.outputs.execution_file" "$ANTH" && grep -qF "steps.claude-retry.outputs.execution_file" "$ANTH"' "recovery reads each attempt's transcript through the action's declared execution_file output, not a hardcoded path"
+check 'step_body "Claude Code PR review (retry after an empty first attempt)" "$ANTH" | grep -qF "if: steps.recover.outputs.still_missing == '"'"'true'"'"'" && step_body "Claude Code PR review (retry after an empty first attempt)" "$ANTH" | grep -c "uses: anthropics/claude-code-action@" >/dev/null' "the retry gate sits on the claude-code-action retry step itself"
+check '[[ $(grep -c "uses: anthropics/claude-code-action@5eb090f3" "$ANTH") -eq 2 ]]' "exactly two pinned claude-code-action invocations exist (attempt and retry)"
+check 'step_body "Reset the path-guard log for the retry" "$ANTH" | grep -qF ": > \"\$PATH_GUARD_LOG\"" && step_body "Reset the path-guard log for the retry" "$ANTH" | grep -c "still_missing" >/dev/null' "the path-guard log is wiped, gated on still_missing, before the retry so verify judges the producing attempt"
+check 'step_body "Verify the sandbox held and the review was written" "$ANTH" | grep -qF "echo \"❌ Anthropic engine: claude-code-action finished but wrote no review to \$OUTPUT_PATH\""' "verify fails closed, in its own step body, when no review exists"
+
+# The retry is a copy of attempt 1 by design (a step cannot run twice). Pin
+# the copies together: with comments, the id, the gate and the three retry
+# prompt lines removed, the bodies must be byte-identical, so the sandbox and
+# credential config (settings hook, claude_args, allowed_non_write_users,
+# GIT_CONFIG_*, the SHA) cannot drift between attempts.
+normalised_engine_step() {
+  step_body "$1" "$ANTH" \
+    | grep -vE '^[[:space:]]*#' \
+    | grep -vE '^[[:space:]]*id: ' \
+    | grep -vF 'if: steps.recover.outputs.still_missing' \
+    | grep -vF 'A first attempt at this review already ended without writing the file;' \
+    | grep -vF 'this is the retry. Make that Write call before you finish, even if the' \
+    | grep -vF 'review is short.' \
+    | awk 'NF'
+}
+check 'diff <(normalised_engine_step "Claude Code PR review") <(normalised_engine_step "Claude Code PR review (retry after an empty first attempt)") >/dev/null' "retry step matches attempt 1 modulo name, gate, comments and the retry prompt lines"
 check 'grep -qF -- '"'"'--model ${{ inputs.model }} ${{ steps.effort.outputs.flag }}'"'"' "$ANTH"' "anthropic engine maps effort onto claude_args via the resolve-effort step"
 check 'grep -qE "if \[\[ -n \"\\\$EFFORT\" \]\]" "$ANTH"' "anthropic engine applies effort only when non-empty"
 

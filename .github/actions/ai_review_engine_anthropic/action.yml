@@ -229,6 +229,7 @@ runs:
         echo "flag=$FLAG" >> "$GITHUB_OUTPUT"
 
     - name: Claude Code PR review
+      id: claude
       # v1.0.253 (CLI 2.1.303, 2026-10-18). LiteLLM's claude-opus-5-5 alias
       # requires Claude Code >= 2.1.280; the previous pin (fefa07e, CLI 2.1.126)
       # failed those reviews with claude_code_version_too_old.
@@ -424,42 +425,26 @@ runs:
       shell: bash
       env:
         OUTPUT_PATH: ${{ inputs.output_path }}
-        EXECUTION_FILE: ${{ runner.temp }}/claude-execution-output.json
+        EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
-        # The engine sometimes ends its turn with the finished review as chat
-        # text instead of calling Write (seen on derivatives-trader: the job
-        # failed with "claude-code-action finished but wrote no review"). That
-        # text is in the session transcript the action saved; a complete review
-        # there IS the review, so recover it instead of failing the job.
-        # Anything short of a complete review leaves the file alone and the
-        # verify step below fails closed exactly as before. The recovered text
-        # is model output with the same trust level as a written file: the
-        # caller's exfiltration scan still runs over it before anything posts.
-        missing=true
-        if [[ -s "$OUTPUT_PATH" ]]; then
-          missing=false
-        elif [[ -f "$EXECUTION_FILE" ]]; then
-          text=$(jq -r '
-            (if type == "array" then . else [.] end)
-            | [ .[] | select(.type == "assistant") | (.message.content // [])[] | select(.type == "text") | .text ]
-            | last // ""
-          ' "$EXECUTION_FILE" 2>/dev/null || true)
-          if [[ -z "$text" ]]; then
-            # Newline-delimited stream-json instead of one JSON array.
-            text=$(jq -sr '
-              [ .[] | select(.type == "assistant") | (.message.content // [])[] | select(.type == "text") | .text ]
-              | last // ""
-            ' "$EXECUTION_FILE" 2>/dev/null || true)
-          fi
-          if [[ ${#text} -ge 200 ]] && grep -q '\*\*Recommendation:\*\*' <<<"$text"; then
-            printf '%s\n' "$text" > "$OUTPUT_PATH"
-            echo "♻️ Anthropic engine: recovered the review from the session transcript ($(wc -c < "$OUTPUT_PATH") bytes) — the model answered in chat instead of writing the file"
-            missing=false
-          fi
-        fi
-        echo "still_missing=$missing" >> "$GITHUB_OUTPUT"
+        # See recover-review.sh next to this action: lifts a complete review
+        # out of the session transcript when the model answered in chat
+        # instead of writing the file. Shared by both recovery steps so the
+        # extraction and its gate cannot drift between attempts.
+        bash "$ACTION_PATH/recover-review.sh"
+
+    - name: Reset the path-guard log for the retry
+      if: steps.recover.outputs.still_missing == 'true'
+      shell: bash
+      env:
+        PATH_GUARD_LOG: ${{ runner.temp }}/ai-review-path-guard/decisions.log
+      run: |
+        : > "$PATH_GUARD_LOG"
+        echo "♻️ Anthropic engine: path-guard log reset; the verify step will judge the retry's decisions only"
 
     - name: Claude Code PR review (retry after an empty first attempt)
+      id: claude-retry
       if: steps.recover.outputs.still_missing == 'true'
       # v1.0.253 (CLI 2.1.303, 2026-10-18). LiteLLM's claude-opus-5-5 alias
       # requires Claude Code >= 2.1.280; the previous pin (fefa07e, CLI 2.1.126)
@@ -475,8 +460,8 @@ runs:
         # action spawns the CLI with this step's env). GITHUB_WORKSPACE is set by
         # the runner. PATH_GUARD_LOG receives one line per decision and is
         # checked by the verify step: a review with an empty log means the hook
-        # never fired. The directory is wiped by the install step above, so no
-        # stale log survives on a persistent runner.
+        # never fired. For this retry, the reset step above wiped the log
+        # first, so no decision from attempt 1 survives into this check.
         OUTPUT_PATH: ${{ inputs.output_path }}
         CONTEXT_PATH: ${{ inputs.review_context_path }}
         DIFF_PATH: ${{ inputs.pr_diff_path }}
@@ -654,45 +639,19 @@ runs:
           --disallowedTools "Bash,WebFetch,WebSearch,mcp__github_comment,mcp__github_inline_comment,mcp__github_file_ops,mcp__github"
           --setting-sources user
 
-    - name: Recover the review from the session transcript
+    - name: Recover the retry's review from the session transcript
       id: recover-again
       shell: bash
       env:
         OUTPUT_PATH: ${{ inputs.output_path }}
-        EXECUTION_FILE: ${{ runner.temp }}/claude-execution-output.json
+        EXECUTION_FILE: ${{ steps.claude-retry.outputs.execution_file }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
-        # The engine sometimes ends its turn with the finished review as chat
-        # text instead of calling Write (seen on derivatives-trader: the job
-        # failed with "claude-code-action finished but wrote no review"). That
-        # text is in the session transcript the action saved; a complete review
-        # there IS the review, so recover it instead of failing the job.
-        # Anything short of a complete review leaves the file alone and the
-        # verify step below fails closed exactly as before. The recovered text
-        # is model output with the same trust level as a written file: the
-        # caller's exfiltration scan still runs over it before anything posts.
-        missing=true
-        if [[ -s "$OUTPUT_PATH" ]]; then
-          missing=false
-        elif [[ -f "$EXECUTION_FILE" ]]; then
-          text=$(jq -r '
-            (if type == "array" then . else [.] end)
-            | [ .[] | select(.type == "assistant") | (.message.content // [])[] | select(.type == "text") | .text ]
-            | last // ""
-          ' "$EXECUTION_FILE" 2>/dev/null || true)
-          if [[ -z "$text" ]]; then
-            # Newline-delimited stream-json instead of one JSON array.
-            text=$(jq -sr '
-              [ .[] | select(.type == "assistant") | (.message.content // [])[] | select(.type == "text") | .text ]
-              | last // ""
-            ' "$EXECUTION_FILE" 2>/dev/null || true)
-          fi
-          if [[ ${#text} -ge 200 ]] && grep -q '\*\*Recommendation:\*\*' <<<"$text"; then
-            printf '%s\n' "$text" > "$OUTPUT_PATH"
-            echo "♻️ Anthropic engine: recovered the review from the session transcript ($(wc -c < "$OUTPUT_PATH") bytes) — the model answered in chat instead of writing the file"
-            missing=false
-          fi
-        fi
-        echo "still_missing=$missing" >> "$GITHUB_OUTPUT"
+        # See recover-review.sh next to this action: lifts a complete review
+        # out of the session transcript when the model answered in chat
+        # instead of writing the file. Shared by both recovery steps so the
+        # extraction and its gate cannot drift between attempts.
+        bash "$ACTION_PATH/recover-review.sh"
 
     - name: Verify the sandbox held and the review was written
       id: verify
@@ -752,14 +711,18 @@ runs:
           exit 1
         fi
 
-        # 3. The path guard actually ran. A review exists, so the model made at
-        #    least one tool call (the Write that produced it), so the match-all
-        #    PreToolUse hook must have logged at least one decision. An empty or
-        #    missing log means the hook never fired — the `settings` plumbing or
-        #    the hook contract changed under a SHA bump — and this review was
-        #    produced with no path confinement at all, with the job token in
-        #    the CLI's environment. It is not handed to the caller. Fail closed;
-        #    do not downgrade this to a warning.
+        # 3. The path guard actually ran. A review exists. Whether the producing
+        #    attempt wrote it with the Write tool or the recovery step lifted it
+        #    from that attempt's transcript, the model made tool calls in that
+        #    attempt (at minimum the Reads), so the match-all PreToolUse hook
+        #    must have logged at least one decision — and if a retry ran, the
+        #    reset step wiped the log first, so the decisions counted are the
+        #    producing attempt's own. An empty or missing log means the hook
+        #    never fired — the `settings` plumbing or the hook contract changed
+        #    under a SHA bump — and this review was produced with no path
+        #    confinement at all, with the job token in the CLI's environment.
+        #    It is not handed to the caller. Fail closed; do not downgrade
+        #    this to a warning.
         if [[ ! -s "$PATH_GUARD_LOG" ]]; then
           echo "❌ Anthropic engine: the review was written but the path guard never ran (no decisions logged at $PATH_GUARD_LOG)."
           echo "   The PreToolUse hook is the only path control in this engine; without it the model could read anything on the runner, including its own process environment."
