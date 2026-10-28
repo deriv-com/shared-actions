@@ -257,6 +257,7 @@ check 'awk '\''/^      effort:/{f=1} f && /default:/{print; exit}'\'' "$WF" | gr
 check 'grep -qE "^[[:space:]]+EFFORT_INPUT:" "$WF"' "resolve step reads effort"
 check 'grep -q "echo \"effort=\$EFFORT\"" "$WF"' "resolve step emits effort on the step outputs"
 check 'grep -q "effort: \${{ steps.engine.outputs.effort }}" "$WF"' "anthropic dispatch step passes effort through"
+check 'grep -q "^  effort:" "$ANTH"' "anthropic engine declares the effort input"
 check 'grep -q "Recover the review from the session transcript" "$ANTH"' "anthropic engine recovers a chat-answered review from the session transcript"
 check 'grep -q "steps.recover.outputs.still_missing == '"'"'true'"'"'" "$ANTH"' "anthropic engine retries once when the first attempt wrote nothing"
 check 'grep -q "claude-code-action finished but wrote no review" "$ANTH"' "anthropic engine still fails closed when no review can be recovered or retried into existence"
