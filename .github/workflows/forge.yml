@@ -104,11 +104,33 @@ on:
           dstp subcommand. `auto` opens the first PR. `revise` applies later
           changes: AI PR Review comments (`<!-- deriv-pr-review-`), CI
           failures, and human Slack notes posted on the issue as
-          `<!-- forge-slack-revise -->`. Callers must pass this through
+          `<!-- forge-slack-revise -->`. `update` only brings the PR branch
+          up to date with its base (dstp update; see update_base and
+          resolve_conflicts_unattended). Callers must pass this through
           from workflow_dispatch.
         required: false
         default: "auto"
         type: string
+      update_base:
+        description: >-
+          With command=revise, integrate the base branch into the PR branch
+          before revising (dstp revise --update-base --strategy merge), so
+          the revision and VERIFY see the merged tree. With command=update
+          it is implied. Default false keeps today's revise argv untouched.
+        required: false
+        default: false
+        type: boolean
+      resolve_conflicts_unattended:
+        description: >-
+          Opt-in: when integrating the base hits conflicts, let dstp attempt
+          an agent resolution with no human diff approval
+          (--resolve-conflicts-unattended). Mechanical checks and VERIFY on
+          the merged tree are the gate; nothing is pushed on a red verify.
+          Needs an engine that knows the flag (spec-to-pr 0.8.x with the
+          unattended option); older engines fail the run on the unknown flag.
+        required: false
+        default: false
+        type: boolean
 
       # --- per-repo tuning --------------------------------------------------
       node_version:
@@ -603,6 +625,8 @@ jobs:
           WRITE_INSTALLATION_ID: ${{ steps.repo-token.outputs.installation-id }}
           FAST_LANE: ${{ inputs.fast_lane }}
           FORGE_COMMAND: ${{ inputs.command }}
+          UPDATE_BASE: ${{ inputs.update_base }}
+          RESOLVE_CONFLICTS_UNATTENDED: ${{ inputs.resolve_conflicts_unattended }}
           TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
           # dstp 0.8.0 throws in GitHub Actions without these two. Do not set
           # DSTP_FORGE_API_URL — that override is refused; production
@@ -626,6 +650,7 @@ jobs:
           COMMAND="$FORGE_COMMAND"
           case "$COMMAND" in
             revise) COMMAND=revise ;;
+            update) COMMAND=update ;;
             *) COMMAND=auto ;;
           esac
 
@@ -826,11 +851,28 @@ jobs:
           # reset (ESC[0m) instead of "{". Strip escape sequences before looking
           # for the JSON line, or a no-change verdict reads as a failed revise
           # (live: derivatives-trader runs 40529108642 and 40531359221).
+          # One scrubbed line for anything dstp reports: tokens out, newlines
+          # out, capped — safe for GITHUB_OUTPUT and for the Slack report.
+          scrub_one_line() {
+            sed -E \
+              -e 's/gh[pousr]_[A-Za-z0-9]{20,}/***/g' \
+              -e 's/github_pat_[A-Za-z0-9_]{20,}/***/g' \
+              -e 's/sk-[A-Za-z0-9_-]{20,}/***/g' \
+              -e 's/fk_[A-Za-z0-9_-]{8,}/***/g' \
+              -e 's/xox[abposr]-[A-Za-z0-9-]{10,}/***/g' \
+              -e 's#x-access-token:[^@]*@#x-access-token:***@#g' \
+              | tr '\r\n' '  ' | sed 's/[[:space:]]*$//' | cut -c1-500
+          }
+
           read_revise_result() {
-            local log="$1" RESULT pr err
+            local log="$1" RESULT pr err status cr
             RESULT=$(sed -e "s/$(printf '\033')\[[0-9;]*[A-Za-z]//g" "$log" | grep -oE '^[[:space:]]*\{.*\}[[:space:]]*$' | tail -1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)
             [ -z "$RESULT" ] && return 0
-            err=$(printf '%s' "$RESULT" | jq -r '.error // empty' | tr '\r\n' '  ' | sed 's/[[:space:]]*$//' | cut -c1-500)
+            # The conflict report rides every revise/update result; surface it
+            # verbatim (compact JSON) so Report can say what was resolved.
+            cr=$(printf '%s' "$RESULT" | jq -c '.conflict_resolution // empty' 2>/dev/null || true)
+            [ -n "$cr" ] && echo "conflict_resolution=$cr" >> "$GITHUB_OUTPUT"
+            err=$(printf '%s' "$RESULT" | jq -r '.error // empty' | scrub_one_line)
             if printf '%s' "$err" | grep -qi 'produced no changes'; then
               NO_CHANGE=1
               NO_CHANGE_REASON="$err"
@@ -839,9 +881,20 @@ jobs:
               return 0
             fi
             if [ -n "$err" ]; then
+              echo "dstp_error=$err" >> "$GITHUB_OUTPUT"
               echo "dstp revise reported an error: $err"
               return 1
             fi
+            # A stopped update/revise (conflict left, red verify, unpushable)
+            # is a result, not an error line — and never a handled verdict.
+            status=$(printf '%s' "$RESULT" | jq -r '.status // empty')
+            case "$status" in
+              conflict|verify-failed|unpushable|declined)
+                echo "dstp_error=dstp stopped (${status}) — nothing was pushed" >> "$GITHUB_OUTPUT"
+                echo "dstp stopped with status ${status}; nothing was pushed"
+                return 1
+                ;;
+            esac
             pr=$(github_pr_url "$(printf '%s' "$RESULT" | jq -r '.pr_url // empty')")
             [ -n "$pr" ] && echo "pr_url=$pr" >> "$GITHUB_OUTPUT"
             return 0
@@ -862,12 +915,37 @@ jobs:
               echo "Could not resolve the head branch for $PR_URL"
               return 1
             fi
-            echo "Running: dstp revise $branch <instruction> --cwd . --unattended --json"
+            # Fixed argv per mode — the mode flags are workflow booleans,
+            # never text parsed out of the (untrusted) instruction.
+            local -a ARGS=(revise "$branch" "$(cat "$instruction_file")" --cwd . --unattended --json)
+            if [ "${UPDATE_BASE:-false}" = "true" ]; then
+              ARGS+=(--update-base --strategy merge)
+              [ "${RESOLVE_CONFLICTS_UNATTENDED:-false}" = "true" ] && ARGS+=(--resolve-conflicts-unattended)
+            fi
+            echo "Running: dstp revise $branch <instruction> ${ARGS[*]:4}"
             local rc=0
             remint_write_token 300
-            node "$FORGE_CLI" revise "$branch" "$(cat "$instruction_file")" --cwd . --unattended --json 2>&1 | tee /tmp/forge.log || rc=$?
+            node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || rc=$?
             read_revise_result /tmp/forge.log || return 1
             [ "${NO_CHANGE:-0}" = "1" ] && return 0
+            return "$rc"
+          }
+
+          # Conflicts-only mode: bring the branch up to date with its base and
+          # push the merge — no revision agent, no review loop afterwards.
+          run_branch_update() {
+            local branch
+            if ! branch=$(gh pr view "$PR_URL" --json headRefName --jq .headRefName) || [ -z "$branch" ]; then
+              echo "Could not resolve the head branch for $PR_URL"
+              return 1
+            fi
+            local -a ARGS=(update "$branch" --cwd . --unattended --json --strategy merge)
+            [ "${RESOLVE_CONFLICTS_UNATTENDED:-false}" = "true" ] && ARGS+=(--resolve-conflicts-unattended)
+            echo "Running: dstp ${ARGS[*]}"
+            local rc=0
+            remint_write_token 300
+            node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || rc=$?
+            read_revise_result /tmp/forge.log || return 1
             return "$rc"
           }
 
@@ -1875,7 +1953,7 @@ jobs:
 
           # Issue-URL dstp revise only reads QA sub-issues and refuses PR
           # comments. A later Slack/AI revise must use the open PR's branch.
-          if [ "$COMMAND" = "revise" ]; then
+          if [ "$COMMAND" = "revise" ] || [ "$COMMAND" = "update" ]; then
             slack_progress "Revising the open PR"
             PR_URL=$(github_pr_url "$(find_open_pr)")
             STATUS=0
@@ -1885,6 +1963,20 @@ jobs:
               STATUS=1
             else
               echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+            fi
+            if [ "$COMMAND" = "update" ] && [ "$STATUS" -eq 0 ]; then
+              # Conflicts-only: one dstp update, then straight to Report. The
+              # wait/revise loop below must not run — there is no instruction
+              # to revise with, and a stopped update must not be re-read as
+              # items handled.
+              slack_progress "Bringing the PR branch up to date"
+              run_branch_update || STATUS=$?
+              STATUS=${STATUS:-0}
+              if [ "$STATUS" -eq 0 ]; then
+                echo "pushed=1" >> "$GITHUB_OUTPUT"
+              else
+                echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
+              fi
             fi
           else
             slack_progress "Opening the PR"
@@ -1921,7 +2013,7 @@ jobs:
           THREADS_REPLIED=0
           CI_NOTED=0
           CLEAN=0
-          if [ "$STATUS" -eq 0 ] && [ -n "$PR_URL" ]; then
+          if [ "$STATUS" -eq 0 ] && [ -n "$PR_URL" ] && [ "$COMMAND" != "update" ]; then
             ROUND=0
             READ_RETRIES=0
             WAITS_USED=0
@@ -2128,6 +2220,8 @@ jobs:
           NO_CHANGE: ${{ steps.forge.outputs.no_change }}
           NO_CHANGE_REASON: ${{ steps.forge.outputs.no_change_reason }}
           REVISE_TROUBLE: ${{ steps.forge.outputs.revise_trouble }}
+          DSTP_ERROR: ${{ steps.forge.outputs.dstp_error }}
+          CONFLICT_RESOLUTION: ${{ steps.forge.outputs.conflict_resolution }}
           SLACK_PROGRESS_TS: ${{ steps.forge.outputs.slack_progress_ts || inputs.slack_message_ts }}
           SLACK_STARTED_AT: ${{ inputs.slack_started_at }}
           SLACK_MENTION_TS: ${{ inputs.slack_mention_ts }}
@@ -2296,6 +2390,25 @@ jobs:
           fi
           TROUBLE=""
           [ "${REVISE_TROUBLE:-}" = "1" ] && TROUBLE="Wait/revise hit trouble — see the run log."
+          # The exact dstp stop reason beats the generic line: a conflict stop,
+          # a red verify, a hook failure. Already scrubbed at the source.
+          if [ -n "${DSTP_ERROR:-}" ]; then
+            TROUBLE="Stopped: $(printf '%s' "$DSTP_ERROR" | slack_escape | cut -c1-500)"
+          fi
+          # What an unattended conflict attempt did, from dstp's own JSON:
+          # per-file kind, also-touched files, and the merge SHA pushed.
+          CONFLICT_LINE=""
+          if [ -n "${CONFLICT_RESOLUTION:-}" ]; then
+            CONFLICT_LINE=$(printf '%s' "$CONFLICT_RESOLUTION" | jq -r '
+              if .attempted then
+                "Conflicts: " +
+                (if .resolved then "resolved and merged" else "attempted, not resolved" end) +
+                (if .merge_sha then " (\(.merge_sha[0:7]))" else "" end) +
+                (if (.files | length) > 0 then "; " + ([.files[] | "\(.file) (\(.kind))"] | join(", ")) else "" end) +
+                (if (.also_touched | length) > 0 then "; also touched: " + (.also_touched | join(", ")) else "" end) +
+                (if ((.unresolved // []) | length) > 0 then "; still conflicted: " + (.unresolved | join(", ")) else "" end)
+              else "" end' 2>/dev/null | slack_escape | cut -c1-500 || true)
+          fi
           [ -n "${UNCOVERED_REFS:-}" ] && TROUBLE="Some items still have no reply: ${UNCOVERED_REFS} — see the PR."
           # Per-item outcome of the reply pass, shared by every branch below.
           ITEMS_SUMMARY=""
@@ -2342,7 +2455,7 @@ jobs:
             FACTS="Nothing was committed. Forge ${VERDICT_LINE}. The items above are marked handled, so they will not be raised again."
             QUIET="🤷 Nothing to change · Took ${TOOK}"
             REACTION="shrug"
-            DETAILS=$(detail_lines "$DONE" "$ITEMS_SUMMARY" "$NOT_OURS" "$FACTS" "$TROUBLE")
+            DETAILS=$(detail_lines "$DONE" "$ITEMS_SUMMARY" "$NOT_OURS" "$FACTS" "$CONFLICT_LINE" "$TROUBLE")
             NL=$'\n'
             BODY=$(printf '🔨 **Forge** — nothing was committed.\n\nForge %s.\n\n%s\nTook %s.' "$VERDICT_LINE" "${DETAILS:+$DETAILS$NL}" "$TOOK")
             LABEL="forge:done"
@@ -2401,8 +2514,15 @@ jobs:
               FACTS="${GREEN_WORDING}. AI reviewers reported no remaining issues."
               EMOJI="✅"
             fi
+            # A stopped dstp run (conflict, red verify) is not "the PR is up":
+            # the stop reason leads and the emoji follows it.
+            if [ -n "${DSTP_ERROR:-}" ]; then
+              FACTS="$TROUBLE"
+              TROUBLE=""
+              EMOJI="⚠️"
+            fi
             # A failed read leads the completion, so it never reads as "PR is up".
-            DETAILS=$(detail_lines "$DONE" "$ITEMS_SUMMARY" "$NOT_OURS" "$FACTS" "$TROUBLE")
+            DETAILS=$(detail_lines "$DONE" "$ITEMS_SUMMARY" "$NOT_OURS" "$FACTS" "$CONFLICT_LINE" "$TROUBLE")
             if [ -n "${READ_FAILED:-}" ]; then
               EMOJI="⚠️"
               READ_WHAT=$(printf '%s' "$READ_FAILED" | slack_escape | cut -c1-100)

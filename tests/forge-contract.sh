@@ -36,7 +36,7 @@ check '! grep -qE "^  (issues|pull_request|push|schedule):" "$WF"' \
 # --- inputs callers pass by name ------------------------------------------
 for input in issue_number slack_channel slack_thread_ts requested_by \
              slack_message_ts slack_started_at \
-             analysis_brief command \
+             analysis_brief command update_base resolve_conflicts_unattended \
              node_version install_command model runner_group engine_ref \
              fast_lane timeout_minutes; do
   check "grep -q '^      ${input}:' \"\$WF\"" "input '${input}' is declared"
@@ -230,6 +230,26 @@ check 'grep "ALL_THREADS=" "$WF" | grep "fetch_review_threads" | grep -qF "|| re
   "an unreadable review-thread query is not treated as zero threads"
 check 'grep -q "dstp revise reported an error" "$WF"' \
   "a dstp revise error other than no-change fails the revise"
+check 'awk "/^      update_base:/{f=1} f && /default:/{print; exit}" "$WF" | grep -q "default: false"' \
+  "update_base defaults to false so existing callers keep today's argv"
+check 'awk "/^      resolve_conflicts_unattended:/{f=1} f && /default:/{print; exit}" "$WF" | grep -q "default: false"' \
+  "resolve_conflicts_unattended defaults to false so existing callers keep today's argv"
+check 'grep -q "update) COMMAND=update ;;" "$WF"' \
+  "command=update is a real mode, not folded into auto"
+check 'grep -q "run_branch_update" "$WF"' \
+  "conflicts-only mode runs dstp update"
+check 'grep -q "ARGS+=(--update-base --strategy merge)" "$WF"' \
+  "combined mode adds --update-base --strategy merge to the revise argv"
+check 'grep -q "ARGS+=(--resolve-conflicts-unattended)" "$WF"' \
+  "the unattended conflict flag reaches dstp only from the boolean input"
+check '! grep -qE "revise .*\\$\\(cat.*resolve-conflicts" "$WF"' \
+  "conflict flags are never parsed out of the untrusted instruction text"
+check 'grep -q "dstp_error=" "$WF" && grep -q "DSTP_ERROR:" "$WF"' \
+  "a scrubbed dstp_error output reaches Report"
+check 'grep -q "conflict_resolution=" "$WF" && grep -q "CONFLICT_RESOLUTION:" "$WF"' \
+  "the conflict_resolution JSON reaches Report"
+check 'grep -q "dstp stopped (" "$WF"' \
+  "a stopped status (conflict/verify-failed/unpushable) is reported, never handled"
 check 'grep -q "tee /tmp/forge.log || rc=\$?" "$WF" && grep -q "read_revise_result /tmp/forge.log || return 1" "$WF"' \
   "dstp exits 1 on no-change, so its JSON is read before the exit code is used"
 check 'grep -q "VREASON=" "$WF" && grep -q "VERDICT_REASON:-" "$WF"' \
