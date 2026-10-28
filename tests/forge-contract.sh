@@ -36,7 +36,7 @@ check '! grep -qE "^  (issues|pull_request|push|schedule):" "$WF"' \
 # --- inputs callers pass by name ------------------------------------------
 for input in issue_number slack_channel slack_thread_ts requested_by \
              slack_message_ts slack_started_at \
-             analysis_brief command update_base resolve_conflicts_unattended \
+             analysis_brief command update_base resolve_conflicts_unattended ai_reviews_only \
              node_version install_command model runner_group engine_ref \
              fast_lane timeout_minutes; do
   check "grep -q '^      ${input}:' \"\$WF\"" "input '${input}' is declared"
@@ -234,6 +234,12 @@ check 'awk "/^      update_base:/{f=1} f && /default:/{print; exit}" "$WF" | gre
   "update_base defaults to false so existing callers keep today's argv"
 check 'awk "/^      resolve_conflicts_unattended:/{f=1} f && /default:/{print; exit}" "$WF" | grep -q "default: false"' \
   "resolve_conflicts_unattended defaults to false so existing callers keep today's argv"
+check 'awk "/^      ai_reviews_only:/{f=1} f && /default:/{print; exit}" "$WF" | grep -q "default: false"' \
+  "ai_reviews_only defaults to false so existing callers keep every item in scope"
+check 'grep -q "AI_REVIEWS_ONLY: \${{ inputs.ai_reviews_only }}" "$WF" && grep -q ".threads = \[\] | .comments = \[\] | .reviews = \[\] | .slack = \[\] | .checks = \[\]" "$WF"' \
+  "ai_reviews_only makes build_items drop every non-AI category"
+check 'grep -q "AI-reviews-only run: leaving the watermark where it is" "$WF"' \
+  "an AI-reviews-only run never advances the watermark past human items"
 check 'grep -q "update) COMMAND=update ;;" "$WF"' \
   "command=update is a real mode, not folded into auto"
 check 'grep -q "run_branch_update" "$WF"' \

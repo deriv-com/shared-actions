@@ -131,6 +131,16 @@ on:
         required: false
         default: false
         type: boolean
+      ai_reviews_only:
+        description: >-
+          With command=revise, scope the run to AI PR Review items only:
+          build_items drops unresolved threads, human PR comments, review
+          summaries, Slack change requests and failing checks before the
+          instruction is written. Default false keeps every outstanding item
+          in scope.
+        required: false
+        default: false
+        type: boolean
 
       # --- per-repo tuning --------------------------------------------------
       node_version:
@@ -627,6 +637,7 @@ jobs:
           FORGE_COMMAND: ${{ inputs.command }}
           UPDATE_BASE: ${{ inputs.update_base }}
           RESOLVE_CONFLICTS_UNATTENDED: ${{ inputs.resolve_conflicts_unattended }}
+          AI_REVIEWS_ONLY: ${{ inputs.ai_reviews_only }}
           TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
           # dstp 0.8.0 throws in GitHub Actions without these two. Do not set
           # DSTP_FORGE_API_URL — that override is refused; production
@@ -1508,6 +1519,17 @@ jobs:
                   + [ .slack[] | {ref: "slack:\(.id)", kind: "slack", url: (.html_url // ""), label: "Slack change request"} ]
                 )
             ' "$dest" > "$tmp" && mv "$tmp" "$dest"
+            # AI-reviews-only runs (Slack ai_reviews mode): drop every category
+            # except the AI review items before the instruction is written, so
+            # the run does exactly what was ordered. Refs are filtered to the
+            # surviving AI kinds; the coverage/reply pass only ever sees what
+            # this run was asked to cover.
+            if [ "${AI_REVIEWS_ONLY:-false}" = "true" ]; then
+              tmp=$(mktemp)
+              jq '.threads = [] | .comments = [] | .reviews = [] | .slack = [] | .checks = []
+                  | .refs = [ .refs[] | select(.kind == "ai" or .kind == "ai-finding" or .kind == "ai-nit") ]' \
+                "$dest" > "$tmp" && mv "$tmp" "$dest"
+            fi
           }
 
           write_revise_instruction() {
@@ -2106,7 +2128,10 @@ jobs:
                 CLEAN=1
                 # A pure approval was read this round; move the watermark past
                 # it so it is not re-read as an outstanding review forever.
-                if [ "$(jq '.approvals | length' "$ITEMS_FILE")" != "0" ]; then
+                # An AI-reviews-only run never moves the watermark: it did not
+                # look at human comments, threads or Slack requests, and moving
+                # past them here would drop them from every later round.
+                if [ "${AI_REVIEWS_ONLY:-false}" != "true" ] && [ "$(jq '.approvals | length' "$ITEMS_FILE")" != "0" ]; then
                   post_silent_watermark "$PR_NUM"
                 fi
                 break
@@ -2156,7 +2181,11 @@ jobs:
               REPLIES_POSTED=0
               ITEMS_COVERED=0
               reply_to_reviews "$ITEMS_FILE" || { echo "The reply pass failed"; echo "revise_trouble=1" >> "$GITHUB_OUTPUT"; }
-              if [ "${ITEMS_COVERED:-0}" = "1" ]; then
+              if [ "${AI_REVIEWS_ONLY:-false}" = "true" ]; then
+                # Coverage was AI-only by construction; advancing the watermark
+                # would silently retire human items this run never attempted.
+                echo "AI-reviews-only run: leaving the watermark where it is"
+              elif [ "${ITEMS_COVERED:-0}" = "1" ]; then
                 post_silent_watermark "$PR_NUM"
                 {
                   echo "ai_reviews_remaining=0"
