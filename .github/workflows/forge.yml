@@ -959,6 +959,64 @@ jobs:
             echo "timeout"
           }
 
+          # Exact per-check states on the PR's current head, read now — never
+          # waited for. Rounds act on statuses that are already final; waiting
+          # is only the fallback when nothing is actionable yet. Buckets:
+          # queued (not started / waiting), running, passed (success, skipped
+          # or neutral), failed. One row per check, name-matched everywhere.
+          snapshot_checks() {
+            local pr_url="$1" rollup
+            rollup=$(gh_read pr view "$pr_url" --json statusCheckRollup) || return $?
+            printf '%s' "$rollup" | jq -c '
+              def bucket:
+                ((.conclusion // "") | ascii_upcase) as $c
+                | ((.status // "") | ascii_upcase) as $st
+                | ((.state // "") | ascii_upcase) as $s
+                | if ($c == "FAILURE" or $c == "ERROR" or $c == "TIMED_OUT" or $c == "CANCELLED" or $s == "FAILURE" or $s == "ERROR") then "failed"
+                  elif ($c == "SUCCESS" or $s == "SUCCESS" or $c == "SKIPPED" or $c == "NEUTRAL" or $st == "COMPLETED") then "passed"
+                  elif ($st == "IN_PROGRESS") then "running"
+                  else "queued" end;
+              [(.statusCheckRollup // [])[]
+               | {name: (.name // .context // ""), state: bucket, url: (.detailsUrl // .targetUrl // "")}
+               | select(.name != "")]
+            '
+          }
+
+          pr_head_sha() {
+            local sha
+            sha=$(gh_read pr view "$1" --json headRefOid --jq .headRefOid 2>/dev/null || true)
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] && printf '%s' "$sha" || return 1
+          }
+
+          # Verify-after-push: wait for the checks dstp just tried to fix —
+          # and only those — to finish on the new head. Sets VERIFY_PENDING
+          # (JSON rows still not terminal, "not started" when a target has no
+          # run on the new head yet) and returns 1 when the time reserved for
+          # another revise round runs out first.
+          VERIFY_PENDING="[]"
+          wait_for_targets() {
+            local pr_url="$1" targets="$2" deadline snap pending
+            deadline=$(( $(remaining_job_seconds) - MIN_CYCLE_SECONDS ))
+            [ "$deadline" -lt 0 ] && deadline=0
+            VERIFY_PENDING="[]"
+            while :; do
+              snap=$(snapshot_checks "$pr_url" 2>/dev/null || echo '[]')
+              pending=$(printf '%s' "$snap" | jq -c --argjson targets "$targets" '
+                . as $snap
+                | [ $targets[] as $t
+                    | ([$snap[] | select(.name == $t)] | first) as $hit
+                    | select($hit == null or ($hit.state != "passed" and $hit.state != "failed"))
+                    | {name: $t, state: (if $hit == null then "not started" else $hit.state end)} ]
+              ' 2>/dev/null || echo '[]')
+              VERIFY_PENDING="$pending"
+              [ "$pending" = "[]" ] && return 0
+              [ "$deadline" -le 0 ] && return 1
+              slack_progress "Verifying the fix on the new head"
+              sleep 15
+              deadline=$((deadline - 15))
+            done
+          }
+
           # Same token scrub as the Report failure log. Anything that reaches a
           # GitHub body or the dstp instruction from a log or from model output
           # goes through it.
@@ -1134,12 +1192,74 @@ jobs:
             '
           }
 
+          # Cross-PR probe for the environmental class. A check that passes on
+          # the base head but fails on this PR may still not be this PR's: the
+          # Cloudflare Pages check on derivatives-trader passes on master and
+          # fails on nearly every PR (its build config lives outside the repo),
+          # so billing it to dstp on every PR wastes rounds and misreports CI.
+          # Sample the newest open PRs and count how often the same-named
+          # check fails there. A candidate (passing on the base head) is
+          # environmental when a strict majority of its finished runs across
+          # at least 3 sampled PRs fail, with at least 3 failures: green on
+          # the base branch, red on most PRs. Queued/running runs are not
+          # evidence either way and do not count. Fail-soft by design: an
+          # unreadable PR is skipped, a thin sample classifies nothing, and
+          # any probe error leaves the base classification untouched.
+          ENV_SAMPLE_PRS=8
+          ENV_MIN_SAMPLE=3
+          ENV_MIN_FAILS=3
+          probe_environmental_checks() {
+            local pr_url="$1" checks="$2" self n other_rollup samples="[]"
+            self=$(basename "$pr_url")
+            [[ "$self" =~ ^[0-9]+$ ]] || return 0
+            local numbers
+            numbers=$(gh_read api "repos/${GITHUB_REPOSITORY}/pulls?state=open&sort=created&direction=desc&per_page=9" --jq '.[].number' 2>/dev/null || true)
+            local sampled_n=0
+            while IFS= read -r n; do
+              [ -z "$n" ] && continue
+              [ "$n" = "$self" ] && continue
+              [ "$sampled_n" -ge "$ENV_SAMPLE_PRS" ] && break
+              [[ "$n" =~ ^[0-9]+$ ]] || continue
+              other_rollup=$(gh_read pr view "https://github.com/${GITHUB_REPOSITORY}/pull/${n}" --json statusCheckRollup 2>/dev/null) || continue
+              sampled_n=$((sampled_n + 1))
+              samples=$(printf '%s' "$samples" | jq --argjson r "$other_rollup" '
+                . + [{checks: [($r.statusCheckRollup // [])[] | {
+                  name: (.name // .context // ""),
+                  failed: ((((.conclusion // "") | ascii_upcase) as $c
+                    | ((.state // "") | ascii_upcase) as $s
+                    | ($c == "FAILURE" or $c == "ERROR" or $c == "TIMED_OUT" or $c == "CANCELLED"
+                       or $s == "FAILURE" or $s == "ERROR"))),
+                  done: ((((.conclusion // "") | ascii_upcase) as $c
+                    | ((.state // "") | ascii_upcase) as $s
+                    | ((.status // "") | ascii_upcase) as $st
+                    | ($c != "" or $s == "SUCCESS" or $s == "FAILURE" or $s == "ERROR" or $st == "COMPLETED")))
+                } | select(.name != "")]}]
+              ' 2>/dev/null || printf '%s' "$samples")
+            done <<< "$numbers"
+            printf '%s' "$checks" | jq --argjson samples "$samples" \
+              --argjson min_sample "$ENV_MIN_SAMPLE" --argjson min_fails "$ENV_MIN_FAILS" '
+              [ .[] | if .base != "passing" then .
+                else
+                  . as $check
+                  | ([$samples[] | .checks[] | select(.name == $check.name and .done)] ) as $hits
+                  | ($hits | length) as $present
+                  | ([$hits[] | select(.failed)] | length) as $fails
+                  | .sampled = $present
+                  | .sample_failing = $fails
+                  | if $present >= $min_sample and $fails >= $min_fails and ($fails * 2) > $present
+                    then .base = "environmental" else . end
+                end ]
+            ' 2>/dev/null || printf '%s' "$checks"
+          }
+
           # Failing checks on the PR, other than ignored scans. Each is compared with the
           # same-name check runs on the base branch head: base is "failing"
-          # (unrelated to this PR, not sent to dstp), "passing", or "none" (no
-          # run there to compare, so it counts as this PR's).
+          # (unrelated to this PR, not sent to dstp), "passing", "environmental"
+          # (passes on the base head but fails across unrelated open PRs — not
+          # sent to dstp either), or "none" (no run there to compare, so it
+          # counts as this PR's).
           fetch_failing_checks() {
-            local pr_url="$1" rollup base sha runs
+            local pr_url="$1" rollup base sha runs checks
             rollup=$(gh_read pr view "$pr_url" --json statusCheckRollup) || return $?
             base=$(gh_read pr view "$pr_url" --json baseRefName --jq .baseRefName) || return $?
             if ! [[ "$base" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$base" == *..* ]]; then
@@ -1158,7 +1278,7 @@ jobs:
             runs=$(printf '%s' "$runs" | jq -s '.') || return 1
             # Both documents go through stdin: a big repo's check runs exceed the
             # kernel's per-argument limit, so jq fails with "Argument list too long".
-            printf '%s\n%s\n' "$rollup" "$runs" | jq -n --arg base "$base" "${IGNORED_SCAN_JQ}"'
+            checks=$(printf '%s\n%s\n' "$rollup" "$runs" | jq -n --arg base "$base" "${IGNORED_SCAN_JQ}"'
               def failing:
                 ((.conclusion // "") | ascii_upcase) as $c
                 | ((.state // "") | ascii_upcase) as $s
@@ -1178,7 +1298,13 @@ jobs:
                           elif ($same | any((.conclusion // "") | IN("failure", "timed_out", "cancelled", "startup_failure"))) then "failing"
                           else "passing" end)
                  }]
-            ' || return 1
+            ') || return 1
+            # Only a base-passing failing check can be environmental, so the
+            # probe (and its extra reads) run only when one exists.
+            if printf '%s' "$checks" | jq -e '[.[] | select(.base == "passing")] | length > 0' >/dev/null 2>&1; then
+              checks=$(probe_environmental_checks "$pr_url" "$checks")
+            fi
+            printf '%s' "$checks"
           }
 
           # The last 80 lines of each failed job log for the checks that are
@@ -1190,6 +1316,7 @@ jobs:
               url=$(printf '%s' "$row" | jq -r '.url // ""')
               log=""
               if [ "$(printf '%s' "$row" | jq -r '.base')" != "failing" ] \
+                && [ "$(printf '%s' "$row" | jq -r '.base')" != "environmental" ] \
                 && [[ "$url" =~ ^https://github\.com/([^/]+/[^/]+)/actions/runs/[0-9]+/job/([0-9]+)$ ]] \
                 && [ "${BASH_REMATCH[1]}" = "$GITHUB_REPOSITORY" ]; then
                 job="${BASH_REMATCH[2]}"
@@ -1319,7 +1446,7 @@ jobs:
           PREAMBLE
               jq -r '
                 def cap($n): (. // "") | tostring | .[0:$n];
-                ([.checks[] | select(.base != "failing")]) as $ours
+                ([.checks[] | select(.base != "failing" and .base != "environmental")]) as $ours
                 | (if ($ours | length) == 0 then "\nNo failing CI checks for this PR. Ignored scans (Trivy/SCA by default) are not a dstp fix.\n"
                    else
                      "\nCI is still failing on this PR (excluding ignored scans). Fix those failures. Ignored scans (Trivy/SCA by default) are not a dstp fix.\n",
@@ -1514,6 +1641,7 @@ jobs:
             body=$(jq -r --slurpfile reply "$reply" --argjson allowed "$allowed" "${CLEAN_JQ}"'
               (([.ai, .comments, .reviews, .slack] | map(length) | add) > 0) as $replyable
               | ([.checks[] | select(.base == "failing")]) as $unrelated
+              | ([.checks[] | select(.base == "environmental")]) as $environmental
               | ([.checks[] | select(.base == "none")]) as $unbased
               | ($reply[0].items // []) as $reply_items
               | (if $replyable and ($reply_items | length) > 0 then
@@ -1524,9 +1652,10 @@ jobs:
                     | join("\n"))
                  elif $replyable then ($reply[0].comment // "") else "" end) as $rendered
               | [ (if $replyable then $rendered else "" end),
-                  (if (($unrelated + $unbased) | length) > 0 then
+                  (if (($unrelated + $environmental + $unbased) | length) > 0 then
                      "### CI\n"
                      + ([$unrelated[] | "- Not this PR: `\(.name | gsub("[`\\r\\n]"; ""))` also fails on `\(.base_ref)`."]
+                        + [$environmental[] | "- Not this PR: `\(.name | gsub("[`\\r\\n]"; ""))` is failing on \(.sample_failing // 0) of \(.sampled // 0) recent PRs and passes on `\(.base_ref)` — treated as environmental; not sent to dstp."]
                         + [$unbased[] | "- `\(.name | gsub("[`\\r\\n]"; ""))`: no run on `\(.base_ref)` head to compare, so it was treated as this PR'"'"'s."]
                         | join("\n"))
                    else "" end) ]
@@ -1543,7 +1672,7 @@ jobs:
                 echo "ai_reviews_replied=1" >> "$GITHUB_OUTPUT"
                 echo "ai_reviews_replied_count=$AI_REVIEWS_REPLIED_COUNT" >> "$GITHUB_OUTPUT"
               fi
-              jq -e '[.checks[] | select(.base == "failing")] | length > 0' "$items" >/dev/null && CI_NOTED=1
+              jq -e '[.checks[] | select(.base == "failing" or .base == "environmental")] | length > 0' "$items" >/dev/null && CI_NOTED=1
             else
               echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
             fi
@@ -1778,6 +1907,10 @@ jobs:
           # hold, skip it and the reply says why.
           MAX_REVISE=8
           MIN_CYCLE_SECONDS=720
+          # Idle waits per run: a round with nothing actionable yet may wait
+          # for pending checks/reviews at most this many times (each wait is
+          # internally bounded) before proceeding on what exists.
+          MAX_IDLE_WAITS=2
           NO_CHANGE=0
           NO_CHANGE_REASON=""
           SENT_THREADS=""
@@ -1791,6 +1924,7 @@ jobs:
           if [ "$STATUS" -eq 0 ] && [ -n "$PR_URL" ]; then
             ROUND=0
             READ_RETRIES=0
+            WAITS_USED=0
             while [ "$ROUND" -lt "$MAX_REVISE" ]; do
               remint_write_token
               LEFT=$(remaining_job_seconds)
@@ -1799,19 +1933,27 @@ jobs:
                 echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
                 break
               fi
-              echo "Waiting for CI and PR Review checks on $PR_URL (round $((ROUND+1))/$MAX_REVISE)"
-              slack_progress "Waiting for CI and AI reviews"
-              READY=$(wait_for_rollup "$PR_URL")
-              if [[ "$READY" == noreview:* ]]; then
-                echo "No *PR Review* check after bounded polls; proceeding on CI only"
-                FAILING=${READY#noreview:}
-              elif [[ "$READY" == ready:* ]]; then
-                FAILING=${READY#ready:}
-              else
-                echo "Checks not ready yet ($READY); not treating an empty rollup as green"
-                continue
-              fi
               PR_NUM=$(basename "$PR_URL")
+              # Status first: read the exact check states that already exist
+              # on this head and act on them this round — a revise ask naming
+              # a failed check reaches dstp now, not after a settle wait.
+              # Waiting survives only as the bounded idle fallback below.
+              SNAPSHOT_JSON=$(snapshot_checks "$PR_URL" 2>/dev/null || echo '[]')
+              if [ "$SNAPSHOT_JSON" = "[]" ]; then
+                # An unreadable or empty rollup is never treated as green:
+                # force the failing-check read (which has its own retries)
+                # and count this head as still pending.
+                FAILING=1
+                SNAPSHOT_N=0
+                SNAPSHOT_PENDING=1
+                REVIEW_PENDING=1
+              else
+                FAILING=$(printf '%s' "$SNAPSHOT_JSON" | jq '[.[] | select(.state == "failed")] | length')
+                SNAPSHOT_N=$(printf '%s' "$SNAPSHOT_JSON" | jq 'length')
+                SNAPSHOT_PENDING=$(printf '%s' "$SNAPSHOT_JSON" | jq '[.[] | select(.state == "queued" or .state == "running")] | length')
+                REVIEW_PENDING=$(printf '%s' "$SNAPSHOT_JSON" | jq '[.[] | select((.state == "queued" or .state == "running") and (.name | test("PR Review")))] | length')
+              fi
+              echo "check_states=$(printf '%s' "$SNAPSHOT_JSON" | jq -c '[.[] | select(.state != "passed")]')" >> "$GITHUB_OUTPUT"
               # Retry only network errors and 5xx, never a request GitHub rejected.
               READ_RC=0
               read_pr_state || READ_RC=$?
@@ -1848,13 +1990,26 @@ jobs:
               THREAD_N=$(jq '.threads | length' "$ITEMS_FILE")
               echo "threads_remaining=$THREAD_N" >> "$GITHUB_OUTPUT"
               HUMAN_N=$(jq '(.comments + .reviews) | length' "$ITEMS_FILE")
-              OURS_N=$(jq '[.checks[] | select(.base != "failing")] | length' "$ITEMS_FILE")
+              OURS_N=$(jq '[.checks[] | select(.base != "failing" and .base != "environmental")] | length' "$ITEMS_FILE")
               {
                 echo "unrelated_checks=$(jq -c '[.checks[] | select(.base == "failing") | .name]' "$ITEMS_FILE")"
+                echo "environmental_checks=$(jq -c '[.checks[] | select(.base == "environmental") | {name, sampled: (.sampled // 0), sample_failing: (.sample_failing // 0)}]' "$ITEMS_FILE")"
                 echo "unbased_checks=$(jq -c '[.checks[] | select(.base == "none") | .name]' "$ITEMS_FILE")"
                 echo "base_ref=$(jq -r '[.checks[].base_ref] | first // ""' "$ITEMS_FILE")"
               } >> "$GITHUB_OUTPUT"
               if [ "$OURS_N" = "0" ] && [ "$FINDINGS" = "0" ] && [ "$SLACK_N" = "0" ] && [ "$THREAD_N" = "0" ] && [ "$HUMAN_N" = "0" ]; then
+                # Nothing actionable yet is not the same as done: checks or
+                # the AI review for this head may still be on their way. Wait
+                # (bounded, counted) and re-read; once the waits are used up,
+                # proceed on what exists rather than spinning until the job
+                # budget dies.
+                if { [ "${REVIEW_PENDING:-0}" != "0" ] || [ "${SNAPSHOT_PENDING:-0}" != "0" ] || [ "${SNAPSHOT_N:-0}" = "0" ]; } && [ "$WAITS_USED" -lt "$MAX_IDLE_WAITS" ]; then
+                  WAITS_USED=$((WAITS_USED + 1))
+                  echo "Nothing actionable yet and checks are still pending; waiting for CI and AI reviews (wait $WAITS_USED of $MAX_IDLE_WAITS)"
+                  slack_progress "Waiting for CI and AI reviews"
+                  wait_for_rollup "$PR_URL" >/dev/null || true
+                  continue
+                fi
                 echo "No failing checks of this PR and nothing left to address: no AI PR Review findings, review threads, human comments, or Slack change requests."
                 CLEAN=1
                 # A pure approval was read this round; move the watermark past
@@ -1864,6 +2019,7 @@ jobs:
                 fi
                 break
               fi
+              WAITS_USED=0
               LEFT=$(remaining_job_seconds)
               if [ "$LEFT" -lt "$MIN_CYCLE_SECONDS" ]; then
                 echo "Not enough remaining job time (${LEFT}s) to start dstp revise"
@@ -1882,6 +2038,11 @@ jobs:
                 break
               fi
               slack_progress "Revising round ${ROUND} of ${MAX_REVISE}"
+              # Checks this round is trying to fix (failing and this PR's;
+              # .checks holds failing checks only). After a push, the loop
+              # verifies exactly these on the new head.
+              VERIFY_TARGETS=$(jq -c '[.checks[] | select(.base != "failing" and .base != "environmental") | .name]' "$ITEMS_FILE")
+              HEAD_BEFORE=$(pr_head_sha "$PR_URL" || echo "")
               REVISE_STATUS=0
               run_branch_revise /tmp/forge-revise-instruction.md || REVISE_STATUS=$?
               # The token dstp ran with may be nearly an hour old; the reads
@@ -1916,11 +2077,26 @@ jobs:
                 echo "dstp produced no changes; stopping wait/revise"
                 break
               fi
+              # Verify the push against the checks it was meant to fix. The
+              # next round re-reads everything, so a target that failed again
+              # goes back to dstp with its fresh log. If the reserved time
+              # runs out first, stop and let Report name the exact states.
+              VERIFY_N=$(printf '%s' "${VERIFY_TARGETS:-[]}" | jq 'length' 2>/dev/null || true)
+              if [ "${VERIFY_N:-0}" != "0" ]; then
+                HEAD_AFTER=$(pr_head_sha "$PR_URL" || echo "")
+                if [ -n "$HEAD_BEFORE" ] && [ -n "$HEAD_AFTER" ] && [ "$HEAD_BEFORE" != "$HEAD_AFTER" ]; then
+                  if ! wait_for_targets "$PR_URL" "$VERIFY_TARGETS"; then
+                    echo "verify_pending=$(printf '%s' "$VERIFY_PENDING" | jq -c '.')" >> "$GITHUB_OUTPUT"
+                    echo "Ran out of reserved time verifying the fix on the new head; stopping wait/revise"
+                    break
+                  fi
+                fi
+              fi
             done
             # Checks that also fail on the base head were never sent to dstp.
             # Say so on the PR once per run.
             if [ "$CLEAN" = "1" ] && [ "$CI_NOTED" = "0" ] \
-              && jq -e '[.checks[] | select(.base == "failing")] | length > 0' "$ITEMS_FILE" >/dev/null 2>&1; then
+              && jq -e '[.checks[] | select(.base == "failing" or .base == "environmental")] | length > 0' "$ITEMS_FILE" >/dev/null 2>&1; then
               jq '{ai: [], threads: [], comments: [], reviews: [], slack: [], checks}' "$ITEMS_FILE" > /tmp/forge-ci-only-items.json \
                 && { reply_to_reviews /tmp/forge-ci-only-items.json || echo "revise_trouble=1" >> "$GITHUB_OUTPUT"; }
             fi
@@ -1969,9 +2145,12 @@ jobs:
           PR_EDITED: ${{ steps.forge.outputs.pr_edited }}
           READ_FAILED: ${{ steps.forge.outputs.read_failed }}
           UNRELATED_CHECKS: ${{ steps.forge.outputs.unrelated_checks }}
+          ENVIRONMENTAL_CHECKS: ${{ steps.forge.outputs.environmental_checks }}
           UNBASED_CHECKS: ${{ steps.forge.outputs.unbased_checks }}
           BASE_REF: ${{ steps.forge.outputs.base_ref }}
           PUSHED: ${{ steps.forge.outputs.pushed }}
+          VERIFY_PENDING: ${{ steps.forge.outputs.verify_pending }}
+          CHECK_STATES: ${{ steps.forge.outputs.check_states }}
           AI_APPROVALS: ${{ steps.forge.outputs.ai_approvals }}
           ITEMS_CHECKED: ${{ steps.forge.outputs.items_checked }}
           ITEMS_FIXED: ${{ steps.forge.outputs.items_fixed }}
@@ -2027,9 +2206,11 @@ jobs:
             # output is a real error (or no checks at all).
             if [ "$rc" -eq 0 ] || { { [ "$rc" -eq 1 ] || [ "$rc" -eq 8 ]; } && [ -n "$CHECKS" ]; }; then
               CI_STATE="ok"
-              # Checks that also fail on the base head are not this PR's.
-              local skip failing
-              skip=$(printf '%s' "${UNRELATED_CHECKS:-[]}" | jq -c 'if type == "array" then [.[] | strings] else [] end' 2>/dev/null || echo '[]')
+              # Checks that also fail on the base head, and checks classified
+              # environmental (failing across recent PRs), are not this PR's.
+              local skip failing env_names
+              env_names=$(printf '%s' "${ENVIRONMENTAL_CHECKS:-[]}" | jq -c 'if type == "array" then [ .[] | (.name // .) | strings ] else [] end' 2>/dev/null || echo '[]')
+              skip=$(printf '%s' "${UNRELATED_CHECKS:-[]}" | jq -c --argjson env "$env_names" 'if type == "array" then ([.[] | strings] + $env | unique) else $env end' 2>/dev/null || echo '[]')
               # Same is_ignored_scan as the revise loop, on gh pr checks' tab-separated name and bucket.
               if ! failing=$(printf '%s\n' "$CHECKS" | jq -R -n -c --argjson skip "$skip" "${IGNORED_SCAN_JQ}"'
                 [inputs | split("\t") | select(length > 1 and .[1] == "fail") | {name: .[0]}
@@ -2109,6 +2290,10 @@ jobs:
           if [ "$(num_or_zero "$(list_len "${UNBASED_CHECKS:-}")")" -gt 0 ]; then
             NOT_OURS="${NOT_OURS:+$NOT_OURS }No run on ${BASE_NAME} head to compare for $(list_names "${UNBASED_CHECKS:-}"), so they were treated as this PR's."
           fi
+          if [ "$(num_or_zero "$(list_len "${ENVIRONMENTAL_CHECKS:-}")")" -gt 0 ]; then
+            ENV_DETAIL=$(printf '%s' "${ENVIRONMENTAL_CHECKS:-[]}" | jq -r 'if type == "array" then [ .[] | "\(.name // .) (\(.sample_failing // 0)/\(.sampled // 0) recent PRs)" ] | join(", ") else "" end' 2>/dev/null || true)
+            [ -n "$ENV_DETAIL" ] && NOT_OURS="${NOT_OURS:+$NOT_OURS }Failing across recent PRs, not just this one — treated as environmental: $(printf '%s' "$ENV_DETAIL" | slack_escape)."
+          fi
           TROUBLE=""
           [ "${REVISE_TROUBLE:-}" = "1" ] && TROUBLE="Wait/revise hit trouble — see the run log."
           [ -n "${UNCOVERED_REFS:-}" ] && TROUBLE="Some items still have no reply: ${UNCOVERED_REFS} — see the PR."
@@ -2181,6 +2366,13 @@ jobs:
                 FACTS="CI still failing: ${CI_FAILING_NAMES}. AI reviewers: no items outstanding."
               fi
               EMOJI="⚠️"
+            elif [ "${CI_PENDING:-0}" != "0" ] && [ -n "${VERIFY_PENDING:-}" ] && [ "${VERIFY_PENDING}" != "[]" ]; then
+              # The verify wait ran out of reserved time: name the exact
+              # checks and states instead of a bare pending count.
+              VERIFY_LIST=$(printf '%s' "$VERIFY_PENDING" | jq -r 'if type == "array" then [.[] | "\(.name) (\(.state))"] | join(", ") else "" end' 2>/dev/null || true)
+              FACTS="Fix pushed this run. The run's remaining time ran out while verifying: $(printf '%s' "$VERIFY_LIST" | slack_escape) — see the PR checks."
+              EMOJI="⏳"
+              PUSHED_PENDING=1
             elif [ "${CI_PENDING:-0}" != "0" ] && [ "${PUSHED:-}" = "1" ]; then
               # The run did its work and pushed; CI simply has not finished
               # on the new head yet. That is a status, not a warning.
