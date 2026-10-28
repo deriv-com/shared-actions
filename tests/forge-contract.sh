@@ -614,7 +614,18 @@ case "$args" in
   "api repos/o/r/git/ref/heads/master --jq .object.sha") echo 1111111111111111111111111111111111111111 ;;
   "api repos/o/r/commits/1111111111111111111111111111111111111111/check-runs?per_page=100 --paginate --jq "*) jq -c "${@: -1}" "$S/base_checks.json" ;;
   "pr view https://github.com/o/r/pull/7 --json statusCheckRollup")
-    if [ -f "$S/dstp_ran" ]; then cat "$S/rollup_after.json"; else cat "$S/rollup.json"; fi ;;
+    if [ -f "$S/dstp_ran" ]; then
+      if [ -f "$S/rollup_after2.json" ] && [ "$(cat "$S/dstp_count" 2>/dev/null || echo 0)" -ge 2 ]; then cat "$S/rollup_after2.json"; else cat "$S/rollup_after.json"; fi
+    else cat "$S/rollup.json"; fi ;;
+  "pr view https://github.com/o/r/pull/"*" --json statusCheckRollup")
+    u="${args#pr view }"; u="${u%% *}"; n="${u##*/}"
+    if [ -f "$S/rollup_pr_$n.json" ]; then cat "$S/rollup_pr_$n.json"; else echo "UNHANDLED: $args" >> "$S/unhandled.log"; exit 1; fi ;;
+  "api repos/o/r/pulls?state=open&sort=created&direction=desc&per_page=9 --jq "*)
+    if [ -f "$S/pulls.json" ]; then jq -c "${@: -1}" "$S/pulls.json"; else echo '[]'; fi ;;
+  "pr view https://github.com/o/r/pull/7 --json headRefOid --jq .headRefOid")
+    if [ ! -f "$S/dstp_ran" ]; then head -c 40 /dev/zero | tr '\0' 'a'; echo
+    elif [ "$(cat "$S/dstp_count" 2>/dev/null || echo 0)" -ge 2 ]; then head -c 40 /dev/zero | tr '\0' 'c'; echo
+    else head -c 40 /dev/zero | tr '\0' 'b'; echo; fi ;;
   "pr view https://github.com/o/r/pull/7 --json headRefName --jq .headRefName") echo feature ;;
   "pr view https://github.com/o/r/pull/7 --json baseRefName --jq .baseRefName") echo master ;;
   "pr view https://github.com/o/r/pull/7 --json title,body") cat "$S/pr.json" ;;
@@ -1149,6 +1160,63 @@ C=$(report_only already_reacted OUTCOME=failure SLACK_MENTION_TS=3.3 FAKE_SLACK_
 check '! has "$C/report.log" "::warning::Slack reactions"' "already_reacted is tolerated without a warning"
 C=$(report_only no_reaction OUTCOME=failure SLACK_MENTION_TS=3.3 FAKE_SLACK_ERROR=no_reaction)
 check '! has "$C/report.log" "::warning::Slack reactions"' "no_reaction is tolerated without a warning"
+
+# A check that passes on the base head but fails across unrelated open PRs
+# is environmental: never sent to dstp, named once as not this PR's.
+C=$(new_case env_cloudflare)
+jq '.statusCheckRollup += [{"__typename": "CheckRun", "name": "Cloudflare Pages", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://dash.cloudflare.com/pages/view/x"}]' \
+  "$C/rollup.json" > "$C/x" && mv "$C/x" "$C/rollup.json"
+jq '.statusCheckRollup |= map(if .name == "E2E preview smoke" then .conclusion = "SUCCESS" else . end)' \
+  "$C/rollup.json" > "$C/rollup_after.json"
+jq '.check_runs += [{"name": "Cloudflare Pages", "status": "completed", "conclusion": "success"}]' \
+  "$C/base_checks.json" > "$C/x" && mv "$C/x" "$C/base_checks.json"
+jq -n '[{number: 10}, {number: 9}, {number: 8}, {number: 7}]' > "$C/pulls.json"
+for n in 8 9 10; do
+  jq -n '{statusCheckRollup: [
+    {"__typename": "CheckRun", "name": "Cloudflare Pages", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://dash.cloudflare.com/pages/view/x"},
+    {"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}]}' > "$C/rollup_pr_$n.json"
+done
+printf 'Cloudflare Pages\tfail\t1m\thttps://dash.cloudflare.com/x\t\n' >> "$C/pr_checks.txt"
+run_case "$C"
+check '[ "$(cat "$C/dstp_count")" = 1 ]' "an environmental check does not cost an extra revise round"
+check '! has "$C/instruction.1.md" "Failing check: Cloudflare Pages" && has "$C/instruction.1.md" "Failing check: E2E preview smoke"' \
+  "a base-passing check failing on 3 of 3 sampled PRs is kept out of the instruction"
+P=$(ls "$C"/pr_comment.*.md)
+check 'has "$P" "Not this PR" && has "$P" "Cloudflare Pages" && has "$P" "is failing on 3 of 3 recent PRs and passes on" && has "$P" "treated as environmental; not sent to dstp"' \
+  "the PR comment names the environmental check with its cross-PR evidence"
+check 'has "$C/completion.txt" "treated as environmental: Cloudflare Pages (3/3 recent PRs)" && ! has "$C/completion.txt" "CI still failing" && has "$C/completion.txt" "All non-ignored checks are green"' \
+  "Slack names the environmental check as not this PR's, never as failing CI"
+check 'grep -q "^environmental_checks=\[{\"name\":\"Cloudflare Pages\",\"sampled\":3,\"sample_failing\":3}\]" "$C/out"' \
+  "Run Forge reports the environmental classification with its sample counts"
+check '[ ! -f "$C/sleep.log" ] || ! grep -qx 15 "$C/sleep.log"' \
+  "status-first rounds act on already-final checks without a settle wait"
+
+# The check dstp just fixed fails again on the new head: verified, then
+# revised again with the fresh failure, until it passes.
+C=$(new_case refail)
+cp "$C/rollup.json" "$C/rollup_after.json"
+jq '(.statusCheckRollup[] | select(.name == "E2E preview smoke") | .conclusion) = "SUCCESS"' \
+  "$C/rollup.json" > "$C/rollup_after2.json"
+run_case "$C"
+check '[ "$(cat "$C/dstp_count")" = 2 ]' "a target check failing again on the new head is revised a second time"
+check '[ -f "$C/instruction.2.md" ] && has "$C/instruction.2.md" "### Failing check: E2E preview smoke"' \
+  "the second round's instruction carries the fresh failing check"
+check 'has "$C/completion.txt" "All non-ignored checks are green" && ! has "$C/completion.txt" "CI still failing"' \
+  "once the target passes on the new head the completion is green"
+
+# The verify wait runs out of reserved job time: the completion names the
+# still-pending target check and its exact state, not a bare pending count.
+C=$(new_case verify_pending)
+echo 16 > "$C/timeout_minutes"
+jq '(.statusCheckRollup[] | select(.name == "E2E preview smoke")) |= (.status = "IN_PROGRESS" | .conclusion = null)' \
+  "$C/rollup.json" > "$C/rollup_after.json"
+printf 'E2E preview smoke\tpending\t0\thttps://x/1\t\nlint\tfail\t9s\thttps://x/2\t\ntest\tpass\t4m\thttps://x/4\t\n' > "$C/pr_checks.txt"
+run_case "$C"
+check '[ "$(cat "$C/dstp_count")" = 1 ]' "an exhausted verify wait does not revise again blindly"
+check 'grep "^verify_pending=" "$C/out" | grep -q "E2E preview smoke" && grep "^verify_pending=" "$C/out" | grep -q "running"' \
+  "Run Forge reports the still-pending target check with its exact state"
+check 'has "$C/completion.txt" "ran out while verifying: E2E preview smoke (running)" && ! has "$C/completion.txt" "CI still running:"' \
+  "the completion names the pending check and its state instead of a generic pending count"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"
