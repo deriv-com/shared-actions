@@ -240,6 +240,8 @@ check 'grep -q "AI_REVIEWS_ONLY: \${{ inputs.ai_reviews_only }}" "$WF" && grep -
   "ai_reviews_only makes build_items drop every non-AI category"
 check 'grep -q "AI-reviews-only run: leaving the watermark where it is" "$WF"' \
   "an AI-reviews-only run never advances the watermark past human items"
+check 'awk "/AI-reviews-only run: leaving the watermark/{f=1} f && /ai_reviews_remaining=0/{print; exit}" "$WF" | grep -q "ai_reviews_remaining=0"' \
+  "a covered AI-reviews-only run still reports zero remaining, so Report does not call it unfinished"
 check 'grep -q "update) COMMAND=update ;;" "$WF"' \
   "command=update is a real mode, not folded into auto"
 check 'grep -q "run_branch_update" "$WF"' \

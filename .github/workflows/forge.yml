@@ -2185,6 +2185,18 @@ jobs:
                 # Coverage was AI-only by construction; advancing the watermark
                 # would silently retire human items this run never attempted.
                 echo "AI-reviews-only run: leaving the watermark where it is"
+                if [ "${ITEMS_COVERED:-0}" = "1" ]; then
+                  # The report verdicts are not the watermark: a covered AI-only
+                  # round is finished, and Report must say so. Break, too — the
+                  # unmoved watermark means the next round would re-read the
+                  # same AI comments and revise again for nothing.
+                  {
+                    echo "ai_reviews_remaining=0"
+                    echo "slack_requests_remaining=0"
+                    echo "threads_remaining=0"
+                  } >> "$GITHUB_OUTPUT"
+                  break
+                fi
               elif [ "${ITEMS_COVERED:-0}" = "1" ]; then
                 post_silent_watermark "$PR_NUM"
                 {
