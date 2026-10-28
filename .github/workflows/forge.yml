@@ -1273,13 +1273,13 @@ jobs:
                   else "unknown" end;
               def finding_titles:
                 [ (.body // "") | split("\n")[]
-                  | select(test("^[0-9]+\\. "))
-                  | (capture("^[0-9]+\\. \\*\\*(?<t>[^*]+)\\*\\*"; "") // capture("^[0-9]+\\. (?<t>.+)"; "") | .t // "")
+                  | select(test("^[0-9]+\\.\\s+"))
+                  | (capture("^[0-9]+\\.\\s+\\*\\*(?<t>[^*]+)\\*\\*"; "") // capture("^[0-9]+\\.\\s+(?<t>.+)"; "") | .t // "")
                   | gsub("\\s+"; " ") | .[0:160] | select(length > 0) ];
               def nit_titles:
                 [ (.body // "") | split("\n")[]
-                  | select(test("^[-*] Still open\\b"))
-                  | (capture("Still open\\s*(—|--|-)\\s*(?<t>.+)"; "") // {t: .} | .t // "")
+                  | select(test("^[-*]\\s+Still open\\b"))
+                  | (capture("Still open\\s*(—|--|:|-)\\s*(?<t>.+)"; "") // capture("Still open\\s+(?<t>.+)"; "") // {t: .} | .t // "")
                   | gsub("\\s+"; " ") | .[0:160] | select(length > 0) ];
               .ai_items = [ .ai[] | {id, html_url, verdict: verdict, findings: finding_titles, nits: nit_titles} ]
               | .ai_items = [ .ai_items[]
@@ -1699,7 +1699,7 @@ jobs:
                 if ((.verdict.outcome // "") | IN("false_positive", "already_handled", "no_change", "partial")) then .verdict.outcome
                 else ([((.items // [])[]?, (.threads // [])[]?) | .status] as $s
                       | if ($s | length) == 0 then "no_change"
-                        elif ([$s[] | select(. == "skipped")] | length) == ($s | length) then "false_positive"
+                        elif ([$s[] | select(. == "skipped")] | length) == ($s | length) then "no_change"
                         elif ([$s[] | select(. == "already")] | length) == ($s | length) then "already_handled"
                         else "partial" end)
                 end' "$reply_file" 2>/dev/null | tr '\r\n' ' ' | cut -c1-60)"
