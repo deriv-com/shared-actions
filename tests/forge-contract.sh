@@ -1210,7 +1210,9 @@ C=$(new_case verify_pending)
 echo 16 > "$C/timeout_minutes"
 jq '(.statusCheckRollup[] | select(.name == "E2E preview smoke")) |= (.status = "IN_PROGRESS" | .conclusion = null)' \
   "$C/rollup.json" > "$C/rollup_after.json"
-printf 'E2E preview smoke\tpending\t0\thttps://x/1\t\nlint\tfail\t9s\thttps://x/2\t\ntest\tpass\t4m\thttps://x/4\t\n' > "$C/pr_checks.txt"
+# pr checks disagrees with the rollup here (no pending line): the completion
+# must still name the verify target via the verify_pending output alone.
+printf 'E2E preview smoke\tpass\t4s\thttps://x/1\t\nlint\tfail\t9s\thttps://x/2\t\ntest\tpass\t4m\thttps://x/4\t\n' > "$C/pr_checks.txt"
 run_case "$C"
 check '[ "$(cat "$C/dstp_count")" = 1 ]' "an exhausted verify wait does not revise again blindly"
 check 'grep "^verify_pending=" "$C/out" | grep -q "E2E preview smoke" && grep "^verify_pending=" "$C/out" | grep -q "running"' \

@@ -1400,13 +1400,13 @@ jobs:
                   else "unknown" end;
               def finding_titles:
                 [ (.body // "") | split("\n")[]
-                  | select(test("^[0-9]+\\. "))
-                  | (capture("^[0-9]+\\. \\*\\*(?<t>[^*]+)\\*\\*"; "") // capture("^[0-9]+\\. (?<t>.+)"; "") | .t // "")
+                  | select(test("^[0-9]+\\.\\s+"))
+                  | (capture("^[0-9]+\\.\\s+\\*\\*(?<t>[^*]+)\\*\\*"; "") // capture("^[0-9]+\\.\\s+(?<t>.+)"; "") | .t // "")
                   | gsub("\\s+"; " ") | .[0:160] | select(length > 0) ];
               def nit_titles:
                 [ (.body // "") | split("\n")[]
-                  | select(test("^[-*] Still open\\b"))
-                  | (capture("Still open\\s*(—|--|-)\\s*(?<t>.+)"; "") // {t: .} | .t // "")
+                  | select(test("^[-*]\\s+Still open\\b"))
+                  | (capture("Still open\\s*(—|--|:|-)\\s*(?<t>.+)"; "") // capture("Still open\\s+(?<t>.+)"; "") // {t: .} | .t // "")
                   | gsub("\\s+"; " ") | .[0:160] | select(length > 0) ];
               .ai_items = [ .ai[] | {id, html_url, verdict: verdict, findings: finding_titles, nits: nit_titles} ]
               | .ai_items = [ .ai_items[]
@@ -1828,7 +1828,7 @@ jobs:
                 if ((.verdict.outcome // "") | IN("false_positive", "already_handled", "no_change", "partial")) then .verdict.outcome
                 else ([((.items // [])[]?, (.threads // [])[]?) | .status] as $s
                       | if ($s | length) == 0 then "no_change"
-                        elif ([$s[] | select(. == "skipped")] | length) == ($s | length) then "false_positive"
+                        elif ([$s[] | select(. == "skipped")] | length) == ($s | length) then "no_change"
                         elif ([$s[] | select(. == "already")] | length) == ($s | length) then "already_handled"
                         else "partial" end)
                 end' "$reply_file" 2>/dev/null | tr '\r\n' ' ' | cut -c1-60)"
@@ -1953,7 +1953,6 @@ jobs:
                 SNAPSHOT_PENDING=$(printf '%s' "$SNAPSHOT_JSON" | jq '[.[] | select(.state == "queued" or .state == "running")] | length')
                 REVIEW_PENDING=$(printf '%s' "$SNAPSHOT_JSON" | jq '[.[] | select((.state == "queued" or .state == "running") and (.name | test("PR Review")))] | length')
               fi
-              echo "check_states=$(printf '%s' "$SNAPSHOT_JSON" | jq -c '[.[] | select(.state != "passed")]')" >> "$GITHUB_OUTPUT"
               # Retry only network errors and 5xx, never a request GitHub rejected.
               READ_RC=0
               read_pr_state || READ_RC=$?
@@ -2150,7 +2149,6 @@ jobs:
           BASE_REF: ${{ steps.forge.outputs.base_ref }}
           PUSHED: ${{ steps.forge.outputs.pushed }}
           VERIFY_PENDING: ${{ steps.forge.outputs.verify_pending }}
-          CHECK_STATES: ${{ steps.forge.outputs.check_states }}
           AI_APPROVALS: ${{ steps.forge.outputs.ai_approvals }}
           ITEMS_CHECKED: ${{ steps.forge.outputs.items_checked }}
           ITEMS_FIXED: ${{ steps.forge.outputs.items_fixed }}
@@ -2366,9 +2364,12 @@ jobs:
                 FACTS="CI still failing: ${CI_FAILING_NAMES}. AI reviewers: no items outstanding."
               fi
               EMOJI="⚠️"
-            elif [ "${CI_PENDING:-0}" != "0" ] && [ -n "${VERIFY_PENDING:-}" ] && [ "${VERIFY_PENDING}" != "[]" ]; then
+            elif [ -n "${VERIFY_PENDING:-}" ] && [ "${VERIFY_PENDING}" != "[]" ] && [ "${PUSHED:-}" = "1" ]; then
               # The verify wait ran out of reserved time: name the exact
-              # checks and states instead of a bare pending count.
+              # checks and states instead of a bare pending count. The
+              # verify_pending output is only written on that timeout, so
+              # it is the trigger — the pending count may not include the
+              # targets when the two reads disagree.
               VERIFY_LIST=$(printf '%s' "$VERIFY_PENDING" | jq -r 'if type == "array" then [.[] | "\(.name) (\(.state))"] | join(", ") else "" end' 2>/dev/null || true)
               FACTS="Fix pushed this run. The run's remaining time ran out while verifying: $(printf '%s' "$VERIFY_LIST" | slack_escape) — see the PR checks."
               EMOJI="⏳"
