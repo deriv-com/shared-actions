@@ -845,9 +845,9 @@ jobs:
               (.body | contains("Click2Fix - Acknowledge"))
               and (
                 .user.login == "github-actions[bot]"
-                # Forge's revise loop posts explained-skip acknowledgements
-                # under its write App; name it explicitly rather than
-                # widening this to any bot or any author.
+                # The Forge revise loop posts explained-skip
+                # acknowledgements under its write App; name it explicitly
+                # rather than widening this to any bot or any author.
                 or .user.login == "gh-app-write"
                 or .user.login == "gh-app-write[bot]"
                 or (.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
