@@ -128,12 +128,18 @@ joined_step_body() { step_body "$1" "$2" | awk '/\\$/ { sub(/\\$/, ""); buf = bu
 # extracted block against fixture reviews.
 check 'grep -q "deriv-pr-review-verdict: %s; findings=%s" "$WF"' "post step appends the deriv-pr-review-verdict marker"
 check 'grep -qF "gh-app-write[bot]" "$WF"' "acknowledge scan accepts Forge's write-App identity"
-VERDICT_BLOCK=$(step_body "Post review as single PR comment" "$WF" | awk '/verdict_token="unknown"/{f=1} f{print} f && /REVIEW_OUTPUT_FILE/{done=1} done{next}' | sed 's/^ *//')
+# The awk must stop after the marker-append line (the "} >> $REVIEW_OUTPUT_FILE"
+# line): an earlier version set done after printing, so the block ran on into
+# the step's posting code and a local run of this suite posted every fixture
+# to the PR as a real comment. The gh check below plus the emptied tokens in
+# verdict_of keep that impossible even if the step grows new side effects.
+VERDICT_BLOCK=$(step_body "Post review as single PR comment" "$WF" | awk '/verdict_token="unknown"/{f=1} !done && f{print} f && />> "\$REVIEW_OUTPUT_FILE"/{done=1}' | sed 's/^ *//')
+check '[[ -n "$VERDICT_BLOCK" ]] && ! grep -qE "gh (pr comment|api)" <<< "$VERDICT_BLOCK"' "the extracted verdict block stops at the marker append and contains no gh call"
 verdict_of() {
   local fixture marker
   fixture=$(mktemp)
   printf '%s\n' "$1" > "$fixture"
-  REVIEW_OUTPUT_FILE="$fixture" CURRENT_SHA=abc REVIEW_ENGINE=claude REVIEW_SLOT_SUFFIX="" bash -c "$VERDICT_BLOCK" >/dev/null 2>&1
+  GH_TOKEN= GITHUB_TOKEN= REVIEW_OUTPUT_FILE="$fixture" CURRENT_SHA=abc REVIEW_ENGINE=claude REVIEW_SLOT_SUFFIX="" bash -c "$VERDICT_BLOCK" >/dev/null 2>&1
   marker=$(grep -o 'deriv-pr-review-verdict: [a-z-]*; findings=[0-9]*' "$fixture" | awk 'NR==1')
   rm -f "$fixture"
   printf '%s' "$marker"
@@ -258,6 +264,73 @@ check 'grep -qE "^[[:space:]]+EFFORT_INPUT:" "$WF"' "resolve step reads effort"
 check 'grep -q "echo \"effort=\$EFFORT\"" "$WF"' "resolve step emits effort on the step outputs"
 check 'grep -q "effort: \${{ steps.engine.outputs.effort }}" "$WF"' "anthropic dispatch step passes effort through"
 check 'grep -q "^  effort:" "$ANTH"' "anthropic engine declares the effort input"
+
+# --- Anthropic recover/retry: behaviour pins, scoped to the step or script
+# that owns them so a comment elsewhere cannot satisfy them. ---
+ANTH_RECOVER="$ROOT/.github/actions/ai_review_engine_anthropic/recover-review.sh"
+check '[[ -f "$ANTH_RECOVER" ]]' "the recovery logic ships as one script in the anthropic engine"
+check '[[ $(grep -c "bash \"\$ACTION_PATH/recover-review.sh\"" "$ANTH") -eq 2 ]]' "both recovery steps call the shared recovery script"
+check 'grep -qF "select(.type == \"assistant\")" "$ANTH_RECOVER"' "recovery extracts the final assistant text from the session transcript"
+ANTH_RECOVER_CODE="$(grep -vE '^[[:space:]]*#' "$ANTH_RECOVER")"
+check 'grep -qF "if length == 1 and (.[0]|type) == \"array\"" "$ANTH_RECOVER" && grep -qF "select(.type == \"assistant\")" "$ANTH_RECOVER"' "recovery slurps the transcript, flattening a single JSON array, and takes the final assistant text"
+check 'grep -qF '"'"'^\*\*Recommendation:\*\*[[:space:]]+(APPROVE|REQUEST CHANGES|BLOCK MERGE)'"'"' <<< "$ANTH_RECOVER_CODE" && grep -qF "> \"\$OUTPUT_PATH\"" <<< "$ANTH_RECOVER_CODE" && grep -qF "echo \"still_missing=\$missing\"" <<< "$ANTH_RECOVER_CODE"' "recovery only writes a complete review (anchored Recommendation verdict) and reports still_missing"
+check 'step_body "Recover the retry'"'"'s review from the session transcript" "$ANTH" | grep -cF "bash \"\$ACTION_PATH/recover-review.sh\"" >/dev/null' "the retry recovery step has its own name and calls the same script"
+check 'grep -qF "steps.claude.outputs.execution_file" "$ANTH" && grep -qF "steps.claude-retry.outputs.execution_file" "$ANTH"' "recovery reads each attempt's transcript through the action's declared execution_file output, not a hardcoded path"
+check 'step_body "Claude Code PR review (retry after an empty first attempt)" "$ANTH" | grep -cF "if: steps.recover.outputs.still_missing == '"'"'true'"'"'" >/dev/null && step_body "Claude Code PR review (retry after an empty first attempt)" "$ANTH" | grep -c "uses: anthropics/claude-code-action@" >/dev/null' "the retry gate sits on the claude-code-action retry step itself"
+check '[[ $(grep -c "uses: anthropics/claude-code-action@5eb090f3" "$ANTH") -eq 2 ]]' "exactly two pinned claude-code-action invocations exist (attempt and retry)"
+check 'step_body "Reset the path-guard log for the retry" "$ANTH" | grep -cF ": > \"\$PATH_GUARD_LOG\"" >/dev/null && step_body "Reset the path-guard log for the retry" "$ANTH" | grep -c "still_missing" >/dev/null' "the path-guard log is wiped, gated on still_missing, before the retry so verify judges the producing attempt"
+check 'step_body "Verify the sandbox held and the review was written" "$ANTH" | grep -cF "echo \"❌ Anthropic engine: claude-code-action finished but wrote no review to \$OUTPUT_PATH\"" >/dev/null' "verify fails closed, in its own step body, when no review exists"
+
+# Behavioural: run the shipped recovery script against fixture transcripts.
+RECOVER_TMP=$(mktemp -d)
+RECOVERY_REVIEW='## Summary
+
+A perfectly serviceable review body with enough prose to clear the two
+hundred character completeness threshold recovery requires before it will
+trust a transcript over the fail-closed verify step.
+
+**Recommendation:** APPROVE'
+jq -n --arg t "$RECOVERY_REVIEW" '[{type:"user",message:{content:[{type:"text",text:"review this"}]}},{type:"assistant",message:{content:[{type:"text",text:$t}]}}]' > "$RECOVER_TMP/array.json"
+{ jq -cn --arg t "Let me read the context file first, then the diff, and gather my thoughts before writing anything up." '{type:"assistant",message:{content:[{type:"text",text:$t}]}}'
+  jq -cn --arg t "$RECOVERY_REVIEW" '{type:"assistant",message:{content:[{type:"text",text:$t}]}}'
+} > "$RECOVER_TMP/stream.ndjson"
+jq -n '[{type:"assistant",message:{content:[{type:"text",text:"## Summary\n\nPartial ans"}]}}]' > "$RECOVER_TMP/truncated.json"
+jq -n --arg t "This draft quotes the mandated line mid-sentence, the format is **Recommendation:** APPROVE when the review is finished, and then keeps talking for a good while longer so the length threshold is comfortably cleared as well." '[{type:"assistant",message:{content:[{type:"text",text:$t}]}}]' > "$RECOVER_TMP/midline.json"
+recover_fixture() {
+  local d
+  d=$(mktemp -d)
+  if [[ -n "${2:-}" ]]; then printf '%s' "$2" > "$d/out.txt"; fi
+  OUTPUT_PATH="$d/out.txt" EXECUTION_FILE="$1" GITHUB_OUTPUT="$d/gh.txt" bash "$ANTH_RECOVER" >/dev/null 2>&1
+  printf '%s' "$d"
+}
+d=$(recover_fixture "$RECOVER_TMP/array.json")
+check 'grep -qF "still_missing=false" "$d/gh.txt" && grep -qF "**Recommendation:** APPROVE" "$d/out.txt"' "recovery recovers a complete review from a JSON-array transcript"
+d=$(recover_fixture "$RECOVER_TMP/stream.ndjson")
+check 'grep -qF "still_missing=false" "$d/gh.txt" && grep -qF "**Recommendation:** APPROVE" "$d/out.txt" && ! grep -qF "Let me read the context file" "$d/out.txt"' "recovery takes only the final assistant text from a stream-json transcript, never earlier preambles"
+d=$(recover_fixture "$RECOVER_TMP/truncated.json")
+check 'grep -qF "still_missing=true" "$d/gh.txt" && [[ ! -s "$d/out.txt" ]]' "recovery leaves a truncated transcript unrecovered"
+d=$(recover_fixture "$RECOVER_TMP/midline.json")
+check 'grep -qF "still_missing=true" "$d/gh.txt" && [[ ! -s "$d/out.txt" ]]' "recovery does not recover a mid-line quote of the Recommendation format"
+d=$(recover_fixture "$RECOVER_TMP/array.json" "EXISTING REVIEW KEEP ME")
+check 'grep -qF "still_missing=false" "$d/gh.txt" && [[ "$(cat "$d/out.txt")" == "EXISTING REVIEW KEEP ME" ]]' "recovery never overwrites a review the engine did write"
+rm -rf "$RECOVER_TMP"
+
+# The retry is a copy of attempt 1 by design (a step cannot run twice). Pin
+# the copies together: with comments, the id, the gate and the three retry
+# prompt lines removed, the bodies must be byte-identical, so the sandbox and
+# credential config (settings hook, claude_args, allowed_non_write_users,
+# GIT_CONFIG_*, the SHA) cannot drift between attempts.
+normalised_engine_step() {
+  step_body "$1" "$ANTH" \
+    | grep -vE '^[[:space:]]*#' \
+    | grep -vE '^[[:space:]]*id: ' \
+    | grep -vF 'if: steps.recover.outputs.still_missing' \
+    | grep -vF 'A first attempt at this review already ended without writing the file;' \
+    | grep -vF 'this is the retry. Make that Write call before you finish, even if the' \
+    | grep -vF 'review is short.' \
+    | awk 'NF'
+}
+check 'diff <(normalised_engine_step "Claude Code PR review") <(normalised_engine_step "Claude Code PR review (retry after an empty first attempt)") >/dev/null' "retry step matches attempt 1 modulo name, gate, comments and the retry prompt lines"
 check 'grep -qF -- '"'"'--model ${{ inputs.model }} ${{ steps.effort.outputs.flag }}'"'"' "$ANTH"' "anthropic engine maps effort onto claude_args via the resolve-effort step"
 check 'grep -qE "if \[\[ -n \"\\\$EFFORT\" \]\]" "$ANTH"' "anthropic engine applies effort only when non-empty"
 

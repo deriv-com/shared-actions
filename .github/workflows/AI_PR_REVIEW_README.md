@@ -222,6 +222,16 @@ assuming parity:
   `output_config.effort` value, so it is rejected here. The engine pins
   `anthropics/claude-code-action` v1.0.253 (CLI 2.1.303).
 
+  The model intermittently ends its turn with the finished review as chat
+  text instead of calling `Write`, leaving the output file empty. When that
+  happens, the engine first recovers a complete review from the session
+  transcript the action saves (its `execution_file` output; only text whose
+  `**Recommendation:**` line parses as a verdict counts), and otherwise
+  retries the engine once before recovering again. The path-guard log is
+  reset before the retry, so the verify step still proves the hook ran for
+  the attempt that produced the review, and a run that still produces
+  nothing fails closed exactly as before.
+
 - **Grok** — permissions (`dontAsk`) plus `--tools Read,Grep,Write,Edit` are the
   guarantee; `--sandbox read-only` is extra (cannot write the checkout; temp
   and `$GROK_HOME` stay writable). Bash, WebFetch and WebSearch are denied and
