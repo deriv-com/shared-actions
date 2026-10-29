@@ -20,18 +20,15 @@ missing=true
 if [[ -s "$OUTPUT_PATH" ]]; then
   missing=false
 elif [[ -f "$EXECUTION_FILE" ]]; then
-  text=$(jq -r '
-    (if type == "array" then . else [.] end)
+  # Always slurp: the action writes one JSON array (flattened below), but a
+  # newline-delimited stream-json transcript slurps to one object per line.
+  # Without -s the filter would run once per object and concatenate every
+  # assistant turn, preambles included, instead of taking the final text.
+  text=$(jq -sr '
+    (if length == 1 and (.[0]|type) == "array" then .[0] else . end)
     | [ .[] | select(.type == "assistant") | (.message.content // [])[] | select(.type == "text") | .text ]
     | last // ""
   ' "$EXECUTION_FILE" 2>/dev/null || true)
-  if [[ -z "$text" ]]; then
-    # Newline-delimited stream-json instead of one JSON array.
-    text=$(jq -sr '
-      [ .[] | select(.type == "assistant") | (.message.content // [])[] | select(.type == "text") | .text ]
-      | last // ""
-    ' "$EXECUTION_FILE" 2>/dev/null || true)
-  fi
   # Complete means the caller's verdict parser can read it: the mandated
   # Recommendation line, anchored, with a real verdict — not a mid-line quote
   # of the format, which would post with an "unknown" verdict.
