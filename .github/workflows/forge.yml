@@ -2443,8 +2443,10 @@ jobs:
             CONFLICT_LINE=$(printf '%s' "$CONFLICT_RESOLUTION" | jq -r '
               if .attempted then
                 "Conflicts: " +
-                (if .resolved then "resolved and merged" else "attempted, not resolved" end) +
-                (if .merge_sha then " (\(.merge_sha[0:7]))" else "" end) +
+                (if .resolved then
+                   (if .merge_sha then "resolved and merged (\(.merge_sha[0:7]))" else "resolved locally — not pushed" end)
+                 else "attempted, not resolved" end) +
+                (if .reason then "; reason: " + .reason else "" end) +
                 (if (.files | length) > 0 then "; " + ([.files[] | "\(.file) (\(.kind))"] | join(", ")) else "" end) +
                 (if (.also_touched | length) > 0 then "; also touched: " + (.also_touched | join(", ")) else "" end) +
                 (if ((.unresolved // []) | length) > 0 then "; still conflicted: " + (.unresolved | join(", ")) else "" end)

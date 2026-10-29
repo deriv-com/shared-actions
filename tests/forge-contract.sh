@@ -256,6 +256,8 @@ check 'grep -q "dstp_error=" "$WF" && grep -q "DSTP_ERROR:" "$WF"' \
   "a scrubbed dstp_error output reaches Report"
 check 'grep -q "conflict_resolution=" "$WF" && grep -q "CONFLICT_RESOLUTION:" "$WF"' \
   "the conflict_resolution JSON reaches Report"
+check 'grep -q "resolved locally — not pushed" "$WF" && grep -q "resolved and merged" "$WF"' \
+  "Report keys the pushed wording to merge_sha, present only after a push"
 check 'grep -q "dstp stopped (" "$WF"' \
   "a stopped status (conflict/verify-failed/unpushable) is reported, never handled"
 check 'grep -q "tee /tmp/forge.log || rc=\$?" "$WF" && grep -q "read_revise_result /tmp/forge.log || return 1" "$WF"' \
