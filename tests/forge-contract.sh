@@ -595,7 +595,6 @@ body_arg() { local a; for a in "$@"; do case "$a" in body=*) printf '%s' "${a#bo
 case "$args" in
   "api repos/o/r/actions/runs/"*) date -u +%Y-%m-%dT%H:%M:%SZ ;;
   *closedByPullRequestsReferences*) echo "https://github.com/o/r/pull/7" ;;
-  *minimizeComment*) echo '{}' ;;
   *resolveReviewThread*|*unresolveReviewThread*) echo "$args" >> "$S/resolved.log"; echo '{}' ;;
   *reviewThreads*)
     if [ -f "$S/threads_error" ]; then cat "$S/threads_error"; echo "gh: GraphQL error" >&2; exit 1; fi
