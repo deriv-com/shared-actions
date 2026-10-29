@@ -53,7 +53,8 @@ jobs:
         with:
           repository: deriv-com/shared-actions
           pr_number: "181"
-          api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: glm-5.3
+          api_key: ${{ secrets.LLM_API_KEY }}
 
       - name: Show the review the retry produced
         run: |
