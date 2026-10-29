@@ -1034,7 +1034,7 @@ jobs:
               if [ "$snap" = "[]" ]; then
                 pending='[{"name":"(no checks reported yet)","state":"not started"}]'
               else
-                pending=$(printf '%s' "$snap" | jq -c '[.[] | select(.state == "queued" or .state == "running") | {name, state}]')
+                pending=$(printf '%s' "$snap" | jq -c '[.[] | select(.state == "queued" or .state == "running") | {name, state}]' 2>/dev/null) || pending='[{"name":"(check snapshot unreadable)","state":"unknown"}]'
               fi
               SETTLE_PENDING="$pending"
               [ "$pending" = "[]" ] && return 0
