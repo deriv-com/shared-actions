@@ -1,0 +1,62 @@
+name: Anthropic retry live test (SCRATCH)
+
+# SCRATCH ONLY — exists solely on test/anthropic-retry-live-181 to prove the
+# Anthropic engine's recover -> guard-log reset -> retry -> recover -> verify
+# path runs end to end (shared-actions#181, Ako re-review nit). Attempt 1 is
+# sabotaged on this branch to end without writing the review. Never merge.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  live-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Prepare scratch review inputs
+        run: |
+          cat > /tmp/review_context.md <<'EOF'
+          # Review context (scratch live test)
+
+          Review the trivial documentation change in the pre-fetched diff at
+          /tmp/pr_diff.txt. There is no other code to inspect beyond this
+          checkout if you need it.
+
+          Required output format for the review file:
+          - Start with a "## Summary" section of at least eighty words
+            describing the change and why it is safe.
+          - End with exactly one line: **Recommendation:** APPROVE
+          EOF
+          cat > /tmp/pr_diff.txt <<'EOF'
+          diff --git a/README.md b/README.md
+          --- a/README.md
+          +++ b/README.md
+          @@ -1,1 +1,1 @@
+          -Shared GitHub Actions and workflows.
+          +Shared GitHub Actions and reusable workflows.
+          EOF
+
+      - name: Run Anthropic engine (local scratch-branch copy)
+        id: engine
+        uses: ./.github/actions/ai_review_engine_anthropic
+        with:
+          repository: deriv-com/shared-actions
+          pr_number: "181"
+          api_key: ${{ secrets.LLM_API_KEY }}
+
+      - name: Show the review the retry produced
+        run: |
+          echo "engine output_path: ${{ steps.engine.outputs.output_path }}"
+          echo "--- review file ---"
+          cat /tmp/ai_review_output.txt
