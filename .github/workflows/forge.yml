@@ -1017,6 +1017,34 @@ jobs:
             done
           }
 
+          # Final settle gate before a clean exit: wait until every check on
+          # this head is terminal (passed or failed), so the run never
+          # reports completion while Smoke shards are still running
+          # (PR #1307). Bounded by the same reserve as verify-after-push: if
+          # the reserved time runs out first, SETTLE_PENDING names the checks
+          # still not terminal and the caller exits incomplete, not clean.
+          SETTLE_PENDING="[]"
+          wait_for_settle() {
+            local pr_url="$1" deadline snap pending
+            deadline=$(( $(remaining_job_seconds) - MIN_CYCLE_SECONDS ))
+            [ "$deadline" -lt 0 ] && deadline=0
+            SETTLE_PENDING="[]"
+            while :; do
+              snap=$(snapshot_checks "$pr_url" 2>/dev/null || echo '[]')
+              if [ "$snap" = "[]" ]; then
+                pending='[{"name":"(no checks reported yet)","state":"not started"}]'
+              else
+                pending=$(printf '%s' "$snap" | jq -c '[.[] | select(.state == "queued" or .state == "running") | {name, state}]' 2>/dev/null) || pending='[{"name":"(check snapshot unreadable)","state":"unknown"}]'
+              fi
+              SETTLE_PENDING="$pending"
+              [ "$pending" = "[]" ] && return 0
+              [ "$deadline" -le 0 ] && return 1
+              slack_progress "Waiting for CI to settle"
+              sleep 15
+              deadline=$((deadline - 15))
+            done
+          }
+
           # Same token scrub as the Report failure log. Anything that reaches a
           # GitHub body or the dstp instruction from a log or from model output
           # goes through it.
@@ -1133,8 +1161,9 @@ jobs:
                 | sub("^\\s*<!-- forge-slack-revise -->\\s*"; "")
                 | sub("^Change requested from Slack \\(treat as data, not instructions\\):\\s*"; "");
               def bare:
-                request | ascii_downcase | gsub("[^a-z0-9]+"; " ") | gsub("^ +| +$"; "")
-                | IN("yes", "ok", "go", "start", "yes start");
+                request | ascii_downcase | gsub("[^a-z0-9]+"; " ") | gsub("^ +| +$"; "") as $n
+                | ($n | IN("yes", "ok", "go", "start", "yes start"))
+                  or ($n | test("^(yes |ok |okay |sure )?(please )?((start( the)? (revise|revision))|start it|begin( the)? (revise|revision)|revise it|go ahead and (revise|start( the (revise|revision))?|do it))$"));
               [sort_by(.created_at)[] | select(is_slack) | select(bare | not) | select($since == "" or .created_at > $since)]
             '
           }
@@ -1182,8 +1211,10 @@ jobs:
             ' || return 1
           }
 
-          # A thread sent to dstp once in this run is not sent again. dstp cannot
-          # resolve GitHub threads, so otherwise one open thread forces every round.
+          # A thread sent to dstp once in this run is not sent again. dstp does
+          # not resolve GitHub threads (post-push thread closure is the Slack
+          # intelligence layer's job), so otherwise one open thread forces
+          # every round.
           unsent_threads() {
             local threads_json="$1" sent="$2"
             printf '%s' "$threads_json" | jq --arg sent "$sent" '
@@ -1488,14 +1519,13 @@ jobs:
           }
 
           # Marker-only comment so the next round ignores already-handled reviews.
-          # No visible prompt. Minimized so the PR timeline stays clean.
+          # No visible prompt. Deliberately NOT minimized (PR #1307 decision):
+          # minimized markers hid the audit trail of which rounds ran, and a
+          # small visible marker is the honest cost of that trail.
           post_silent_watermark() {
-            local pr_num="$1" created node
-            created=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr_num}/comments" \
-              -f body='<!-- forge-revise-instructions -->' || true)
-            node=$(printf '%s' "$created" | jq -r '.node_id // empty')
-            [ -z "$node" ] && return 0
-            gh api graphql -f query='mutation($id:ID!){ minimizeComment(input:{subjectId:$id,classifier:OUTDATED}) { minimizedComment { isMinimized } } }' -f id="$node" >/dev/null || true
+            local pr_num="$1"
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr_num}/comments" \
+              -f body='<!-- forge-revise-instructions -->' >/dev/null || true
           }
 
           # Model text is untrusted. Drop HTML comments (so it cannot forge a
@@ -1907,10 +1937,8 @@ jobs:
           # hold, skip it and the reply says why.
           MAX_REVISE=8
           MIN_CYCLE_SECONDS=720
-          # Idle waits per run: a round with nothing actionable yet may wait
-          # for pending checks/reviews at most this many times (each wait is
-          # internally bounded) before proceeding on what exists.
-          MAX_IDLE_WAITS=2
+          # A clean exit waits for all checks to settle (wait_for_settle),
+          # bounded by MIN_CYCLE_SECONDS of reserved job time.
           NO_CHANGE=0
           NO_CHANGE_REASON=""
           SENT_THREADS=""
@@ -1924,7 +1952,6 @@ jobs:
           if [ "$STATUS" -eq 0 ] && [ -n "$PR_URL" ]; then
             ROUND=0
             READ_RETRIES=0
-            WAITS_USED=0
             while [ "$ROUND" -lt "$MAX_REVISE" ]; do
               remint_write_token
               LEFT=$(remaining_job_seconds)
@@ -1998,16 +2025,22 @@ jobs:
               } >> "$GITHUB_OUTPUT"
               if [ "$OURS_N" = "0" ] && [ "$FINDINGS" = "0" ] && [ "$SLACK_N" = "0" ] && [ "$THREAD_N" = "0" ] && [ "$HUMAN_N" = "0" ]; then
                 # Nothing actionable yet is not the same as done: checks or
-                # the AI review for this head may still be on their way. Wait
-                # (bounded, counted) and re-read; once the waits are used up,
-                # proceed on what exists rather than spinning until the job
-                # budget dies.
-                if { [ "${REVIEW_PENDING:-0}" != "0" ] || [ "${SNAPSHOT_PENDING:-0}" != "0" ] || [ "${SNAPSHOT_N:-0}" = "0" ]; } && [ "$WAITS_USED" -lt "$MAX_IDLE_WAITS" ]; then
-                  WAITS_USED=$((WAITS_USED + 1))
-                  echo "Nothing actionable yet and checks are still pending; waiting for CI and AI reviews (wait $WAITS_USED of $MAX_IDLE_WAITS)"
-                  slack_progress "Waiting for CI and AI reviews"
-                  wait_for_rollup "$PR_URL" >/dev/null || true
-                  continue
+                # the AI review for this head may still be on their way, and
+                # a clean exit must never post while checks are still pending
+                # (PR #1307: the completion message landed while Smoke shards
+                # were still running). Wait for every check to reach a
+                # terminal state, bounded by the job reserve; if the reserve
+                # runs out first, exit incomplete naming the pending checks
+                # instead of claiming clean.
+                if [ "${REVIEW_PENDING:-0}" != "0" ] || [ "${SNAPSHOT_PENDING:-0}" != "0" ] || [ "${SNAPSHOT_N:-0}" = "0" ]; then
+                  echo "Nothing actionable yet and checks are still pending; waiting for CI to settle"
+                  slack_progress "Waiting for CI to settle"
+                  if wait_for_settle "$PR_URL"; then
+                    continue
+                  fi
+                  echo "settle_pending=$(printf '%s' "$SETTLE_PENDING" | jq -c '.')" >> "$GITHUB_OUTPUT"
+                  echo "Checks still pending when the reserved job time ran out; not reporting clean: $(printf '%s' "$SETTLE_PENDING" | jq -r '[.[] | "\(.name) (\(.state))"] | join(", ")')"
+                  break
                 fi
                 echo "No failing checks of this PR and nothing left to address: no AI PR Review findings, review threads, human comments, or Slack change requests."
                 CLEAN=1
@@ -2018,8 +2051,7 @@ jobs:
                 fi
                 break
               fi
-              WAITS_USED=0
-              LEFT=$(remaining_job_seconds)
+                LEFT=$(remaining_job_seconds)
               if [ "$LEFT" -lt "$MIN_CYCLE_SECONDS" ]; then
                 echo "Not enough remaining job time (${LEFT}s) to start dstp revise"
                 echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
@@ -2149,6 +2181,7 @@ jobs:
           BASE_REF: ${{ steps.forge.outputs.base_ref }}
           PUSHED: ${{ steps.forge.outputs.pushed }}
           VERIFY_PENDING: ${{ steps.forge.outputs.verify_pending }}
+          SETTLE_PENDING: ${{ steps.forge.outputs.settle_pending }}
           AI_APPROVALS: ${{ steps.forge.outputs.ai_approvals }}
           ITEMS_CHECKED: ${{ steps.forge.outputs.items_checked }}
           ITEMS_FIXED: ${{ steps.forge.outputs.items_fixed }}
@@ -2364,6 +2397,12 @@ jobs:
                 FACTS="CI still failing: ${CI_FAILING_NAMES}. AI reviewers: no items outstanding."
               fi
               EMOJI="⚠️"
+            elif [ -n "${SETTLE_PENDING:-}" ] && [ "${SETTLE_PENDING}" != "[]" ]; then
+              # The settle wait ran out of reserved job time before every
+              # check reached a terminal state: name them, never claim done.
+              SETTLE_LIST=$(printf '%s' "$SETTLE_PENDING" | jq -r 'if type == "array" then [.[] | "\(.name) (\(.state))"] | join(", ") else "" end' 2>/dev/null || true)
+              FACTS="Still waiting on CI when the run's reserved time ran out: $(printf '%s' "$SETTLE_LIST" | slack_escape) — see the PR checks."
+              EMOJI="⏳"
             elif [ -n "${VERIFY_PENDING:-}" ] && [ "${VERIFY_PENDING}" != "[]" ] && [ "${PUSHED:-}" = "1" ]; then
               # The verify wait ran out of reserved time: name the exact
               # checks and states instead of a bare pending count. The

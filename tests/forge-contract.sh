@@ -259,10 +259,14 @@ check 'grep -q "test(\"<!-- deriv-pr-review-\")" "$WF"' \
   "findings match every deriv-pr-review- engine, not a hardcoded pair"
 check 'grep -q "test(\"<!-- deriv-pr-review-progress-\") | not" "$WF"' \
   "progress markers are not treated as review findings"
-check 'grep -q "minimizeComment" "$WF"' \
-  "the watermark comment is minimized"
+check '! grep -q "minimizeComment" "$WF"' \
+  "the watermark comment is NOT minimized (stays visible as the rounds audit trail)"
 check 'grep -q "body='\''<!-- forge-revise-instructions -->'\''" "$WF"' \
   "watermark body is the HTML marker only"
+check 'grep -q "wait_for_settle" "$WF" && ! grep -q "MAX_IDLE_WAITS" "$WF"' \
+  "clean exit waits for all checks to settle instead of breaking after idle waits"
+check 'grep -q "settle_pending" "$WF"' \
+  "reserve-exhausted settle names the still-pending checks instead of reporting clean"
 check 'grep -q "slack_progress" "$WF"' \
   "Slack progress updates a living message"
 check 'grep -q "chat.update" "$WF"' \
@@ -492,7 +496,7 @@ for b in bad:
     print("UNBALANCED: " + b)
 PY
 )
-check '[ "$(printf "%s\n" "$QUERY_REPORT" | head -1)" -ge 3 ]' \
+check '[ "$(printf "%s\n" "$QUERY_REPORT" | head -1)" -ge 2 ]' \
   "found the workflow's GraphQL queries"
 check '! printf "%s\n" "$QUERY_REPORT" | grep -q UNBALANCED' \
   "every GraphQL query has balanced braces and parentheses"
@@ -591,7 +595,6 @@ body_arg() { local a; for a in "$@"; do case "$a" in body=*) printf '%s' "${a#bo
 case "$args" in
   "api repos/o/r/actions/runs/"*) date -u +%Y-%m-%dT%H:%M:%SZ ;;
   *closedByPullRequestsReferences*) echo "https://github.com/o/r/pull/7" ;;
-  *minimizeComment*) echo '{}' ;;
   *resolveReviewThread*|*unresolveReviewThread*) echo "$args" >> "$S/resolved.log"; echo '{}' ;;
   *reviewThreads*)
     if [ -f "$S/threads_error" ]; then cat "$S/threads_error"; echo "gh: GraphQL error" >&2; exit 1; fi
