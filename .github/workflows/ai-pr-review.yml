@@ -884,6 +884,10 @@ jobs:
           HAS_PREVIOUS: ${{ steps.previous-review.outputs.has_previous }}
           HAS_ACKNOWLEDGED: ${{ steps.acknowledged.outputs.has_acknowledged }}
           LAST_REVIEWED_SHA: ${{ steps.previous-review.outputs.last_reviewed_sha }}
+          # For the compare API calls that find the PR's merge-base with the
+          # base branch (incremental diff). Nothing in this step runs PR code.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
@@ -920,14 +924,73 @@ jobs:
           # NOISE_PATTERN alone) it would remove those files from review
           # entirely.
           INCREMENTAL_NOISE_PATTERN="${NOISE_PATTERN}"'|\.spec\.(tsx?|jsx?)|/__tests__/|\.scss$|\.md$'
+
+          # Merge-base of $1 with the base branch, from the compare API: the
+          # checkout is shallow and has no base ref, so git cannot work it out
+          # locally. Prints nothing when the API fails or answers oddly.
+          base_merge_base() {
+            local mb
+            mb=$(gh api "repos/${REPO}/compare/${BASE_SHA}...$1" --jq '.merge_base_commit.sha' 2>/dev/null) || return 0
+            [[ "$mb" =~ ^[0-9a-f]{40}$ ]] && printf '%s' "$mb"
+            return 0
+          }
+
+          # The PR's own changes from the last reviewed commit ($1) to HEAD.
+          # $2 and $3 are the PR's merge-base with the base branch at the last
+          # review and now (empty when unknown). A plain `$1..HEAD` diff also
+          # carries every base-branch commit the PR merged in since the last
+          # review, and a follow-up then reviews the base branch's code as if
+          # this PR had written it. So when the merge-base moved, the last
+          # reviewed commit is replayed onto the new merge-base with
+          # merge-tree, and HEAD is diffed against that. If the replay
+          # conflicts or the old merge-base is missing from the shallow
+          # checkout, the diff is cut down to the files the PR changes. If
+          # the new merge-base is missing, neither is possible and the plain
+          # diff is used, with a scope that makes the context warn the model.
+          # Sets INCREMENTAL_SCOPE to plain, replayed, pr-files, or unfiltered.
+          pr_incremental_diff() {
+            local last=$1 old_mb=$2 new_mb=$3 tree f files=()
+            INCREMENTAL_SCOPE=plain
+            if [[ -z "$old_mb" || -z "$new_mb" || "$old_mb" == "$new_mb" ]]; then
+              git diff "$last" HEAD
+              return
+            fi
+            if ! git cat-file -e "${new_mb}^{commit}" 2>/dev/null; then
+              INCREMENTAL_SCOPE=unfiltered
+              git diff "$last" HEAD
+              return
+            fi
+            if git cat-file -e "${old_mb}^{commit}" 2>/dev/null \
+              && tree=$(git merge-tree --write-tree --merge-base="$old_mb" "$last" "$new_mb" 2>/dev/null); then
+              INCREMENTAL_SCOPE=replayed
+              git diff "${tree%%$'\n'*}" HEAD
+              return
+            fi
+            INCREMENTAL_SCOPE=pr-files
+            while IFS= read -r -d '' f; do files+=("$f"); done < <(git diff --name-only --no-renames -z "$new_mb" HEAD)
+            if (( ${#files[@]} > 0 )); then
+              git --literal-pathspecs diff "$last" HEAD -- "${files[@]}"
+            fi
+          }
+
           echo "" > /tmp/incremental_diff.txt
+          INCREMENTAL_SCOPE=plain
           if [[ "$HAS_PREVIOUS" == "true" && -n "$LAST_REVIEWED_SHA" ]]; then
             echo "📋 Generating incremental diff since last reviewed commit: $LAST_REVIEWED_SHA"
             if git cat-file -e "$LAST_REVIEWED_SHA" 2>/dev/null; then
-              git diff "$LAST_REVIEWED_SHA"..HEAD | awk -v noise="$INCREMENTAL_NOISE_PATTERN" '
+              OLD_MERGE_BASE=$(base_merge_base "$LAST_REVIEWED_SHA")
+              NEW_MERGE_BASE=$(base_merge_base "$CURRENT_SHA")
+              echo "📋 Merge-base with the base branch: last review ${OLD_MERGE_BASE:-unknown}, now ${NEW_MERGE_BASE:-unknown}"
+              # Not piped: a pipeline would run the function in a subshell
+              # and lose INCREMENTAL_SCOPE. `|| echo` keeps a git failure
+              # non-fatal under bash -e, as the old `git diff | awk` was.
+              pr_incremental_diff "$LAST_REVIEWED_SHA" "$OLD_MERGE_BASE" "$NEW_MERGE_BASE" > /tmp/incremental_raw.txt \
+                || echo "⚠️ git diff failed; the incremental diff may be incomplete"
+              echo "📋 Incremental diff scope: $INCREMENTAL_SCOPE"
+              awk -v noise="$INCREMENTAL_NOISE_PATTERN" '
                 /^diff --git / { in_noise = ($0 ~ noise); if (!in_noise) print; next }
                 !in_noise { print }
-              ' > /tmp/incremental_diff.txt
+              ' /tmp/incremental_raw.txt > /tmp/incremental_diff.txt
               [ -s /tmp/incremental_diff.txt ] && echo "✅ Incremental diff generated" || echo "ℹ️ No changes since last reviewed commit"
             else
               echo "⚠️ Last reviewed commit $LAST_REVIEWED_SHA not found in history (fetch-depth may be too shallow)"
@@ -972,6 +1035,11 @@ jobs:
                 echo "---INCREMENTAL_DIFF---"
                 echo "The following diff shows ONLY the changes made since the last review. Use this to confirm what was explicitly fixed."
                 echo "If a pattern appears on a \`-\` line here it was removed. If it does not appear here at all, that means nothing: open the file."
+                case "$INCREMENTAL_SCOPE" in
+                  replayed) echo "The branch merged its base branch since the last review. Changes that came in with that merge are left out of this diff. They are not part of this PR." ;;
+                  pr-files) echo "The branch merged its base branch since the last review, so this diff is limited to files this PR changes. Hunks in those files can still come from the base branch. A hunk that does not appear in $PR_DIFF_FILE came from the base branch: do not report it as a new defect." ;;
+                  unfiltered) echo "The branch merged its base branch since the last review, and this diff could not be narrowed, so it can include base-branch changes. A hunk that does not appear in $PR_DIFF_FILE came from the base branch: do not report it as a new defect." ;;
+                esac
                 echo '```diff'
                 cat /tmp/incremental_diff.txt
                 echo '```'
