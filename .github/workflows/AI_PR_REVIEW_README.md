@@ -737,8 +737,10 @@ asserts all of it.
    (the PR's merge-base, read from the compare API, moved), the last reviewed
    commit is replayed onto the new merge-base with `git merge-tree` and HEAD
    is diffed against that, so base-branch commits are not presented as new PR
-   code. If that replay conflicts or the shallow checkout lacks a commit, the
-   diff is limited to the files the PR changes and the context says so.
+   code. If that replay conflicts or the shallow checkout lacks the old
+   merge-base, the diff is limited to the files the PR changes. If it lacks
+   the new merge-base, the plain diff is used. In both cases the context tells
+   the model that a hunk missing from the PR diff came from the base branch.
 9. **Pre-fetch the diff** to `/tmp/pr_diff.txt` with the trusted token (so the
    engine needs no shell), filtered for build noise only — lockfiles and
    generated output, never test or doc files, which the review must see.

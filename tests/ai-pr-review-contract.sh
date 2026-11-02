@@ -764,7 +764,8 @@ CTX_CODE="$(grep -vE '^[[:space:]]*#' <<< "$CTX_BODY")"
 check '! grep -qF "git diff \"\$LAST_REVIEWED_SHA\"..HEAD" <<< "$CTX_CODE"' "incremental diff is no longer a plain last-reviewed..HEAD diff"
 check 'grep -qF "pr_incremental_diff \"\$LAST_REVIEWED_SHA\" \"\$OLD_MERGE_BASE\" \"\$NEW_MERGE_BASE\"" <<< "$CTX_CODE"' "build-context computes the incremental diff with pr_incremental_diff"
 check 'grep -qF "compare/\${BASE_SHA}...\$1" <<< "$CTX_CODE" && grep -qF "BASE_SHA: \${{ github.event.pull_request.base.sha }}" <<< "$CTX_BODY"' "merge-bases come from the compare API against the event's base.sha"
-check 'grep -qF "replayed)" <<< "$CTX_CODE" && grep -qF "pr-files)" <<< "$CTX_CODE"' "context tells the model when base-branch changes were left out"
+check 'grep -qF "replayed)" <<< "$CTX_CODE" && grep -qF "pr-files)" <<< "$CTX_CODE" && grep -qF "unfiltered)" <<< "$CTX_CODE"' "context tells the model when base-branch changes were left out or may remain"
+check '[[ $(grep -cF "A hunk that does not appear in \$PR_DIFF_FILE came from the base branch" <<< "$CTX_CODE") -eq 2 ]]' "pr-files and unfiltered notes point the model at the PR diff file"
 check 'grep -q "replayed onto the new merge-base" "$README"' "README documents the base-merge replay"
 INCR_FN="$(awk '/^          pr_incremental_diff\(\) \{/{f=1} f{print} f && /^          \}$/{exit}' <<< "$CTX_BODY" | sed 's/^          //')"
 check '[[ -n "$INCR_FN" ]]' "pr_incremental_diff is extractable"
@@ -781,7 +782,7 @@ INCR_TMP=$(mktemp -d)
   git checkout -q -b pr2 mb_old; printf 'a\nPR-C1\n' > pr.txt; git commit -qam c1; git tag last2
   git checkout -q -b main2 mb_old; printf 'a\nBASE-C\n' > pr.txt; printf 'x\nBASE-C-ONLY\n' > base.txt; git commit -qam basec; git tag mb_new2
   git checkout -q pr2; git merge -q --no-edit mb_new2 || true; printf 'a\nPR-C1\nBASE-C\nPR-C2\n' > pr.txt
-  git add -A && git commit -qm "resolve + pr c2"; git tag tip2
+  git mv both.txt renamed.txt; git add -A && git commit -qm "resolve + pr c2 + rename"; git tag tip2
 ) >/dev/null 2>&1
 incr() { (cd "$INCR_TMP" && git checkout -q "$1" && eval "$INCR_FN" && pr_incremental_diff "${@:2}" > out.diff && printf '%s' "$INCREMENTAL_SCOPE"); }
 rev() { git -C "$INCR_TMP" rev-parse "$1"; }
@@ -789,7 +790,9 @@ check '[[ "$(incr tip "$(rev last)" "$(rev mb_old)" "$(rev mb_new)")" == replaye
 check '[[ "$(incr tip "$(rev last)" "$(rev mb_old)" "$(rev mb_old)")" == plain ]] && [[ "$(cat "$INCR_TMP/out.diff")" == "$(git -C "$INCR_TMP" diff "$(rev last)" "$(rev tip)")" ]]' "with an unmoved merge-base the incremental diff is the plain last..HEAD diff"
 check '[[ "$(incr tip "$(rev last)" "" "")" == plain ]]' "unknown merge-bases fall back to the plain diff"
 check '[[ "$(incr tip2 "$(rev last2)" "$(rev mb_old)" "$(rev mb_new2)")" == pr-files ]] && grep -q "^+PR-C2" "$INCR_TMP/out.diff" && ! grep -q "BASE-C-ONLY" "$INCR_TMP/out.diff"' "a conflicting base merge falls back to the PR's files, still without base-only files"
+check '[[ "$(incr tip2 "$(rev last2)" "$(rev mb_old)" "$(rev mb_new2)")" == pr-files ]] && grep -q "both.txt" "$INCR_TMP/out.diff" && grep -q "renamed.txt" "$INCR_TMP/out.diff"' "in the pr-files fallback a rename keeps its old path"
 check '[[ "$(incr tip "$(rev last)" "0123456789abcdef0123456789abcdef01234567" "$(rev mb_new)")" == pr-files ]] && grep -q "^+PR-TWO" "$INCR_TMP/out.diff" && ! grep -q "BASE-ONLY" "$INCR_TMP/out.diff"' "an old merge-base missing from the shallow checkout falls back to the PR's files"
+check '[[ "$(incr tip "$(rev last)" "$(rev mb_old)" "0123456789abcdef0123456789abcdef01234567")" == unfiltered ]] && [[ "$(cat "$INCR_TMP/out.diff")" == "$(git -C "$INCR_TMP" diff "$(rev last)" "$(rev tip)")" ]]' "a new merge-base missing from the shallow checkout gives the plain diff under the unfiltered scope"
 rm -rf "$INCR_TMP"
 
 if [[ "$fail" -ne 0 ]]; then

@@ -943,14 +943,20 @@ jobs:
           # this PR had written it. So when the merge-base moved, the last
           # reviewed commit is replayed onto the new merge-base with
           # merge-tree, and HEAD is diffed against that. If the replay
-          # conflicts or an object is missing from the shallow checkout, the
-          # diff is cut down to the files the PR changes. Sets
-          # INCREMENTAL_SCOPE to plain, replayed, or pr-files.
+          # conflicts or the old merge-base is missing from the shallow
+          # checkout, the diff is cut down to the files the PR changes. If
+          # the new merge-base is missing, neither is possible and the plain
+          # diff is used, with a scope that makes the context warn the model.
+          # Sets INCREMENTAL_SCOPE to plain, replayed, pr-files, or unfiltered.
           pr_incremental_diff() {
             local last=$1 old_mb=$2 new_mb=$3 tree f files=()
             INCREMENTAL_SCOPE=plain
-            if [[ -z "$old_mb" || -z "$new_mb" || "$old_mb" == "$new_mb" ]] \
-              || ! git cat-file -e "${new_mb}^{commit}" 2>/dev/null; then
+            if [[ -z "$old_mb" || -z "$new_mb" || "$old_mb" == "$new_mb" ]]; then
+              git diff "$last" HEAD
+              return
+            fi
+            if ! git cat-file -e "${new_mb}^{commit}" 2>/dev/null; then
+              INCREMENTAL_SCOPE=unfiltered
               git diff "$last" HEAD
               return
             fi
@@ -961,7 +967,7 @@ jobs:
               return
             fi
             INCREMENTAL_SCOPE=pr-files
-            while IFS= read -r -d '' f; do files+=("$f"); done < <(git diff --name-only -z "$new_mb" HEAD)
+            while IFS= read -r -d '' f; do files+=("$f"); done < <(git diff --name-only --no-renames -z "$new_mb" HEAD)
             if (( ${#files[@]} > 0 )); then
               git --literal-pathspecs diff "$last" HEAD -- "${files[@]}"
             fi
@@ -1031,7 +1037,8 @@ jobs:
                 echo "If a pattern appears on a \`-\` line here it was removed. If it does not appear here at all, that means nothing: open the file."
                 case "$INCREMENTAL_SCOPE" in
                   replayed) echo "The branch merged its base branch since the last review. Changes that came in with that merge are left out of this diff. They are not part of this PR." ;;
-                  pr-files) echo "The branch merged its base branch since the last review. This diff is limited to files this PR changes, but hunks in those files can still come from the base branch. Judge them against the PR diff, not as new PR code." ;;
+                  pr-files) echo "The branch merged its base branch since the last review, so this diff is limited to files this PR changes. Hunks in those files can still come from the base branch. A hunk that does not appear in $PR_DIFF_FILE came from the base branch: do not report it as a new defect." ;;
+                  unfiltered) echo "The branch merged its base branch since the last review, and this diff could not be narrowed, so it can include base-branch changes. A hunk that does not appear in $PR_DIFF_FILE came from the base branch: do not report it as a new defect." ;;
                 esac
                 echo '```diff'
                 cat /tmp/incremental_diff.txt
