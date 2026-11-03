@@ -51,8 +51,8 @@ jobs:
       # cannot silently alter what this repo runs — which matters more here than
       # anywhere, since this is where those defaults are edited.
       engine: kimi
-      # LiteLLM proxy alias for Kimi K3.1 Pro. The Kimi-platform id `k3` resolves only at
-      # api.kimi.com/coding/v1 and the proxy answers it with a bare 400.
+      # LiteLLM proxy alias for Kimi K3.1 Pro. Kimi-platform ids such as K3's `k3`
+      # resolve only at api.kimi.com/coding/v1 and the proxy answers them with a bare 400.
       model: kimi-k3.1-pro
       # Wire dialect. Must match what base_url serves: the proxy serves plain
       # /v1/chat/completions, which is `openai`. `kimi` targets the Kimi Code

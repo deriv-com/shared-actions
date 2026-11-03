@@ -98,8 +98,8 @@ succeeds. **Change these two inputs together, never one alone.** Valid types:
 
 **Model names belong to the endpoint, not the model.** `model` is passed through
 verbatim, so it must be whatever the thing in `base_url` calls it. On the Deriv
-LiteLLM proxy Kimi K3.1 Pro is `kimi-k3.1-pro`; the Kimi-platform ids (`k3`, `k3-256k`,
-`kimi-for-coding`) resolve only against `api.kimi.com/coding/v1` and return a
+LiteLLM proxy Kimi K3.1 Pro is `kimi-k3.1-pro`; Kimi-platform ids (such as K3's `k3` and
+`k3-256k`, or `kimi-for-coding`) resolve only against `api.kimi.com/coding/v1` and return a
 bare `400 The request was invalid` from the proxy. List what a proxy accepts:
 
 ```bash
