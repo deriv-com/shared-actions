@@ -52,7 +52,7 @@ inputs:
     description: "API key for base_url. Composite actions cannot read the secrets context, so the caller must pass this explicitly. Mapped to XAI_API_KEY in the run step env and never written to disk."
     required: true
   max_context_size:
-    description: "Maximum context window in tokens. Must not exceed what the endpoint allows for the selected model, or the CLI over-packs context and the request is rejected. grok-4.6 input window is 500000. If a 400 persists after confirming the model name, try lowering this. Maps to [model.review].context_window."
+    description: "Maximum context window in tokens. Must not exceed what the endpoint allows for the selected model, or the CLI over-packs context and the request is rejected. grok-4.7 input window is 500000. If a 400 persists after confirming the model name, try lowering this. Maps to [model.review].context_window."
     required: false
     default: "500000"
   cli_version:

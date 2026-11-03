@@ -55,7 +55,7 @@ on:
         default: ""
         type: string
       max_context_size:
-        description: "[engine-specific: kimi, grok] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; grok-4.6 is 500000; the 256k Kimi variants are 262144. Empty resolves per engine. Ignored when engine is `anthropic`, `codex` or `muse`."
+        description: "[engine-specific: kimi, grok] Maximum context window in tokens. Must not exceed the window the endpoint actually allows for the selected model, or the CLI over-packs context and the request is rejected. K3 is 1048576; grok-4.7 is 500000; the 256k Kimi variants are 262144. Empty resolves per engine. Ignored when engine is `anthropic`, `codex` or `muse`."
         required: false
         default: ""
         type: string
@@ -320,7 +320,7 @@ jobs:
               ;;
             grok)
               # LiteLLM alias for Grok 4.7. Context is the 500k input window
-              # advertised for grok-4.6 — 1M over-packs and the proxy 400s.
+              # advertised for grok-4.7 — 1M over-packs and the proxy 400s.
               DEFAULT_MODEL="grok-4.7"
               METRICS_AGENT="grok_review"
               ARTIFACT_PREFIX="grok-review"
