@@ -1,0 +1,21 @@
+# THROWAWAY: smoke test for the grok-4.7 default from PR #186. Do not merge.
+# Runs on pull_request so the PR's own copy of this file and of
+# ai-pr-review.yml are used. `model` is left unset on purpose so the run
+# exercises the new grok DEFAULT_MODEL in the resolve step.
+name: Grok 4.7 smoke
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  grok-smoke:
+    uses: ./.github/workflows/ai-pr-review.yml
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    with:
+      engine: grok
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
