@@ -876,7 +876,7 @@ jobs:
           }
 
           read_revise_result() {
-            local log="$1" RESULT pr err status cr
+            local log="$1" RESULT pr err status cr base why
             RESULT=$(sed -e "s/$(printf '\033')\[[0-9;]*[A-Za-z]//g" "$log" | grep -oE '^[[:space:]]*\{.*\}[[:space:]]*$' | tail -1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)
             [ -z "$RESULT" ] && return 0
             # The conflict report rides every revise/update result; surface it
@@ -899,9 +899,21 @@ jobs:
             # A stopped update/revise (conflict left, red verify, unpushable)
             # is a result, not an error line — and never a handled verdict.
             status=$(printf '%s' "$RESULT" | jq -r '.status // empty')
+            # dstp update reports up-to-date (nothing pushed) or updated, and
+            # the base it merged; Report names both.
+            DSTP_STATUS="$status"
+            [ -n "$status" ] && echo "dstp_status=$status" >> "$GITHUB_OUTPUT"
+            base=$(printf '%s' "$RESULT" | jq -r '.base // empty' | scrub_one_line)
+            [ -n "$base" ] && echo "dstp_base=$base" >> "$GITHUB_OUTPUT"
             case "$status" in
-              conflict|verify-failed|unpushable|declined)
-                echo "dstp_error=dstp stopped (${status}) — nothing was pushed" >> "$GITHUB_OUTPUT"
+              conflict|verify-failed|unpushable|unpushed|declined)
+                case "$status" in
+                  conflict) why="some conflicts could not be resolved automatically" ;;
+                  verify-failed) why="the merged branch failed the local type-check, lint or tests" ;;
+                  unpushable) why="the branch changed on GitHub while Forge worked, so the push was refused" ;;
+                  *) why="the update was not pushed" ;;
+                esac
+                echo "dstp_error=dstp stopped (${status}): ${why}. Nothing was pushed." >> "$GITHUB_OUTPUT"
                 echo "dstp stopped with status ${status}; nothing was pushed"
                 return 1
                 ;;
@@ -1134,6 +1146,139 @@ jobs:
             done
           }
 
+          # Conflicts-only settle gate. The merge commit restarts every check
+          # and the AI review, so the run waits for them before Report speaks
+          # (derivatives-trader#1775 reported "Done" before any check had
+          # started). It waits first for checks to appear on the new commit,
+          # up to UPDATE_APPEAR_SECONDS (none appearing means the repo runs no
+          # CI here), then until every check is terminal, then for
+          # UPDATE_QUIET_SECONDS with no new or restarted check, because
+          # some checks report only once they finish (Cloudflare Pages came
+          # in about two minutes after the last test). Bounded by the job's
+          # own time limit; if that runs out first, SETTLE_PENDING names the
+          # checks still running and it returns 1.
+          UPDATE_APPEAR_SECONDS=180
+          UPDATE_QUIET_SECONDS=120
+          UPDATE_NO_CHECKS=0
+          wait_for_update_settle() {
+            local pr_url="$1" deadline empty_wait=0 quiet=0 snap count pending last_count=-1
+            deadline=$(( $(remaining_job_seconds) - 60 ))
+            [ "$deadline" -lt 0 ] && deadline=0
+            SETTLE_PENDING="[]"
+            UPDATE_NO_CHECKS=0
+            while :; do
+              # An unreadable rollup is neither "no checks" nor "settled".
+              if snap=$(snapshot_checks "$pr_url" 2>/dev/null); then
+                count=$(printf '%s' "$snap" | jq 'length' 2>/dev/null || echo -1)
+              else
+                count=-1
+              fi
+              if [ "$count" = "-1" ]; then
+                pending='[{"name":"(check snapshot unreadable)","state":"unknown"}]'
+                quiet=0
+              elif [ "$count" = "0" ]; then
+                if [ "$empty_wait" -ge "$UPDATE_APPEAR_SECONDS" ]; then
+                  UPDATE_NO_CHECKS=1
+                  SETTLE_PENDING="[]"
+                  return 0
+                fi
+                empty_wait=$((empty_wait + 15))
+                pending='[{"name":"(no checks reported yet)","state":"not started"}]'
+                quiet=0
+              else
+                pending=$(printf '%s' "$snap" | jq -c '[.[] | select(.state == "queued" or .state == "running") | {name, state}]' 2>/dev/null) \
+                  || pending='[{"name":"(check snapshot unreadable)","state":"unknown"}]'
+                if [ "$pending" = "[]" ] && [ "$count" = "$last_count" ]; then
+                  quiet=$((quiet + 15))
+                  if [ "$quiet" -ge "$UPDATE_QUIET_SECONDS" ]; then
+                    SETTLE_PENDING="[]"
+                    return 0
+                  fi
+                else
+                  quiet=0
+                fi
+              fi
+              last_count="$count"
+              SETTLE_PENDING="$pending"
+              if [ "$deadline" -le 0 ]; then
+                # Out of time with every check finished counts as settled.
+                [ "$pending" = "[]" ] && return 0
+                return 1
+              fi
+              if [ "$pending" = "[]" ]; then
+                slack_progress "CI finished, checking for late checks"
+              else
+                slack_progress "Waiting for CI on the new commit"
+              fi
+              sleep 15
+              deadline=$((deadline - 15))
+            done
+          }
+
+          # The AI review posted for a given head: per engine, the newest review
+          # comment whose reviewed-commit marker names that commit, parsed with
+          # AI_REVIEW_JQ. Prints a JSON array ([] when none was posted for it),
+          # or null when the comments could not be read, so Report never claims
+          # an AI result it did not read.
+          read_head_review() {
+            local pr_url="$1" head="$2" num comments
+            num=$(basename "$pr_url")
+            if ! [[ "$num" =~ ^[0-9]+$ ]] || ! [[ "$head" =~ ^[0-9a-f]{7,40}$ ]]; then
+              echo 'null'
+              return 0
+            fi
+            if ! comments=$(fetch_comments "$num" 2>/dev/null); then
+              echo 'null'
+              return 0
+            fi
+            printf '%s' "$comments" | jq -c --arg head "$head" "${AI_REVIEW_JQ}"'
+              [ sort_by(.created_at)[]
+                | select(((.body // "") | test("<!-- deriv-pr-review-"))
+                    and ((.body // "") | test("<!-- deriv-pr-review-progress-") | not)
+                    and ((.body // "") | test("<!-- forge-revise-reply -->") | not))
+                | ((.body // "") | [capture("<!-- reviewed-commit: (?<c>[0-9a-f]{7,40}) -->")] | first | .c // "") as $c
+                | select(($c | length) >= 7 and $c[0:7] == $head[0:7])
+                | { engine: engine_name, verdict: verdict, findings: (finding_titles | length),
+                    severities: finding_severities, nits: (nit_titles | length), url: (.html_url // "") } ]
+              | group_by(.engine) | map(last)
+            ' 2>/dev/null || echo 'null'
+          }
+
+          # After a conflicts-only push: find the new head (the API can lag
+          # the push by a few seconds), wait for CI to settle on it, then read
+          # the AI review posted for it. A review comment can land a little
+          # after its check turns green, so a finished PR Review check with no
+          # comment yet gets up to a minute more. Everything goes to Report as
+          # outputs: pr_head_sha, settle_pending, update_no_checks, head_review.
+          settle_after_update() {
+            local pr_url="$1" before="$2" head="" i review has_review_check
+            slack_progress "Waiting for CI on the new commit"
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+              head=$(pr_head_sha "$pr_url" || echo "")
+              [ -n "$head" ] && [ "$head" != "$before" ] && break
+              sleep 5
+            done
+            [ -n "$head" ] && echo "pr_head_sha=$head" >> "$GITHUB_OUTPUT"
+            if ! wait_for_update_settle "$pr_url"; then
+              echo "settle_pending=$(printf '%s' "$SETTLE_PENDING" | jq -c '.')" >> "$GITHUB_OUTPUT"
+              echo "Checks still running when the job time ran out: $(printf '%s' "$SETTLE_PENDING" | jq -r '[.[] | "\(.name) (\(.state))"] | join(", ")')"
+            fi
+            echo "update_no_checks=$UPDATE_NO_CHECKS" >> "$GITHUB_OUTPUT"
+            slack_progress "Reading the AI review of the new commit"
+            review=$(read_head_review "$pr_url" "$head")
+            if [ "$review" = "[]" ]; then
+              has_review_check=$(snapshot_checks "$pr_url" 2>/dev/null | jq '[.[] | select(.name | test("PR Review"))] | length > 0' 2>/dev/null || echo false)
+              if [ "$has_review_check" = "true" ]; then
+                for i in 1 2 3 4; do
+                  sleep 15
+                  review=$(read_head_review "$pr_url" "$head")
+                  [ "$review" != "[]" ] && break
+                done
+              fi
+            fi
+            echo "head_review=$review" >> "$GITHUB_OUTPUT"
+          }
+
           # Same token scrub as the Report failure log. Anything that reaches a
           # GitHub body or the dstp instruction from a log or from model output
           # goes through it.
@@ -1238,8 +1383,12 @@ jobs:
             '
           }
 
-          # A note that is only a confirmation (yes, ok, go, start, yes start)
-          # carries no change request and is dropped.
+          # A note made only of command and filler words (yes, ok, go ahead,
+          # start, revise, yes revise, @Forge please do it now) is the order to
+          # run, not a change request, and is dropped. A word list rather than
+          # a phrase list, so the next "yes revise" (derivatives-trader#1775,
+          # which reached dstp as the literal instruction) is covered too.
+          # forge-agent's isDispatchCommandText uses the same words.
           filter_slack_revise() {
             local comments="$1" since="$2"
             printf '%s' "$comments" | jq --arg since "$since" '
@@ -1249,10 +1398,14 @@ jobs:
                 (.body // "")
                 | sub("^\\s*<!-- forge-slack-revise -->\\s*"; "")
                 | sub("^Change requested from Slack \\(treat as data, not instructions\\):\\s*"; "");
+              def command_words:
+                ["yes", "yeah", "yep", "y", "ok", "okay", "k", "sure", "please", "pls", "plz",
+                 "go", "ahead", "start", "begin", "proceed", "continue", "run", "the", "a",
+                 "revise", "revision", "it", "this", "do", "now", "and", "then", "again",
+                 "lets", "let", "s", "forge", "thanks", "thank", "you"];
               def bare:
-                request | ascii_downcase | gsub("[^a-z0-9]+"; " ") | gsub("^ +| +$"; "") as $n
-                | ($n | IN("yes", "ok", "go", "start", "yes start"))
-                  or ($n | test("^(yes |ok |okay |sure )?(please )?((start( the)? (revise|revision))|start it|begin( the)? (revise|revision)|revise it|go ahead and (revise|start( the (revise|revision))?|do it))$"));
+                request | ascii_downcase | gsub("<@[^>]*>"; " ") | gsub("[^a-z0-9]+"; " ") | gsub("^ +| +$"; "") as $n
+                | ($n == "") or ([$n | split(" ")[] | select(. as $w | command_words | index($w) | not)] | length == 0);
               [sort_by(.created_at)[] | select(is_slack) | select(bare | not) | select($since == "" or .created_at > $since)]
             '
           }
@@ -1478,8 +1631,56 @@ jobs:
           # no Still open items is a pure approval, not work. An APPROVE with
           # Still open items is a nit queue: those items are owed the same
           # fix-or-explain treatment as findings. Reviews with no verdict
-          # marker (pre-#166 comments, prompt_gist_url callers) keep the old
-          # treat-as-actionable behaviour.
+          # marker (pre-#166 comments, prompt_gist_url callers) fall back to
+          # their Recommendation line.
+          #
+          # One parser for AI PR Review comments, shared by build_items and
+          # the conflicts-only head review (read_head_review). A finding is a
+          # collapsible "<summary>🟢 <strong>1. Title</strong> ...</summary>"
+          # block, the format Claude and Kimi post; only a review with none
+          # of those falls back to "1. Title" lines. Missing the summary form
+          # made derivatives-trader#1775's first review (APPROVE, two Low
+          # findings) read as a pure approval, so nothing was fixed or
+          # answered. forge-agent's parseReviewVerdict follows the same rule.
+          AI_REVIEW_JQ=$(cat <<'JQ'
+          def norm: ascii_downcase | gsub("[^a-z0-9]+"; " ") | gsub("^ +| +$"; "");
+          def verdict:
+            (.body // "") as $b
+            | if ($b | test("<!-- deriv-pr-review-verdict: [a-z-]+; findings=[0-9]+ -->"))
+                then ($b | capture("<!-- deriv-pr-review-verdict: (?<v>[a-z-]+); findings=(?<n>[0-9]+) -->") | .v)
+              elif ($b | test("\\*\\*Recommendation:\\*\\* (APPROVE|REQUEST CHANGES|BLOCK MERGE)"))
+                then ($b | capture("\\*\\*Recommendation:\\*\\* (?<r>APPROVE|REQUEST CHANGES|BLOCK MERGE)") | .r
+                      | if . == "APPROVE" then "approve" elif . == "REQUEST CHANGES" then "request-changes" else "block-merge" end)
+              else "unknown" end;
+          def summary_findings:
+            [ (.body // "") | split("\n")[]
+              | select(test("<summary>[^<]*<strong>\\s*[0-9]+\\.\\s"))
+              | capture("<summary>(?<sev>[^<]*)<strong>\\s*[0-9]+\\.\\s*(?<t>.+?)</strong>")
+              | { title: (.t | gsub("<[^>]+>"; "") | gsub("&lt;"; "<") | gsub("&gt;"; ">") | gsub("&quot;"; "\"")
+                           | gsub("&#39;"; "\u0027") | gsub("&amp;"; "&") | gsub("\\s+"; " ") | gsub("^ +| +$"; "") | .[0:160]),
+                  severity: (.sev | if test("🔴") then "critical" elif test("🟠") then "high"
+                                    elif test("🟡") then "medium" elif test("🟢") then "low" else "" end) }
+              | select(.title | length > 0) ];
+          def finding_titles:
+            summary_findings as $s
+            | if ($s | length) > 0 then [ $s[].title ]
+              else [ (.body // "") | split("\n")[]
+                     | select(test("^[0-9]+\\.\\s+"))
+                     | (capture("^[0-9]+\\.\\s+\\*\\*(?<t>[^*]+)\\*\\*"; "") // capture("^[0-9]+\\.\\s+(?<t>.+)"; "") | .t // "")
+                     | gsub("\\s+"; " ") | .[0:160] | select(length > 0) ] end;
+          def finding_severities: [ summary_findings[].severity | select(length > 0) ];
+          def nit_titles:
+            [ (.body // "") | split("\n")[]
+              | select(test("^[-*]\\s+Still open\\b"))
+              | (capture("Still open\\s*(—|--|:|-)\\s*(?<t>.+)"; "") // capture("Still open\\s+(?<t>.+)"; "") // {t: .} | .t // "")
+              | gsub("\\s+"; " ") | .[0:160] | select(length > 0) ];
+          def engine_name:
+            (.body // "") as $b
+            | ($b | capture("##[^\\n]*?(?<n>[A-Z][A-Za-z0-9.]*(?: [A-Z0-9][A-Za-z0-9.]*)*) PR Review Complete") | .n)
+              // ($b | capture("<!-- deriv-pr-review-(?<n>[a-z0-9-]+) -->") | .n | sub("^anthropic$"; "Claude") | sub("^kimi$"; "Kimi"))
+              // "AI";
+          JQ
+          )
           build_items() {
             local dest="$1" since tmp ack
             since=$(watermark_since "$PR_COMMENTS")
@@ -1508,26 +1709,7 @@ jobs:
                 | select(length > 0) ]
             ' 2>/dev/null || echo '[]')
             tmp=$(mktemp)
-            jq --argjson ack "$ack" '
-              def norm: ascii_downcase | gsub("[^a-z0-9]+"; " ") | gsub("^ +| +$"; "");
-              def verdict:
-                (.body // "") as $b
-                | if ($b | test("<!-- deriv-pr-review-verdict: [a-z-]+; findings=[0-9]+ -->"))
-                    then ($b | capture("<!-- deriv-pr-review-verdict: (?<v>[a-z-]+); findings=(?<n>[0-9]+) -->") | .v)
-                  elif ($b | test("\\*\\*Recommendation:\\*\\* (APPROVE|REQUEST CHANGES|BLOCK MERGE)"))
-                    then ($b | capture("\\*\\*Recommendation:\\*\\* (?<r>APPROVE|REQUEST CHANGES|BLOCK MERGE)") | .r
-                          | if . == "APPROVE" then "approve" elif . == "REQUEST CHANGES" then "request-changes" else "block-merge" end)
-                  else "unknown" end;
-              def finding_titles:
-                [ (.body // "") | split("\n")[]
-                  | select(test("^[0-9]+\\.\\s+"))
-                  | (capture("^[0-9]+\\.\\s+\\*\\*(?<t>[^*]+)\\*\\*"; "") // capture("^[0-9]+\\.\\s+(?<t>.+)"; "") | .t // "")
-                  | gsub("\\s+"; " ") | .[0:160] | select(length > 0) ];
-              def nit_titles:
-                [ (.body // "") | split("\n")[]
-                  | select(test("^[-*]\\s+Still open\\b"))
-                  | (capture("Still open\\s*(—|--|:|-)\\s*(?<t>.+)"; "") // capture("Still open\\s+(?<t>.+)"; "") // {t: .} | .t // "")
-                  | gsub("\\s+"; " ") | .[0:160] | select(length > 0) ];
+            jq --argjson ack "$ack" "${AI_REVIEW_JQ}"'
               .ai_items = [ .ai[] | {id, html_url, verdict: verdict, findings: finding_titles, nits: nit_titles} ]
               | .ai_items = [ .ai_items[]
                   | .findings = [ .findings[] | norm as $t | select([$ack[] as $a | select(($a != "") and (($a | contains($t)) or ($t | contains($a))))] | length == 0) ]
@@ -1947,13 +2129,39 @@ jobs:
             if [ "${ITEMS_COVERED:-0}" != "1" ]; then
               echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
             fi
-            items_fixed_n=$(jq '[((.items // [])[]?, (.threads // [])[]?) | select(.status == "fixed")] | length' "$reply_file" 2>/dev/null || true)
-            items_already_n=$(jq '[((.items // [])[]?, (.threads // [])[]?) | select(.status == "already")] | length' "$reply_file" 2>/dev/null || true)
-            items_skipped_n=$(jq '[((.items // [])[]?, (.threads // [])[]?) | select(.status == "skipped")] | length' "$reply_file" 2>/dev/null || true)
+            # Counted per ref this round minted, once each: an entry for a ref
+            # Forge never fetched, or a second entry for the same ref, does
+            # not count.
+            item_counts=$(jq -c --slurpfile items "$items" '
+              ([$items[0].refs[]?.ref]) as $refs
+              | [ ((.items // [])[]? | {ref: (.ref // "" | tostring), status: (.status // "")}),
+                  ((.threads // [])[]? | {ref: ("thread:" + (.id // "" | tostring)), status: (.status // "")}) ]
+              | map(select(.ref as $r | $refs | index($r))) | group_by(.ref) | map(.[0].status)
+              | {fixed: (map(select(. == "fixed")) | length),
+                 already: (map(select(. == "already")) | length),
+                 skipped: (map(select(. == "skipped")) | length)}
+            ' "$reply_file" 2>/dev/null || echo '{}')
+            items_refs_n=$(jq '(.refs // []) | length' "$items" 2>/dev/null || true)
+            items_fixed_n=$(printf '%s' "$item_counts" | jq '.fixed // 0' 2>/dev/null || true)
+            items_already_n=$(printf '%s' "$item_counts" | jq '.already // 0' 2>/dev/null || true)
+            items_skipped_n=$(printf '%s' "$item_counts" | jq '.skipped // 0' 2>/dev/null || true)
+            # Report-only tallies: an unreadable count adds nothing.
+            [[ "$items_refs_n" =~ ^[0-9]+$ ]] || items_refs_n=0
+            [[ "$items_fixed_n" =~ ^[0-9]+$ ]] || items_fixed_n=0
+            [[ "$items_already_n" =~ ^[0-9]+$ ]] || items_already_n=0
+            [[ "$items_skipped_n" =~ ^[0-9]+$ ]] || items_skipped_n=0
+            # Totals over every reply pass this run, so a later round (or the
+            # CI-only pass) adds to the counts instead of replacing them, and
+            # Report only ever counts items a reply pass actually covered.
+            ITEMS_CHECKED_SUM=$(( ${ITEMS_CHECKED_SUM:-0} + items_refs_n ))
+            ITEMS_FIXED_SUM=$(( ${ITEMS_FIXED_SUM:-0} + items_fixed_n ))
+            ITEMS_ALREADY_SUM=$(( ${ITEMS_ALREADY_SUM:-0} + items_already_n ))
+            ITEMS_SKIPPED_SUM=$(( ${ITEMS_SKIPPED_SUM:-0} + items_skipped_n ))
             {
-              echo "items_fixed=${items_fixed_n:-0}"
-              echo "items_already=${items_already_n:-0}"
-              echo "items_skipped=${items_skipped_n:-0}"
+              echo "items_checked=${ITEMS_CHECKED_SUM}"
+              echo "items_fixed=${ITEMS_FIXED_SUM}"
+              echo "items_already=${ITEMS_ALREADY_SUM}"
+              echo "items_skipped=${ITEMS_SKIPPED_SUM}"
               echo "verdict_outcome=$(jq -r '
                 if ((.verdict.outcome // "") | IN("false_positive", "already_handled", "no_change", "partial")) then .verdict.outcome
                 else ([((.items // [])[]?, (.threads // [])[]?) | .status] as $s
@@ -1961,7 +2169,7 @@ jobs:
                         elif ([$s[] | select(. == "skipped")] | length) == ($s | length) then "no_change"
                         elif ([$s[] | select(. == "already")] | length) == ($s | length) then "already_handled"
                         else "partial" end)
-                end' "$reply_file" 2>/dev/null | tr '\r\n' ' ' | cut -c1-60)"
+                end' "$reply_file" 2>/dev/null | tr -d '\r\n' | cut -c1-60)"
               echo "verdict_reason=$(jq -r '(.verdict.reason // "") | tostring' "$reply_file" 2>/dev/null | tr '\r\n' '  ' | sed 's/  */ /g; s/^ //; s/ $//' | cut -c1-500)"
             } >> "$GITHUB_OUTPUT"
             post_thread_replies "$items" "$reply_file"
@@ -2006,7 +2214,12 @@ jobs:
           # Issue-URL dstp revise only reads QA sub-issues and refuses PR
           # comments. A later Slack/AI revise must use the open PR's branch.
           if [ "$COMMAND" = "revise" ] || [ "$COMMAND" = "update" ]; then
-            slack_progress "Revising the open PR"
+            # A conflicts-only run never revises; its first line names the merge.
+            if [ "$COMMAND" = "update" ]; then
+              slack_progress "Bringing the PR branch up to date"
+            else
+              slack_progress "Revising the open PR"
+            fi
             PR_URL=$(github_pr_url "$(find_open_pr)")
             STATUS=0
             if [ -z "$PR_URL" ]; then
@@ -2017,17 +2230,22 @@ jobs:
               echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
             fi
             if [ "$COMMAND" = "update" ] && [ "$STATUS" -eq 0 ]; then
-              # Conflicts-only: one dstp update, then straight to Report. The
-              # wait/revise loop below must not run — there is no instruction
-              # to revise with, and a stopped update must not be re-read as
-              # items handled.
-              slack_progress "Bringing the PR branch up to date"
+              # Conflicts-only: one dstp update, then the settle wait, then
+              # Report. The wait/revise loop below must not run: there is no
+              # instruction to revise with, and a stopped update must not be
+              # re-read as items handled. Findings on the new commit are
+              # reported, not fixed; Report offers a revise for them.
+              HEAD_BEFORE=$(pr_head_sha "$PR_URL" || echo "")
               run_branch_update || STATUS=$?
               STATUS=${STATUS:-0}
-              if [ "$STATUS" -eq 0 ]; then
-                echo "pushed=1" >> "$GITHUB_OUTPUT"
-              else
+              if [ "$STATUS" -ne 0 ]; then
                 echo "revise_trouble=1" >> "$GITHUB_OUTPUT"
+              elif [ "${DSTP_STATUS:-}" = "up-to-date" ]; then
+                # Nothing was pushed, so there is no new commit to wait on.
+                echo "The branch was already up to date; nothing pushed"
+              else
+                echo "pushed=1" >> "$GITHUB_OUTPUT"
+                settle_after_update "$PR_URL" "$HEAD_BEFORE"
               fi
             fi
           else
@@ -2124,7 +2342,9 @@ jobs:
               FINDINGS=$(jq '[.refs[]? | select(.kind | startswith("ai"))] | length' "$ITEMS_FILE")
               echo "ai_reviews_remaining=$FINDINGS" >> "$GITHUB_OUTPUT"
               echo "ai_approvals=$(jq '.approvals | length' "$ITEMS_FILE")" >> "$GITHUB_OUTPUT"
-              echo "items_checked=$(jq '.refs | length' "$ITEMS_FILE")" >> "$GITHUB_OUTPUT"
+              # The review state was really read this run, so Report may speak
+              # for the AI reviewers. items_checked comes from the reply pass.
+              echo "ai_read=1" >> "$GITHUB_OUTPUT"
               SLACK_N=$(jq '.slack | length' "$ITEMS_FILE")
               echo "slack_requests_remaining=$SLACK_N" >> "$GITHUB_OUTPUT"
               THREAD_N=$(jq '.threads | length' "$ITEMS_FILE")
@@ -2325,6 +2545,12 @@ jobs:
           VERDICT_OUTCOME: ${{ steps.forge.outputs.verdict_outcome }}
           VERDICT_REASON: ${{ steps.forge.outputs.verdict_reason }}
           UNCOVERED_REFS: ${{ steps.forge.outputs.uncovered_refs }}
+          AI_READ: ${{ steps.forge.outputs.ai_read }}
+          DSTP_STATUS: ${{ steps.forge.outputs.dstp_status }}
+          DSTP_BASE: ${{ steps.forge.outputs.dstp_base }}
+          PR_HEAD_SHA: ${{ steps.forge.outputs.pr_head_sha }}
+          UPDATE_NO_CHECKS: ${{ steps.forge.outputs.update_no_checks }}
+          HEAD_REVIEW: ${{ steps.forge.outputs.head_review }}
           FORGE_COMMAND: ${{ inputs.command }}
           OUTCOME: ${{ steps.forge.outcome }}
           ENGINE_TAG: ${{ steps.engine.outputs.engine_tag }}
@@ -2356,20 +2582,29 @@ jobs:
           TOOK=$(format_took $(( $(date -u +%s) - PROGRESS_EPOCH )))
 
           read_pr_checks() {
-            local pr_url="$1" rc
+            local pr_url="$1" rc errf err
             CI_FAILING=0
             CI_PENDING=0
+            CI_PASSED=0
             CI_FAILING_NAMES=""
             CI_STATE="unknown"
+            errf=$(mktemp)
             # GitHub Actions runs this script with bash -e. gh pr checks exits 1
             # when a check failed and 8 when one is pending, so turn -e off
             # around the read.
             set +e
-            CHECKS=$(gh pr checks "$pr_url" 2>/dev/null)
+            CHECKS=$(gh pr checks "$pr_url" 2>"$errf")
             rc=$?
             set -e
+            err=$(head -c 500 "$errf" 2>/dev/null || true)
+            rm -f "$errf"
             # Exit 1 or 8 with output is a successful read. Exit 1 with no
-            # output is a real error (or no checks at all).
+            # output is either "no checks reported" (none have started on
+            # this head yet, so CI_STATE=none) or a real error (unknown).
+            if [ "$rc" -eq 1 ] && [ -z "$CHECKS" ] && printf '%s' "$err" | grep -qi 'no checks reported'; then
+              CI_STATE="none"
+              return 0
+            fi
             if [ "$rc" -eq 0 ] || { { [ "$rc" -eq 1 ] || [ "$rc" -eq 8 ]; } && [ -n "$CHECKS" ]; }; then
               CI_STATE="ok"
               # Checks that also fail on the base head, and checks classified
@@ -2389,12 +2624,14 @@ jobs:
                  | select(is_ignored_scan) | .name] | .[0:5] | join(", ")' 2>/dev/null || true)
               CI_FAILING=$(printf '%s' "$failing" | jq 'length')
               CI_PENDING=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="pending"{c++} END{print c+0}')
+              CI_PASSED=$(printf '%s\n' "$CHECKS" | awk -F '\t' 'BEGIN{c=0} $2=="pass"{c++} END{print c+0}')
               CI_FAILING_NAMES=$(printf '%s' "$failing" | jq -r '.[0:5] | join(", ")')
             fi
           }
 
           CI_FAILING=0
           CI_PENDING=0
+          CI_PASSED=0
           CI_FAILING_NAMES=""
           CI_IGNORED_FAILING_NAMES=""
           CI_STATE="unknown"
@@ -2416,12 +2653,31 @@ jobs:
           [ -n "${REQUESTED_BY:-}" ] && WHO="<@${REQUESTED_BY}> "
           ISSUE_LINK="<${ISSUE_URL}|#${ISSUE_NUMBER}>"
 
+          # The job this run did, so each mode gets its own wording. A
+          # conflicts-only run (update) never says "Fix pushed"; a combined
+          # run (revise with update_base) reads as a revise plus the
+          # conflict line.
+          case "${FORGE_COMMAND:-}" in
+            update) MODE=update ;;
+            revise) MODE=revise ;;
+            *) MODE=auto ;;
+          esac
+
           # What the revise did, for the completion. Check and branch names come
           # from the repo, so they are Slack-escaped.
           slack_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
           num_or_zero() { if [[ "${1:-}" =~ ^[0-9]+$ ]]; then printf '%s' "$1"; else printf 0; fi; }
           list_len() { printf '%s' "${1:-}" | jq -r 'if type == "array" then length else 0 end' 2>/dev/null || true; }
           list_names() { printf '%s' "${1:-}" | jq -r 'if type == "array" then join(", ") else "" end' 2>/dev/null | slack_escape || true; }
+          # plural <n> <singular> <plural>: "1 check", "3 checks".
+          plural() { if [ "$1" = "1" ]; then printf '1 %s' "$2"; else printf '%s %s' "$1" "$3"; fi; }
+          ai_open_text() { if [ "$1" = "1" ]; then printf '1 AI review item is still open'; else printf '%s AI review items are still open' "$1"; fi; }
+          PR_NUM=""
+          PR_SLACK=""
+          if [ -n "${PR_URL:-}" ]; then
+            PR_NUM="${PR_URL##*/}"
+            PR_SLACK="<${PR_URL}|PR #${PR_NUM}>"
+          fi
           T_TOTAL=$(num_or_zero "${THREADS_TOTAL:-}")
           T_FIXED=$(num_or_zero "${THREADS_FIXED:-}")
           T_ALREADY=$(num_or_zero "${THREADS_ALREADY:-}")
@@ -2444,60 +2700,129 @@ jobs:
           [ "${PR_COMMENT_POSTED:-}" = "1" ] && DONE="${DONE:+$DONE }Posted one reply comment on the PR."
           [[ " ${PR_EDITED:-} " == *" body "* ]] && DONE="${DONE:+$DONE }Updated the PR description."
           [[ " ${PR_EDITED:-} " == *" title "* ]] && DONE="${DONE:+$DONE }Updated the PR title."
-          BASE_NAME=$(printf '%s' "${BASE_REF:-}" | slack_escape)
-          [ -z "$BASE_NAME" ] && BASE_NAME="the base branch"
+          BASE_PLAIN="${BASE_REF:-}"
+          [ -z "$BASE_PLAIN" ] && BASE_PLAIN="${DSTP_BASE:-}"
+          [ -z "$BASE_PLAIN" ] && BASE_PLAIN="the base branch"
+          BASE_NAME=$(printf '%s' "$BASE_PLAIN" | slack_escape)
           NOT_OURS=""
           N_UNRELATED=$(num_or_zero "$(list_len "${UNRELATED_CHECKS:-}")")
           if [ "$N_UNRELATED" -eq 1 ]; then
-            NOT_OURS="1 check fails on ${BASE_NAME} too — not this PR: $(list_names "${UNRELATED_CHECKS:-}")."
+            NOT_OURS="1 check also fails on ${BASE_NAME}, so it is not this PR's: $(list_names "${UNRELATED_CHECKS:-}")."
           elif [ "$N_UNRELATED" -gt 1 ]; then
-            NOT_OURS="${N_UNRELATED} checks fail on ${BASE_NAME} too — not this PR: $(list_names "${UNRELATED_CHECKS:-}")."
+            NOT_OURS="${N_UNRELATED} checks also fail on ${BASE_NAME}, so they are not this PR's: $(list_names "${UNRELATED_CHECKS:-}")."
           fi
-          if [ "$(num_or_zero "$(list_len "${UNBASED_CHECKS:-}")")" -gt 0 ]; then
-            NOT_OURS="${NOT_OURS:+$NOT_OURS }No run on ${BASE_NAME} head to compare for $(list_names "${UNBASED_CHECKS:-}"), so they were treated as this PR's."
+          N_UNBASED=$(num_or_zero "$(list_len "${UNBASED_CHECKS:-}")")
+          if [ "$N_UNBASED" -eq 1 ]; then
+            NOT_OURS="${NOT_OURS:+$NOT_OURS }No run on the ${BASE_NAME} head to compare for $(list_names "${UNBASED_CHECKS:-}"), so Forge treated it as this PR's."
+          elif [ "$N_UNBASED" -gt 1 ]; then
+            NOT_OURS="${NOT_OURS:+$NOT_OURS }No run on the ${BASE_NAME} head to compare for $(list_names "${UNBASED_CHECKS:-}"), so Forge treated them as this PR's."
           fi
           if [ "$(num_or_zero "$(list_len "${ENVIRONMENTAL_CHECKS:-}")")" -gt 0 ]; then
             ENV_DETAIL=$(printf '%s' "${ENVIRONMENTAL_CHECKS:-[]}" | jq -r 'if type == "array" then [ .[] | "\(.name // .) (\(.sample_failing // 0)/\(.sampled // 0) recent PRs)" ] | join(", ") else "" end' 2>/dev/null || true)
-            [ -n "$ENV_DETAIL" ] && NOT_OURS="${NOT_OURS:+$NOT_OURS }Failing across recent PRs, not just this one — treated as environmental: $(printf '%s' "$ENV_DETAIL" | slack_escape)."
+            [ -n "$ENV_DETAIL" ] && NOT_OURS="${NOT_OURS:+$NOT_OURS }Failing on most recent PRs, not just this one, so treated as environmental: $(printf '%s' "$ENV_DETAIL" | slack_escape)."
           fi
           TROUBLE=""
-          [ "${REVISE_TROUBLE:-}" = "1" ] && TROUBLE="Wait/revise hit trouble — see the run log."
-          # The exact dstp stop reason beats the generic line: a conflict stop,
-          # a red verify, a hook failure. Already scrubbed at the source.
+          if [ "${REVISE_TROUBLE:-}" = "1" ]; then
+            if [ "$MODE" = "update" ]; then
+              TROUBLE="The branch update hit trouble before it finished. The run log has the details."
+            else
+              TROUBLE="The revise hit trouble before it finished. The run log has the details."
+            fi
+          fi
+          # The exact dstp stop reason beats the generic line and leads the
+          # details: a conflict stop, a red verify, a blocked Forge API call.
+          # Already scrubbed at the source.
+          STOP=""
           if [ -n "${DSTP_ERROR:-}" ]; then
-            TROUBLE="Stopped: $(printf '%s' "$DSTP_ERROR" | slack_escape | cut -c1-500)"
+            STOP="Stopped: $(printf '%s' "$DSTP_ERROR" | slack_escape | cut -c1-500)"
+            TROUBLE=""
           fi
-          # What an unattended conflict attempt did, from dstp's own JSON:
-          # per-file kind, also-touched files, and the merge SHA pushed.
+          # What an unattended conflict attempt did, from dstp's own JSON, in
+          # plain words: which files had conflicts (basenames), how each was
+          # resolved, files changed beyond them, and anything left conflicted.
+          # merge_sha is present only once the merge was pushed.
+          IFS= read -r -d '' CONFLICT_JQ <<'JQ' || true
+          def short: split("/") | last;
+          def names: map(short) | if length <= 1 then (.[0] // "")
+            elif length == 2 then "\(.[0]) and \(.[1])"
+            else "\(.[0:-1] | join(", ")) and \(.[-1])" end;
+          def one_kind($k; $n):
+            if $k == "reconciled" then "Kept changes from both sides."
+            elif $k == "ours" then "Kept this PR's version."
+            elif $k == "theirs" then "Took \($base)'s version."
+            elif $k == "base" then "⚠️ Dropped both sides' changes."
+            elif $k == "deleted" then (if $n == 1 then "Deleted the file." else "Deleted the files." end)
+            else "Resolved." end;
+          def kind_in($k; $files):
+            if $k == "reconciled" then "kept changes from both sides in \($files)"
+            elif $k == "ours" then "kept this PR's version of \($files)"
+            elif $k == "theirs" then "took \($base)'s version of \($files)"
+            elif $k == "base" then "⚠️ dropped both sides' changes in \($files)"
+            elif $k == "deleted" then "deleted \($files)"
+            else "resolved \($files)" end;
+          def capital: (.[0:1] | ascii_upcase) + .[1:];
+          if (.attempted // false) | not then ""
+          else
+            (.files // []) as $f
+            | ($f | length) as $n
+            | ($f | group_by(.kind)) as $groups
+            | [ (if $n == 1 then "1 file had conflicts: \([$f[0].file] | names)."
+                 elif $n > 1 then "\($n) files had conflicts: \([$f[].file] | names)."
+                 else "" end),
+                (if (.resolved // false) | not then
+                   "Tried to resolve the conflicts but could not\(if .reason then ": \(.reason)" else "" end)."
+                 elif ($groups | length) == 1 then one_kind($groups[0][0].kind; $n)
+                 elif ($groups | length) > 1 then ([$groups[] | kind_in(.[0].kind; ([.[].file] | names))] | join("; ") | capital) + "."
+                 else "" end),
+                (if (.resolved // false) and ((.merge_sha // "") == "") then "Resolved the conflicts locally, but nothing was pushed." else "" end),
+                (if ((.also_touched // []) | length) > 0 then "Also changed \(.also_touched | names) to make the merge work." else "" end),
+                (if ((.unresolved // []) | length) > 0 then "Still conflicted: \(.unresolved | names)." else "" end) ]
+            | map(select(. != "")) | join(" ")
+          end
+          JQ
           CONFLICT_LINE=""
+          CONFLICT_FILES=0
+          MERGE_SHA=""
           if [ -n "${CONFLICT_RESOLUTION:-}" ]; then
-            CONFLICT_LINE=$(printf '%s' "$CONFLICT_RESOLUTION" | jq -r '
-              if .attempted then
-                "Conflicts: " +
-                (if .resolved then
-                   (if .merge_sha then "resolved and merged (\(.merge_sha[0:7]))" else "resolved locally — not pushed" end)
-                 else "attempted, not resolved" end) +
-                (if .reason then "; reason: " + .reason else "" end) +
-                (if (.files | length) > 0 then "; " + ([.files[] | "\(.file) (\(.kind))"] | join(", ")) else "" end) +
-                (if (.also_touched | length) > 0 then "; also touched: " + (.also_touched | join(", ")) else "" end) +
-                (if ((.unresolved // []) | length) > 0 then "; still conflicted: " + (.unresolved | join(", ")) else "" end)
-              else "" end' 2>/dev/null | slack_escape | cut -c1-500 || true)
+            CONFLICT_LINE=$(printf '%s' "$CONFLICT_RESOLUTION" | jq -r --arg base "$BASE_PLAIN" "$CONFLICT_JQ" 2>/dev/null | slack_escape | cut -c1-600 || true)
+            CONFLICT_FILES=$(printf '%s' "$CONFLICT_RESOLUTION" | jq -r 'if (.attempted // false) then ((.files // []) | length) else 0 end' 2>/dev/null || true)
+            CONFLICT_FILES=$(num_or_zero "$CONFLICT_FILES")
+            MERGE_SHA=$(printf '%s' "$CONFLICT_RESOLUTION" | jq -r '.merge_sha // ""' 2>/dev/null | tr -cd '0-9a-f' | cut -c1-7 || true)
           fi
-          [ -n "${UNCOVERED_REFS:-}" ] && TROUBLE="Some items still have no reply: ${UNCOVERED_REFS} — see the PR."
-          # Per-item outcome of the reply pass, shared by every branch below.
+          [ -n "${UNCOVERED_REFS:-}" ] && TROUBLE="Some items still have no reply on the PR: $(printf '%s' "$UNCOVERED_REFS" | slack_escape | cut -c1-300)."
+          # Per-item outcome of the reply passes. Only a reply pass writes
+          # items_checked, so nothing is counted that was never answered.
           ITEMS_SUMMARY=""
-          if [ "$(num_or_zero "${ITEMS_CHECKED:-}")" != "0" ]; then
-            ITEMS_SUMMARY="Checked ${ITEMS_CHECKED} item(s): $(num_or_zero "${ITEMS_FIXED:-}") fixed, $(num_or_zero "${ITEMS_ALREADY:-}") already handled, $(num_or_zero "${ITEMS_SKIPPED:-}") not taken (explained on the PR)."
+          N_CHECKED=$(num_or_zero "${ITEMS_CHECKED:-}")
+          if [ "$N_CHECKED" != "0" ]; then
+            N_FIXED=$(num_or_zero "${ITEMS_FIXED:-}")
+            N_ALREADY=$(num_or_zero "${ITEMS_ALREADY:-}")
+            N_SKIPPED=$(num_or_zero "${ITEMS_SKIPPED:-}")
+            N_NOREPLY=$((N_CHECKED - N_FIXED - N_ALREADY - N_SKIPPED))
+            [ "$N_NOREPLY" -lt 0 ] && N_NOREPLY=0
+            ITEM_PARTS="${N_FIXED} fixed"
+            [ "$N_ALREADY" != "0" ] && ITEM_PARTS="${ITEM_PARTS}, ${N_ALREADY} already handled"
+            [ "$N_SKIPPED" != "0" ] && ITEM_PARTS="${ITEM_PARTS}, ${N_SKIPPED} not taken (the PR replies say why)"
+            [ "$N_NOREPLY" != "0" ] && ITEM_PARTS="${ITEM_PARTS}, ${N_NOREPLY} still without a reply"
+            ITEMS_SUMMARY="Checked $(plural "$N_CHECKED" item items): ${ITEM_PARTS}."
           fi
           GREEN_WORDING="All CI is green"
+          IGNORED_LINE=""
           if [ -n "${CI_IGNORED_FAILING_NAMES:-}" ]; then
-            GREEN_WORDING="All non-ignored checks are green. Ignored scan(s) still failing: $(printf '%s' "$CI_IGNORED_FAILING_NAMES" | slack_escape) — Forge ignores those and they were not sent to dstp"
+            GREEN_WORDING="All non-ignored checks are green"
+            IGNORED_LINE="$(printf '%s' "$CI_IGNORED_FAILING_NAMES" | slack_escape | sed -E 's/, ([^,]*)$/ and \1/') failed, but Forge ignores scan checks and does not try to fix them."
+          fi
+          SETTLE_LIST=""
+          if [ -n "${SETTLE_PENDING:-}" ] && [ "${SETTLE_PENDING}" != "[]" ]; then
+            SETTLE_LIST=$(printf '%s' "$SETTLE_PENDING" | jq -r 'if type == "array" then [.[] | "\(.name) (\(.state))"] | join(", ") else "" end' 2>/dev/null | slack_escape || true)
           fi
           # Lines that follow the headline, in order, blank ones dropped.
+          # detail_lines <prefix> <line>...: "• " for Slack, "- " for GitHub.
           detail_lines() {
-            local line
+            local prefix="$1" line
+            shift
             for line in "$@"; do
-              [ -n "$line" ] && printf '%s\n' "$line"
+              [ -n "$line" ] && printf '%s%s\n' "$prefix" "$line"
             done
             return 0
           }
@@ -2506,118 +2831,286 @@ jobs:
           QUIET=""
           REACTION=""
           SLACK_TEXT=""
+          NL=$'\n'
           if [ "${PR_UNRESOLVED:-}" = "1" ]; then
-            FACTS="No open PR is linked to this issue. Link it with Closes #${ISSUE_NUMBER} in the PR body and ask again."
-            QUIET="⚠️ No open PR linked · Took ${TOOK}"
+            VERB="revise"
+            [ "$MODE" = "update" ] && VERB="update"
+            FACTS="No open PR is linked to this issue, so there is nothing to ${VERB}."
+            QUIET="⚠️ No open PR linked"
             REACTION="warning"
-            BODY=$(printf '🔨 **Forge** — no open PR is linked to this issue, so there is nothing to revise.\n\nAdd `Closes #%s` to the PR body and ask again.\n\nTook %s.' "$ISSUE_NUMBER" "$TOOK")
+            BODY=$(printf '🔨 %s\n\nAdd `Closes #%s` to the PR body and ask again.\n\nTook %s.' "$FACTS" "$ISSUE_NUMBER" "$TOOK")
             LABEL="forge:failed"
-            SLACK_TEXT=$(printf '%s⚠️ %s — no open PR is linked to this issue. Add Closes #%s to the PR body and ask again.\nTook %s.' "$WHO" "$ISSUE_LINK" "$ISSUE_NUMBER" "$TOOK")
+            SLACK_TEXT=$(printf '%s⚠️ No open PR is linked to issue %s, so there is nothing to %s. Add Closes #%s to the PR body and ask again.\nTook %s.' "$WHO" "$ISSUE_LINK" "$VERB" "$ISSUE_NUMBER" "$TOOK")
           elif [ "${NO_CHANGE:-}" = "1" ]; then
             # Handled verdict, not a failure: dstp checked the items and
             # changed nothing. Say which verdict it was in plain words; only
             # a verdict the reply pass actually returned may be called a
             # false positive.
-            VREASON=$(printf '%s' "${VERDICT_REASON:-}" | slack_escape | cut -c1-500)
+            VREASON=$(printf '%s' "${VERDICT_REASON:-}" | slack_escape | cut -c1-500 | sed 's/[.[:space:]]*$//')
             case "${VERDICT_OUTCOME:-}" in
-              false_positive) VERDICT_LINE="checked, nothing to change — the finding is a false positive" ;;
-              already_handled) VERDICT_LINE="checked, nothing to change — earlier commits already handle it" ;;
-              partial) VERDICT_LINE="checked — some items were already handled, the rest do not hold" ;;
-              *) VERDICT_LINE="checked, nothing to change" ;;
+              false_positive) VERDICT_LINE="The review items do not hold, so nothing needed changing" ;;
+              already_handled) VERDICT_LINE="Earlier commits already handle these items" ;;
+              partial) VERDICT_LINE="Some items were already handled and the rest do not hold" ;;
+              *) VERDICT_LINE="Nothing needed changing" ;;
             esac
             [ -n "$VREASON" ] && VERDICT_LINE="${VERDICT_LINE}: ${VREASON}"
-            FACTS="Nothing was committed. Forge ${VERDICT_LINE}. The items above are marked handled, so they will not be raised again."
-            QUIET="🤷 Nothing to change · Took ${TOOK}"
+            HANDLED=""
+            [ -n "${DONE}${ITEMS_SUMMARY}" ] && HANDLED="These items are marked handled, so they will not be raised again."
+            FACTS="Nothing was committed. ${VERDICT_LINE}."
+            QUIET="🤷 Nothing to change"
             REACTION="shrug"
-            DETAILS=$(detail_lines "$DONE" "$ITEMS_SUMMARY" "$NOT_OURS" "$FACTS" "$CONFLICT_LINE" "$TROUBLE")
-            NL=$'\n'
-            BODY=$(printf '🔨 **Forge** — nothing was committed.\n\nForge %s.\n\n%s\nTook %s.' "$VERDICT_LINE" "${DETAILS:+$DETAILS$NL}" "$TOOK")
+            TARGET_SLACK="$ISSUE_LINK"
+            TARGET_MD="this issue"
+            if [ -n "$PR_SLACK" ]; then
+              TARGET_SLACK="${PR_SLACK} (issue ${ISSUE_LINK})"
+              TARGET_MD="#${PR_NUM}"
+            fi
+            DETAILS_SLACK=$(detail_lines '• ' "$STOP" "$DONE" "$ITEMS_SUMMARY" "$HANDLED" "$CONFLICT_LINE" "$NOT_OURS" "$TROUBLE")
+            DETAILS_MD=$(detail_lines '- ' "$STOP" "$DONE" "$ITEMS_SUMMARY" "$HANDLED" "$CONFLICT_LINE" "$NOT_OURS" "$TROUBLE")
+            BODY=$(printf '🔨 Checked %s. %s\n\n%s\nTook %s.' "$TARGET_MD" "$FACTS" "${DETAILS_MD:+$DETAILS_MD$NL}" "$TOOK")
             LABEL="forge:done"
-            SLACK_TEXT=$(printf '%s🤷 %s — checked, nothing to change.\n%sTook %s.' "$WHO" "$ISSUE_LINK" "${DETAILS:+$DETAILS$NL}" "$TOOK")
+            SLACK_TEXT=$(printf '%s🤷 Checked %s. %s\n%sTook %s.' "$WHO" "$TARGET_SLACK" "$FACTS" "${DETAILS_SLACK:+$DETAILS_SLACK$NL}" "$TOOK")
           elif [ "$OUTCOME" = "success" ] && [ -z "${PR_URL:-}" ]; then
             FACTS="No code change needed."
-            QUIET="✅ No code change needed · Took ${TOOK}"
+            QUIET="✅ No code change needed"
             REACTION="shrug"
-            BODY=$(printf '🔨 **Forge** — no code change needed.\n\nTook %s.' "$TOOK")
+            BODY=$(printf '🔨 %s\n\nTook %s.' "$FACTS" "$TOOK")
             LABEL="forge:done"
-            SLACK_TEXT=$(printf '%s✅ %s — No code change needed.\nTook %s.' "$WHO" "$ISSUE_LINK" "$TOOK")
+            SLACK_TEXT=$(printf '%s✅ %s: no code change needed.\nTook %s.' "$WHO" "$ISSUE_LINK" "$TOOK")
+          elif [ -n "${PR_URL:-}" ] && [ "$MODE" = "update" ]; then
+            # Conflicts-only. The headline says what happened to the branch;
+            # the CI and AI lines describe the new commit after the settle
+            # wait (settle_after_update). Findings are reported and offered
+            # as a revise, never fixed in this mode.
+            EMOJI=""
+            HEAD_SHA7=$(printf '%s' "${PR_HEAD_SHA:-}" | tr -cd '0-9a-f' | cut -c1-7)
+            SHOW_SHA="${MERGE_SHA:-$HEAD_SHA7}"
+            if [ -n "$STOP" ] || { [ "${PUSHED:-}" != "1" ] && [ "${DSTP_STATUS:-}" != "up-to-date" ]; }; then
+              HEAD_KIND=failed
+              EMOJI="⚠️"
+              QUIET="⚠️ Could not update the branch"
+            elif [ "${DSTP_STATUS:-}" = "up-to-date" ] && [ "${PUSHED:-}" != "1" ]; then
+              HEAD_KIND=current
+              QUIET="✅ Already up to date"
+            elif [ "$CONFLICT_FILES" != "0" ]; then
+              HEAD_KIND=resolved
+              QUIET="Conflicts resolved"
+            else
+              HEAD_KIND=merged
+              QUIET="Merged ${BASE_NAME} in"
+            fi
+            # headline <PR ref> <issue suffix>: Slack and GitHub differ only
+            # in how they name the PR and whether they name the issue.
+            headline() {
+              local pr="$1" is="$2" commit="the merge commit" merge="the merge"
+              if [ -n "$SHOW_SHA" ]; then
+                commit="merge commit ${SHOW_SHA}"
+                merge="$SHOW_SHA"
+              fi
+              case "$HEAD_KIND" in
+                failed) printf 'Could not bring %s%s up to date with %s.' "$pr" "$is" "$BASE_NAME" ;;
+                current) printf '%s%s was already up to date with %s, so there was nothing to push.' "$pr" "$is" "$BASE_NAME" ;;
+                resolved) printf 'Resolved the merge conflicts on %s%s and pushed %s.' "$pr" "$is" "$commit" ;;
+                *) printf '%s%s was already conflict-free; merged %s in and pushed %s.' "$pr" "$is" "$BASE_NAME" "$merge" ;;
+              esac
+            }
+            CI_LINE=""
+            AI_LINE=""
+            OFFER=""
+            SCAN_LINE=""
+            if [ "${PUSHED:-}" = "1" ]; then
+              CI_SHORT="CI passed"
+              if [ "${UPDATE_NO_CHECKS:-}" = "1" ]; then
+                CI_LINE="No CI checks ran on the new commit."
+                CI_SHORT="no CI ran"
+              elif [ -n "$SETTLE_LIST" ]; then
+                CI_LINE="CI was still running on the new commit when the run hit its time limit: ${SETTLE_LIST}. See the PR checks."
+                CI_SHORT="CI still running"
+                EMOJI="⏳"
+              elif [ "$CI_STATE" = "none" ]; then
+                CI_LINE="No CI checks had reported on the new commit when the run ended. See the PR checks."
+                CI_SHORT="no CI yet"
+                EMOJI="⏳"
+              elif [ "$CI_STATE" != "ok" ]; then
+                CI_LINE="Could not read the CI checks on the new commit. See the PR checks."
+                CI_SHORT="CI unread"
+                EMOJI="⚠️"
+              elif [ "${CI_FAILING:-0}" != "0" ]; then
+                CI_LINE="CI on the new commit: $(plural "$CI_PASSED" check checks) passed, ${CI_FAILING} failed: $(printf '%s' "$CI_FAILING_NAMES" | slack_escape)."
+                CI_SHORT="CI failing"
+                EMOJI="⚠️"
+              elif [ "${CI_PENDING:-0}" != "0" ]; then
+                CI_LINE="CI on the new commit: $(plural "$CI_PASSED" check checks) passed, ${CI_PENDING} still running. See the PR checks."
+                CI_SHORT="CI still running"
+                EMOJI="⏳"
+              else
+                CI_LINE="CI on the new commit: $(plural "$CI_PASSED" check checks) passed."
+              fi
+              [ "$CI_STATE" = "ok" ] && SCAN_LINE="$IGNORED_LINE"
+              QUIET="${QUIET}, ${CI_SHORT}"
+              # Only a review read for this head is reported (read_head_review);
+              # null means the comments could not be read.
+              if [ -n "${HEAD_REVIEW:-}" ]; then
+                AI_LINE=$(printf '%s' "$HEAD_REVIEW" | jq -r --argjson pending "$([ -n "$SETTLE_LIST" ] && echo true || echo false)" '
+                  def plural($n; $one; $many): if $n == 1 then "1 \($one)" else "\($n) \($many)" end;
+                  def tally: group_by(.) | map("\(length) \(.[0])") | join(", ");
+                  if . == null then "Could not read the AI review of the new commit."
+                  elif type != "array" then ""
+                  elif length == 0 then
+                    (if $pending then "The AI review of the new commit had not posted when the run ended."
+                     else "No AI review was posted for the new commit." end)
+                  else
+                    [ .[]
+                      | "\(.engine) PR Review: "
+                        + (if .verdict == "approve" then "approved"
+                           elif .verdict == "request-changes" then "requested changes"
+                           elif .verdict == "block-merge" then "asked to block the merge"
+                           else "reviewed the new commit" end)
+                        + (if (.findings // 0) > 0
+                           then ", with \(plural(.findings; "finding"; "findings"))\(if ((.severities // []) | length) > 0 then " (\(.severities | tally))" else "" end)"
+                           else ", no new findings" end)
+                        + (if (.nits // 0) > 0 then "; \(plural(.nits; "earlier review item is"; "earlier review items are")) still open" else "" end)
+                        + "." ]
+                    | join(" ")
+                  end' 2>/dev/null | slack_escape || true)
+                AI_OPEN=$(printf '%s' "$HEAD_REVIEW" | jq -r 'if type == "array" then ([.[] | (.findings // 0) + (.nits // 0)] | add // 0) else 0 end' 2>/dev/null || true)
+                AI_OPEN=$(num_or_zero "$AI_OPEN")
+                if [ "$AI_OPEN" != "0" ] && [ "${CI_FAILING:-0}" != "0" ]; then
+                  OFFER="This run only handled the conflicts. Tag @Forge and ask for a revise if you want the failing checks and the $(plural "$AI_OPEN" "review item" "review items") fixed."
+                elif [ "$AI_OPEN" != "0" ]; then
+                  OFFER="This run only handled the conflicts. Tag @Forge and ask for a revise if you want the $(plural "$AI_OPEN" "review item" "review items") fixed."
+                fi
+              fi
+              if [ -z "$OFFER" ] && [ "$CI_STATE" = "ok" ] && [ "${CI_FAILING:-0}" != "0" ]; then
+                OFFER="This run only handled the conflicts. Tag @Forge and ask for a revise if you want the failing checks fixed."
+              fi
+            fi
+            case "$QUIET" in
+              ⚠️*|✅*) ;;
+              *) QUIET="${EMOJI:-✅} ${QUIET}" ;;
+            esac
+            DETAILS_SLACK=$(detail_lines '• ' "$STOP" "$CONFLICT_LINE" "$CI_LINE" "$SCAN_LINE" "$AI_LINE" "$OFFER" "$TROUBLE")
+            DETAILS_MD=$(detail_lines '- ' "$STOP" "$CONFLICT_LINE" "$CI_LINE" "$SCAN_LINE" "$AI_LINE" "$OFFER" "$TROUBLE")
+            BODY=$(printf '🔨 %s\n\n%s\nTook %s.' "$(headline "#${PR_NUM}" "")" "${DETAILS_MD:+$DETAILS_MD$NL}" "$TOOK")
+            SLACK_TEXT=$(printf '%s%s%s\n%sTook %s.' "$WHO" "${EMOJI:+$EMOJI }" "$(headline "$PR_SLACK" " (issue ${ISSUE_LINK})")" "${DETAILS_SLACK:+$DETAILS_SLACK$NL}" "$TOOK")
+            REACTION="white_check_mark"
+            [ "$EMOJI" = "⚠️" ] && REACTION="warning"
+            LABEL="forge:done"
           elif [ -n "${PR_URL:-}" ]; then
             PUSHED_PENDING=0
-            if [ "$CI_STATE" != "ok" ]; then
-              FACTS="CI state unknown — could not read the checks. See the PR checks."
+            EMOJI="✅"
+            if [ "$CI_STATE" = "none" ]; then
+              FACTS="No CI checks have reported on the PR yet. See the PR checks."
+              EMOJI="⏳"
+            elif [ "$CI_STATE" != "ok" ]; then
+              FACTS="Could not read the CI checks on the PR. See the PR checks."
               EMOJI="⚠️"
             elif [ "${CI_FAILING:-0}" != "0" ]; then
-              if [ "$REMAINING" != "0" ]; then
-                FACTS="CI still failing: ${CI_FAILING_NAMES}. AI reviewers still have ${REMAINING} item(s) outstanding."
-              else
-                FACTS="CI still failing: ${CI_FAILING_NAMES}. AI reviewers: no items outstanding."
-              fi
+              FACTS="CI still failing: $(printf '%s' "$CI_FAILING_NAMES" | slack_escape)."
+              [ "$REMAINING" != "0" ] && FACTS="${FACTS} $(ai_open_text "$REMAINING")."
               EMOJI="⚠️"
-            elif [ -n "${SETTLE_PENDING:-}" ] && [ "${SETTLE_PENDING}" != "[]" ]; then
+            elif [ -n "$SETTLE_LIST" ]; then
               # The settle wait ran out of reserved job time before every
               # check reached a terminal state: name them, never claim done.
-              SETTLE_LIST=$(printf '%s' "$SETTLE_PENDING" | jq -r 'if type == "array" then [.[] | "\(.name) (\(.state))"] | join(", ") else "" end' 2>/dev/null || true)
-              FACTS="Still waiting on CI when the run's reserved time ran out: $(printf '%s' "$SETTLE_LIST" | slack_escape) — see the PR checks."
+              FACTS="CI was still running when the run hit its time limit: ${SETTLE_LIST}. See the PR checks."
               EMOJI="⏳"
             elif [ -n "${VERIFY_PENDING:-}" ] && [ "${VERIFY_PENDING}" != "[]" ] && [ "${PUSHED:-}" = "1" ]; then
               # The verify wait ran out of reserved time: name the exact
               # checks and states instead of a bare pending count. The
               # verify_pending output is only written on that timeout, so
-              # it is the trigger — the pending count may not include the
+              # it is the trigger; the pending count may not include the
               # targets when the two reads disagree.
               VERIFY_LIST=$(printf '%s' "$VERIFY_PENDING" | jq -r 'if type == "array" then [.[] | "\(.name) (\(.state))"] | join(", ") else "" end' 2>/dev/null || true)
-              FACTS="Fix pushed this run. The run's remaining time ran out while verifying: $(printf '%s' "$VERIFY_LIST" | slack_escape) — see the PR checks."
+              FACTS="Fix pushed this run. The run's remaining time ran out while verifying: $(printf '%s' "$VERIFY_LIST" | slack_escape). See the PR checks."
               EMOJI="⏳"
               PUSHED_PENDING=1
             elif [ "${CI_PENDING:-0}" != "0" ] && [ "${PUSHED:-}" = "1" ]; then
               # The run did its work and pushed; CI simply has not finished
               # on the new head yet. That is a status, not a warning.
-              FACTS="Fix pushed this run. CI is still running on the new commit: ${CI_PENDING} check(s) pending — see the PR checks."
+              FACTS="Fix pushed this run. CI is still running on the new commit: $(plural "$CI_PENDING" check checks) pending. See the PR checks."
               EMOJI="⏳"
               PUSHED_PENDING=1
             elif [ "${CI_PENDING:-0}" != "0" ]; then
-              FACTS="CI still running: ${CI_PENDING} checks pending — see the run log."
-              EMOJI="⚠️"
+              FACTS="CI still running: $(plural "$CI_PENDING" check checks) pending. See the PR checks."
+              EMOJI="⏳"
             elif [ "$THREADS_LEFT" != "0" ]; then
-              FACTS="${GREEN_WORDING}, but ${THREADS_LEFT} human review threads were not addressed — see the run log."
+              if [ "$THREADS_LEFT" = "1" ]; then
+                FACTS="${GREEN_WORDING}, but 1 human review thread was not addressed. See the run log."
+              else
+                FACTS="${GREEN_WORDING}, but ${THREADS_LEFT} human review threads were not addressed. See the run log."
+              fi
               EMOJI="⚠️"
             elif [ "$SLACK_REMAINING" != "0" ]; then
-              FACTS="${GREEN_WORDING}, but ${SLACK_REMAINING} Slack change requests were not addressed — see the run log."
+              if [ "$SLACK_REMAINING" = "1" ]; then
+                FACTS="${GREEN_WORDING}, but 1 Slack change request was not addressed. See the run log."
+              else
+                FACTS="${GREEN_WORDING}, but ${SLACK_REMAINING} Slack change requests were not addressed. See the run log."
+              fi
               EMOJI="⚠️"
             elif [ "$REMAINING" != "0" ]; then
-              FACTS="${GREEN_WORDING}. AI reviewers still have ${REMAINING} item(s) outstanding — I did not finish wait/revise. See the run log."
+              FACTS="${GREEN_WORDING}, but $(ai_open_text "$REMAINING"): the revise loop stopped before it finished them. See the run log."
               EMOJI="⚠️"
             elif [ "$(num_or_zero "${AI_APPROVALS:-}")" != "0" ]; then
               FACTS="${GREEN_WORDING}. The AI reviewer approved this PR and raised no new defects."
-              EMOJI="✅"
             elif [ "${AI_REVIEWS_REPLIED:-}" = "1" ]; then
-              FACTS="${GREEN_WORDING}. Replied on the PR to ${AI_REVIEWS_REPLIED_COUNT:-0} AI review comments."
-              EMOJI="✅"
-            else
+              FACTS="${GREEN_WORDING}. Replied on the PR to $(plural "${AI_REVIEWS_REPLIED_COUNT:-0}" "AI review comment" "AI review comments")."
+            elif [ "${AI_READ:-}" = "1" ]; then
               FACTS="${GREEN_WORDING}. AI reviewers reported no remaining issues."
-              EMOJI="✅"
+            else
+              # The review state was never read this run, so say nothing
+              # about the AI reviewers.
+              FACTS="${GREEN_WORDING}."
             fi
-            # A stopped dstp run (conflict, red verify) is not "the PR is up":
-            # the stop reason leads and the emoji follows it.
-            if [ -n "${DSTP_ERROR:-}" ]; then
-              FACTS="$TROUBLE"
-              TROUBLE=""
-              EMOJI="⚠️"
+            # A stopped dstp run (conflict, red verify, a blocked call) leads.
+            [ -n "$STOP" ] && EMOJI="⚠️"
+            if [ "$MODE" = "revise" ] && [ "${PUSHED:-}" != "1" ] && { [ -n "$STOP" ] || [ "${REVISE_TROUBLE:-}" = "1" ]; }; then
+              HEAD_SLACK="Could not revise ${PR_SLACK} (issue ${ISSUE_LINK})."
+              HEAD_MD="Could not revise #${PR_NUM}."
+            elif [ "$MODE" = "auto" ]; then
+              HEAD_SLACK="Opened ${PR_SLACK} for issue ${ISSUE_LINK}."
+              HEAD_MD="Opened #${PR_NUM}."
+            elif [ "${PUSHED:-}" = "1" ]; then
+              HEAD_SLACK="Updated ${PR_SLACK} (issue ${ISSUE_LINK})."
+              HEAD_MD="Updated #${PR_NUM}."
+            else
+              HEAD_SLACK="Checked ${PR_SLACK} (issue ${ISSUE_LINK})."
+              HEAD_MD="Checked #${PR_NUM}."
             fi
-            # A failed read leads the completion, so it never reads as "PR is up".
-            DETAILS=$(detail_lines "$DONE" "$ITEMS_SUMMARY" "$NOT_OURS" "$FACTS" "$CONFLICT_LINE" "$TROUBLE")
+            DETAILS_SLACK=$(detail_lines '• ' "$STOP" "$CONFLICT_LINE" "$DONE" "$ITEMS_SUMMARY" "$FACTS" "$IGNORED_LINE" "$NOT_OURS" "$TROUBLE")
+            DETAILS_MD=$(detail_lines '- ' "$STOP" "$CONFLICT_LINE" "$DONE" "$ITEMS_SUMMARY" "$FACTS" "$IGNORED_LINE" "$NOT_OURS" "$TROUBLE")
+            # A failed read leads the completion, so it never reads as done.
             if [ -n "${READ_FAILED:-}" ]; then
               EMOJI="⚠️"
               READ_WHAT=$(printf '%s' "$READ_FAILED" | slack_escape | cut -c1-100)
-              BODY=$(printf '🔨 **Forge** — could not read %s on %s, so it stopped revising.\n\n%s\n\nTook %s.' "$READ_WHAT" "$PR_URL" "$DETAILS" "$TOOK")
-              SLACK_TEXT=$(printf '%s⚠️ Could not read %s on %s — stopped revising the <%s|PR>.\n%s\nTook %s.' "$WHO" "$READ_WHAT" "$ISSUE_LINK" "$PR_URL" "$DETAILS" "$TOOK")
-            else
-              BODY=$(printf '🔨 **Forge** — %s is up.\n\n%s\n\nTook %s.' "$PR_URL" "$DETAILS" "$TOOK")
-              SLACK_TEXT=$(printf '%s%s %s — <%s|PR> is up.\n%s\nTook %s.' "$WHO" "$EMOJI" "$ISSUE_LINK" "$PR_URL" "$DETAILS" "$TOOK")
+              HEAD_SLACK="Could not read ${READ_WHAT} on ${PR_SLACK} (issue ${ISSUE_LINK}), so Forge stopped revising."
+              HEAD_MD="Could not read ${READ_WHAT} on #${PR_NUM}, so Forge stopped revising."
             fi
-            QUIET="✅ Done · Took ${TOOK}"
-            [ "$EMOJI" = "⚠️" ] && QUIET="⚠️ Done · Took ${TOOK}"
-            [ "$PUSHED_PENDING" = "1" ] && QUIET="⏳ Fix pushed, CI running · Took ${TOOK}"
+            BODY=$(printf '🔨 %s\n\n%s\nTook %s.' "$HEAD_MD" "${DETAILS_MD:+$DETAILS_MD$NL}" "$TOOK")
+            if [ "$EMOJI" = "✅" ]; then
+              SLACK_TEXT=$(printf '%s%s\n%sTook %s.' "$WHO" "$HEAD_SLACK" "${DETAILS_SLACK:+$DETAILS_SLACK$NL}" "$TOOK")
+            else
+              SLACK_TEXT=$(printf '%s%s %s\n%sTook %s.' "$WHO" "$EMOJI" "$HEAD_SLACK" "${DETAILS_SLACK:+$DETAILS_SLACK$NL}" "$TOOK")
+            fi
+            # The card follows the outcome; the time is in the completion.
+            if [ -n "${READ_FAILED:-}" ]; then
+              QUIET="⚠️ Could not read ${READ_WHAT}"
+            elif [ -n "$STOP" ]; then
+              QUIET="⚠️ dstp stopped, see the reply below"
+            elif [ "$PUSHED_PENDING" = "1" ]; then
+              QUIET="⏳ Fix pushed, CI running"
+            elif [ "$EMOJI" = "⏳" ]; then
+              QUIET="⏳ CI still running"
+            elif [ "$EMOJI" = "⚠️" ] && [ "$CI_STATE" = "ok" ] && [ "${CI_FAILING:-0}" != "0" ]; then
+              QUIET="⚠️ CI failing, see the reply below"
+            elif [ "$EMOJI" = "⚠️" ]; then
+              QUIET="⚠️ Needs a look, see the reply below"
+            elif [ "$MODE" = "auto" ]; then
+              QUIET="✅ PR opened"
+            elif [ "${PUSHED:-}" = "1" ]; then
+              QUIET="✅ PR updated"
+            else
+              QUIET="✅ Nothing left to fix"
+            fi
             REACTION="white_check_mark"
             [ "$EMOJI" = "⚠️" ] && REACTION="warning"
             LABEL="forge:done"
@@ -2634,17 +3127,17 @@ jobs:
               -e 's/xox[abposr]-[A-Za-z0-9-]{10,}/***/g' \
               -e 's#x-access-token:[^@]*@#x-access-token:***@#g' \
               || echo "no output captured")
-            BODY=$(printf '🔨 **Forge** failed — [full log](%s)\n\n<details><summary>Last output</summary>\n\n```\n%s\n```\n\n</details>\n\nRe-apply the `forge` label to retry.\n\nTook %s.' "$RUN_URL" "$TAIL" "$TOOK")
+            BODY=$(printf '🔨 Forge failed. [Full log](%s)\n\n<details><summary>Last output</summary>\n\n```\n%s\n```\n\n</details>\n\nRe-apply the `forge` label to retry.\n\nTook %s.' "$RUN_URL" "$TAIL" "$TOOK")
             LABEL="forge:failed"
             REACTION="x"
             [ "${OUTCOME:-}" = "cancelled" ] && REACTION="octagonal_sign"
             FAIL_SNIPPET=$(printf '%s\n' "$TAIL" | sed $'s/\x1b\\[[0-9;]*[A-Za-z]//g' | grep -E 'Verify failed:|spec-coverage [(]|unrecognized_model' | tail -n 1 | tr -d '\r`$\\' | sed -E 's/^[[:space:]]+//' | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' | cut -c1-180 || true)
             if [ -n "$FAIL_SNIPPET" ]; then
-              QUIET="❌ Failed · ${FAIL_SNIPPET} · Took ${TOOK}"
-              SLACK_TEXT=$(printf '%s❌ Failed on %s — %s\n<%s|see the run log>. The error is also on the issue.\nTook %s.' "$WHO" "$ISSUE_LINK" "$FAIL_SNIPPET" "$RUN_URL" "$TOOK")
+              QUIET="❌ Failed · ${FAIL_SNIPPET}"
+              SLACK_TEXT=$(printf '%s❌ Failed on %s: %s\nThe <%s|run log> has the details, and the error is also on the issue.\nTook %s.' "$WHO" "$ISSUE_LINK" "$FAIL_SNIPPET" "$RUN_URL" "$TOOK")
             else
-              QUIET="❌ Failed · Took ${TOOK}"
-              SLACK_TEXT=$(printf '%s❌ Failed on %s — <%s|see the run log>. The error is also on the issue.\nTook %s.' "$WHO" "$ISSUE_LINK" "$RUN_URL" "$TOOK")
+              QUIET="❌ Failed"
+              SLACK_TEXT=$(printf '%s❌ Failed on %s. The <%s|run log> has the details, and the error is also on the issue.\nTook %s.' "$WHO" "$ISSUE_LINK" "$RUN_URL" "$TOOK")
             fi
           fi
 
