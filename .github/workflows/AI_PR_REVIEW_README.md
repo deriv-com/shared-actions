@@ -67,7 +67,7 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 | | `kimi` | `anthropic` | `grok` | `codex` | `muse` |
 |---|---|---|---|---|---|
 | Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) | `@xai-official/grok` CLI — Grok Build (npm, pinned) | `@openai/codex` CLI (npm, pinned) | Meta Muse Code CLI (native binary via the `dev.meta.ai` installer, **pinned by version assertion** — see below) |
-| Default model | `kimi-k3` | `claude-sonnet-5-5` | `grok-4.6` | `gpt-6.1-sol` | `meta-muse-wonder-1.0` |
+| Default model | `kimi-k3.1-pro` | `claude-sonnet-5-5` | `grok-4.6` | `gpt-6.1-sol` | `meta-muse-wonder-1.0` |
 | `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** | proxy origin **+ `/v1`** | proxy origin **+ `/v1`** | proxy origin **+ `/v1`**, pinned in Muse Code `settings.json` as `endpoint_transport` (a `--base-url` flag makes the CLI withhold its key); the CLI posts `{base_url}/responses` |
 | Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (+ Claude Code's permission-free `Grep`/`Glob`; the only GitHub MCP server agent mode mounts here is `github_file_ops`, denied by name and by the guard — see below) | `Read`, `Grep`, `Write`/`Edit` **output dir only** | Codex's unified exec + `apply_patch` (no per-file Read/Grep/Glob tools to scope) | `read_file`, `search` only (`--disable-shell --disable-write`); the review is the CLI's final reply, captured from stdout by the engine |
 | Shell | none (absent from `[tools] enabled`; the deny rule is intent only, and the path guard denies it too) | none (`--allowedTools` omits Bash, `--disallowedTools` re-denies it, the path guard denies it too) | none (`dontAsk` + `--tools` allowlist + `--deny Bash`) | sandboxed (`exec` runs commands inside the sandbox; `network_access=false` + `approval_policy=never` keep them off the network and un-escalatable) | none (the shell tool is removed by `--disable-shell`; the OS sandbox stays on around the file tools) |
@@ -98,7 +98,7 @@ succeeds. **Change these two inputs together, never one alone.** Valid types:
 
 **Model names belong to the endpoint, not the model.** `model` is passed through
 verbatim, so it must be whatever the thing in `base_url` calls it. On the Deriv
-LiteLLM proxy K3 is `kimi-k3`; the Kimi-platform ids (`k3`, `k3-256k`,
+LiteLLM proxy Kimi K3.1 Pro is `kimi-k3.1-pro`; the Kimi-platform ids (`k3`, `k3-256k`,
 `kimi-for-coding`) resolve only against `api.kimi.com/coding/v1` and return a
 bare `400 The request was invalid` from the proxy. List what a proxy accepts:
 
@@ -553,7 +553,7 @@ summary regardless of dashboard state:
   "agent": "ai_review",
   "event_type": "initial_review | followup_review",
   "timestamp": "…", "pr_number": "…", "repo": "…",
-  "payload": { "commit_sha": "…", "review_size_bytes": 0, "model": "kimi-k3", "engine": "kimi" }
+  "payload": { "commit_sha": "…", "review_size_bytes": 0, "model": "kimi-k3.1-pro", "engine": "kimi" }
 }
 ```
 

@@ -41,10 +41,10 @@ inputs:
     description: "Number of the PR under review (prompt preamble only)."
     required: true
   model:
-    description: "Model ID as the endpoint in base_url names it. With the LiteLLM proxy that is a proxy alias, e.g. `kimi-k3`. The Kimi-platform ids (`k3`, `k3-256k`, `kimi-for-coding`, `kimi-for-coding-highspeed`) only resolve against api.kimi.com/coding/v1 and return 400 from the proxy. Maps to KIMI_MODEL_NAME."
+    description: "Model ID as the endpoint in base_url names it. With the LiteLLM proxy that is a proxy alias, e.g. `kimi-k3.1-pro`. The Kimi-platform ids (`k3`, `k3-256k`, `kimi-for-coding`, `kimi-for-coding-highspeed`) only resolve against api.kimi.com/coding/v1 and return 400 from the proxy. Maps to KIMI_MODEL_NAME."
     required: false
     # Matches the default base_url below, which is the LiteLLM proxy.
-    default: "kimi-k3"
+    default: "kimi-k3.1-pro"
   base_url:
     description: "LLM API base URL. A trailing /v1 is appended when absent, so the identical value also works for the anthropic engine (which needs it removed). Maps to KIMI_MODEL_BASE_URL."
     required: false
