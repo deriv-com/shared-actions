@@ -239,6 +239,31 @@ check 'grep -qxF "    default: \"${KIMI_CLI_VERSION}\"" <<< "$KIMI_CLI_INPUT"' "
 # codex bump cannot satisfy or fail it.
 check 'grep -qF "per engine (\`${KIMI_CLI_VERSION}\` kimi," "$README"' "README inputs table lists ${KIMI_CLI_VERSION} for kimi"
 
+# Kimi and grok default models. Same rule as the anthropic block: every live
+# copy of each alias must match, so a bump that misses one fails here. The
+# copies: the engine's resolve-step arm and its part of the `model` input
+# description in ai-pr-review.yml, the engine action's `model` default, and the
+# README engines table. Kimi also has the dogfood caller in ai-review.yml.
+# Arm, input-block and here-string scoping keep one engine's copy from
+# satisfying or failing the other's check.
+KIMI_DEFAULT_MODEL="kimi-k3.1-pro"
+GROK_DEFAULT_MODEL="grok-4.7"
+DOGFOOD_WF="$ROOT/.github/workflows/ai-review.yml"
+GROK_ARM="$(awk '/^            grok\)/{f=1} f{print} f && /;;/{exit}' "$WF")"
+KIMI_MODEL_INPUT="$(awk '/^  model:/{f=1; next} f && /^  [a-z_]+:/{exit} f' "$KIMI")"
+GROK_MODEL_INPUT="$(awk '/^  model:/{f=1; next} f && /^  [a-z_]+:/{exit} f' "$GROK")"
+README_MODEL_ROW="$(grep -E '^\| Default model \|' "$README")"
+check 'grep -qxF "              DEFAULT_MODEL=\"${KIMI_DEFAULT_MODEL}\"" <<< "$KIMI_ARM"' "kimi arm pins DEFAULT_MODEL=${KIMI_DEFAULT_MODEL}"
+check 'grep -qxF "              DEFAULT_MODEL=\"${GROK_DEFAULT_MODEL}\"" <<< "$GROK_ARM"' "grok arm pins DEFAULT_MODEL=${GROK_DEFAULT_MODEL}"
+check 'grep -qF "kimi -> ${KIMI_DEFAULT_MODEL}," "$WF"' "model input description names ${KIMI_DEFAULT_MODEL} for kimi"
+check 'grep -qF "grok -> ${GROK_DEFAULT_MODEL}," "$WF"' "model input description names ${GROK_DEFAULT_MODEL} for grok"
+check 'grep -qxF "    default: \"${KIMI_DEFAULT_MODEL}\"" <<< "$KIMI_MODEL_INPUT"' "kimi engine action defaults model to ${KIMI_DEFAULT_MODEL}"
+check 'grep -qxF "    default: \"${GROK_DEFAULT_MODEL}\"" <<< "$GROK_MODEL_INPUT"' "grok engine action defaults model to ${GROK_DEFAULT_MODEL}"
+# Kimi is the first column, grok the third.
+check 'grep -qE "^\| Default model \| \`${KIMI_DEFAULT_MODEL//./\\.}\` \|" <<< "$README_MODEL_ROW"' "README engines table lists ${KIMI_DEFAULT_MODEL} for kimi"
+check 'grep -qE "^\| Default model \|[^|]*\|[^|]*\| \`${GROK_DEFAULT_MODEL//./\\.}\` \|" <<< "$README_MODEL_ROW"' "README engines table lists ${GROK_DEFAULT_MODEL} for grok"
+check 'grep -qxF "      model: ${KIMI_DEFAULT_MODEL}" "$DOGFOOD_WF"' "ai-review.yml dogfood caller runs ${KIMI_DEFAULT_MODEL}"
+
 # Dispatch: an if-gated step referencing the codex engine by absolute @master path.
 check 'grep -q "if: steps.engine.outputs.engine == '\''codex'\''" "$WF"' "codex dispatch step is if-gated on the engine output"
 check 'grep -q "ai_review_engine_codex@master" "$WF"' "codex dispatch references the engine by absolute @master path"

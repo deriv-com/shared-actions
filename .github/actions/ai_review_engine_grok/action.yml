@@ -41,9 +41,9 @@ inputs:
     description: "Number of the PR under review (prompt preamble only)."
     required: true
   model:
-    description: "Model ID as the endpoint in base_url names it. With the LiteLLM proxy that is a proxy alias, e.g. grok-4.6. Maps to config.toml [model.review].model."
+    description: "Model ID as the endpoint in base_url names it. With the LiteLLM proxy that is a proxy alias, e.g. grok-4.7. Maps to config.toml [model.review].model."
     required: false
-    default: "grok-4.6"
+    default: "grok-4.7"
   base_url:
     description: "LLM API base URL. A trailing /v1 is appended when absent, so the identical value also works for the anthropic engine (which needs it removed). Maps to [model.review].base_url."
     required: false
@@ -52,7 +52,7 @@ inputs:
     description: "API key for base_url. Composite actions cannot read the secrets context, so the caller must pass this explicitly. Mapped to XAI_API_KEY in the run step env and never written to disk."
     required: true
   max_context_size:
-    description: "Maximum context window in tokens. Must not exceed what the endpoint allows for the selected model, or the CLI over-packs context and the request is rejected. grok-4.6 input window is 500000. If a 400 persists after confirming the model name, try lowering this. Maps to [model.review].context_window."
+    description: "Maximum context window in tokens. Must not exceed what the endpoint allows for the selected model, or the CLI over-packs context and the request is rejected. grok-4.7 input window is 500000. If a 400 persists after confirming the model name, try lowering this. Maps to [model.review].context_window."
     required: false
     default: "500000"
   cli_version:
@@ -328,7 +328,7 @@ runs:
 
           echo "ℹ️  Troubleshooting: a 400 on the FIRST request is config —"
           echo "    api_backend (chat_completions vs responses) or max_context_size"
-          echo "    above the window LiteLLM allows for grok-4.6. After the agent"
+          echo "    above the window LiteLLM allows for grok-4.7. After the agent"
           echo "    has started reading files, config is probably fine."
         }
 

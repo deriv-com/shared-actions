@@ -51,9 +51,9 @@ jobs:
       # cannot silently alter what this repo runs — which matters more here than
       # anywhere, since this is where those defaults are edited.
       engine: kimi
-      # LiteLLM proxy alias for K3. The Kimi-platform id `k3` resolves only at
-      # api.kimi.com/coding/v1 and the proxy answers it with a bare 400.
-      model: kimi-k3
+      # LiteLLM proxy alias for Kimi K3.1 Pro. Kimi-platform ids such as K3's `k3`
+      # resolve only at api.kimi.com/coding/v1 and the proxy answers them with a bare 400.
+      model: kimi-k3.1-pro
       # Wire dialect. Must match what base_url serves: the proxy serves plain
       # /v1/chat/completions, which is `openai`. `kimi` targets the Kimi Code
       # platform and the proxy rejects it, even with a correct model and key.
@@ -66,7 +66,7 @@ jobs:
       # reaps the stale Claude comment on any PR left open across the switch.
 
     secrets:
-      # LiteLLM virtual key, authorised for `kimi-k3` on litellmsa.deriv.ai.
+      # LiteLLM virtual key, authorised for `kimi-k3.1-pro` on litellmsa.deriv.ai.
       # NOTE: this secret does not exist in this repo yet — it must be added
       # (repo- or org-level) or the run fails at the engine step.
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
