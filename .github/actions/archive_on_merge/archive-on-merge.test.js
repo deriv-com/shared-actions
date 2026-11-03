@@ -801,9 +801,11 @@ test("a failed job-summary write is annotated, not just logged", (t) => {
   );
 });
 
-// The reusable workflow checks this script out inside the caller's repo, so
-// Node reads the caller's package.json to decide the module type. A caller
-// with "type": "module" must still load it as CommonJS (issue #124).
+// The reusable workflow checks this script out inside the caller's repo. Node
+// takes the module type from the nearest package.json above the script, which
+// here is the caller's. A caller with "type": "module" must still load it as
+// CommonJS (issue #124). The test uses require() rather than running the file,
+// so main() and its network calls never run; both paths use the same lookup.
 test("loads as CommonJS inside a repo whose package.json sets type module", (t) => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "archive-on-merge-esm-"));
   t.after(() => fs.rmSync(repo, { recursive: true, force: true }));
@@ -815,7 +817,7 @@ test("loads as CommonJS inside a repo whose package.json sets type module", (t) 
   const loaded = execFileSync(
     process.execPath,
     ["-e", `process.stdout.write(typeof require(${JSON.stringify(path.join(dir, script))}).extractChangeNames)`],
-    { cwd: repo, encoding: "utf8" },
+    { encoding: "utf8" },
   );
   assert.strictEqual(loaded, "function");
 });

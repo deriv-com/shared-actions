@@ -95,6 +95,14 @@ and retried up to 3 times with exponential backoff on network errors, timeouts,
 failure — a real answer — and fails immediately rather than retrying three
 times and burying the cause.
 
+## Why the script is `.cjs`
+
+The reusable workflow checks the script out inside the caller's workspace, so
+Node takes its module type from the caller's `package.json`. The `.cjs`
+extension makes Node load it as CommonJS even when that file sets
+`"type": "module"` ([#124](https://github.com/deriv-com/shared-actions/issues/124)).
+Don't rename it back to `.js`.
+
 ## Tests
 
 ```bash
