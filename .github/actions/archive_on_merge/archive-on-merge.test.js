@@ -5,6 +5,10 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const http = require("node:http");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
 
 const {
   extractChangeNames,
@@ -26,7 +30,7 @@ const {
   fetchPullRequestFiles,
   FILES_PER_PAGE,
   MAX_FILE_PAGES,
-} = require("./archive-on-merge.js");
+} = require("./archive-on-merge.cjs");
 
 /**
  * Start a stub GitHub API on a random port. `handler(url, req)` returns either
@@ -795,4 +799,25 @@ test("a failed job-summary write is annotated, not just logged", (t) => {
     logs.some((l) => l.startsWith("::warning::") && l.includes("job summary")),
     `expected a ::warning:: annotation, got: ${JSON.stringify(logs)}`
   );
+});
+
+// The reusable workflow checks this script out inside the caller's repo. Node
+// takes the module type from the nearest package.json above the script, which
+// here is the caller's. A caller with "type": "module" must still load it as
+// CommonJS (issue #124). The test uses require() rather than running the file,
+// so main() and its network calls never run; both paths use the same lookup.
+test("loads as CommonJS inside a repo whose package.json sets type module", (t) => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "archive-on-merge-esm-"));
+  t.after(() => fs.rmSync(repo, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ type: "module" }));
+  const dir = path.join(repo, ".shared-actions", ".github", "actions", "archive_on_merge");
+  fs.mkdirSync(dir, { recursive: true });
+  const script = "archive-on-merge.cjs";
+  fs.copyFileSync(path.join(__dirname, script), path.join(dir, script));
+  const loaded = execFileSync(
+    process.execPath,
+    ["-e", `process.stdout.write(typeof require(${JSON.stringify(path.join(dir, script))}).extractChangeNames)`],
+    { encoding: "utf8" },
+  );
+  assert.strictEqual(loaded, "function");
 });

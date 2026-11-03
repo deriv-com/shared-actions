@@ -117,7 +117,7 @@ jobs:
           # openspec telemetry auto-disables when CI=true; set DO_NOT_TRACK too
           # as defense-in-depth and for local runs outside CI.
           DO_NOT_TRACK: "1"
-        run: node .shared-actions/.github/actions/archive_on_merge/archive-on-merge.js
+        run: node .shared-actions/.github/actions/archive_on_merge/archive-on-merge.cjs
 
       - name: Remove shared-actions checkout
         if: always()
