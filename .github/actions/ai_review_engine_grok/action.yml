@@ -41,9 +41,9 @@ inputs:
     description: "Number of the PR under review (prompt preamble only)."
     required: true
   model:
-    description: "Model ID as the endpoint in base_url names it. With the LiteLLM proxy that is a proxy alias, e.g. grok-4.6. Maps to config.toml [model.review].model."
+    description: "Model ID as the endpoint in base_url names it. With the LiteLLM proxy that is a proxy alias, e.g. grok-4.7. Maps to config.toml [model.review].model."
     required: false
-    default: "grok-4.6"
+    default: "grok-4.7"
   base_url:
     description: "LLM API base URL. A trailing /v1 is appended when absent, so the identical value also works for the anthropic engine (which needs it removed). Maps to [model.review].base_url."
     required: false
@@ -328,7 +328,7 @@ runs:
 
           echo "ℹ️  Troubleshooting: a 400 on the FIRST request is config —"
           echo "    api_backend (chat_completions vs responses) or max_context_size"
-          echo "    above the window LiteLLM allows for grok-4.6. After the agent"
+          echo "    above the window LiteLLM allows for grok-4.7. After the agent"
           echo "    has started reading files, config is probably fine."
         }
 
