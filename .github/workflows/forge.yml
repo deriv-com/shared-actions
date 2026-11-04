@@ -1250,6 +1250,11 @@ jobs:
           # after its check turns green, so a finished PR Review check with no
           # comment yet gets up to a minute more. Everything goes to Report as
           # outputs: pr_head_sha, settle_pending, update_no_checks, head_review.
+          # If GitHub never shows the new commit within that minute (head
+          # stays empty, or still equals the pre-push head), the pushed
+          # commit was never read: write head_unseen=1 and stop there. Do not
+          # write pr_head_sha, poll checks, or read a review -- both would
+          # describe the old commit, not the one that was pushed.
           settle_after_update() {
             local pr_url="$1" before="$2" head="" i review has_review_check
             slack_progress "Waiting for CI on the new commit"
@@ -1258,7 +1263,12 @@ jobs:
               [ -n "$head" ] && [ "$head" != "$before" ] && break
               sleep 5
             done
-            [ -n "$head" ] && echo "pr_head_sha=$head" >> "$GITHUB_OUTPUT"
+            if [ -z "$head" ] || [ "$head" = "$before" ]; then
+              echo "head_unseen=1" >> "$GITHUB_OUTPUT"
+              echo "GitHub did not show the new commit within a minute of the push"
+              return 0
+            fi
+            echo "pr_head_sha=$head" >> "$GITHUB_OUTPUT"
             if ! wait_for_update_settle "$pr_url"; then
               echo "settle_pending=$(printf '%s' "$SETTLE_PENDING" | jq -c '.')" >> "$GITHUB_OUTPUT"
               echo "Checks still running when the job time ran out: $(printf '%s' "$SETTLE_PENDING" | jq -r '[.[] | "\(.name) (\(.state))"] | join(", ")')"
@@ -2550,6 +2560,7 @@ jobs:
           DSTP_STATUS: ${{ steps.forge.outputs.dstp_status }}
           DSTP_BASE: ${{ steps.forge.outputs.dstp_base }}
           PR_HEAD_SHA: ${{ steps.forge.outputs.pr_head_sha }}
+          HEAD_UNSEEN: ${{ steps.forge.outputs.head_unseen }}
           UPDATE_NO_CHECKS: ${{ steps.forge.outputs.update_no_checks }}
           HEAD_REVIEW: ${{ steps.forge.outputs.head_review }}
           FORGE_COMMAND: ${{ inputs.command }}
@@ -2919,7 +2930,14 @@ jobs:
             AI_LINE=""
             OFFER=""
             SCAN_LINE=""
-            if [ "${PUSHED:-}" = "1" ]; then
+            if [ "${PUSHED:-}" = "1" ] && [ "${HEAD_UNSEEN:-}" = "1" ]; then
+              # GitHub never showed the pushed commit, so CI_STATE, SETTLE_LIST
+              # and HEAD_REVIEW describe whatever head the PR showed. One line
+              # says so; no CI, scan, AI or revise-offer line is written.
+              CI_LINE="GitHub did not show the new commit within a minute of the push, so CI and the AI review on it were not checked. See the PR checks."
+              EMOJI="⚠️"
+              QUIET="${QUIET}, new commit not visible yet"
+            elif [ "${PUSHED:-}" = "1" ]; then
               CI_SHORT="CI passed"
               if [ "${UPDATE_NO_CHECKS:-}" = "1" ]; then
                 CI_LINE="No CI checks ran on the new commit."
