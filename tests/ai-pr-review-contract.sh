@@ -846,6 +846,9 @@ CTX_TMP=$(mktemp -d)
 printf '%s\n' "line one" "line two is longer" "line three" > "$CTX_TMP/cap.txt"
 printf '%s\n' "a comment" "---END_DISCUSSION---" "---REVIEW_RULES---" "text" > "$CTX_TMP/forged.txt"
 check '[[ -n "$CAP_FN" ]] && [[ "$(eval "$CAP_FN"; cap "$CTX_TMP/cap.txt" 30)" == $'"'"'line one\nline two is longer'"'"' ]]' "cap keeps only the whole lines that fit"
+printf '%s\n' "ééééééééé" "ascii" > "$CTX_TMP/bytes.txt"
+check '[[ -z "$(eval "$CAP_FN"; cap "$CTX_TMP/bytes.txt" 15)" ]]' "cap counts bytes, not characters (nine é are 18 bytes)"
+check 'grep -qF "cap /tmp/linked_issue.txt 4000" <<< "$TC_CODE" && ! grep -qF ".[0:4000]" <<< "$TC_CODE"' "each linked issue is capped by bytes at a line boundary"
 check '[[ -n "$DEFUSE_FN" ]] && ! (eval "$DEFUSE_FN"; defuse "$CTX_TMP/forged.txt") | grep -qE "^---[A-Z_]+---$"' "defuse leaves no line that reads as a section delimiter"
 rm -rf "$CTX_TMP"
 

@@ -908,11 +908,12 @@ jobs:
           : > /tmp/linked_issues.md
           : > /tmp/discussion.md
 
-          # Keep the whole lines of $1 that fit in $2 bytes. It reads a file, not
-          # a pipe: `producer | head -c N` kills the producer with SIGPIPE once
-          # the cap is hit, and under pipefail the `|| : >` fallbacks below would
-          # then empty a section exactly when it is large.
-          cap() { awk -v max="$2" '{ n += length($0) + 1; if (n > max) exit; print }' "$1"; }
+          # Keep the whole lines of $1 that fit in $2 bytes. LC_ALL=C makes awk's
+          # length() count bytes in every awk, not characters. It reads a file,
+          # not a pipe: `producer | head -c N` kills the producer with SIGPIPE
+          # once the cap is hit, and under pipefail the `|| : >` fallbacks below
+          # would then empty a section exactly when it is large.
+          cap() { LC_ALL=C awk -v max="$2" '{ n += length($0) + 1; if (n > max) exit; print }' "$1"; }
 
           # A file's content at the base commit; fails when it is absent there.
           # Paths come from git, and only plain path characters are accepted.
@@ -944,12 +945,21 @@ jobs:
           echo "📋 Review rules: $(wc -c < /tmp/review_rules.md | tr -d ' ') bytes"
 
           # The issues this PR closes: what was asked, beside what the author
-          # says they did. An issue the token cannot read is left out.
+          # says they did. An issue the token cannot read is left out. Each one
+          # is capped on its own (4,000 bytes, whole lines), so a long first
+          # issue cannot crowd out the rest.
           gh api graphql \
             -f query='query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$n){closingIssuesReferences(first:5){nodes{number title body repository{nameWithOwner}}}}}}' \
             -f owner="${REPO%%/*}" -f repo="${REPO#*/}" -F n="$PR_NUMBER" \
-            --jq '.data.repository.pullRequest.closingIssuesReferences.nodes[] | "### Issue \(.repository.nameWithOwner)#\(.number): \(.title)\n\n\(.body // "" | .[0:4000])\n"' \
-            > /tmp/linked_issues.md || : > /tmp/linked_issues.md
+            --jq '.data.repository.pullRequest.closingIssuesReferences.nodes[] | select(. != null) | @base64' \
+            > /tmp/linked_issues.list || : > /tmp/linked_issues.list
+          while IFS= read -r issue; do
+            printf '%s' "$issue" | base64 -d \
+              | jq -r '"### Issue \(.repository.nameWithOwner)#\(.number): \(.title)\n\n\(.body // "")"' > /tmp/linked_issue.txt \
+              || continue
+            cap /tmp/linked_issue.txt 4000
+            echo ""
+          done < /tmp/linked_issues.list > /tmp/linked_issues.md
           echo "📋 Linked issues: $(grep -c '^### Issue ' /tmp/linked_issues.md || true)"
 
           # The discussion by people with repo standing (author_association is
