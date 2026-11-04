@@ -665,6 +665,8 @@ case "$args" in
     if [ -f "$S/pulls.json" ]; then jq -c "${@: -1}" "$S/pulls.json"; else echo '[]'; fi ;;
   "pr view https://github.com/o/r/pull/7 --json headRefOid --jq .headRefOid")
     if [ ! -f "$S/dstp_ran" ]; then head -c 40 /dev/zero | tr '\0' 'a'; echo
+    elif [ -f "$S/head_fail" ]; then exit 1
+    elif [ -f "$S/head_stale" ]; then head -c 40 /dev/zero | tr '\0' 'a'; echo
     elif [ "$(cat "$S/dstp_count" 2>/dev/null || echo 0)" -ge 2 ]; then head -c 40 /dev/zero | tr '\0' 'c'; echo
     else head -c 40 /dev/zero | tr '\0' 'b'; echo; fi ;;
   "pr view https://github.com/o/r/pull/7 --json headRefName --jq .headRefName") echo feature ;;
@@ -1340,6 +1342,27 @@ check '[ "$(grep -c "Took " "$C/completion.txt")" = 1 ] && [ "$(cat "$C/quiet.tx
 check '! grep -qE "Fix pushed|is up|Done|AI reviewers reported|—" "$C/completion.txt"' \
   "a conflicts-only completion never says Fix pushed, is up, Done, or claims an AI result it did not read"
 check '[ "$(reactions "$C" add)" = white_check_mark ]' "a settled, green conflicts run reacts white_check_mark"
+
+# GitHub never shows the pushed commit (head unchanged, or every head read
+# fails): say so, and report nothing about the old head.
+for mode in head_stale head_fail; do
+  C=$(update_case "update_$mode")
+  touch "$C/$mode"
+  jq -nc '{status: "updated", branch: "feature", base: "master", conflict_resolution: {attempted: true, strategy: "merge", unattended: true, resolved: true, reason: null,
+    files: [{file: "packages/reports/src/positions-content.spec.tsx", kind: "reconciled"}], also_touched: [], unresolved: [],
+    merge_sha: "527e3e47aaaabbbbccccddddeeeeffff00001111"}}' > "$C/update_result.json"
+  run_case "$C"
+  check '[ "$(cat "$C/run.rc")" = 0 ] && grep -q "^pushed=1$" "$C/out" && grep -q "^head_unseen=1$" "$C/out" && ! grep -q "^pr_head_sha=" "$C/out"' \
+    "$mode: a pushed commit GitHub never shows writes head_unseen=1 and no pr_head_sha"
+  check '! grep -qE "^(head_review|settle_pending|update_no_checks)=" "$C/out" && [ ! -f "$C/rollup_seq.n" ]' \
+    "$mode: no settle wait, no review read, and the checks are never polled after the push"
+  check 'grep -qxF "• GitHub did not show the new commit within a minute of the push, so CI and the AI review on it were not checked. See the PR checks." "$C/completion.txt"' \
+    "$mode: the completion carries the one not-checked line"
+  check '! has "$C/completion.txt" "CI on the new commit" && ! has "$C/completion.txt" "PR Review:" && ! has "$C/completion.txt" "Could not read the AI review" && ! has "$C/completion.txt" "This run only handled the conflicts" && ! has "$C/completion.txt" "ignores scan checks"' \
+    "$mode: no CI line, no AI line, no revise offer and no scan line for the old head"
+  check '[ "$(cat "$C/quiet.txt")" = "⚠️ Conflicts resolved, new commit not visible yet" ] && [ "$(reactions "$C" add)" = warning ]' \
+    "$mode: the card says the new commit is not visible and the reaction is warning (got $(cat "$C/quiet.txt"))"
+done
 
 # A clean merge (no conflicts) says so instead of claiming it resolved any.
 C=$(update_case update_clean)
