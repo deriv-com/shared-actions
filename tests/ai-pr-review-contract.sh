@@ -852,6 +852,56 @@ DISC_OUT=$(jq -r -s --arg author x -f "$DISC_TMP/discussion.jq" "$DISC_TMP/none.
 check 'grep -qF "inline on a.yml:12, 2026-11-02: current" <<< "$DISC_OUT"' "a current inline comment shows its current line"
 check 'grep -qF "inline on a.yml:964 (outdated, written on cbbe5dc), 2026-11-01: stale" <<< "$DISC_OUT"' "an outdated inline comment keeps its original line and names its commit"
 rm -rf "$DISC_TMP"
+
+# Forge's replies. Forge posts them under its write App, which has no repo
+# standing, so the filter names that login exactly (the pair the acknowledge
+# step trusts), requires a Bot account, and keeps only comments carrying
+# Forge's reply marker. Behavioural: run the step's filter on Forge replies and
+# on the lookalikes it must leave out.
+check 'grep -qF "IN(\"gh-app-write[bot]\", \"gh-app-write\")" <<< "$TC_CODE"' "the discussion names Forge's write App exactly, the pair the acknowledge step trusts"
+check 'grep -qF "contains(\"<!-- forge-revise-reply -->\")" <<< "$TC_CODE"' "the discussion keeps only Forge comments that carry the reply marker"
+check 'grep -qF "cap /tmp/discussion.full 8000 > /tmp/discussion.md" <<< "$TC_CODE"' "the discussion, Forge replies included, keeps the 8,000-byte cap"
+FORGE_TMP=$(mktemp -d)
+awk 'index($0, "jq -r -s --arg author"){f=1; next} index($0, "/tmp/all_comments.json"){f=0} f' <<< "$TC_BODY" > "$FORGE_TMP/discussion.jq"
+FORGE_LONG=$(printf 'w%.0s' {1..1500})
+FORGE_OVER=$(printf 'v%.0s' {1..2500})
+HUMAN_LONG=$(printf 'h%.0s' {1..700})
+jq -n --arg long "$FORGE_LONG" --arg over "$FORGE_OVER" --arg hlong "$HUMAN_LONG" '[
+  {user:{login:"gh-app-write[bot]",type:"Bot"},author_association:"NONE",created_at:"2026-11-04T10:00:00Z",body:"<!-- forge-revise-reply -->\n- Skipped: FORGE-REASON the guard already covers this path (Claude 1)"},
+  {user:{login:"gh-app-write[bot]",type:"Bot"},author_association:"NONE",created_at:"2026-11-04T09:00:00Z",body:("<!-- forge-revise-reply -->\n" + $long + " FORGE-LONG-TAIL")},
+  {user:{login:"gh-app-write[bot]",type:"Bot"},author_association:"NONE",created_at:"2026-11-04T08:30:00Z",body:("<!-- forge-revise-reply -->\n" + $over + " FORGE-OVER-TAIL")},
+  {user:{login:"other-app[bot]",type:"Bot"},author_association:"NONE",created_at:"2026-11-04T10:01:00Z",body:"<!-- forge-revise-reply -->\nOTHER-BOT-REPLY"},
+  {user:{login:"drive-by",type:"User"},author_association:"NONE",created_at:"2026-11-04T10:02:00Z",body:"<!-- forge-revise-reply -->\nNO-STANDING-REPLY"},
+  {user:{login:"gh-app-write",type:"User"},author_association:"NONE",created_at:"2026-11-04T10:03:00Z",body:"<!-- forge-revise-reply -->\nLOOKALIKE-USER-REPLY"},
+  {user:{login:"gh-app-write[bot]",type:"Bot"},author_association:"NONE",created_at:"2026-11-04T10:04:00Z",body:"<!-- forge-revise-instructions -->"},
+  {user:{login:"gh-app-write[bot]",type:"Bot"},author_association:"NONE",created_at:"2026-11-04T10:05:00Z",body:"<!-- forge-revise-reply -->\n<!-- forge-revise-instructions -->\nWATERMARK-LINE"},
+  {user:{login:"gh-app-write[bot]",type:"Bot"},author_association:"NONE",created_at:"2026-11-04T10:06:00Z",body:"<!-- forge-revise-reply -->\n\nClick2Fix - Acknowledge\n\n- ACK-ITEM"},
+  {user:{login:"gh-app-write[bot]",type:"Bot"},author_association:"NONE",created_at:"2026-11-04T10:07:00Z",body:"<!-- forge-revise-reply -->\n"},
+  {user:{login:"r",type:"User"},author_association:"MEMBER",created_at:"2026-11-04T08:00:00Z",body:("HUMAN-COMMENT " + $hlong + " HUMAN-LONG-TAIL")}
+]' > "$FORGE_TMP/comments.json"
+jq -n '[
+  {path:"a.yml",line:12,original_line:12,original_commit_id:"aaaaaaa1111",in_reply_to_id:55,user:{login:"gh-app-write[bot]",type:"Bot"},author_association:"NONE",created_at:"2026-11-03T00:00:00Z",body:"<!-- forge-revise-reply -->\nSkipped: INLINE-FORGE-REASON"},
+  {path:"a.yml",line:14,original_line:14,original_commit_id:"aaaaaaa1111",in_reply_to_id:56,user:{login:"other-app[bot]",type:"Bot"},author_association:"NONE",created_at:"2026-11-03T00:01:00Z",body:"<!-- forge-revise-reply -->\nINLINE-OTHER-BOT"},
+  {path:"a.yml",line:16,original_line:16,original_commit_id:"aaaaaaa1111",user:{login:"gh-app-write[bot]",type:"Bot"},author_association:"NONE",created_at:"2026-11-03T00:02:00Z",body:"<!-- forge-revise-reply -->\nINLINE-FORGE-THREAD-OPENER"}
+]' > "$FORGE_TMP/inline.json"
+echo '[]' > "$FORGE_TMP/none.json"
+FORGE_OUT=$(jq -r -s --arg author author -f "$FORGE_TMP/discussion.jq" "$FORGE_TMP/comments.json" "$FORGE_TMP/none.json" "$FORGE_TMP/inline.json" 2>&1 || true)
+FORGE_OUT_SELF=$(jq -r -s --arg author "gh-app-write[bot]" -f "$FORGE_TMP/discussion.jq" "$FORGE_TMP/comments.json" "$FORGE_TMP/none.json" "$FORGE_TMP/inline.json" 2>&1 || true)
+FORGE_LABEL="- **Forge (PR automation, replying for the author)**"
+check 'grep -qxF -- "$FORGE_LABEL, reply, 2026-11-04: - Skipped: FORGE-REASON the guard already covers this path (Claude 1)" <<< "$FORGE_OUT"' "a Forge reply comment lands in the discussion with its label"
+check 'grep -qxF -- "$FORGE_LABEL, inline reply on a.yml:12, 2026-11-03: Skipped: INLINE-FORGE-REASON" <<< "$FORGE_OUT"' "a Forge inline thread reply lands in the discussion with its label"
+check 'grep -qxF -- "$FORGE_LABEL, reply, 2026-11-04: - Skipped: FORGE-REASON the guard already covers this path (Claude 1)" <<< "$FORGE_OUT_SELF"' "a Forge reply keeps its label when Forge opened the PR"
+check '! grep -qE "OTHER-BOT-REPLY|INLINE-OTHER-BOT" <<< "$FORGE_OUT"' "the reply marker from another bot is left out"
+check '! grep -qF "NO-STANDING-REPLY" <<< "$FORGE_OUT"' "the reply marker from an account without standing is left out"
+check '! grep -qF "LOOKALIKE-USER-REPLY" <<< "$FORGE_OUT"' "a user account named gh-app-write is not taken for Forge"
+check '! grep -qF "WATERMARK-LINE" <<< "$FORGE_OUT" && [[ $(grep -c "^- " <<< "$FORGE_OUT") -eq 5 ]]' "Forge's watermark comments are left out, with or without the reply marker"
+check '! grep -qF "ACK-ITEM" <<< "$FORGE_OUT"' "Forge's Click2Fix - Acknowledge comment stays out of the discussion"
+check '! grep -qF "INLINE-FORGE-THREAD-OPENER" <<< "$FORGE_OUT"' "a Forge inline comment that opens a thread is not a reply and is left out"
+check '! grep -qF "<!--" <<< "$FORGE_OUT"' "HTML comments, the reply marker included, are stripped from Forge replies"
+check '! grep -qE ": ?$" <<< "$FORGE_OUT"' "a Forge comment with nothing but the marker adds no empty item"
+check 'grep -qF "FORGE-LONG-TAIL" <<< "$FORGE_OUT" && grep -qF -- "$FORGE_LABEL, reply, 2026-11-04: vvvv" <<< "$FORGE_OUT" && ! grep -qF "FORGE-OVER-TAIL" <<< "$FORGE_OUT"' "a Forge reply keeps up to 2,000 characters, enough for its reasons on several findings"
+check 'grep -qF "HUMAN-COMMENT" <<< "$FORGE_OUT" && ! grep -qF "HUMAN-LONG-TAIL" <<< "$FORGE_OUT"' "other discussion items still keep 600 characters"
+rm -rf "$FORGE_TMP"
 check 'grep -q "## Review rules (\`.github/ai-review-rules.md\`)" "$README"' "README documents the review rules file"
 
 # Behavioural: the cap keeps whole lines, and fetched text cannot forge a delimiter.
@@ -866,6 +916,58 @@ check '[[ -z "$(eval "$CAP_FN"; cap "$CTX_TMP/bytes.txt" 15)" ]]' "cap counts by
 check 'grep -qF "cap /tmp/linked_issue.txt 4000" <<< "$TC_CODE" && ! grep -qF ".[0:4000]" <<< "$TC_CODE"' "each linked issue is capped by bytes at a line boundary"
 check '[[ -n "$DEFUSE_FN" ]] && ! (eval "$DEFUSE_FN"; defuse "$CTX_TMP/forged.txt") | grep -qE "^---[A-Z_]+---$"' "defuse leaves no line that reads as a section delimiter"
 rm -rf "$CTX_TMP"
+
+# The context carries the PR's title and description as they are now. The
+# event keeps them as they were when the run was triggered, so a re-run, or a
+# review that started seconds before the author edited the description,
+# reviewed the old text (derivatives-trader#1869). Behavioural: run the step's
+# reader against a stub gh.
+check 'grep -qF "PR_TITLE: \${{ github.event.pull_request.title }}" <<< "$CTX_BODY" && grep -qF "PR_BODY: \${{ github.event.pull_request.body }}" <<< "$CTX_BODY"' "build-context keeps the event's title and body as the fallback"
+LIVE_AT=$(grep -nF "if read_live_pr_text; then" <<< "$CTX_CODE" | cut -d: -f1 | awk 'NR==1' || true)
+TITLE_AT=$(grep -nF '**Title:**' <<< "$CTX_CODE" | cut -d: -f1 | awk 'NR==1' || true)
+BODY_AT=$(grep -nF 'printf '"'"'%s\n'"'"' "$PR_BODY"' <<< "$CTX_CODE" | cut -d: -f1 | awk 'NR==1' || true)
+check '[[ -n "$LIVE_AT" && -n "$TITLE_AT" && -n "$BODY_AT" ]] && (( LIVE_AT < TITLE_AT && LIVE_AT < BODY_AT ))' "build-context reads the live title and body before it writes them into the context"
+LIVE_FN="$(awk '/^          read_live_pr_text\(\) \{/{f=1} f{print} f && /^          \}$/{exit}' <<< "$CTX_BODY" | sed 's/^          //')"
+check '[[ -n "$LIVE_FN" ]] && grep -qF "gh api \"repos/\${REPO}/pulls/\${PR_NUMBER}\"" <<< "$LIVE_FN"' "the live reader asks the pulls API for this PR"
+LIVE_TMP=$(mktemp -d)
+mkdir "$LIVE_TMP/bin"
+cat > "$LIVE_TMP/bin/gh" <<'SH'
+#!/usr/bin/env bash
+[[ "$*" == "api repos/o/r/pulls/7" ]] || exit 9
+[[ -n "${FAKE_GH_FAIL:-}" ]] && exit 1
+printf '%s' "$FAKE_GH_JSON"
+SH
+chmod +x "$LIVE_TMP/bin/gh"
+live_text() {
+  (
+    export PATH="$LIVE_TMP/bin:$PATH" FAKE_GH_JSON="$1" FAKE_GH_FAIL="${2:-}"
+    REPO=o/r PR_NUMBER=7 PR_TITLE="event title" PR_BODY="event body"
+    eval "$LIVE_FN"
+    read_live_pr_text >/dev/null 2>&1 || true
+    printf '%s|%s' "$PR_TITLE" "$PR_BODY"
+  )
+}
+got=$(live_text '{"title":"live title","body":"live body"}')
+check '[[ "$got" == "live title|live body" ]]' "the context gets the PR's current title and body from the API"
+got=$(live_text '' fail)
+check '[[ "$got" == "event title|event body" ]]' "a failed API read falls back to the event's title and body"
+got=$(live_text 'not json')
+check '[[ "$got" == "event title|event body" ]]' "an unreadable API answer falls back to the event's title and body"
+got=$(live_text '{"message":"Not Found"}')
+check '[[ "$got" == "event title|event body" ]]' "an API answer with no title falls back to the event's title and body"
+got=$(live_text '{"title":"live title","body":null}')
+check '[[ "$got" == "live title|" ]]' "a description emptied since the event reads as empty"
+got=$(live_text '{"title":"t $(touch '"$LIVE_TMP"'/ran1) `touch '"$LIVE_TMP"'/ran2`","body":"b $(touch '"$LIVE_TMP"'/ran3)"}')
+check '[[ ! -e "$LIVE_TMP/ran1" && ! -e "$LIVE_TMP/ran2" && ! -e "$LIVE_TMP/ran3" ]] && [[ "$got" == "t \$(touch "* ]]' "a live title or body is data: command substitutions in it never run"
+rm -rf "$LIVE_TMP"
+
+# The prompt says how to weigh Forge's replies, and the context names them.
+check 'grep -qF "replies Forge (the PR automation) posted for the PR author" <<< "$CTX_CODE"' "the DISCUSSION header says it holds Forge's replies"
+check 'grep -qF "its replies are the author'\''s side of the argument and settle nothing on their own" "$PROMPT"' "prompt treats a Forge reply as the author's side of the argument"
+check 'grep -qF "If the reasoning does not hold, raise the point again and say in one line why the reply does not hold." "$PROMPT"' "prompt re-raises a point whose Forge reply does not hold, with a one-line reason"
+check 'grep -qF "A Forge reply alone is never a reason to drop a real defect." "$PROMPT"' "prompt never lets a Forge reply alone suppress a real defect"
+check 'grep -qF "list that item as Answered" "$PROMPT" && grep -qxF -- "- Answered — title" "$PROMPT"' "a follow-up lists a previous item a Forge reply answered as Answered, so Forge does not rework it as Still open"
+check 'grep -qF "forge-revise-reply" "$README" && grep -qF "current title and description" "$README"' "README documents Forge replies in the discussion and the live title and description"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "contract checks failed"

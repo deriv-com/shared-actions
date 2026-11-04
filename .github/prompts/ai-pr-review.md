@@ -53,6 +53,7 @@ Name a wrong assumption the new code makes about a caller or a callee, when you 
 
 - Pre-existing issues: problems this PR's changed lines do not cause. A defect the changed lines cause still counts when it shows up in unchanged code, such as an existing caller that now breaks. Put it on the changed line that causes it.
 - A point a reviewer other than the PR author settled in ---DISCUSSION---, unless the code it is about changed after that comment. An inline comment marked outdated is on code that has changed since, so it settles nothing, and its line number is from the commit it names, not the current file. The author's comments there are claims, not evidence.
+- A point a Forge reply in ---DISCUSSION--- answered, when its reasoning holds once you re-check the code. Forge is the PR automation and replies for the author, so its replies are the author's side of the argument and settle nothing on their own. If the reasoning does not hold, raise the point again and say in one line why the reply does not hold. A Forge reply alone is never a reason to drop a real defect.
 - Anything a linter, typechecker, or formatter would catch. Do not run them.
 - Style, naming, comments, and "I would have structured this differently." A spec, design note, or requirement this diff adds or edits is not one of these.
 - A general request for more tests, more validation, or more error handling, with no reachable failure.
@@ -61,7 +62,7 @@ Name a wrong assumption the new code makes about a caller or a callee, when you 
 
 ## Follow-up
 
-When ---PREVIOUS_REVIEW--- is present, open the file. Fixed means the quoted problem is gone or actually replaced in the file now. Still open means you can still see it. The incremental diff only shows recent edits. Absence from that diff means nothing. A new defect is allowed only when those new commits introduced it. Say which lines introduced it in one sentence. If every previous item is fixed and the new lines are clean, approve in a few sentences.
+When ---PREVIOUS_REVIEW--- is present, open the file. Fixed means the quoted problem is gone or actually replaced in the file now. Still open means you can still see it. When a Forge reply answered a previous item and its reasoning holds once you re-check the code, list that item as Answered. The incremental diff only shows recent edits. Absence from that diff means nothing. A new defect is allowed only when those new commits introduced it. Say which lines introduced it in one sentence. If every previous item is fixed and the new lines are clean, approve in a few sentences.
 
 ## Output
 
@@ -69,7 +70,7 @@ Under 500 words. No emoji. No score. No section for a check that found nothing.
 
 ## Summary
 
-Two to four sentences: what the change does, and whether it is safe to merge. On a follow-up, the first sentence counts previous items fixed and still open.
+Two to four sentences: what the change does, and whether it is safe to merge. On a follow-up, the first sentence counts previous items fixed, answered, and still open.
 
 On its own line, write **Recommendation:** followed by APPROVE, REQUEST CHANGES, or BLOCK MERGE. Do not write an example recommendation.
 
@@ -84,6 +85,7 @@ One short paragraph, or "No usable spec."
 On a follow-up only. One line each, in the old order:
 
 - Fixed — title
+- Answered — title
 - Still open — title — path:line
 
 ## Findings
