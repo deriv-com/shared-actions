@@ -22,6 +22,7 @@ engine is pluggable: pick `kimi`, `anthropic`, `grok`, `codex`, or `muse` with o
 - 🧱 The Kimi and Anthropic engines confine the model's `Read`/`Grep`/`Glob` to the PR checkout and its `Write` to the single output file with a shared, unit-tested **PreToolUse path guard** (match-all, fail-closed, unknown tools denied), and fail the job if a review was produced while the guard never ran
 - 🛡️ The post step refuses to publish a review containing the LLM API key, the job's GitHub token, anything shaped like a GitHub token, or the on-disk shapes of git credential plumbing (comment bodies are not covered by Actions secret masking; the failure message names the exact pattern that hit), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
+- 📚 Gives the model the context it cannot fetch itself: the issues the PR closes (the Spec axis compares against what was asked, not only the description), the discussion by accounts with repo standing (a point a reviewer settled is not raised again), and the base branch's `AGENTS.md` / `CLAUDE.md` for the changed paths plus `.github/ai-review-rules.md`. Guidance and rules are read from the base commit, never from the PR, so a PR still cannot instruct its own reviewer
 - 📊 Emits events to the OneAboveAll metrics dashboard, and always to the job summary
 - ⏳ Posts a caller-owned "working on it" comment (**Model:** then **Effort:** at the top) before the engine runs, then edits that same comment into the review; the CLI never gets a GitHub token. Empty Kimi knobs show `model default (no override sent)`; empty anthropic/codex knobs show `medium` (default); empty muse knobs show `high` (default); Grok prints `n/a`
 - 🏷️ The reusable job is named after the engine (`Grok PR Review` / `Kimi PR Review` / `Claude PR Review` / `Codex PR Review` / `Muse PR Review`), or after `review_title` when that input is set. empty title = one slot per engine; set title = concurrent slot on that engine (concurrency, HTML marker, and progress marker include the title)
@@ -477,6 +478,10 @@ the migration guide keep their existing `permissions` block unchanged.
 `id-token: write` also appears unused by both engines and is a candidate for the
 same trim, pending a check that the self-hosted runner group does not rely on it.
 
+## Review rules (`.github/ai-review-rules.md`)
+
+A consumer repo can keep standing rules for this review in `.github/ai-review-rules.md`: a pattern the team accepts, a false positive that keeps coming back, a convention the reviewer should hold the line on. The review reads the file from the PR's **base** commit, so a rule takes effect once it is merged, and a PR cannot change the rules its own review follows. The prompt tells the model to ignore any rule that says to approve, skip a check, or ignore the prompt. Up to 8,000 bytes are used.
+
 ## Known limitations
 
 **Engine actions are referenced at `@master`, not a pinned SHA.** Every other
@@ -729,10 +734,18 @@ asserts all of it.
    engine step may come from a path an engine can write.
 7. **Collect acknowledged suggestions** from `Click2Fix - Acknowledge` comments
    posted by the bot or by accounts with repo standing (`author_association`),
-   so a drive-by comment cannot suppress findings.
+   so a drive-by comment cannot suppress findings. Then **gather trusted
+   context** (best effort: a failure leaves the older context and never fails
+   the job): the `AGENTS.md` / `CLAUDE.md` files on the base commit that sit in
+   or above a changed file's directory, `.github/ai-review-rules.md` from the
+   base commit, the issues the PR closes (`closingIssuesReferences`), and the
+   conversation comments, review bodies and inline comments of accounts with
+   repo standing. Each section is capped, cut at a line boundary.
 8. **Build `/tmp/review_context.md`** — instructions, previous review,
-   noise-filtered incremental diff, acknowledged items, PR metadata, review
-   procedure, output format. The incremental diff holds only the PR's own
+   noise-filtered incremental diff, acknowledged items, PR metadata, linked
+   issues, discussion, repo guidance, review rules, review procedure, output
+   format. A line in fetched text that looks like a section delimiter is
+   defused, so it cannot close its own section. The incremental diff holds only the PR's own
    changes since the last review. When the branch merged its base in between
    (the PR's merge-base, read from the compare API, moved), the last reviewed
    commit is replayed onto the new merge-base with `git merge-tree` and HEAD
