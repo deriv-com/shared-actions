@@ -19,7 +19,7 @@ name: Forge — issue to PR
 #         slack_message_ts:{ required: false, type: string }
 #         slack_started_at:{ required: false, type: string }  # unix seconds
 #         slack_mention_ts:{ required: false, type: string }  # requester's message
-#         requested_by:    { required: false, type: string }
+#         requested_by:    { required: false, type: string }  # Slack user id, or U…/W…/S… ids to tag
 #         analysis_brief:  { required: false, type: string }
 #         command:         { required: false, type: string }  # auto (first open) or revise
 #
@@ -34,7 +34,7 @@ name: Forge — issue to PR
 #         slack_message_ts:${{ github.event.inputs.slack_message_ts }}
 #         slack_started_at:${{ github.event.inputs.slack_started_at }}
 #         slack_mention_ts:${{ github.event.inputs.slack_mention_ts }}
-#         requested_by:    ${{ github.event.inputs.requested_by }}
+#         requested_by:    ${{ github.event.inputs.requested_by }}  # who the completion tags
 #         analysis_brief:  ${{ github.event.inputs.analysis_brief }}
 #         command:         ${{ github.event.inputs.command || 'auto' }}
 #         install_command: "npm ci"          # whatever your CI runs
@@ -88,7 +88,10 @@ on:
         required: false
         type: string
       requested_by:
-        description: "Slack user id that asked for this, for the audit trail"
+        description: >-
+          The Slack user id that asked, or a comma-separated list of Slack
+          user (U…/W…) and user-group (S…) ids to tag in the completion.
+          Any other token is dropped.
         required: false
         type: string
       analysis_brief:
@@ -2661,8 +2664,32 @@ jobs:
           THREADS_LEFT="${THREADS_REMAINING:-0}"
           [ -z "$THREADS_LEFT" ] && THREADS_LEFT=0
 
-          WHO=""
-          [ -n "${REQUESTED_BY:-}" ] && WHO="<@${REQUESTED_BY}> "
+          # Who the completion tags: the Slack user id that asked, or the
+          # comma-separated user (U…/W…) and user-group (S…) ids a bot request
+          # names, so a bot's ask tags the repo's owners instead of the bot.
+          # Anyone with dispatch rights can set requested_by, so only these
+          # strict id shapes become mentions. Any other token (<!channel>,
+          # <!here>, free mrkdwn) is dropped and only counted in the log.
+          render_who() {
+            local raw tok out="" dropped=0
+            local -a toks=()
+            raw=$(printf '%s' "${1:-}" | tr ',\r\n\t' '    ')
+            read -r -a toks <<< "$raw" || true
+            for tok in ${toks[@]+"${toks[@]}"}; do
+              if [[ "$tok" =~ ^[UW][A-Z0-9]{6,}$ ]]; then
+                out="${out}<@${tok}> "
+              elif [[ "$tok" =~ ^S[A-Z0-9]{6,}$ ]]; then
+                out="${out}<!subteam^${tok}> "
+              else
+                dropped=$((dropped + 1))
+              fi
+            done
+            if [ "$dropped" -gt 0 ]; then
+              echo "::warning::requested_by: dropped ${dropped} token(s) that are not Slack user (U/W) or user-group (S) ids." >&2
+            fi
+            printf '%s' "$out"
+          }
+          WHO=$(render_who "${REQUESTED_BY:-}")
           ISSUE_LINK="<${ISSUE_URL}|#${ISSUE_NUMBER}>"
 
           # The job this run did, so each mode gets its own wording. A
@@ -2837,6 +2864,49 @@ jobs:
               [ -n "$line" ] && printf '%s%s\n' "$prefix" "$line"
             done
             return 0
+          }
+          # fail_snippet <log tail>: why a failed run failed, as one
+          # Slack-escaped line of at most 180 characters, or nothing. A Verify
+          # failed, spec-coverage or unrecognized_model line is quoted as is.
+          # A commit the repo's own pre-commit hook rejected (husky,
+          # lint-staged) is named by the first lint error row. dstp prints the
+          # hook's output inside one {"error":"..."} JSON line, so its newlines
+          # are the two characters \n and its colours are literal \u001b[..m
+          # text as well as real ESC bytes; both are decoded for this parse
+          # only. When the tail has both kinds, the later one wins.
+          fail_snippet() {
+            local log="$1" verify hook
+            verify=$(printf '%s\n' "$log" | sed $'s/\x1b\\[[0-9;]*[A-Za-z]//g' | grep -E 'Verify failed:|spec-coverage [(]|unrecognized_model' | tail -n 1 || true)
+            # Bytewise (LC_ALL=C): tail -c can cut a UTF-8 character in half.
+            hook=$(printf '%s\n' "$log" \
+              | LC_ALL=C awk '{ gsub(/\\n/, "\n"); print }' \
+              | LC_ALL=C sed -E -e $'s/\x1b\\[[0-9;]*[A-Za-z]//g' -e 's/\\u001[bB]\[[0-9;]*[A-Za-z]//g' \
+              | LC_ALL=C tr -d '\r' \
+              | LC_ALL=C awk -v said="the repo's pre-commit hook rejected the commit" '
+                  { line[NR] = $0 }
+                  /Verify failed:|spec-coverage [(]|unrecognized_model/ { v = NR }
+                  /pre-commit hook exited with code/ { h = NR; exited = 1 }
+                  /husky - pre-commit/ { h = NR }
+                  index($0, "[FAILED]") { failed = 1 }
+                  END {
+                    if (!h || !(exited || failed) || v > h) exit
+                    # ESLint rows sit under their file path: "  18:26  error
+                    # <message>  <rule>", columns two or more spaces apart.
+                    file = ""
+                    for (i = 1; i < h; i++) {
+                      s = line[i]
+                      if (s ~ /^[^ \t]/) { file = s; continue }
+                      sub(/^[ \t]+/, "", s)
+                      n = split(s, f, "  +")
+                      if (file != "" && n >= 3 && f[1] ~ /^[0-9]+:[0-9]+$/ && f[2] == "error") {
+                        sub(/.*\//, "", file)
+                        printf "%s: %s:%s%s\n", said, file, f[1], (n >= 4 ? " " f[n] : "")
+                        exit
+                      }
+                    }
+                    print said
+                  }' || true)
+            printf '%s\n' "${hook:-$verify}" | tr -d '\r`$\\' | sed -E 's/^[[:space:]]+//' | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' | cut -c1-180 || true
           }
 
           FACTS=""
@@ -3150,7 +3220,7 @@ jobs:
             LABEL="forge:failed"
             REACTION="x"
             [ "${OUTCOME:-}" = "cancelled" ] && REACTION="octagonal_sign"
-            FAIL_SNIPPET=$(printf '%s\n' "$TAIL" | sed $'s/\x1b\\[[0-9;]*[A-Za-z]//g' | grep -E 'Verify failed:|spec-coverage [(]|unrecognized_model' | tail -n 1 | tr -d '\r`$\\' | sed -E 's/^[[:space:]]+//' | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' | cut -c1-180 || true)
+            FAIL_SNIPPET=$(fail_snippet "$TAIL")
             if [ -n "$FAIL_SNIPPET" ]; then
               QUIET="❌ Failed · ${FAIL_SNIPPET}"
               SLACK_TEXT=$(printf '%s❌ Failed on %s: %s\nThe <%s|run log> has the details, and the error is also on the issue.\nTook %s.' "$WHO" "$ISSUE_LINK" "$FAIL_SNIPPET" "$RUN_URL" "$TOOK")

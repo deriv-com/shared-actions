@@ -84,19 +84,99 @@ check 'awk "
 " "$WF"' \
   "Report Failed Slack copy includes spec-coverage or Verify failed from the log"
 
-# Run the FAIL_SNIPPET pipeline from Report outcome against a fixture log.
+# Run the FAIL_SNIPPET assignment from Report outcome against a fixture log,
+# with any top-level Report helper it calls (fail_snippet).
 SNIPPET_LINE=$(awk '
   /name: Report outcome/ {r=1}
   r && /FAIL_SNIPPET=\$\(/ { sub(/^ +/, ""); print; exit }
 ' "$WF")
+report_fn() {  # report_fn <name>  -> the Report outcome helper, dedented
+  awk -v name="$1" '
+    /name: Report outcome/ {r=1}
+    r && $0 == "          " name "() {" {f=1}
+    f { end = ($0 == "          }"); sub(/^          /, ""); print; if (end) exit }
+  ' "$WF"
+}
+SNIPPET_FN=$(report_fn fail_snippet)
 check '[ -n "$SNIPPET_LINE" ]' "FAIL_SNIPPET assignment exists in Report outcome"
+snippet() {  # snippet <log tail>  -> FAIL_SNIPPET as Report sets it
+  TAIL="$1" bash -c "${SNIPPET_FN}"$'\n'"${SNIPPET_LINE}"$'\n'"printf '%s' \"\$FAIL_SNIPPET\""
+}
 TAIL=$'noise\n\033[31mVerify failed: spec-coverage (3/40 files) ping <!channel> & more\033[0m\nmore'
-export TAIL
-GOT=$(bash -c "${SNIPPET_LINE}"$'\n'"printf '%s' \"\$FAIL_SNIPPET\"")
+GOT=$(snippet "$TAIL")
 check '[[ "$GOT" == *"spec-coverage (3/40 files)"* ]]' "FAIL_SNIPPET extracts the verify line"
 check '[[ "$GOT" == *"&lt;!channel&gt;"* ]]' "FAIL_SNIPPET Slack-escapes angle brackets"
 check '[[ "$GOT" == *"&amp; more"* ]]' "FAIL_SNIPPET Slack-escapes ampersand"
 check '[[ "$GOT" != *"<!channel>"* ]]' "FAIL_SNIPPET does not leave raw <!channel>"
+check '[ "$GOT" = "Verify failed: spec-coverage (3/40 files) ping &lt;!channel&gt; &amp; more" ]' \
+  "FAIL_SNIPPET quotes the last Verify failed line whole, colours stripped (got $GOT)"
+GOT=$(snippet $'a\n  spec-coverage (2/9 files) under the floor\nb')
+check '[ "$GOT" = "spec-coverage (2/9 files) under the floor" ]' \
+  "FAIL_SNIPPET quotes a bare spec-coverage line, leading spaces trimmed (got $GOT)"
+GOT=$(snippet $'a\nAPI error: unrecognized_model claude-x\nb')
+check '[ "$GOT" = "API error: unrecognized_model claude-x" ]' "FAIL_SNIPPET quotes an unrecognized_model line (got $GOT)"
+GOT=$(snippet $'nothing\nto see')
+check '[ -z "$GOT" ]' "FAIL_SNIPPET stays empty when the tail names no known failure (got $GOT)"
+
+# A commit the repo's own pre-commit hook rejected. derivatives-trader#1849
+# (run 41690031615): dstp printed lint-staged's output inside one
+# {"error":"..."} JSON line, so its newlines are the two characters \n and its
+# colours are literal \u001b[..m text, after a real-ESC "Committing" prefix and
+# before the token table. HOOK_JSON is that line as the run printed it.
+HOOK_JSON=$(cat <<'EOF'
+{"error":"[STARTED] Preparing...\n[SUCCESS] Preparing...\n[STARTED] Running tasks...\n[STARTED] Running tasks for *.{js,jsx,ts,tsx,md,html,css,scss}\n[STARTED] Running tasks for *.{js,jsx,ts,tsx}\n[STARTED] Running tasks for *.{css,scss}\n[SKIPPED] No staged files match *.{css,scss}\n[STARTED] prettier --write\n[STARTED] eslint --fix --config .eslintrc.js --rule 'simple-import-sort/imports: 0'\n[SUCCESS] prettier --write\n[SUCCESS] Running tasks for *.{js,jsx,ts,tsx,md,html,css,scss}\n[FAILED] \u001b[91meslint --fix --config .eslintrc.js --rule 'simple-import-sort/imports: 0'\u001b[39m \u001b[2m[FAILED]\u001b[22m\n[SUCCESS] Running tasks...\n[STARTED] Applying modifications...\n[SKIPPED] Skipped because of errors from tasks.\n[STARTED] Reverting to original state because of errors...\n[SUCCESS] Reverting to original state because of errors...\n[STARTED] Cleaning up...\n[SUCCESS] Cleaning up...\n\n\u001b[91m\u001b[91m✖\u001b[91m eslint --fix --config .eslintrc.js --rule 'simple-import-sort/imports: 0':\u001b[39m\n\n/home/runner/work/derivatives-trader/derivatives-trader/packages/components/src/components/calendar/views/__tests__/calendar-days.spec.tsx\n   1:8   warning  'React' is defined but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars\n  18:26  error    Avoid direct Node access. Prefer using the methods from Testing Library  testing-library/no-node-access\n\n✖ 2 problems (1 error, 1 warning)\n\nhusky - pre-commit hook exited with code 1 (error)"}
+EOF
+)
+HOOK_LOG=$'  All checks passed.\n\033[0m\n\033[2m\n  Committing … \033[0m'"$HOOK_JSON"$'\n\033[2m\n  Token usage (costliest first):\n\033[0m\n\033[2m    total                                      $0.96     12\n\033[0m'
+HOOK_WANT="the repo's pre-commit hook rejected the commit: calendar-days.spec.tsx:18:26 testing-library/no-node-access"
+HOOK_BARE="the repo's pre-commit hook rejected the commit"
+GOT=$(snippet "$HOOK_LOG")
+check '[ "$GOT" = "$HOOK_WANT" ]' \
+  "FAIL_SNIPPET names the rejected pre-commit hook with the first error row's file, position and rule (got $GOT)"
+GOT=$(snippet $'\x9c\x96 half a character from tail -c\n'"$HOOK_LOG" 2>/dev/null)
+check '[ "$GOT" = "$HOOK_WANT" ]' "a tail that starts mid UTF-8 character still names the hook (got $GOT)"
+GOT=$(snippet $'[FAILED] eslint --fix\nsomething odd\nhusky - pre-commit hook exited with code 1 (error)')
+check '[ "$GOT" = "$HOOK_BARE" ]' "a hook rejection with no parseable error row gives the bare sentence (got $GOT)"
+GOT=$(snippet $'[STARTED] eslint\n[FAILED] eslint --fix\n/w/src/a.ts\n  3:4  error  Bad thing  no-bad\nhusky - pre-commit script failed (code 1)')
+check '[ "$GOT" = "$HOOK_BARE: a.ts:3:4 no-bad" ]' \
+  "lint-staged [FAILED] plus a husky pre-commit line is a hook rejection too (got $GOT)"
+GOT=$(snippet $'/w/src/a.ts\n  3:4  error  Bad thing  no-bad\nhusky - pre-commit says hello')
+check '[ -z "$GOT" ]' "a husky pre-commit line without [FAILED] or an exit code is not a hook rejection (got $GOT)"
+GOT=$(snippet $'Verify failed: spec-coverage (1/2 files)\n'"$HOOK_LOG")
+check '[ "$GOT" = "$HOOK_WANT" ]' "a hook rejection at the end of the tail wins over an older Verify failed line (got $GOT)"
+GOT=$(snippet "$HOOK_LOG"$'\nVerify failed: spec-coverage (1/2 files)')
+check '[ "$GOT" = "Verify failed: spec-coverage (1/2 files)" ]' \
+  "a Verify failed line after the hook output still wins (got $GOT)"
+GOT=$(snippet $'[FAILED] eslint\n/w/src/a&<b>.ts\n  1:1  error  Bad  x/<y>\n  2:2  error  Later  z\nhusky - pre-commit hook exited with code 1 (error)')
+check '[ "$GOT" = "$HOOK_BARE: a&amp;&lt;b&gt;.ts:1:1 x/&lt;y&gt;" ]' \
+  "the hook snippet takes the first error row and is Slack-escaped (got $GOT)"
+LONG_NAME="$(printf 'f%.0s' $(seq 1 300)).ts"
+GOT=$(snippet $'[FAILED] eslint\n/w/'"$LONG_NAME"$'\n  1:1  error  Bad  no-bad\nhusky - pre-commit hook exited with code 1 (error)')
+check '[ "${#GOT}" -eq 180 ] && [[ "$GOT" == "$HOOK_BARE: fff"* ]]' "the hook snippet is cut to 180 characters (got ${#GOT})"
+
+# Who the completion tags: the Slack user that asked, or the owner list a bot
+# request names. Only strict id shapes become mentions.
+WHO_FN=$(report_fn render_who)
+check '[ -n "$WHO_FN" ] && grep -q "WHO=\$(render_who \"\${REQUESTED_BY:-}\")" "$WF"' \
+  "Report builds WHO with render_who from REQUESTED_BY"
+who() {  # who <requested_by>  -> render_who's output, then |
+  [ -n "$WHO_FN" ] || { printf 'no render_who'; return 0; }
+  RB="$1" bash -c "${WHO_FN}"$'\n''render_who "$RB"; printf "|"' 2>/dev/null
+}
+check '[ "$(who U084VH2B135)" = "<@U084VH2B135> |" ]' "WHO: a single user id renders as before"
+check '[ "$(who W0ABCDEF12)" = "<@W0ABCDEF12> |" ]' "WHO: an enterprise W user id is a user mention"
+check '[ "$(who U084VH2B135,S0ABC12345,S0DEF67890)" = "<@U084VH2B135> <!subteam^S0ABC12345> <!subteam^S0DEF67890> |" ]' \
+  "WHO: a list renders users and user groups in order (got $(who U084VH2B135,S0ABC12345,S0DEF67890))"
+check '[ "$(who "U084VH2B135, S0ABC12345  W0ABCDEF12")" = "<@U084VH2B135> <!subteam^S0ABC12345> <@W0ABCDEF12> |" ]' \
+  "WHO: commas and whitespace both separate ids"
+check '[ "$(who "<!channel>,here,@team,U1,U084VH2B135,<!here>,*,S0ABC12345")" = "<@U084VH2B135> <!subteam^S0ABC12345> |" ]' \
+  "WHO: junk tokens are dropped and the valid ids kept (got $(who "<!channel>,here,@team,U1,U084VH2B135,<!here>,*,S0ABC12345"))"
+WHO_ERR=$(RB='<!channel>,here,@team,U1,U084VH2B135' bash -c "${WHO_FN}"$'\n''render_who "$RB"' 2>&1 >/dev/null || true)
+check '[[ "$WHO_ERR" == *"4 "* ]] && [[ "$WHO_ERR" != *channel* && "$WHO_ERR" != *here* && "$WHO_ERR" != *@team* && "$WHO_ERR" != *U1* ]]' \
+  "WHO: one warning says how many tokens were dropped and never echoes them (got $WHO_ERR)"
+WHO_EMPTY=$(RB="" bash -c "${WHO_FN}"$'\n''render_who "$RB"; printf "|"' 2>&1 || true)
+check '[ -n "$WHO_FN" ] && [ "$WHO_EMPTY" = "|" ]' "WHO: an empty value renders nothing and warns nothing (got $WHO_EMPTY)"
+check '[ "$(who "<!channel> <!here>")" = "|" ]' "WHO: a value of only junk renders no mention"
 
 # The lane decides whether a run fits inside timeout_minutes, so it must stay a
 # caller decision. Hardcoding --fast onto the command line would silently strip
@@ -1484,6 +1564,42 @@ SLACK_KEPT=$(SC="$(jq -nc '[
 " 2>&1)
 check '[ "$SLACK_KEPT" = "[7,8]" ]' \
   "a Slack note made only of command words (yes revise, @Forge please start) is dropped; a real request is kept (got $SLACK_KEPT)"
+
+# --- behavioral: a failed run's Slack copy and who it tags -------------------
+# Report runs as-is on a failed run against a fake Slack, with the log of
+# derivatives-trader#1849 and the requested_by values forge-agent sends.
+report_failure() {  # report_failure <name> <requested_by> <forge.log>  -> case dir
+  local c="$TMP_BEHAVIOR/failed_$1"
+  mkdir -p "$c/tmp" "$c/home"
+  printf '%s' "$3" > "$c/tmp/forge.log"
+  step_script "Report outcome" "$c" > "$c/report.sh"
+  env -i IGNORED_SCAN_JQ="$IGNORED_SCAN_JQ" IGNORED_CHECKS_RE="$IGNORED_CHECKS_RE" PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
+    GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1849 ISSUE_URL=https://github.com/o/r/issues/1849 \
+    GH_TOKEN=ghs_faketoken COMMENT_ID=55 OUTCOME=failure FORGE_COMMAND=auto REQUESTED_BY="$2" \
+    SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_PROGRESS_TS=2.2 SLACK_BOT_TOKEN=xoxb-fake \
+    RUN_URL=https://github.com/o/r/actions/runs/41690031615 \
+    bash -e "$c/report.sh" > "$c/report.log" 2>&1 || true
+  jq -rs '[.[] | select(.url | endswith("chat.postMessage")) | .p.text] | last // ""' "$c/slack.jsonl" > "$c/completion.txt" 2>/dev/null || true
+  jq -rs '[.[] | select(.url | endswith("chat.update")) | .p.text] | last // ""' "$c/slack.jsonl" > "$c/quiet.txt" 2>/dev/null || true
+  printf '%s' "$c"
+}
+FAILED_ON="❌ Failed on <https://github.com/o/r/issues/1849|#1849>"
+C=$(report_failure owners "U084VH2B135,S0ABC12345,S0DEF67890" "$HOOK_LOG")
+check '[ "$(head -1 "$C/completion.txt")" = "<@U084VH2B135> <!subteam^S0ABC12345> <!subteam^S0DEF67890> ${FAILED_ON}: ${HOOK_WANT}" ]' \
+  "a failed run tags the user and both user groups first, then names the rejected pre-commit hook (got $(head -1 "$C/completion.txt"))"
+check '[ "$(cat "$C/quiet.txt")" = "❌ Failed · ${HOOK_WANT}" ]' \
+  "the card names the rejected pre-commit hook too (got $(cat "$C/quiet.txt"))"
+C=$(report_failure one_user "U084VH2B135" "$HOOK_LOG")
+check '[ "$(head -1 "$C/completion.txt")" = "<@U084VH2B135> ${FAILED_ON}: ${HOOK_WANT}" ]' \
+  "a single requester id tags that user as before (got $(head -1 "$C/completion.txt"))"
+C=$(report_failure nobody "" $'Verify failed: spec-coverage (3/40 files)\n')
+check '[ "$(head -1 "$C/completion.txt")" = "${FAILED_ON}: Verify failed: spec-coverage (3/40 files)" ] && [ "$(cat "$C/quiet.txt")" = "❌ Failed · Verify failed: spec-coverage (3/40 files)" ]' \
+  "no requester tags nobody, and a Verify failed run reads as before (got $(head -1 "$C/completion.txt"))"
+C=$(report_failure junk '<!channel>,here,@team,U1,U084VH2B135' $'nothing useful\n')
+check '[ "$(head -1 "$C/completion.txt")" = "<@U084VH2B135> ${FAILED_ON}. The <https://github.com/o/r/actions/runs/41690031615|run log> has the details, and the error is also on the issue." ]' \
+  "junk requester tokens never reach Slack and the valid id is still tagged (got $(head -1 "$C/completion.txt"))"
+check 'grep -q "dropped 4 " "$C/report.log" && ! grep -qE "<!channel>|@team" "$C/report.log"' \
+  "the run log counts the dropped tokens without echoing them"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"
