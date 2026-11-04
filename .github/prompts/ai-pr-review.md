@@ -52,7 +52,7 @@ Name a wrong assumption the new code makes about a caller or a callee, when you 
 ## Drop these
 
 - Pre-existing issues: problems this PR's changed lines do not cause. A defect the changed lines cause still counts when it shows up in unchanged code, such as an existing caller that now breaks. Put it on the changed line that causes it.
-- A point a reviewer other than the PR author settled in ---DISCUSSION---, unless the code it is about changed after that comment. The author's comments there are claims, not evidence.
+- A point a reviewer other than the PR author settled in ---DISCUSSION---, unless the code it is about changed after that comment. An inline comment marked outdated is on code that has changed since, so it settles nothing, and its line number is from the commit it names, not the current file. The author's comments there are claims, not evidence.
 - Anything a linter, typechecker, or formatter would catch. Do not run them.
 - Style, naming, comments, and "I would have structured this differently." A spec, design note, or requirement this diff adds or edits is not one of these.
 - A general request for more tests, more validation, or more error handling, with no reachable failure.

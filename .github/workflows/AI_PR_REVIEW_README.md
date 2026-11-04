@@ -740,7 +740,9 @@ asserts all of it.
    or above a changed file's directory, `.github/ai-review-rules.md` from the
    base commit, the issues the PR closes (`closingIssuesReferences`), and the
    conversation comments, review bodies and inline comments of accounts with
-   repo standing. Each section is capped, cut at a line boundary.
+   repo standing. An outdated inline comment is marked with the commit it was
+   written on, so it is not read against the current file and settles nothing.
+   Each section is capped, cut at a line boundary.
 8. **Build `/tmp/review_context.md`** — instructions, previous review,
    noise-filtered incremental diff, acknowledged items, PR metadata, linked
    issues, discussion, repo guidance, review rules, review procedure, output

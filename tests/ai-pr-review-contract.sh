@@ -837,6 +837,21 @@ for sec in LINKED_ISSUES DISCUSSION REPO_GUIDANCE REVIEW_RULES; do
 done
 check 'grep -qF "A defect the changed lines cause still counts when it shows up in unchanged code" "$PROMPT"' "prompt keeps a broken existing caller in scope"
 check 'grep -qF "A point a reviewer other than the PR author settled in ---DISCUSSION---" "$PROMPT"' "prompt does not re-raise a settled point"
+check 'grep -qF "An inline comment marked outdated is on code that has changed since, so it settles nothing" "$PROMPT"' "prompt says an outdated inline comment settles nothing"
+
+# Behavioural: run the step's discussion filter on one current and one outdated
+# inline comment. GitHub sets line to null on an outdated one.
+DISC_TMP=$(mktemp -d)
+awk 'index($0, "jq -r -s --arg author"){f=1; next} index($0, "/tmp/all_comments.json"){f=0} f' <<< "$TC_BODY" > "$DISC_TMP/discussion.jq"
+echo '[]' > "$DISC_TMP/none.json"
+cat > "$DISC_TMP/inline.json" <<'JSON'
+[{"path":"a.yml","line":12,"original_line":10,"original_commit_id":"aaaaaaa1111","author_association":"MEMBER","user":{"login":"r","type":"User"},"body":"current","created_at":"2026-11-02T00:00:00Z"},
+ {"path":"a.yml","line":null,"original_line":964,"original_commit_id":"cbbe5dc2222","author_association":"MEMBER","user":{"login":"r","type":"User"},"body":"stale","created_at":"2026-11-01T00:00:00Z"}]
+JSON
+DISC_OUT=$(jq -r -s --arg author x -f "$DISC_TMP/discussion.jq" "$DISC_TMP/none.json" "$DISC_TMP/none.json" "$DISC_TMP/inline.json" 2>&1 || true)
+check 'grep -qF "inline on a.yml:12, 2026-11-02: current" <<< "$DISC_OUT"' "a current inline comment shows its current line"
+check 'grep -qF "inline on a.yml:964 (outdated, written on cbbe5dc), 2026-11-01: stale" <<< "$DISC_OUT"' "an outdated inline comment keeps its original line and names its commit"
+rm -rf "$DISC_TMP"
 check 'grep -q "## Review rules (\`.github/ai-review-rules.md\`)" "$README"' "README documents the review rules file"
 
 # Behavioural: the cap keeps whole lines, and fetched text cannot forge a delimiter.
