@@ -1657,7 +1657,9 @@ jobs:
               | select(test("<summary>[^<]*<strong>\\s*[0-9]+\\.\\s"))
               | capture("<summary>(?<sev>[^<]*)<strong>\\s*[0-9]+\\.\\s*(?<t>.+?)</strong>")
               | { title: (.t | gsub("<[^>]+>"; "") | gsub("&lt;"; "<") | gsub("&gt;"; ">") | gsub("&quot;"; "\"")
-                           | gsub("&#39;"; "\u0027") | gsub("&amp;"; "&") | gsub("\\s+"; " ") | gsub("^ +| +$"; "") | .[0:160]),
+                           | gsub("&#(?<n>[0-9]{1,7});"; (.n | tonumber) as $c
+                               | if $c > 31 and $c < 1114112 and ($c < 55296 or $c > 57343) then [$c] | implode else " " end)
+                           | gsub("&amp;"; "&") | gsub("\\s+"; " ") | gsub("^ +| +$"; "") | .[0:160]),
                   severity: (.sev | if test("🔴") then "critical" elif test("🟠") then "high"
                                     elif test("🟡") then "medium" elif test("🟢") then "low" else "" end) }
               | select(.title | length > 0) ];
@@ -1671,9 +1673,8 @@ jobs:
           def finding_severities: [ summary_findings[].severity | select(length > 0) ];
           def nit_titles:
             [ (.body // "") | split("\n")[]
-              | select(test("^[-*]\\s+Still open\\b"))
-              | (capture("Still open\\s*(—|--|:|-)\\s*(?<t>.+)"; "") // capture("Still open\\s+(?<t>.+)"; "") // {t: .} | .t // "")
-              | gsub("\\s+"; " ") | .[0:160] | select(length > 0) ];
+              | capture("^[-*]\\s+Still open\\b\\s*(?:—|--|-|:)?\\s*(?<t>.+)$")
+              | .t | gsub("\\s+"; " ") | gsub("^ +| +$"; "") | .[0:160] | select(length > 0) ];
           def engine_name:
             (.body // "") as $b
             | ($b | capture("##[^\\n]*?(?<n>[A-Z][A-Za-z0-9.]*(?: [A-Z0-9][A-Za-z0-9.]*)*) PR Review Complete") | .n)

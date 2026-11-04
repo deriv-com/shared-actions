@@ -1421,6 +1421,13 @@ PARSE=$(jq -nc --arg a "$OCT27_BODY" --arg b "$NOV3_BODY" "$(awk '
   [({body: $a}, {body: $b}) | {v: verdict, f: finding_titles, s: finding_severities, n: (nit_titles | length), e: engine_name}]')
 check '[ "$PARSE" = "[{\"v\":\"approve\",\"f\":[\"Empty &-sections block in contract-card.scss\",\"Sticky test does not assert position: sticky\"],\"s\":[\"low\",\"low\"],\"n\":0,\"e\":\"Claude\"},{\"v\":\"approve\",\"f\":[],\"s\":[],\"n\":2,\"e\":\"Claude\"}]" ]' \
   "summary-block findings are read first, with severities, and Still open items are nits (got $PARSE)"
+EDGE=$(jq -nc --arg a $'<summary>🟢 <strong>1. Use &#8212; not &#39;-&#39; &amp;#8212;</strong></summary>' \
+  --arg b $'- Still open\n- Still open — Real item\n- Still open: Colon item\n- Still openly not a nit\n* Still open X' "$(awk '
+    /^          AI_REVIEW_JQ=\$\(cat <<.JQ.$/ {f=1; next}
+    f && /^          JQ$/ {exit}
+    f { sub(/^          /, ""); print }' "$WF")"' [({body: $a} | finding_titles), ({body: $b} | nit_titles)]')
+check '[ "$EDGE" = "[[\"Use — not '"'"'-'"'"' &#8212;\"],[\"Real item\",\"Colon item\",\"X\"]]" ]' \
+  "numeric entities decode, a bare or run-on Still open is not a nit; forge-agent's parseReviewVerdict pins the same cases (got $EDGE)"
 ITEMS_DIR="$TMP_BEHAVIOR/items"
 mkdir -p "$ITEMS_DIR"
 items_case() {  # items_case <PR comments JSON>  -> build_items output
