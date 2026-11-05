@@ -331,6 +331,10 @@ check 'grep -q "reviewThreads" "$WF"' \
   "unresolved human review threads go in the revise instruction"
 check 'grep -q "github_pr_url" "$WF"' \
   "PR_URL is kept only when it is a GitHub pull URL"
+check 'step_fn find_open_pr | grep -qF "nodes { url state isCrossRepository }" && step_fn find_open_pr | grep -qF -- "--json url,body,isCrossRepository"' \
+  "find_open_pr reads isCrossRepository in the GraphQL query and in the gh pr list fallback"
+check '! grep -qF -- "--json headRefName --jq" "$WF" && [ "$(grep -cF "pr_head_branch \"\$PR_URL\"" "$WF")" = 3 ]' \
+  "dstp revise, dstp update and the fresh-review commit read the head branch only through pr_head_branch"
 check 'grep -q "produced no changes" "$WF"' \
   "dstp no-change is detected and stops the wait loop"
 check 'grep -q "Nothing was committed" "$WF"' \
@@ -727,6 +731,80 @@ check '[ "$(pr_checks_case 1 "$CHECKS_SEVEN")" = "ok 7 0 c1, c2, c3, c4, c5" ]' 
 check '[ "$(UNRELATED_CHECKS="[\"lint\"]" pr_checks_case 1 "$CHECKS_FAIL")" = "ok 1 0 E2E smoke" ]' \
   "Report leaves out checks that also fail on the base head"
 
+# --- forks: Forge works only on branches of this repository (#195) ----------
+# A fork PR's head branch can share its name with a branch here, so choosing
+# it would revise or move the wrong branch. find_open_pr and pr_head_branch
+# are cut from forge.yml and run against a fake gh.
+FIND_OPEN_PR_FNS="$(extract_fn github_pr_url)"$'\n'"$(extract_fn find_open_pr)"
+find_pr_case() {  # find_pr_case <closedBy nodes JSON> [gh pr list JSON]  -> "<chosen PR> <fork PR>", - for none
+  NODES="$1" LIST="${2:-[]}" GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 bash -c '
+    gh() {
+      local q="" a
+      if [ "$1 $2" = "api graphql" ]; then
+        for a in "$@"; do [ "$q" = next ] && { q="$a"; break; }; [ "$a" = --jq ] && q=next; done
+        jq -nc --argjson n "$NODES" "{data: {repository: {issue: {closedByPullRequestsReferences: {nodes: \$n}}}}}" | jq -c "$q"
+      elif [ "$1 $2" = "pr list" ]; then printf "%s" "$LIST"
+      else return 1; fi
+    }
+    '"$FIND_OPEN_PR_FNS"'
+    find_open_pr
+    printf "%s %s\n" "${FOUND_PR_URL:--}" "${FORK_PR_URL:--}"
+  '
+}
+P7=https://github.com/o/r/pull/7
+P8=https://github.com/o/r/pull/8
+OWN7='{"url": "https://github.com/o/r/pull/7", "state": "OPEN", "isCrossRepository": false}'
+FORK8='{"url": "https://github.com/o/r/pull/8", "state": "OPEN", "isCrossRepository": true}'
+GOT=$(find_pr_case "[$FORK8, $OWN7]")
+check '[ "$GOT" = "$P7 $P8" ]' "a fork PR listed first is passed over for the PR from this repository (got $GOT)"
+GOT=$(find_pr_case "[$FORK8]")
+check '[ "$GOT" = "- $P8" ]' "a fork PR alone is never chosen, and is kept as the reason (got $GOT)"
+GOT=$(find_pr_case '[{"url": "https://github.com/o/r/pull/9", "state": "OPEN"}]')
+check '[ "$GOT" = "- https://github.com/o/r/pull/9" ]' "a PR with no isCrossRepository counts as a fork (got $GOT)"
+GOT=$(find_pr_case '[{"url": "https://github.com/o/r/pull/7", "state": "CLOSED", "isCrossRepository": false}]')
+check '[ "$GOT" = "- -" ]' "a closed PR is not chosen (got $GOT)"
+GOT=$(find_pr_case '[]' '[{"url": "https://github.com/o/r/pull/8", "body": "Closes #1213", "isCrossRepository": true}, {"url": "https://github.com/o/r/pull/7", "body": "Fixes #1213", "isCrossRepository": false}]')
+check '[ "$GOT" = "$P7 $P8" ]' "the Closes #N fallback passes over a fork PR too (got $GOT)"
+GOT=$(find_pr_case '[]' '[{"url": "https://github.com/o/r/pull/8", "body": "Closes #1213", "isCrossRepository": true}]')
+check '[ "$GOT" = "- $P8" ]' "the fallback keeps a fork PR it will not use as the reason (got $GOT)"
+GOT=$(find_pr_case '[]' '[]')
+check '[ "$GOT" = "- -" ]' "an issue with no open PR finds nothing (got $GOT)"
+
+# push_fresh_review_commit moves refs/heads/<head branch> of this repository,
+# so a head that lives anywhere else gets no commit and moves no ref.
+HEAD_BRANCH_FNS="$(extract_fn pr_head_branch)"$'\n'"$(extract_fn push_fresh_review_commit)"
+fresh_commit_case() {  # fresh_commit_case <name> <gh pr view JSON>  -> "<rc> <git data API calls>"; calls in $TMP_BEHAVIOR/fresh_<name>.log
+  local log="$TMP_BEHAVIOR/fresh_$1.log"
+  : > "$log"
+  VIEW="$2" LOG="$log" GITHUB_REPOSITORY=o/r PR_URL=https://github.com/o/r/pull/8 bash -c '
+    gh() {
+      if [ "$1 $2" = "pr view" ]; then printf "%s\n" "$VIEW"; return 0; fi
+      echo "$*" >> "$LOG"
+      case "$*" in
+        *"--jq .tree.sha") head -c 40 /dev/zero | tr "\0" e ;;
+        *"--jq .sha") head -c 40 /dev/zero | tr "\0" d ;;
+      esac
+    }
+    '"$HEAD_BRANCH_FNS"'
+    rc=0
+    push_fresh_review_commit "$(head -c 40 /dev/zero | tr "\0" b)" "body" >/dev/null 2>&1 || rc=$?
+    printf "%s %s\n" "$rc" "$(grep -c "git/" "$LOG" || true)"
+  '
+}
+GOT=$(fresh_commit_case same '{"headRefName": "feature", "isCrossRepository": false, "headRepository": {"name": "r"}, "headRepositoryOwner": {"login": "o"}}')
+check '[ "$GOT" = "0 3" ] && grep -q "^api --method PATCH repos/o/r/git/refs/heads/feature --input -$" "$TMP_BEHAVIOR/fresh_same.log"' \
+  "a PR from this repository gets the empty commit on its own branch (got $GOT)"
+GOT=$(fresh_commit_case fork '{"headRefName": "feature", "isCrossRepository": true, "headRepository": {"name": "r"}, "headRepositoryOwner": {"login": "someone"}}')
+check '[ "$GOT" = "1 0" ]' "a fork PR whose branch is named like one here gets no commit and moves no ref (got $GOT)"
+GOT=$(fresh_commit_case deleted_fork '{"headRefName": "feature", "isCrossRepository": true, "headRepository": null, "headRepositoryOwner": null}')
+check '[ "$GOT" = "1 0" ]' "a PR from a deleted fork is refused (got $GOT)"
+GOT=$(fresh_commit_case other_repo '{"headRefName": "feature", "isCrossRepository": false, "headRepository": {"name": "r"}, "headRepositoryOwner": {"login": "other"}}')
+check '[ "$GOT" = "1 0" ]' "a head repository other than this one is refused even when isCrossRepository is false (got $GOT)"
+GOT=$(fresh_commit_case unreadable 'not json')
+check '[ "$GOT" = "1 0" ]' "a PR that cannot be read is refused (got $GOT)"
+GOT=$(fresh_commit_case case '{"headRefName": "feature", "isCrossRepository": false, "headRepository": {"name": "R"}, "headRepositoryOwner": {"login": "O"}}')
+check '[ "$GOT" = "0 3" ]' "the head repository is compared without case (got $GOT)"
+
 # --- behavioral: a whole revise run against a fake GitHub -------------------
 # Run Forge and Report are cut from forge.yml and executed as-is. gh, node
 # (dstp), claude (the reply model), curl (Slack), git and sleep are fakes that
@@ -750,7 +828,15 @@ args="$*"
 body_arg() { local a; for a in "$@"; do case "$a" in body=*) printf '%s' "${a#body=}"; return;; esac; done; }
 case "$args" in
   "api repos/o/r/actions/runs/"*) date -u +%Y-%m-%dT%H:%M:%SZ ;;
-  *closedByPullRequestsReferences*) echo "https://github.com/o/r/pull/7" ;;
+  *closedByPullRequestsReferences*)
+    # The workflow's own --jq runs over closed_by.json, so its filter is what
+    # is tested. Default: PR 7, open, from a branch of this repository.
+    q=""; for a in "$@"; do [ "$q" = next ] && { q="$a"; break; }; [ "$a" = --jq ] && q=next; done
+    if [ -f "$S/closed_by.json" ]; then cat "$S/closed_by.json"
+    else echo '{"data": {"repository": {"issue": {"closedByPullRequestsReferences": {"nodes": [{"url": "https://github.com/o/r/pull/7", "state": "OPEN", "isCrossRepository": false}]}}}}}'
+    fi | jq -c "$q" ;;
+  "pr list --state open --limit 50 --json url,body,isCrossRepository")
+    if [ -f "$S/pr_list.json" ]; then cat "$S/pr_list.json"; else echo '[]'; fi ;;
   *resolveReviewThread*|*unresolveReviewThread*) echo "$args" >> "$S/resolved.log"; echo '{}' ;;
   *reviewThreads*)
     if [ -f "$S/threads_error" ]; then cat "$S/threads_error"; echo "gh: GraphQL error" >&2; exit 1; fi
@@ -792,7 +878,11 @@ case "$args" in
     elif [ -f "$S/head_stale" ]; then head -c 40 /dev/zero | tr '\0' 'a'; echo
     elif [ "$(cat "$S/dstp_count" 2>/dev/null || echo 0)" -ge 2 ]; then head -c 40 /dev/zero | tr '\0' 'c'; echo
     else head -c 40 /dev/zero | tr '\0' 'b'; echo; fi ;;
-  "pr view https://github.com/o/r/pull/7 --json headRefName --jq .headRefName") echo feature ;;
+  "pr view https://github.com/o/r/pull/"*" --json headRefName,isCrossRepository,headRepository,headRepositoryOwner")
+    # head_repo_<n>.json overrides; by default the head is branch feature of o/r.
+    u="${args#pr view }"; u="${u%% *}"; n="${u##*/}"
+    if [ -f "$S/head_repo_$n.json" ]; then cat "$S/head_repo_$n.json"
+    else echo '{"headRefName": "feature", "isCrossRepository": false, "headRepository": {"name": "r"}, "headRepositoryOwner": {"login": "o"}}'; fi ;;
   "pr view https://github.com/o/r/pull/7 --json baseRefName --jq .baseRefName") echo master ;;
   "pr view https://github.com/o/r/pull/7 --json title,body") cat "$S/pr.json" ;;
   "pr checkout"*) : ;;
@@ -1358,6 +1448,29 @@ C=$(report_only no_pr OUTCOME=success SLACK_MENTION_TS=3.3)
 check '[ "$(reactions "$C" add)" = shrug ]' "success with no PR reacts shrug"
 C=$(report_only unresolved OUTCOME=success PR_UNRESOLVED=1 SLACK_MENTION_TS=3.3)
 check '[ "$(reactions "$C" add)" = warning ]' "no linked PR reacts warning"
+completion_of() { jq -rs '[.[] | select(.url | endswith("chat.postMessage")) | .p.text] | last // ""' "$1/slack.jsonl" 2>/dev/null || true; }
+C=$(report_only fork_update OUTCOME=failure FORGE_COMMAND=update PR_UNRESOLVED=1 PR_FROM_FORK=https://github.com/o/r/pull/8 SLACK_MENTION_TS=3.3)
+check '[[ "$(completion_of "$C")" == *"<https://github.com/o/r/pull/8|PR #8>, is from a fork."*"so there is nothing to update."* ]] && [ "$(reactions "$C" add)" = warning ]' \
+  "an update run on a fork PR says there is nothing to update (got $(completion_of "$C"))"
+C=$(report_only fork_junk OUTCOME=failure PR_UNRESOLVED=1 "PR_FROM_FORK=https://evil.example/o/r/pull/8" SLACK_MENTION_TS=3.3)
+check '[[ "$(completion_of "$C")" == *"No open PR is linked to issue"* ]] && ! has "$C/slack.jsonl" "evil.example"' \
+  "a pr_from_fork that is not a GitHub pull URL is never posted"
+
+# The only open PR that closes the issue is from a fork, and its branch is
+# named feature like this repository's PR branch (#195): no dstp run, no
+# empty commit, no ref move, and Report says why.
+C=$(quiet_case fork_only)
+jq -n '{data: {repository: {issue: {closedByPullRequestsReferences: {nodes: [{url: "https://github.com/o/r/pull/8", state: "OPEN", isCrossRepository: true}]}}}}}' > "$C/closed_by.json"
+echo '{"headRefName": "feature", "isCrossRepository": true, "headRepository": {"name": "r"}, "headRepositoryOwner": {"login": "someone"}}' > "$C/head_repo_8.json"
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" = 1 ] && [ ! -s "$C/unhandled.log" ] && grep -q "^pr_from_fork=https://github.com/o/r/pull/8$" "$C/out" && grep -q "^pr_unresolved=1$" "$C/out" && ! grep -q "^pr_url=" "$C/out"' \
+  "a fork-only PR stops the run before dstp and names the fork PR"
+check '[ ! -f "$C/dstp_count" ] && [ ! -f "$C/git_commits.jsonl" ] && [ ! -f "$C/git_refs.jsonl" ] && ! grep -q "pull/8 --json headRefName" "$C/gh.log"' \
+  "Forge never runs dstp on, commits to or moves the branch named like the fork PR's"
+check 'has "$C/completion.txt" "is from a fork. Forge works only on branches in this repository, so there is nothing to revise." && [ "$(cat "$C/quiet.txt")" = "⚠️ PR is from a fork" ] && [ "$(reactions "$C" add)" = warning ]' \
+  "Report says the PR is from a fork, with a warning (got $(cat "$C/quiet.txt"))"
+check 'grep -q -- "--add-label forge:failed" "$C/gh.log" && ! has "$C/completion.txt" "Add Closes"' \
+  "a fork-only PR is labelled forge:failed and is not told to add Closes #N"
 C=$(report_only no_ts OUTCOME=failure)
 check '[ -z "$(reactions "$C" add)$(reactions "$C" remove)" ] && has "$C/slack.jsonl" "chat.postMessage"' \
   "no slack_mention_ts means no reaction calls, and the completion still posts"

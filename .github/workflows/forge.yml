@@ -961,6 +961,26 @@ jobs:
             return 0
           }
 
+          # The PR's head branch, printed only when the head is a branch of
+          # this repository. Every caller acts on refs/heads/<branch> here:
+          # dstp revise and update push to it, and the fresh-review commit
+          # moves it. For a PR from a fork the same name points at a different
+          # branch of this repository, or at none (#195). Returns 1 when the
+          # PR cannot be read and 2 when its head is in another repository.
+          pr_head_branch() {
+            local info
+            info=$(gh pr view "$1" --json headRefName,isCrossRepository,headRepository,headRepositoryOwner 2>/dev/null) || return 1
+            printf '%s' "$info" | jq -e 'type == "object"' >/dev/null 2>&1 || return 1
+            if ! printf '%s' "$info" | jq -e --arg repo "$GITHUB_REPOSITORY" '
+                .isCrossRepository == false
+                and ("\(.headRepositoryOwner.login // "")/\(.headRepository.name // "")" | ascii_downcase) == ($repo | ascii_downcase)
+              ' >/dev/null 2>&1; then
+              echo "The head of $1 is not a branch of ${GITHUB_REPOSITORY}; Forge works only on branches in this repository" >&2
+              return 2
+            fi
+            printf '%s' "$info" | jq -r '.headRefName // empty'
+          }
+
           # Branch form so the instruction is used. Issue-URL revise reads QA
           # sub-issues and refuses PR comments. dstp 0.8.0 takes the instruction
           # as one argv string (MAX_ARG_STRLEN is 128KiB).
@@ -972,7 +992,7 @@ jobs:
               echo "Revise instruction is ${size} bytes; refusing to pass it as argv (Linux MAX_ARG_STRLEN is 128KiB)"
               return 1
             fi
-            if ! branch=$(gh pr view "$PR_URL" --json headRefName --jq .headRefName) || [ -z "$branch" ]; then
+            if ! branch=$(pr_head_branch "$PR_URL") || [ -z "$branch" ]; then
               echo "Could not resolve the head branch for $PR_URL"
               return 1
             fi
@@ -997,7 +1017,7 @@ jobs:
           # push the merge — no revision agent, no review loop afterwards.
           run_branch_update() {
             local branch
-            if ! branch=$(gh pr view "$PR_URL" --json headRefName --jq .headRefName) || [ -z "$branch" ]; then
+            if ! branch=$(pr_head_branch "$PR_URL") || [ -z "$branch" ]; then
               echo "Could not resolve the head branch for $PR_URL"
               return 1
             fi
@@ -1863,12 +1883,14 @@ jobs:
           # but not actions: write, so re-running the review workflow is not
           # an option, and the reviewer workflow runs on the App's pushes.
           # The ref moves only as a fast-forward (force: false), so a branch
-          # that moved meanwhile is left alone. Prints the new head.
+          # that moved meanwhile is left alone. The branch must be this
+          # repository's own (pr_head_branch): a fork PR's branch name would
+          # move a different branch here. Prints the new head.
           # push_fresh_review_commit <head> <commit body>
           push_fresh_review_commit() {
             local head="$1" body="$2" branch tree sha
             [[ "$head" =~ ^[0-9a-f]{40}$ ]] || return 1
-            branch=$(gh pr view "$PR_URL" --json headRefName --jq .headRefName 2>/dev/null) || return 1
+            branch=$(pr_head_branch "$PR_URL") || return 1
             if ! [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$branch" == *..* ]]; then
               echo "Unexpected head branch name: ${branch:0:100}" >&2
               return 1
@@ -2453,21 +2475,33 @@ jobs:
             fi
           }
 
+          # The open PR that closes the issue: the first open
+          # closedByPullRequestsReferences node, else an open PR whose body
+          # says Closes, Fixes or Resolves #N. Only a PR whose head is a branch
+          # of this repository qualifies (#195): Forge pushes to and moves
+          # refs/heads/<head branch> here, and a fork PR's branch name would
+          # name a different branch. A missing isCrossRepository counts as a
+          # fork. Sets FOUND_PR_URL, and FORK_PR_URL to the first fork PR that
+          # closes the issue, so the run can say why it found nothing.
           find_open_pr() {
-            local owner name url
+            local owner name prs
             owner="${GITHUB_REPOSITORY%%/*}"
             name="${GITHUB_REPOSITORY#*/}"
-            url=$(github_pr_url "$(gh api graphql \
+            prs=$(gh api graphql \
               -F owner="$owner" \
               -F name="$name" \
               -F number="$ISSUE_NUMBER" \
-              -f query='query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){ issue(number:$number){ closedByPullRequestsReferences(first:10, includeClosedPrs:false){ nodes { url state } } } } }' \
-              --jq '[.data.repository.issue.closedByPullRequestsReferences.nodes[]? | select(.state=="OPEN") | .url] | .[0] // empty' 2>/dev/null || true)")
-            if [ -z "$url" ]; then
-              url=$(github_pr_url "$(gh pr list --state open --limit 50 --json url,body | jq -r --arg n "$ISSUE_NUMBER" \
-                '[.[] | select((.body // "") | test("(?i)(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s+#"+$n+"\\b"))] | .[0].url // empty')")
+              -f query='query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){ issue(number:$number){ closedByPullRequestsReferences(first:10, includeClosedPrs:false){ nodes { url state isCrossRepository } } } } }' \
+              --jq '[.data.repository.issue.closedByPullRequestsReferences.nodes[]? | select(.state=="OPEN") | {url, fork: (.isCrossRepository != false)}]' 2>/dev/null || echo '[]')
+            FOUND_PR_URL=$(github_pr_url "$(printf '%s' "$prs" | jq -r '[.[]? | select(.fork | not) | .url] | .[0] // empty' 2>/dev/null || true)")
+            FORK_PR_URL=$(github_pr_url "$(printf '%s' "$prs" | jq -r '[.[]? | select(.fork) | .url] | .[0] // empty' 2>/dev/null || true)")
+            if [ -z "$FOUND_PR_URL" ]; then
+              prs=$(gh pr list --state open --limit 50 --json url,body,isCrossRepository | jq -c --arg n "$ISSUE_NUMBER" \
+                '[.[] | select((.body // "") | test("(?i)(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s+#"+$n+"\\b")) | {url, fork: (.isCrossRepository != false)}]' 2>/dev/null || echo '[]')
+              FOUND_PR_URL=$(github_pr_url "$(printf '%s' "$prs" | jq -r '[.[]? | select(.fork | not) | .url] | .[0] // empty' 2>/dev/null || true)")
+              [ -n "$FORK_PR_URL" ] || FORK_PR_URL=$(github_pr_url "$(printf '%s' "$prs" | jq -r '[.[]? | select(.fork) | .url] | .[0] // empty' 2>/dev/null || true)")
             fi
-            printf '%s' "$url"
+            return 0
           }
 
           # Issue-URL dstp revise only reads QA sub-issues and refuses PR
@@ -2479,10 +2513,16 @@ jobs:
             else
               slack_progress "Revising the open PR"
             fi
-            PR_URL=$(github_pr_url "$(find_open_pr)")
+            find_open_pr
+            PR_URL=$(github_pr_url "$FOUND_PR_URL")
             STATUS=0
             if [ -z "$PR_URL" ]; then
-              echo "No open PR linked to issue #${ISSUE_NUMBER}; cannot revise"
+              if [ -n "$FORK_PR_URL" ]; then
+                echo "The open PR for issue #${ISSUE_NUMBER} (${FORK_PR_URL}) is from a fork; Forge works only on branches in this repository, so it cannot ${COMMAND}"
+                echo "pr_from_fork=$FORK_PR_URL" >> "$GITHUB_OUTPUT"
+              else
+                echo "No open PR linked to issue #${ISSUE_NUMBER}; cannot revise"
+              fi
               echo "pr_unresolved=1" >> "$GITHUB_OUTPUT"
               STATUS=1
             else
@@ -2840,6 +2880,7 @@ jobs:
           COMMENT_ID: ${{ steps.claim.outputs.comment_id }}
           PR_URL: ${{ steps.forge.outputs.pr_url }}
           PR_UNRESOLVED: ${{ steps.forge.outputs.pr_unresolved }}
+          PR_FROM_FORK: ${{ steps.forge.outputs.pr_from_fork }}
           NO_CHANGE: ${{ steps.forge.outputs.no_change }}
           NO_CHANGE_REASON: ${{ steps.forge.outputs.no_change_reason }}
           REVISE_TROUBLE: ${{ steps.forge.outputs.revise_trouble }}
@@ -3277,7 +3318,24 @@ jobs:
           REACTION=""
           SLACK_TEXT=""
           NL=$'\n'
-          if [ "${PR_UNRESOLVED:-}" = "1" ]; then
+          # The only open PR that closes the issue is from a fork, so Run
+          # Forge stopped before dstp (find_open_pr). It goes into Slack and
+          # the issue comment, so only a GitHub pull URL is used.
+          FORK_URL=""
+          if [[ "${PR_FROM_FORK:-}" =~ ^https://github.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[1-9][0-9]*$ ]]; then
+            FORK_URL="$PR_FROM_FORK"
+          fi
+          if [ -n "$FORK_URL" ]; then
+            VERB="revise"
+            [ "$MODE" = "update" ] && VERB="update"
+            FORK_NUM="${FORK_URL##*/}"
+            FACTS="The open PR for this issue, #${FORK_NUM}, is from a fork. Forge works only on branches in this repository, so there is nothing to ${VERB}."
+            QUIET="⚠️ PR is from a fork"
+            REACTION="warning"
+            BODY=$(printf '🔨 %s\n\nOpen the PR from a branch in this repository and ask again.\n\nTook %s.' "$FACTS" "$TOOK")
+            LABEL="forge:failed"
+            SLACK_TEXT=$(printf '%s⚠️ The open PR for issue %s, <%s|PR #%s>, is from a fork. Forge works only on branches in this repository, so there is nothing to %s. Open the PR from a branch in this repository and ask again.\nTook %s.' "$WHO" "$ISSUE_LINK" "$FORK_URL" "$FORK_NUM" "$VERB" "$TOOK")
+          elif [ "${PR_UNRESOLVED:-}" = "1" ]; then
             VERB="revise"
             [ "$MODE" = "update" ] && VERB="update"
             FACTS="No open PR is linked to this issue, so there is nothing to ${VERB}."
