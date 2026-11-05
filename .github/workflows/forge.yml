@@ -20,6 +20,7 @@ name: Forge — issue to PR
 #         slack_started_at:{ required: false, type: string }  # unix seconds
 #         slack_mention_ts:{ required: false, type: string }  # requester's message
 #         requested_by:    { required: false, type: string }  # Slack user id, or U…/W…/S… ids to tag
+#         forge_run_id:    { required: false, type: string }  # run id forge-agent registered
 #         analysis_brief:  { required: false, type: string }
 #         command:         { required: false, type: string }  # auto (first open) or revise
 #
@@ -35,6 +36,7 @@ name: Forge — issue to PR
 #         slack_started_at:${{ github.event.inputs.slack_started_at }}
 #         slack_mention_ts:${{ github.event.inputs.slack_mention_ts }}
 #         requested_by:    ${{ github.event.inputs.requested_by }}  # who the completion tags
+#         forge_run_id:    ${{ github.event.inputs.forge_run_id }}
 #         analysis_brief:  ${{ github.event.inputs.analysis_brief }}
 #         command:         ${{ github.event.inputs.command || 'auto' }}
 #         install_command: "npm ci"          # whatever your CI runs
@@ -92,6 +94,15 @@ on:
           The Slack user id that asked, or a comma-separated list of Slack
           user (U…/W…) and user-group (S…) ids to tag in the completion.
           Any other token is dropped.
+        required: false
+        type: string
+      forge_run_id:
+        description: >-
+          The Forge run id forge-agent registered for this dispatch, with
+          who asked for it. The first dstp run of the job (auto, update, or
+          the first revise round) reports under it as DSTP_FORGE_RUN_ID, so
+          Forge can show the run to that person. Later revise rounds get
+          their own ids. A value that is not a UUID is ignored with a warning.
         required: false
         type: string
       analysis_brief:
@@ -648,6 +659,8 @@ jobs:
           # FORGE_API_KEY (LiteLLM) as the service key.
           DSTP_FORGE_TRIGGER: forge_ci
           DSTP_FORGE_SERVICE_KEY: ${{ secrets.DSTP_FORGE_SERVICE_KEY }}
+          # Not DSTP_FORGE_RUN_ID: forge_run_env passes it to the first dstp run only.
+          FORGE_RUN_ID: ${{ inputs.forge_run_id }}
           SLACK_BOT_TOKEN: ${{ secrets.FORGE_SLACK_BOT_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -846,7 +859,8 @@ jobs:
             fi
             echo "Running: dstp ${ARGS[*]}"
             remint_write_token 300
-            node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || return $?
+            forge_run_env
+            env "${RUN_ENV[@]}" node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || return $?
             local RESULT
             RESULT=$(sed -e "s/$(printf '\033')\[[0-9;]*[A-Za-z]//g" /tmp/forge.log | grep -oE '^[[:space:]]*\{.*\}[[:space:]]*$' | tail -1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)
             if [ -n "$RESULT" ]; then
@@ -855,6 +869,27 @@ jobs:
               [ -n "$pr" ] && echo "pr_url=$pr" >> "$GITHUB_OUTPUT"
             fi
             return 0
+          }
+
+          # The run id forge-agent registered for this dispatch (forge_run_id)
+          # names the requested run, so Forge can show it to whoever asked.
+          # run_dstp, run_branch_revise and run_branch_update call forge_run_env
+          # before each dstp run. It sets RUN_ENV to the DSTP_FORGE_RUN_ID=…
+          # assignment for the first dstp run of the job and to nothing after
+          # that: later revise rounds get their own ids. dstp also removes the
+          # variable on first read.
+          FORGE_RUN_ID_USED=0
+          RUN_ENV=()
+          forge_run_env() {
+            RUN_ENV=()
+            [ "$FORGE_RUN_ID_USED" = 1 ] && return 0
+            FORGE_RUN_ID_USED=1
+            [ -n "${FORGE_RUN_ID:-}" ] || return 0
+            if [[ "$FORGE_RUN_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+              RUN_ENV=("DSTP_FORGE_RUN_ID=${FORGE_RUN_ID}")
+            else
+              echo "::warning::forge_run_id is not a lowercase UUID, so this run gets its own Forge run id."
+            fi
           }
 
           # dstp --json reports a failure as {"error": ...} on stderr and exits 1;
@@ -951,7 +986,8 @@ jobs:
             echo "Running: dstp revise $branch <instruction> ${ARGS[*]:4}"
             local rc=0
             remint_write_token 300
-            node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || rc=$?
+            forge_run_env
+            env "${RUN_ENV[@]}" node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || rc=$?
             read_revise_result /tmp/forge.log || return 1
             [ "${NO_CHANGE:-0}" = "1" ] && return 0
             return "$rc"
@@ -970,7 +1006,8 @@ jobs:
             echo "Running: dstp ${ARGS[*]}"
             local rc=0
             remint_write_token 300
-            node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || rc=$?
+            forge_run_env
+            env "${RUN_ENV[@]}" node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || rc=$?
             read_revise_result /tmp/forge.log || return 1
             return "$rc"
           }
