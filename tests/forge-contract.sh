@@ -1459,7 +1459,7 @@ check '[[ "$(completion_of "$C")" == *"No open PR is linked to issue"* ]] && ! h
 # The only open PR that closes the issue is from a fork, and its branch is
 # named feature like this repository's PR branch (#195): no dstp run, no
 # empty commit, no ref move, and Report says why.
-C=$(quiet_case fork_only)
+C=$(new_case fork_only)
 jq -n '{data: {repository: {issue: {closedByPullRequestsReferences: {nodes: [{url: "https://github.com/o/r/pull/8", state: "OPEN", isCrossRepository: true}]}}}}}' > "$C/closed_by.json"
 echo '{"headRefName": "feature", "isCrossRepository": true, "headRepository": {"name": "r"}, "headRepositoryOwner": {"login": "someone"}}' > "$C/head_repo_8.json"
 run_case "$C"
