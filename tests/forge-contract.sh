@@ -852,8 +852,12 @@ case "$args" in
   "api repos/o/r/issues/7/comments --paginate")
     # comments_fail_<n>: the nth read of the PR comments fails, with that
     # file as gh's stderr. comments_fail_from: that read and every later
-    # one fail with a 502.
+    # one fail with a 502. on_read_<n>.jq: what happens on GitHub just
+    # before the nth read (a review finishing between two reads).
     n=$(grep -cxF "api repos/o/r/issues/7/comments --paginate" "$S/gh.log")
+    if [ -f "$S/on_read_$n.jq" ]; then
+      jq -f "$S/on_read_$n.jq" "$S/pr_comments.json" > "$S/pr_comments.next" && mv "$S/pr_comments.next" "$S/pr_comments.json"
+    fi
     if [ -f "$S/comments_fail_$n" ]; then cat "$S/comments_fail_$n" >&2; exit 1; fi
     if [ -f "$S/comments_fail_from" ] && [ "$n" -ge "$(cat "$S/comments_fail_from")" ]; then
       echo "gh: Bad Gateway (HTTP 502)" >&2; exit 1
@@ -2053,6 +2057,76 @@ echo "gh: Not Found (HTTP 404)" > "$C/comments_fail_2"
 run_case "$C"
 check 'grep -qxF "read_failed=$VERDICT_UNREAD" "$C/out" && ! grep -qsx 60 "$C/sleep.log"' \
   "a 4xx at the gate is not retried"
+
+# --- a review that finishes after the round's read is answered (#197) -------
+# An approval can carry a Still open item. One that finishes after the round
+# read the PR used to end the loop as approved, unanswered, and the round's
+# watermark hid it from later runs too.
+still_open_review() {  # still_open_review <id> <head char> <created_at> <updated_at> <item>  -> an approving Claude review with one Still open item
+  local head; head=$(sha_of "$2")
+  jq -nc --argjson id "$1" --arg h "$head" --arg cr "$3" --arg up "$4" --arg item "$5" '
+    {id: $id, user: {login: "github-actions[bot]", type: "Bot"}, created_at: $cr, updated_at: $up,
+     html_url: "https://github.com/o/r/pull/7#issuecomment-\($id)",
+     body: ("<!-- deriv-pr-review-anthropic -->\n## 🤖 Claude PR Review Complete\n\n**Recommendation:** APPROVE\n\nNo new findings.\n\n### Follow-up\n- Still open — \($item)\n\n"
+       + "<!-- reviewed-commit: \($h) -->\n<!-- deriv-pr-review-verdict: approve; findings=0 -->")}'
+}
+LATE_ITEM="total-profit-loss.spec.tsx:136 does not assert position: sticky"
+LATE_REPLY="jsdom has no layout, so a unit test cannot see position: sticky, and the e2e smoke covers it"
+# A skipped AI item gets a reply and an acknowledge comment, so look at all.
+posted() { cat "$1"/pr_comment.*.md 2>/dev/null | grep -qF -- "$2"; }
+
+# The approval lands while a round that changes nothing works.
+C=$(quiet_case late_approval)
+jq --argjson r "$(claude_review 7900 a request-changes 2026-10-28T10:00:00Z 2026-10-28T10:01:00Z "Closed total is not sticky on mobile")" \
+  '. + [$r]' "$C/pr_comments.json" > "$C/x" && mv "$C/x" "$C/pr_comments.json"
+printf '. + [%s]\n' "$(still_open_review 7901 a 2026-10-28T10:30:00Z 2026-10-28T10:31:00Z "$LATE_ITEM")" > "$C/on_dstp_1.jq"
+touch "$C/dstp_no_change"
+sha_of a > "$C/head_override"
+model_reply "$C/model_reply.1.txt" "$(reply_items ai:7900:finding:0 skipped "The Closed total is already sticky: positions-content.tsx sets position sticky on the footer row")"
+model_reply "$C/model_reply.2.txt" "$(reply_items ai:7901:nit:0 skipped "$LATE_REPLY")"
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ "$(cat "$C/dstp_count")" = 2 ] && has "$C/instruction.2.md" "$LATE_ITEM" && ! has "$C/instruction.2.md" "Closed total is not sticky on mobile"' \
+  "an approval with a Still open item that lands while a no-change round works is read in the next round"
+check 'posted "$C" "$LATE_REPLY" && [ ! -f "$C/git_commits.jsonl" ] && grep -q "^review_state=approved$" "$C/out"' \
+  "its item gets a reply in the same run, and the run then ends approved with no empty commit"
+
+# The approval lands between the round's read and the gate's read, at the
+# "nothing left" caller (the gate's read is the run's second).
+C=$(quiet_case late_approval_first)
+printf '. + [%s]\n' "$(still_open_review 7950 a 2026-10-28T10:30:00Z 2026-10-28T10:31:00Z "$LATE_ITEM")" > "$C/on_read_2.jq"
+touch "$C/dstp_no_change"
+sha_of a > "$C/head_override"
+model_reply "$C/model_reply.txt" "$(reply_items ai:7950:nit:0 skipped "$LATE_REPLY")"
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ "$(cat "$C/dstp_count" 2>/dev/null)" = 1 ] && has "$C/instruction.1.md" "$LATE_ITEM" && posted "$C" "$LATE_REPLY"' \
+  "an approval with a Still open item that lands just before the gate reads is answered in the same run"
+check 'grep -q "^review_state=approved$" "$C/out" && [ ! -f "$C/git_commits.jsonl" ] && has "$C/run.log" "An AI review finished after this round read the PR; reading it next round"' \
+  "the run reads it again before ending approved"
+
+# An approval with a Still open item that an earlier run answered sits
+# before this run's watermark. It is the latest review of the head, but no
+# read of this run would find it, so it ends the loop as before.
+C=$(quiet_case earlier_approval)
+jq --argjson r "$(still_open_review 7960 a 2026-10-23T15:00:00Z 2026-10-23T15:01:00Z "$LATE_ITEM")" \
+  '. + [$r]' "$C/pr_comments.json" > "$C/x" && mv "$C/x" "$C/pr_comments.json"
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && grep -q "^review_state=approved$" "$C/out" && ! has "$C/run.log" "An AI review finished after this round read the PR"' \
+  "an approval an earlier run answered ends the loop with no extra round"
+
+check '! grep -q "unanswered_head_review" "$WF"' \
+  "one rule decides which late review is read again: the round's own read"
+
+# A late review is sent back once. Here the round's read misses it (gone,
+# then back for the gate's read), so the gate decides on the states as
+# before instead of sending it back again.
+C=$(quiet_case late_flapping)
+R=$(still_open_review 7970 a 2026-10-28T10:30:00Z 2026-10-28T10:31:00Z "$LATE_ITEM")
+printf '. + [%s]\n' "$R" > "$C/on_read_2.jq"
+echo 'map(select(.id != 7970))' > "$C/on_read_3.jq"
+printf '. + [%s]\n' "$R" > "$C/on_read_4.jq"
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && [ "$(grep -c "An AI review finished after this round read the PR" "$C/run.log")" = 1 ] && [ "$(grep -cxF "api repos/o/r/issues/7/comments --paginate" "$C/gh.log")" = 4 ]' \
+  "a late review is sent back once, so reads that disagree cannot loop"
 
 check '! grep -qE "permission-actions: write|actions: \"write\"" "$WF"' \
   "the write App token never asks for actions: write"
