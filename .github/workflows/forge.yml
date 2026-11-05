@@ -1143,9 +1143,12 @@ jobs:
             '
           }
 
+          # The PR's head SHA. A failed read returns gh_read's status (2 for a
+          # rate limit, 5xx or network error), so review_gate can retry it.
           pr_head_sha() {
-            local sha
-            sha=$(gh_read pr view "$1" --json headRefOid --jq .headRefOid 2>/dev/null || true)
+            local sha rc=0
+            sha=$(gh_read pr view "$1" --json headRefOid --jq .headRefOid 2>/dev/null) || rc=$?
+            [ "$rc" -eq 0 ] || return "$rc"
             [[ "$sha" =~ ^[0-9a-f]{40}$ ]] && printf '%s' "$sha" || return 1
           }
 
@@ -1796,13 +1799,12 @@ jobs:
           # changes or block merge, and every finding repeats one Forge had
           # declined before the review finished), changes (request changes
           # or block merge otherwise), unknown (no verdict to read). key is
-          # filter_reviews' $worked form.
+          # filter_reviews' $worked form. Returns 1 when <head> is not a SHA
+          # or the comments cannot be parsed: an unread verdict must never
+          # read as no verdict (#196).
           head_review_state() {
             local comments="$1" head="$2"
-            if ! [[ "$head" =~ ^[0-9a-f]{7,40}$ ]]; then
-              echo '[]'
-              return 0
-            fi
+            [[ "$head" =~ ^[0-9a-f]{7,40}$ ]] || return 1
             printf '%s' "$comments" | jq -c --arg head "$head" "${AI_REVIEW_JQ}${ACK_JQ}"'
               ack_entries as $acks
               | [ sort_by(.updated_at // .created_at // "")[]
@@ -1821,7 +1823,7 @@ jobs:
                                 (if (.titles | length) > 0 and .repeated == (.titles | length) then "handoff" else "changes" end)
                               else "unknown" end)
                     | del(.repeated))
-            ' 2>/dev/null || echo '[]'
+            ' 2>/dev/null || return 1
           }
           # One word for a head_review_state result: none (no verdict on the
           # head), changes, handoff, or approved.
@@ -1834,23 +1836,67 @@ jobs:
               else "none" end
             ' 2>/dev/null || echo none
           }
+          # One read for review_gate, retried the way read_pr_state is: up to
+          # 5 tries, 60s apart, only while it fails with gh_read's status 2
+          # (rate limit, 5xx, network error) and the job keeps time for
+          # Report. A 4xx or the last failure returns the read's status.
+          # gate_read <what> <command...>  -> the command's output
+          gate_read() {
+            local what="$1" out rc tries=1
+            shift
+            while :; do
+              rc=0
+              out=$("$@") || rc=$?
+              if [ "$rc" -eq 0 ]; then
+                printf '%s' "$out"
+                return 0
+              fi
+              if [ "$rc" -ne 2 ] || [ "$tries" -ge 5 ] || [ "$(remaining_job_seconds)" -lt 180 ]; then
+                return "$rc"
+              fi
+              tries=$((tries + 1))
+              echo "Could not read ${what}; not treating that as clean. Retrying in 60s (attempt ${tries} of 5)" >&2
+              sleep 60
+            done
+          }
           # Where the AI reviewers stand on <head> once a round has nothing
           # left to address, and what the loop does next. Sets REVIEW_HEADS
-          # (head_review_state), REVIEW_STATE (review_overall) and
-          # REVIEW_STOP. Returns 0 when the loop is done (every AI reviewer
-          # approved the head, or none gave a verdict on it, as before), 2
-          # when Forge should ask for a fresh review, and 1 when the PR goes
-          # to a person, with REVIEW_STOP saying why: handoff (every finding
-          # repeats one Forge declined), fresh_used (Forge already asked
-          # once for this code), rounds (no round left to read the fresh
-          # review), out_of_time (no time for CI plus a review).
+          # (head_review_state), REVIEW_STATE (review_overall), REVIEW_STOP,
+          # and REVIEW_HEAD, the head it judged (<head>, or the PR's head
+          # read here when <head> is not a SHA). Returns 0 when the loop is
+          # done (every AI reviewer approved the head, or none gave a verdict
+          # on it, as before), 2 when Forge should ask for a fresh review,
+          # and 1 when the PR goes to a person, with REVIEW_STOP saying why:
+          # handoff (every finding repeats one Forge declined), fresh_used
+          # (Forge already asked once for this code), rounds (no round left
+          # to read the fresh review), out_of_time (no time for CI plus a
+          # review). Returns 3 when the head or its AI reviews could not be
+          # read, with REVIEW_UNREAD naming what (#196): a verdict Forge
+          # could not read is not the same as no verdict.
           review_gate() {
             local head="$1" comments
             REVIEW_HEADS='[]'
             REVIEW_STOP=""
-            if comments=$(fetch_comments "$PR_NUM" 2>/dev/null); then
-              REVIEW_HEADS=$(head_review_state "$comments" "$head")
+            REVIEW_UNREAD=""
+            REVIEW_HEAD=""
+            if ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
+              head=$(gate_read "the head commit" pr_head_sha "$PR_URL") || head=""
             fi
+            # Either read failing, or head_review_state failing to parse what
+            # was read, leaves the verdict unknown.
+            if ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
+              REVIEW_UNREAD="the head commit"
+            elif ! comments=$(gate_read "the AI reviews of the head commit" fetch_comments "$PR_NUM") \
+              || ! REVIEW_HEADS=$(head_review_state "$comments" "$head"); then
+              REVIEW_HEADS='[]'
+              REVIEW_UNREAD="the AI review verdict for the latest commit"
+            fi
+            if [ -n "$REVIEW_UNREAD" ]; then
+              REVIEW_STATE=unread
+              REVIEW_STOP=unread
+              return 3
+            fi
+            REVIEW_HEAD="$head"
             REVIEW_STATE=$(review_overall "$REVIEW_HEADS")
             case "$REVIEW_STATE" in
               none|approved) return 0 ;;
@@ -1875,6 +1921,18 @@ jobs:
               ($w | split("\n")) as $w
               | any(.[]; .state == "changes" and (.key as $k | $w | index($k) | not))
             ' >/dev/null 2>&1
+          }
+          # review_gate returned 3: where the AI reviewers stand on the head
+          # is unknown, so the run stops without calling the PR clean (#196).
+          # Report leads with what could not be read and never says the
+          # reviewer approved.
+          review_unread_stop() {
+            echo "Could not read ${REVIEW_UNREAD}, so Forge cannot tell whether the AI reviewer approved it; stopping without reporting the PR as clean"
+            slack_progress "Could not read ${REVIEW_UNREAD}, stopping"
+            {
+              echo "read_failed=${REVIEW_UNREAD}"
+              echo "revise_trouble=1"
+            } >> "$GITHUB_OUTPUT"
           }
           # An empty commit on the PR branch, so the AI reviewer looks again
           # after a round answered its review without a code change: the
@@ -2575,7 +2633,9 @@ jobs:
           # (ask_fresh_review), at most once per reviewed head and counted as
           # a round. A review that only repeats findings Forge declined, a
           # second request on the same code, no round left, or no time for
-          # CI plus a review ends the run and hands the PR to a person.
+          # CI plus a review ends the run and hands the PR to a person. A
+          # verdict Forge could not read ends the run as a warning, never as
+          # clean (review_unread_stop).
           MAX_REVISE=8
           MIN_CYCLE_SECONDS=720
           # What CI and one AI review need on a new head, reserved before an
@@ -2706,7 +2766,11 @@ jobs:
                 GATE=0
                 HEAD_NOW=$(pr_head_sha "$PR_URL" || echo "")
                 review_gate "$HEAD_NOW" || GATE=$?
-                if [ "$GATE" = "2" ] && ask_fresh_review "$HEAD_NOW"; then
+                if [ "$GATE" = "3" ]; then
+                  review_unread_stop
+                  break
+                fi
+                if [ "$GATE" = "2" ] && ask_fresh_review "$REVIEW_HEAD"; then
                   continue
                 fi
                 if [ "$GATE" = "0" ]; then
@@ -2807,12 +2871,16 @@ jobs:
                 if [ "${ITEMS_COVERED:-0}" = "1" ]; then
                   GATE=0
                   review_gate "$HEAD_BEFORE" || GATE=$?
+                  if [ "$GATE" = "3" ]; then
+                    review_unread_stop
+                    break
+                  fi
                   if [ "$GATE" = "2" ] && unanswered_head_review; then
                     echo "A newer AI review of this head came in while the round worked; reading it next round"
                     REVIEW_STATE=""
                     continue
                   fi
-                  if [ "$GATE" = "2" ] && ask_fresh_review "$HEAD_BEFORE"; then
+                  if [ "$GATE" = "2" ] && ask_fresh_review "$REVIEW_HEAD"; then
                     continue
                   fi
                 fi
@@ -3374,11 +3442,25 @@ jobs:
               TARGET_SLACK="${PR_SLACK} (issue ${ISSUE_LINK})"
               TARGET_MD="#${PR_NUM}"
             fi
+            HEAD_SLACK="Checked ${TARGET_SLACK}."
+            HEAD_MD="Checked ${TARGET_MD}."
+            # A read that failed after the round (the AI review verdict at the
+            # end, or a later round's read) leaves the PR's state unknown. As
+            # in the revise completion, the failed read leads, so it never
+            # reads as done (#196).
+            if [ -n "${READ_FAILED:-}" ]; then
+              READ_WHAT=$(printf '%s' "$READ_FAILED" | slack_escape | cut -c1-100)
+              HEAD_SLACK="Could not read ${READ_WHAT} on ${TARGET_SLACK}, so Forge stopped revising."
+              HEAD_MD="Could not read ${READ_WHAT} on ${TARGET_MD}, so Forge stopped revising."
+              QUIET="⚠️ Could not read ${READ_WHAT}"
+              REACTION="warning"
+              LEAD="⚠️"
+            fi
             DETAILS_SLACK=$(detail_lines '• ' "$STOP" "$DONE" "$ITEMS_SUMMARY" "$HANDLED" ${REVIEW_LINES[@]+"${REVIEW_LINES[@]}"} "$CONFLICT_LINE" "$NOT_OURS" "$TROUBLE")
             DETAILS_MD=$(detail_lines '- ' "$STOP" "$DONE" "$ITEMS_SUMMARY" "$HANDLED" ${REVIEW_LINES[@]+"${REVIEW_LINES[@]}"} "$CONFLICT_LINE" "$NOT_OURS" "$TROUBLE")
-            BODY=$(printf '🔨 Checked %s. %s\n\n%s\nTook %s.' "$TARGET_MD" "$FACTS" "${DETAILS_MD:+$DETAILS_MD$NL}" "$TOOK")
+            BODY=$(printf '🔨 %s %s\n\n%s\nTook %s.' "$HEAD_MD" "$FACTS" "${DETAILS_MD:+$DETAILS_MD$NL}" "$TOOK")
             LABEL="forge:done"
-            SLACK_TEXT=$(printf '%s%s Checked %s. %s\n%sTook %s.' "$WHO" "$LEAD" "$TARGET_SLACK" "$FACTS" "${DETAILS_SLACK:+$DETAILS_SLACK$NL}" "$TOOK")
+            SLACK_TEXT=$(printf '%s%s %s %s\n%sTook %s.' "$WHO" "$LEAD" "$HEAD_SLACK" "$FACTS" "${DETAILS_SLACK:+$DETAILS_SLACK$NL}" "$TOOK")
           elif [ "$OUTCOME" = "success" ] && [ -z "${PR_URL:-}" ]; then
             FACTS="No code change needed."
             QUIET="✅ No code change needed"
@@ -3572,6 +3654,11 @@ jobs:
               FACTS="${GREEN_WORDING}."
               [ "${AI_REVIEWS_REPLIED:-}" = "1" ] && FACTS="${FACTS} Replied on the PR to $(plural "${AI_REVIEWS_REPLIED_COUNT:-0}" "AI review comment" "AI review comments")."
               EMOJI="⚠️"
+            elif [ -n "${READ_FAILED:-}" ]; then
+              # The last read failed, so where the AI reviewers stand is not
+              # known: say what Forge did, never that they approved (#196).
+              FACTS="${GREEN_WORDING}."
+              [ "${AI_REVIEWS_REPLIED:-}" = "1" ] && FACTS="${FACTS} Replied on the PR to $(plural "${AI_REVIEWS_REPLIED_COUNT:-0}" "AI review comment" "AI review comments")."
             elif [ "$(num_or_zero "${AI_APPROVALS:-}")" != "0" ]; then
               FACTS="${GREEN_WORDING}. The AI reviewer approved this PR and raised no new defects."
             elif [ "${AI_REVIEWS_REPLIED:-}" = "1" ]; then
