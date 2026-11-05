@@ -3436,28 +3436,31 @@ jobs:
               REACTION="warning"
               LEAD="⚠️"
             fi
-            # A read that failed after the round (the AI review verdict at the
-            # end, or a later round's read) leaves the PR's state unknown, so
-            # this is a warning that says what was not read (#196).
-            UNREAD_LINE=""
-            if [ -n "${READ_FAILED:-}" ]; then
-              READ_WHAT=$(printf '%s' "$READ_FAILED" | slack_escape | cut -c1-100)
-              UNREAD_LINE="Could not read ${READ_WHAT}, so Forge stopped revising."
-              QUIET="⚠️ Could not read ${READ_WHAT}"
-              REACTION="warning"
-              LEAD="⚠️"
-            fi
             TARGET_SLACK="$ISSUE_LINK"
             TARGET_MD="this issue"
             if [ -n "$PR_SLACK" ]; then
               TARGET_SLACK="${PR_SLACK} (issue ${ISSUE_LINK})"
               TARGET_MD="#${PR_NUM}"
             fi
-            DETAILS_SLACK=$(detail_lines '• ' "$UNREAD_LINE" "$STOP" "$DONE" "$ITEMS_SUMMARY" "$HANDLED" ${REVIEW_LINES[@]+"${REVIEW_LINES[@]}"} "$CONFLICT_LINE" "$NOT_OURS" "$TROUBLE")
-            DETAILS_MD=$(detail_lines '- ' "$UNREAD_LINE" "$STOP" "$DONE" "$ITEMS_SUMMARY" "$HANDLED" ${REVIEW_LINES[@]+"${REVIEW_LINES[@]}"} "$CONFLICT_LINE" "$NOT_OURS" "$TROUBLE")
-            BODY=$(printf '🔨 Checked %s. %s\n\n%s\nTook %s.' "$TARGET_MD" "$FACTS" "${DETAILS_MD:+$DETAILS_MD$NL}" "$TOOK")
+            HEAD_SLACK="Checked ${TARGET_SLACK}."
+            HEAD_MD="Checked ${TARGET_MD}."
+            # A read that failed after the round (the AI review verdict at the
+            # end, or a later round's read) leaves the PR's state unknown. As
+            # in the revise completion, the failed read leads, so it never
+            # reads as done (#196).
+            if [ -n "${READ_FAILED:-}" ]; then
+              READ_WHAT=$(printf '%s' "$READ_FAILED" | slack_escape | cut -c1-100)
+              HEAD_SLACK="Could not read ${READ_WHAT} on ${TARGET_SLACK}, so Forge stopped revising."
+              HEAD_MD="Could not read ${READ_WHAT} on ${TARGET_MD}, so Forge stopped revising."
+              QUIET="⚠️ Could not read ${READ_WHAT}"
+              REACTION="warning"
+              LEAD="⚠️"
+            fi
+            DETAILS_SLACK=$(detail_lines '• ' "$STOP" "$DONE" "$ITEMS_SUMMARY" "$HANDLED" ${REVIEW_LINES[@]+"${REVIEW_LINES[@]}"} "$CONFLICT_LINE" "$NOT_OURS" "$TROUBLE")
+            DETAILS_MD=$(detail_lines '- ' "$STOP" "$DONE" "$ITEMS_SUMMARY" "$HANDLED" ${REVIEW_LINES[@]+"${REVIEW_LINES[@]}"} "$CONFLICT_LINE" "$NOT_OURS" "$TROUBLE")
+            BODY=$(printf '🔨 %s %s\n\n%s\nTook %s.' "$HEAD_MD" "$FACTS" "${DETAILS_MD:+$DETAILS_MD$NL}" "$TOOK")
             LABEL="forge:done"
-            SLACK_TEXT=$(printf '%s%s Checked %s. %s\n%sTook %s.' "$WHO" "$LEAD" "$TARGET_SLACK" "$FACTS" "${DETAILS_SLACK:+$DETAILS_SLACK$NL}" "$TOOK")
+            SLACK_TEXT=$(printf '%s%s %s %s\n%sTook %s.' "$WHO" "$LEAD" "$HEAD_SLACK" "$FACTS" "${DETAILS_SLACK:+$DETAILS_SLACK$NL}" "$TOOK")
           elif [ "$OUTCOME" = "success" ] && [ -z "${PR_URL:-}" ]; then
             FACTS="No code change needed."
             QUIET="✅ No code change needed"

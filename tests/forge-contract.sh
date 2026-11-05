@@ -2028,15 +2028,17 @@ echo 2 > "$C/comments_fail_from"
 run_case "$C"
 check '[ "$(cat "$C/dstp_count")" = 1 ] && grep -qxF "read_failed=$VERDICT_UNREAD" "$C/out" && [ ! -f "$C/git_commits.jsonl" ] && [ ! -f "$C/git_refs.jsonl" ]' \
   "after a no-change round a failed comments read at the gate stops the run, with no empty commit"
-check 'has "$C/completion.txt" "Could not read $VERDICT_UNREAD, so Forge stopped revising." && [ "$(cat "$C/quiet.txt")" = "⚠️ Could not read $VERDICT_UNREAD" ] && [ "$(reactions "$C" add)" = warning ]' \
-  "the no-change completion says the verdict could not be read, with a warning (got $(cat "$C/quiet.txt"), $(reactions "$C" add))"
+check '[[ "$(head -1 "$C/completion.txt")" == "⚠️ Could not read $VERDICT_UNREAD on <https://github.com/o/r/pull/7|PR #7> (issue <https://github.com/o/r/issues/1213|#1213>), so Forge stopped revising. Nothing was committed."* ]] && [ "$(cat "$C/quiet.txt")" = "⚠️ Could not read $VERDICT_UNREAD" ] && [ "$(reactions "$C" add)" = warning ]' \
+  "the no-change completion leads with the verdict it could not read, with a warning (got $(head -1 "$C/completion.txt"))"
+check 'grep "^api --method PATCH repos/o/r/issues/comments/55 " "$C/gh.log" | grep -qF "body=🔨 Could not read $VERDICT_UNREAD on #7, so Forge stopped revising. Nothing was committed."' \
+  "the issue comment leads the same way"
 
 C=$(unread_case unread_no_change_head no_change)
 rm -f "$C/head_override"
 touch "$C/head_fail_all"
 run_case "$C"
-check '[ "$(cat "$C/dstp_count")" = 1 ] && grep -qxF "read_failed=the head commit" "$C/out" && [ ! -f "$C/git_commits.jsonl" ] && has "$C/completion.txt" "Could not read the head commit, so Forge stopped revising."' \
-  "after a no-change round an unreadable head stops the run the same way"
+check '[ "$(cat "$C/dstp_count")" = 1 ] && grep -qxF "read_failed=the head commit" "$C/out" && [ ! -f "$C/git_commits.jsonl" ] && [[ "$(head -1 "$C/completion.txt")" == "⚠️ Could not read the head commit on <https://github.com/o/r/pull/7|PR #7>"* ]]' \
+  "after a no-change round an unreadable head stops the run the same way (got $(head -1 "$C/completion.txt"))"
 
 C=$(unread_case gate_retry first)
 echo "gh: Bad Gateway (HTTP 502)" > "$C/comments_fail_2"
