@@ -34,7 +34,7 @@ check '! grep -qE "^  (issues|pull_request|push|schedule):" "$WF"' \
   "no direct triggers — callers own those"
 
 # --- inputs callers pass by name ------------------------------------------
-for input in issue_number slack_channel slack_thread_ts requested_by \
+for input in issue_number slack_channel slack_thread_ts requested_by forge_run_id \
              slack_message_ts slack_started_at \
              analysis_brief command update_base resolve_conflicts_unattended ai_reviews_only \
              node_version install_command model runner_group engine_ref \
@@ -58,6 +58,44 @@ check 'grep -q "SLACK_MENTION_TS: \${{ inputs.slack_mention_ts }}" "$WF"' \
   "Report reads slack_mention_ts"
 check 'awk "/^      slack_started_at:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
   "input 'slack_started_at' stays optional"
+
+# --- forge_run_id: the run id forge-agent registered, for the first dstp run --
+check 'awk "/^      forge_run_id:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
+  "forge_run_id is an optional input"
+check 'grep -q "FORGE_RUN_ID: \${{ inputs.forge_run_id }}" "$WF"' \
+  "the dstp step reads forge_run_id as FORGE_RUN_ID"
+# The job sets FORGE_RUN_ID, never DSTP_FORGE_RUN_ID, so only run_dstp hands it on.
+check '! grep -qE "^ +DSTP_FORGE_RUN_ID:" "$WF"' "no step exports DSTP_FORGE_RUN_ID to every dstp run"
+step_fn() {  # step_fn <name>  -> a top-level helper of the dstp step, dedented
+  awk -v name="$1" '
+    $0 == "          " name "() {" {f=1}
+    f { end = ($0 == "          }"); sub(/^          /, ""); print; if (end) exit }
+  ' "$WF"
+}
+RUN_ENV_CALL='env "${RUN_ENV[@]}" node'
+check '[ "$(grep -cF "$RUN_ENV_CALL" "$WF")" = 1 ]' "exactly one dstp call takes RUN_ENV"
+check 'grep -qF "$RUN_ENV_CALL" <<<"$(step_fn run_dstp)"' \
+  "that call is run_dstp's, the requested command"
+REVISE_FN=$(step_fn run_branch_revise)
+check '[ -n "$REVISE_FN" ] && ! grep -qE "RUN_ENV|FORGE_RUN_ID" <<<"$REVISE_FN"' \
+  "run_branch_revise never passes the dispatch's run id"
+RUN_ENV_FN=$(step_fn forge_run_env)
+check '[ -n "$RUN_ENV_FN" ]' "forge_run_env exists in the dstp step"
+run_env() {  # run_env <FORGE_RUN_ID> <calls>  -> RUN_ENV after each call, one line per call
+  FORGE_RUN_ID="$1" CALLS="$2" bash -c "FORGE_RUN_ID_USED=0; RUN_ENV=()"$'\n'"${RUN_ENV_FN}"$'\n'\
+'for _ in $(seq "$CALLS"); do forge_run_env; printf "[%s]\n" "${RUN_ENV[*]}"; done'
+}
+ID=6f1c2d3e-4b5a-4c6d-8e7f-90a1b2c3d4e5
+WANT=$'[DSTP_FORGE_RUN_ID='"$ID"$']\n[]'
+GOT=$(run_env "$ID" 2)
+check '[ "$GOT" = "$WANT" ]' "forge_run_env names the first dstp run only (got $GOT)"
+GOT=$(run_env "" 1)
+check '[ "$GOT" = "[]" ]' "no forge_run_id passes nothing (got $GOT)"
+GOT=$(run_env "${ID}; echo pwned" 1)
+check '[[ "$GOT" == *"::warning::forge_run_id is not a lowercase UUID"* && "$GOT" == *"[]" && "$GOT" != *DSTP_FORGE_RUN_ID* ]]' \
+  "a value that is not a lowercase UUID is dropped with a warning (got $GOT)"
+GOT=$(run_env "$(printf '%s' "$ID" | tr '[:lower:]' '[:upper:]')" 1)
+check '[[ "$GOT" == *"::warning::"* && "$GOT" != *DSTP_FORGE_RUN_ID* ]]' "an upper-case id is dropped too (got $GOT)"
 check 'awk "/^      model:/{f=1} f && /default:/{print; exit}" "$WF" | grep -q "default: \"claude-sonnet-5-5\""' \
   "model default is claude-sonnet-5-5"
 # Pass the LiteLLM alias through. Rewriting it to an older catalog id would
