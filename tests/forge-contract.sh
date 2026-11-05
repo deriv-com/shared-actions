@@ -64,7 +64,7 @@ check 'awk "/^      forge_run_id:/{f=1} f && /required:/{print; exit}" "$WF" | g
   "forge_run_id is an optional input"
 check 'grep -q "FORGE_RUN_ID: \${{ inputs.forge_run_id }}" "$WF"' \
   "the dstp step reads forge_run_id as FORGE_RUN_ID"
-# The job sets FORGE_RUN_ID, never DSTP_FORGE_RUN_ID, so only run_dstp hands it on.
+# The job sets FORGE_RUN_ID, never DSTP_FORGE_RUN_ID, so only forge_run_env hands it on.
 check '! grep -qE "^ +DSTP_FORGE_RUN_ID:" "$WF"' "no step exports DSTP_FORGE_RUN_ID to every dstp run"
 step_fn() {  # step_fn <name>  -> a top-level helper of the dstp step, dedented
   awk -v name="$1" '
