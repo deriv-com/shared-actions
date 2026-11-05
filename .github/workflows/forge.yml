@@ -99,10 +99,10 @@ on:
       forge_run_id:
         description: >-
           The Forge run id forge-agent registered for this dispatch, with
-          who asked for it. The first dstp run of the job (the requested
-          command) reports under it as DSTP_FORGE_RUN_ID, so Forge can show
-          the run to that person. The revise rounds that follow get their
-          own ids. A value that is not a UUID is ignored with a warning.
+          who asked for it. The first dstp run of the job (auto, update, or
+          the first revise round) reports under it as DSTP_FORGE_RUN_ID, so
+          Forge can show the run to that person. Later revise rounds get
+          their own ids. A value that is not a UUID is ignored with a warning.
         required: false
         type: string
       analysis_brief:
@@ -659,7 +659,7 @@ jobs:
           # FORGE_API_KEY (LiteLLM) as the service key.
           DSTP_FORGE_TRIGGER: forge_ci
           DSTP_FORGE_SERVICE_KEY: ${{ secrets.DSTP_FORGE_SERVICE_KEY }}
-          # Not DSTP_FORGE_RUN_ID: run_dstp passes it to the first dstp run only.
+          # Not DSTP_FORGE_RUN_ID: forge_run_env passes it to the first dstp run only.
           FORGE_RUN_ID: ${{ inputs.forge_run_id }}
           SLACK_BOT_TOKEN: ${{ secrets.FORGE_SLACK_BOT_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -873,9 +873,11 @@ jobs:
 
           # The run id forge-agent registered for this dispatch (forge_run_id)
           # names the requested run, so Forge can show it to whoever asked.
-          # forge_run_env sets RUN_ENV to the DSTP_FORGE_RUN_ID=… assignment for
-          # the first dstp run of the job and to nothing after that: the revise
-          # rounds get their own ids. dstp also removes the variable on first read.
+          # run_dstp, run_branch_revise and run_branch_update call forge_run_env
+          # before each dstp run. It sets RUN_ENV to the DSTP_FORGE_RUN_ID=…
+          # assignment for the first dstp run of the job and to nothing after
+          # that: later revise rounds get their own ids. dstp also removes the
+          # variable on first read.
           FORGE_RUN_ID_USED=0
           RUN_ENV=()
           forge_run_env() {
@@ -984,7 +986,8 @@ jobs:
             echo "Running: dstp revise $branch <instruction> ${ARGS[*]:4}"
             local rc=0
             remint_write_token 300
-            node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || rc=$?
+            forge_run_env
+            env "${RUN_ENV[@]}" node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || rc=$?
             read_revise_result /tmp/forge.log || return 1
             [ "${NO_CHANGE:-0}" = "1" ] && return 0
             return "$rc"
@@ -1003,7 +1006,8 @@ jobs:
             echo "Running: dstp ${ARGS[*]}"
             local rc=0
             remint_write_token 300
-            node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || rc=$?
+            forge_run_env
+            env "${RUN_ENV[@]}" node "$FORGE_CLI" "${ARGS[@]}" 2>&1 | tee /tmp/forge.log || rc=$?
             read_revise_result /tmp/forge.log || return 1
             return "$rc"
           }

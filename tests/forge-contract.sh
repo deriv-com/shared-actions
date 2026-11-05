@@ -72,13 +72,17 @@ step_fn() {  # step_fn <name>  -> a top-level helper of the dstp step, dedented
     f { end = ($0 == "          }"); sub(/^          /, ""); print; if (end) exit }
   ' "$WF"
 }
-RUN_ENV_CALL='env "${RUN_ENV[@]}" node'
-check '[ "$(grep -cF "$RUN_ENV_CALL" "$WF")" = 1 ]' "exactly one dstp call takes RUN_ENV"
-check 'grep -qF "$RUN_ENV_CALL" <<<"$(step_fn run_dstp)"' \
-  "that call is run_dstp's, the requested command"
-REVISE_FN=$(step_fn run_branch_revise)
-check '[ -n "$REVISE_FN" ] && ! grep -qE "RUN_ENV|FORGE_RUN_ID" <<<"$REVISE_FN"' \
-  "run_branch_revise never passes the dispatch's run id"
+RUN_ENV_CALL='env "${RUN_ENV[@]}" node "$FORGE_CLI"'
+# auto runs run_dstp, update runs run_branch_update, and revise starts with a
+# run_branch_revise round, so each helper offers the id to its dstp run.
+for helper in run_dstp run_branch_revise run_branch_update; do
+  HELPER_FN=$(step_fn "$helper")
+  check '[ -n "$HELPER_FN" ] && grep -qx " *forge_run_env" <<<"$HELPER_FN" && grep -qF "$RUN_ENV_CALL" <<<"$HELPER_FN"' \
+    "$helper runs dstp with forge_run_env's RUN_ENV"
+done
+check '[ "$(grep -cF "node \"\$FORGE_CLI\"" "$WF")" = "$(grep -cF "$RUN_ENV_CALL" "$WF")" ]' \
+  "every dstp run goes through RUN_ENV"
+check '[ "$(grep -cx " *forge_run_env" "$WF")" = 3 ]' "only those three helpers call forge_run_env"
 RUN_ENV_FN=$(step_fn forge_run_env)
 check '[ -n "$RUN_ENV_FN" ]' "forge_run_env exists in the dstp step"
 run_env() {  # run_env <FORGE_RUN_ID> <calls>  -> RUN_ENV after each call, one line per call
