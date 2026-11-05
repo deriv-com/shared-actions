@@ -2049,7 +2049,7 @@ check 'has "$C/completion.txt" "The AI reviewer approved this PR" && [ "$(reacti
 C=$(unread_case gate_404 first)
 echo "gh: Not Found (HTTP 404)" > "$C/comments_fail_2"
 run_case "$C"
-check 'grep -qxF "read_failed=$VERDICT_UNREAD" "$C/out" && ! grep -qx 60 "$C/sleep.log"' \
+check 'grep -qxF "read_failed=$VERDICT_UNREAD" "$C/out" && ! grep -qsx 60 "$C/sleep.log"' \
   "a 4xx at the gate is not retried"
 
 check '! grep -qE "permission-actions: write|actions: \"write\"" "$WF"' \
