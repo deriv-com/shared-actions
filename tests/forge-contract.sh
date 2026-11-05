@@ -2114,6 +2114,18 @@ check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ ! -f "$C
 check '! grep -q "unanswered_head_review" "$WF"' \
   "one rule decides which late review is read again: the round's own read"
 
+# A late review is sent back once. Here the round's read misses it (gone,
+# then back for the gate's read), so the gate decides on the states as
+# before instead of sending it back again.
+C=$(quiet_case late_flapping)
+R=$(still_open_review 7970 a 2026-10-28T10:30:00Z 2026-10-28T10:31:00Z "$LATE_ITEM")
+printf '. + [%s]\n' "$R" > "$C/on_read_2.jq"
+echo 'map(select(.id != 7970))' > "$C/on_read_3.jq"
+printf '. + [%s]\n' "$R" > "$C/on_read_4.jq"
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && [ "$(grep -c "An AI review finished after this round read the PR" "$C/run.log")" = 1 ] && [ "$(grep -cxF "api repos/o/r/issues/7/comments --paginate" "$C/gh.log")" = 4 ]' \
+  "a late review is sent back once, so reads that disagree cannot loop"
+
 check '! grep -qE "permission-actions: write|actions: \"write\"" "$WF"' \
   "the write App token never asks for actions: write"
 
