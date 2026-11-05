@@ -2070,6 +2070,8 @@ still_open_review() {  # still_open_review <id> <head char> <created_at> <update
 }
 LATE_ITEM="total-profit-loss.spec.tsx:136 does not assert position: sticky"
 LATE_REPLY="jsdom has no layout, so a unit test cannot see position: sticky, and the e2e smoke covers it"
+# A skipped AI item gets a reply and an acknowledge comment, so look at all.
+posted() { cat "$1"/pr_comment.*.md 2>/dev/null | grep -qF -- "$2"; }
 
 # The approval lands while a round that changes nothing works.
 C=$(quiet_case late_approval)
@@ -2083,7 +2085,7 @@ model_reply "$C/model_reply.2.txt" "$(reply_items ai:7901:nit:0 skipped "$LATE_R
 run_case "$C"
 check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ "$(cat "$C/dstp_count")" = 2 ] && has "$C/instruction.2.md" "$LATE_ITEM" && ! has "$C/instruction.2.md" "Closed total is not sticky on mobile"' \
   "an approval with a Still open item that lands while a no-change round works is read in the next round"
-check 'has "$C/pr_comment.2.md" "$LATE_REPLY" && [ ! -f "$C/git_commits.jsonl" ] && grep -q "^review_state=approved$" "$C/out"' \
+check 'posted "$C" "$LATE_REPLY" && [ ! -f "$C/git_commits.jsonl" ] && grep -q "^review_state=approved$" "$C/out"' \
   "its item gets a reply in the same run, and the run then ends approved with no empty commit"
 
 # The approval lands between the round's read and the gate's read, at the
@@ -2094,7 +2096,7 @@ touch "$C/dstp_no_change"
 sha_of a > "$C/head_override"
 model_reply "$C/model_reply.txt" "$(reply_items ai:7950:nit:0 skipped "$LATE_REPLY")"
 run_case "$C"
-check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ "$(cat "$C/dstp_count" 2>/dev/null)" = 1 ] && has "$C/instruction.1.md" "$LATE_ITEM" && has "$C/pr_comment.1.md" "$LATE_REPLY"' \
+check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ "$(cat "$C/dstp_count" 2>/dev/null)" = 1 ] && has "$C/instruction.1.md" "$LATE_ITEM" && posted "$C" "$LATE_REPLY"' \
   "an approval with a Still open item that lands just before the gate reads is answered in the same run"
 check 'grep -q "^review_state=approved$" "$C/out" && [ ! -f "$C/git_commits.jsonl" ] && has "$C/run.log" "An AI review finished after this round read the PR; reading it next round"' \
   "the run reads it again before ending approved"
