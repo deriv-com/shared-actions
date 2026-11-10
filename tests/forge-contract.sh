@@ -978,11 +978,30 @@ if [ -f "$FAKE_STATE/model_reply.$k.txt" ]; then cat "$FAKE_STATE/model_reply.$k
 FAKE
 cat > "$FAKE_BIN/curl" <<'FAKE'
 #!/usr/bin/env bash
-url=""; for a in "$@"; do case "$a" in https://*) url="$a";; esac; done
-payload=$(cat)
+# Records {url, p} per call in slack.jsonl. p is the JSON body sent on stdin
+# (--data @-), the form fields (--data-urlencode), or {raw: <file text>} for
+# a file sent with --data-binary @<file> (a Slack file upload).
+url=""; prev=""; form='{}'; file=""; stdin=0
+for a in "$@"; do
+  case "$a" in https://*) url="$a";; esac
+  case "$prev" in
+    --data|--data-binary) if [ "$a" = "@-" ]; then stdin=1; else file="${a#@}"; fi ;;
+    --data-urlencode) form=$(jq -c --arg k "${a%%=*}" --arg v "${a#*=}" '. + {($k): $v}' <<< "$form") ;;
+  esac
+  prev="$a"
+done
+if [ "$stdin" = 1 ]; then payload=$(cat)
+elif [ -n "$file" ]; then payload=$(jq -Rs '{raw: .}' < "$file")
+else payload="$form"; fi
 jq -nc --arg url "$url" --argjson p "$payload" '{url: $url, p: $p}' >> "$FAKE_STATE/slack.jsonl"
 case "$url" in
   *reactions.*) [ -n "${FAKE_SLACK_ERROR:-}" ] && { printf '{"ok":false,"error":"%s"}\n' "$FAKE_SLACK_ERROR"; exit 0; } ;;
+  *files.getUploadURLExternal)
+    [ -n "${FAKE_UPLOAD_ERROR:-}" ] && { printf '{"ok":false,"error":"%s"}\n' "$FAKE_UPLOAD_ERROR"; exit 0; }
+    n=$(grep -c 'files.getUploadURLExternal' "$FAKE_STATE/slack.jsonl")
+    printf '{"ok":true,"upload_url":"https://files.slack.com/upload/v1/fake%s","file_id":"F0UPLOAD%s"}\n' "$n" "$n"
+    exit 0 ;;
+  https://files.slack.com/*) echo "OK - 1"; exit 0 ;;
 esac
 echo '{"ok":true,"ts":"9.9"}'
 FAKE
@@ -2275,7 +2294,7 @@ check '[ "$(grep -cx "api repos/o/r/issues/1213" "$C/gh.log")" = 1 ] && ! grep -
 # --- behavioral: a failed run's Slack copy and who it tags -------------------
 # Report runs as-is on a failed run against a fake Slack, with the log of
 # derivatives-trader#1849 and the requested_by values forge-agent sends.
-report_failure() {  # report_failure <name> <requested_by> <forge.log>  -> case dir
+report_failure() {  # report_failure <name> <requested_by> <forge.log> [VAR=value...]  -> case dir
   local c="$TMP_BEHAVIOR/failed_$1"
   mkdir -p "$c/tmp" "$c/home"
   printf '%s' "$3" > "$c/tmp/forge.log"
@@ -2284,8 +2303,8 @@ report_failure() {  # report_failure <name> <requested_by> <forge.log>  -> case 
     GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1849 ISSUE_URL=https://github.com/o/r/issues/1849 \
     GH_TOKEN=ghs_faketoken COMMENT_ID=55 OUTCOME=failure FORGE_COMMAND=auto REQUESTED_BY="$2" \
     SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_PROGRESS_TS=2.2 SLACK_BOT_TOKEN=xoxb-fake \
-    RUN_URL=https://github.com/o/r/actions/runs/41690031615 \
-    bash -e "$c/report.sh" > "$c/report.log" 2>&1 || true
+    RUN_URL=https://github.com/o/r/actions/runs/41690031615 SLACK_MENTION_TS=3.3 \
+    "${@:4}" bash -e "$c/report.sh" > "$c/report.log" 2>&1 || true
   jq -rs '[.[] | select(.url | endswith("chat.postMessage")) | .p.text] | last // ""' "$c/slack.jsonl" > "$c/completion.txt" 2>/dev/null || true
   jq -rs '[.[] | select(.url | endswith("chat.update")) | .p.text] | last // ""' "$c/slack.jsonl" > "$c/quiet.txt" 2>/dev/null || true
   printf '%s' "$c"
@@ -2310,6 +2329,85 @@ check 'grep -q "dropped 4 " "$C/report.log" && ! grep -qE "<!channel>|@team" "$C
 LABEL_EDIT=$(grep '^issue edit ' "$C/gh.log" | tail -1)
 check '[ "$LABEL_EDIT" = "issue edit 1849 --repo o/r --remove-label forge --remove-label forge:running --remove-label forge:done --add-label forge:failed" ]' \
   "a failed run labels the issue forge:failed and drops a forge:done an earlier run left (got $LABEL_EDIT)"
+
+# --- run files in the Slack thread (#158 step 6) -----------------------------
+# Report posts the plan dstp wrote (plan.md) and, on a failed run, the end of
+# the dstp log (failure.log) through Slack's external upload.
+upload_calls() {  # upload_calls <case dir>  -> the Slack calls from the first upload on, one "<method or host>" per line
+  jq -r '.url | sub("^https://slack.com/api/"; "") | sub("^https://files.slack.com/.*"; "files.slack.com")' "$1/slack.jsonl" \
+    | awk '/^files\./ {f=1} f'
+}
+shared_files() {  # shared_files <case dir>  -> one "<title> <channel> <thread>" per shared file
+  jq -r 'select(.url | endswith("files.completeUploadExternal")) | .p | "\(.files[0].title) \(.channel_id) \(.thread_ts)"' "$1/slack.jsonl"
+}
+FAIL_LOG="$(printf 'line %s\n' $(seq 1 50))
+GH_TOKEN=${FAKE_TOKEN_A} leaked here
+Verify failed: spec-coverage (3/40 files)"
+C=$(report_failure upload_failed "U084VH2B135" "$FAIL_LOG")
+SENT=$(jq -r 'select(.url | startswith("https://files.slack.com/")) | .p.raw' "$C/slack.jsonl")
+SENT_BYTES=$(jq -j 'select(.url | startswith("https://files.slack.com/")) | .p.raw' "$C/slack.jsonl" | wc -c | tr -d ' ')
+ASKED=$(jq -c 'select(.url | endswith("files.getUploadURLExternal")) | .p' "$C/slack.jsonl")
+WANT_ASKED=$(jq -nc --arg n "$SENT_BYTES" '{filename: "failure.log", length: $n}')
+check '[ "$(upload_calls "$C" | head -3 | tr "\n" " ")" = "files.getUploadURLExternal files.slack.com files.completeUploadExternal " ]' \
+  "a failed run posts failure.log with the three upload calls, after the completion (got $(upload_calls "$C" | tr "\n" " "))"
+ORDER=$(jq -rs '[.[].url] | index("https://slack.com/api/chat.postMessage") < index("https://slack.com/api/files.getUploadURLExternal")' "$C/slack.jsonl")
+check '[ "$ORDER" = true ]' \
+  "the file comes under the completion message"
+check '[ "$ASKED" = "$WANT_ASKED" ] && [[ "$SENT" == *"Verify failed: spec-coverage (3/40 files)" ]] && ! has "$C/slack.jsonl" "$FAKE_TOKEN_A" && [[ "$SENT" == *"GH_TOKEN=*** leaked here"* ]]' \
+  "failure.log is the end of the dstp log through the same scrub as the issue comment, and its declared length matches (got $ASKED)"
+check '[ "$(shared_files "$C")" = "The end of the dstp log for o/r#1849 C1 1.1" ] && [ "$(reactions "$C" add)" = x ]' \
+  "failure.log is shared in the run's thread, and the status emoji still follows (got $(shared_files "$C"))"
+
+C=$(report_failure upload_refused "U084VH2B135" "$FAIL_LOG" FAKE_UPLOAD_ERROR=not_allowed_token_type)
+check 'has "$C/report.log" "::warning::Could not post failure.log to Slack: not_allowed_token_type" && ! has "$C/slack.jsonl" "files.slack.com" && ! has "$C/slack.jsonl" "files.completeUploadExternal" && [ "$(reactions "$C" add)" = x ]' \
+  "an upload Slack refuses is a warning, sends nothing, and the run still reacts"
+
+C=$(report_failure no_log "U084VH2B135" "")
+check '! has "$C/slack.jsonl" "files.getUploadURLExternal"' \
+  "a failed run with no dstp log posts no file"
+
+# A plan Run Forge kept is posted on any run that has a thread; a run that
+# did not fail posts no failure.log.
+C=$(quiet_case plan_posted)
+printf '# Plan\n\n1. Keep the Closed total visible.\n' > "$C/tmp/forge-plan.md"
+run_case "$C"
+PLAN_SENT=$(jq -r 'select(.url | startswith("https://files.slack.com/")) | .p.raw' "$C/slack.jsonl")
+check '[ "$(shared_files "$C")" = "The plan dstp wrote for o/r#1213 C1 1.1" ] && [ "$PLAN_SENT" = "$(cat "$C/tmp/forge-plan.md")" ] && ! has "$C/slack.jsonl" "\"failure.log\""' \
+  "a kept plan is posted as plan.md in the thread, and a run that did not fail posts no failure.log (got $(shared_files "$C"))"
+
+# keep_plan keeps only a plain markdown file inside the checkout, scrubbed.
+KEEP_PLAN="$(extract_fn scrub_secrets)"$'\n'"$(extract_fn keep_plan)"
+check '[ -n "$(extract_fn keep_plan)" ]' "Run Forge keeps dstp's plan through keep_plan"
+plan_case() {  # plan_case <name> <plan_path> [setup command]  -> "<kept|none> <log>"
+  local d="$TMP_BEHAVIOR/plan_$1"
+  mkdir -p "$d/repo/docs/spec-to-pr/plans" "$d/out"
+  printf '# Plan\n\nThe token %s must not leak.\n' "$FAKE_TOKEN_B" > "$d/repo/docs/spec-to-pr/plans/2026-11-10-fix.md"
+  printf 'secret\n' > "$d/outside.md"
+  ( cd "$d/repo" && eval "${3:-:}" )
+  local log
+  log=$(cd "$d/repo" && bash -c "${KEEP_PLAN//\/tmp\//$d/out/}"$'\n'"keep_plan \"\$1\"" _ "$2" 2>&1)
+  if [ -f "$d/out/forge-plan.md" ]; then printf 'kept %s' "$log"; else printf 'none %s' "$log"; fi
+}
+GOT=$(plan_case good docs/spec-to-pr/plans/2026-11-10-fix.md)
+check '[ "$GOT" = "kept " ] && ! has "$TMP_BEHAVIOR/plan_good/out/forge-plan.md" "$FAKE_TOKEN_B" && has "$TMP_BEHAVIOR/plan_good/out/forge-plan.md" "The token *** must not leak."' \
+  "a plan inside the checkout is kept, scrubbed (got $GOT)"
+for bad in "../outside.md" "/etc/plan.md" "docs/plan.txt" "docs/spec-to-pr/plans/missing.md"; do
+  GOT=$(plan_case "bad_$(printf '%s' "$bad" | tr -c 'a-z' '_')" "$bad")
+  check '[[ "$GOT" == "none dstp named a plan Forge will not post: "* ]]' \
+    "keep_plan refuses $bad (got $GOT)"
+done
+GOT=$(plan_case symlink docs/link.md "ln -s ../../outside.md docs/link.md")
+check '[[ "$GOT" == "none dstp named a plan Forge will not post: docs/link.md" ]]' \
+  "keep_plan refuses a symlink, even to a markdown file (got $GOT)"
+GOT=$(plan_case big docs/big.md "head -c 1048577 /dev/zero | tr '\\0' x > docs/big.md")
+check '[ "$GOT" = "none The plan is 1048577 bytes; not posting it to Slack" ]' \
+  "keep_plan refuses a plan over 1 MB (got $GOT)"
+GOT=$(plan_case none "")
+check '[ "$GOT" = "none " ]' "no plan_path keeps nothing and says nothing (got $GOT)"
+check 'grep -q "keep_plan .*plan_path" "$WF"' \
+  "run_dstp hands dstp's plan_path to keep_plan"
+check 'grep -qF "TAIL=\$(tail -c 3000 /tmp/forge.log 2>/dev/null | scrub_log" "$WF" && grep -qF "tail -c 262144 /tmp/forge.log | scrub_log" "$WF"' \
+  "the issue comment's tail and failure.log share one scrub"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"
