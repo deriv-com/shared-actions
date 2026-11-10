@@ -1794,8 +1794,9 @@ jobs:
           )
           # Where each AI reviewer stands on one head: per engine, the newest
           # review (by finished time) whose reviewed-commit marker names it.
-          # state: approved (verdict approve; any open item on it was owed
-          # and answered before the loop gets here), handoff (request
+          # state: approved (verdict approve; review_gate sends a review that
+          # still has open items and finished after the round's read to
+          # the next round before it looks at states, #197), handoff (request
           # changes or block merge, and every finding repeats one Forge had
           # declined before the review finished), changes (request changes
           # or block merge otherwise), unknown (no verdict to read). key is
@@ -1872,13 +1873,17 @@ jobs:
           # to read the fresh review), out_of_time (no time for CI plus a
           # review). Returns 3 when the head or its AI reviews could not be
           # read, with REVIEW_UNREAD naming what (#196): a verdict Forge
-          # could not read is not the same as no verdict.
+          # could not read is not the same as no verdict. Returns 4, before
+          # it looks at any state, when an AI review finished after the
+          # round read the PR and the next round would work it (#197),
+          # with REVIEW_LATE counting its items.
           review_gate() {
-            local head="$1" comments
+            local head="$1" comments late new
             REVIEW_HEADS='[]'
             REVIEW_STOP=""
             REVIEW_UNREAD=""
             REVIEW_HEAD=""
+            REVIEW_LATE=0
             if ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
               head=$(gate_read "the head commit" pr_head_sha "$PR_URL") || head=""
             fi
@@ -1890,6 +1895,28 @@ jobs:
               || ! REVIEW_HEADS=$(head_review_state "$comments" "$head"); then
               REVIEW_HEADS='[]'
               REVIEW_UNREAD="the AI review verdict for the latest commit"
+            fi
+            # A review that finished after the round's read (an approval with
+            # findings or Still open items, or a newer request for changes)
+            # is answered before any state counts. late_ai_work is the next
+            # round's own read, so the gate cannot send back a review that
+            # read would skip. A review is sent back once: LATE_SEEN keeps
+            # a disagreement between the two from looping.
+            if [ -z "$REVIEW_UNREAD" ]; then
+              if ! late=$(late_ai_work "$comments"); then
+                REVIEW_HEADS='[]'
+                REVIEW_UNREAD="the AI review verdict for the latest commit"
+              else
+                new=$(printf '%s' "$late" | jq -r --arg seen "${LATE_SEEN:-}" \
+                  '($seen | split("\n")) as $s | [.keys[] | select(. as $k | $s | index($k) | not)] | .[]' 2>/dev/null || true)
+                if [ -n "$new" ]; then
+                  LATE_SEEN=$(printf '%s\n%s' "${LATE_SEEN:-}" "$new")
+                  REVIEW_LATE=$(printf '%s' "$late" | jq '.refs' 2>/dev/null || echo 1)
+                  REVIEW_HEAD="$head"
+                  REVIEW_STATE=late
+                  return 4
+                fi
+              fi
             fi
             if [ -n "$REVIEW_UNREAD" ]; then
               REVIEW_STATE=unread
@@ -1913,14 +1940,33 @@ jobs:
             fi
             return 1
           }
-          # True when a review in REVIEW_HEADS that asks for changes is not
-          # one this run answered: a newer review of the same head came in
-          # while the round worked, and the next round works it instead.
-          unanswered_head_review() {
-            printf '%s' "$REVIEW_HEADS" | jq -e --arg w "$WORKED_AI" '
-              ($w | split("\n")) as $w
-              | any(.[]; .state == "changes" and (.key as $k | $w | index($k) | not))
-            ' >/dev/null 2>&1
+          # The AI review items the next round's read would find in
+          # <comments>: build_items itself, run in a subshell over these
+          # comments with every other source empty, so it reads only reviews
+          # that finished after the run's starting watermark and that this
+          # run has not answered (#197). Prints {keys, refs}: those reviews'
+          # filter_reviews keys and how many AI items they hold.
+          late_ai_work() {
+            local tmp rc=0
+            tmp=$(mktemp)
+            ( PR_COMMENTS="$1" ALL_THREADS='[]' PR_REVIEWS='[]' ISSUE_COMMENTS='[]' CHECKS_JSON='[]'
+              build_items "$tmp" ) >/dev/null 2>&1 || rc=1
+            if [ "$rc" -eq 0 ]; then
+              jq -ce 'if has("refs") then
+                  {keys: [.ai[] | "\(.id)|\(.updated_at // .created_at // "")"],
+                   refs: ([.refs[] | select(.kind | startswith("ai"))] | length)}
+                else error("build_items did not classify the reviews") end' "$tmp" 2>/dev/null || rc=1
+            fi
+            rm -f "$tmp"
+            return "$rc"
+          }
+          # review_gate returned 4: an AI review finished after the round
+          # read the PR, so the next round reads and answers it (#197). Its
+          # items count as open until then, in case no round is left.
+          review_late_read() {
+            echo "An AI review finished after this round read the PR; reading it next round"
+            echo "ai_reviews_remaining=${REVIEW_LATE}" >> "$GITHUB_OUTPUT"
+            REVIEW_STATE=""
           }
           # review_gate returned 3: where the AI reviewers stand on the head
           # is unknown, so the run stops without calling the PR clean (#196).
@@ -2651,6 +2697,8 @@ jobs:
           # filter_reviews), so a later round reads only reviews that are new
           # or edited since.
           WORKED_AI=""
+          # Keys of AI reviews review_gate already sent back to be read (#197).
+          LATE_SEEN=""
           FRESH_ASKED=""
           FRESH_COMMITS=0
           REVIEW_HEADS=""
@@ -2770,6 +2818,10 @@ jobs:
                   review_unread_stop
                   break
                 fi
+                if [ "$GATE" = "4" ]; then
+                  review_late_read
+                  continue
+                fi
                 if [ "$GATE" = "2" ] && ask_fresh_review "$REVIEW_HEAD"; then
                   continue
                 fi
@@ -2875,9 +2927,8 @@ jobs:
                     review_unread_stop
                     break
                   fi
-                  if [ "$GATE" = "2" ] && unanswered_head_review; then
-                    echo "A newer AI review of this head came in while the round worked; reading it next round"
-                    REVIEW_STATE=""
+                  if [ "$GATE" = "4" ]; then
+                    review_late_read
                     continue
                   fi
                   if [ "$GATE" = "2" ] && ask_fresh_review "$REVIEW_HEAD"; then
