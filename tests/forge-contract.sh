@@ -1054,6 +1054,9 @@ C=$(new_case happy)
 run_case "$C"
 I="$C/instruction.1.md"
 check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ]' "revise run exits 0 and only calls known gh commands"
+LABEL_EDIT=$(grep '^issue edit ' "$C/gh.log" | tail -1)
+check '[ "$LABEL_EDIT" = "issue edit 1213 --repo o/r --remove-label forge --remove-label forge:running --remove-label forge:failed --add-label forge:done" ]' \
+  "Report labels the issue forge:done and drops a forge:failed an earlier run left (got $LABEL_EDIT)"
 check '! has "$C/run.log" "Could not read" && ! has "$C/run.log" "Gave up"' "a readable PR logs no Could not read and no Gave up"
 check '[ -f "$I" ] && [ "$(cat "$C/dstp_count")" = 1 ]' "dstp revise runs in round 1 and not again once CI is green"
 for t in 4377187829 4377187840 4377668685 4377668694; do
@@ -1900,6 +1903,9 @@ check '[ "$(head -1 "$C/completion.txt")" = "<@U084VH2B135> ${FAILED_ON}. The <h
   "junk requester tokens never reach Slack and the valid id is still tagged (got $(head -1 "$C/completion.txt"))"
 check 'grep -q "dropped 4 " "$C/report.log" && ! grep -qE "<!channel>|@team" "$C/report.log"' \
   "the run log counts the dropped tokens without echoing them"
+LABEL_EDIT=$(grep '^issue edit ' "$C/gh.log" | tail -1)
+check '[ "$LABEL_EDIT" = "issue edit 1849 --repo o/r --remove-label forge --remove-label forge:running --remove-label forge:done --add-label forge:failed" ]' \
+  "a failed run labels the issue forge:failed and drops a forge:done an earlier run left (got $LABEL_EDIT)"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"

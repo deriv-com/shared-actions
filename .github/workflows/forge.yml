@@ -3621,9 +3621,16 @@ jobs:
           fi
 
           # `forge` is also removed here in case we failed before the claim step —
-          # otherwise re-labelling can't retrigger.
+          # otherwise re-labelling can't retrigger. The other outcome label goes
+          # too, so a retried issue shows only this run's outcome: one that
+          # failed once and then got its PR no longer also reads as failed.
+          case "$LABEL" in
+            forge:failed) OTHER_LABEL="forge:done" ;;
+            *) OTHER_LABEL="forge:failed" ;;
+          esac
           gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --remove-label "forge" --remove-label "forge:running" --add-label "$LABEL" || true
+            --remove-label "forge" --remove-label "forge:running" --remove-label "$OTHER_LABEL" \
+            --add-label "$LABEL" || true
 
           # Living card: quiet chat.update. Completion: always a new postMessage.
           if [ -z "${SLACK_CHANNEL:-}" ] || [ -z "${SLACK_THREAD_TS:-}" ]; then
