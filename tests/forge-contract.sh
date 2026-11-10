@@ -849,7 +849,16 @@ case "$args" in
     jq --arg b "$b" '. + [{id: 900, user: {login: "gh-app-write[bot]", type: "Bot"}, created_at: "2026-10-26T14:00:00Z", body: $b, html_url: "https://github.com/o/r/pull/7#issuecomment-900"}]' \
       "$S/pr_comments.json" > "$S/pr_comments.next" && mv "$S/pr_comments.next" "$S/pr_comments.json"
     echo '{"node_id":"IC_900"}' ;;
-  "api repos/o/r/issues/7/comments --paginate") cat "$S/pr_comments.json" ;;
+  "api repos/o/r/issues/7/comments --paginate")
+    # comments_fail_<n>: the nth read of the PR comments fails, with that
+    # file as gh's stderr. comments_fail_from: that read and every later
+    # one fail with a 502.
+    n=$(grep -cxF "api repos/o/r/issues/7/comments --paginate" "$S/gh.log")
+    if [ -f "$S/comments_fail_$n" ]; then cat "$S/comments_fail_$n" >&2; exit 1; fi
+    if [ -f "$S/comments_fail_from" ] && [ "$n" -ge "$(cat "$S/comments_fail_from")" ]; then
+      echo "gh: Bad Gateway (HTTP 502)" >&2; exit 1
+    fi
+    cat "$S/pr_comments.json" ;;
   "api repos/o/r/issues/1213/comments --paginate") cat "$S/issue_comments.json" ;;
   "api repos/o/r/pulls/7/reviews --paginate") cat "$S/reviews.json" ;;
   "api --method POST repos/o/r/pulls/7/comments/"*"/replies --input -")
@@ -872,7 +881,8 @@ case "$args" in
   "api repos/o/r/pulls?state=open&sort=created&direction=desc&per_page=9 --jq "*)
     if [ -f "$S/pulls.json" ]; then jq -c "${@: -1}" "$S/pulls.json"; else echo '[]'; fi ;;
   "pr view https://github.com/o/r/pull/7 --json headRefOid --jq .headRefOid")
-    if [ -f "$S/head_override" ]; then cat "$S/head_override"
+    if [ -f "$S/head_fail_all" ]; then echo "gh: Bad Gateway (HTTP 502)" >&2; exit 1
+    elif [ -f "$S/head_override" ]; then cat "$S/head_override"
     elif [ ! -f "$S/dstp_ran" ]; then head -c 40 /dev/zero | tr '\0' 'a'; echo
     elif [ -f "$S/head_fail" ]; then exit 1
     elif [ -f "$S/head_stale" ]; then head -c 40 /dev/zero | tr '\0' 'a'; echo
@@ -1974,6 +1984,75 @@ check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ "$(cat "
   "an AI-reviews-only run works only the AI review"
 check '[ "$(wc -l < "$C/git_commits.jsonl" | tr -d " ")" = 1 ] && grep -q "^review_state=approved$" "$C/out" && ! grep "POST" "$C/gh.log" | grep -q "forge-revise-instructions"' \
   "an AI-reviews-only run asks for a fresh review and reads the approval, without moving the watermark"
+
+# --- a verdict Forge could not read is never clean (#196) -------------------
+# review_gate reads the PR comments, and the head when it has none, once a
+# round has nothing left. A failed read used to count as no verdict, so the
+# run ended clean. read_pr_state makes the run's first PR comments read, so
+# the gate's is the second. first: an approval was read and nothing is open
+# (the "nothing left" caller). no_change: a request-changes review answered
+# by a round that changed nothing (the no-change caller).
+unread_case() {  # unread_case <name> <first|no_change>  -> prints the case dir
+  local c; c=$(quiet_case "$1")
+  if [ "$2" = no_change ]; then
+    jq --argjson r "$(claude_review 7800 a request-changes 2026-10-28T10:00:00Z 2026-10-28T10:01:00Z "Closed total is not sticky on mobile")" \
+      '. + [$r]' "$c/pr_comments.json" > "$c/x" && mv "$c/x" "$c/pr_comments.json"
+    touch "$c/dstp_no_change"
+    sha_of a > "$c/head_override"
+    model_reply "$c/model_reply.txt" "$(reply_items ai:7800:finding:0 skipped "The Closed total is already sticky: positions-content.tsx sets position sticky on the footer row")"
+  else
+    jq --argjson r "$(claude_review 7800 a approve 2026-10-28T10:00:00Z 2026-10-28T10:01:00Z)" \
+      '. + [$r]' "$c/pr_comments.json" > "$c/x" && mv "$c/x" "$c/pr_comments.json"
+  fi
+  printf '%s' "$c"
+}
+VERDICT_UNREAD="the AI review verdict for the latest commit"
+C=$(unread_case unread_first first)
+echo 2 > "$C/comments_fail_from"
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && grep -qxF "read_failed=$VERDICT_UNREAD" "$C/out" && grep -q "^revise_trouble=1$" "$C/out" && grep -q "^review_state=unread$" "$C/out"' \
+  "a failed comments read at the gate is reported as unread, not as no verdict"
+check '! has "$C/run.log" "and nothing left to address" && ! grep "POST" "$C/gh.log" | grep -q "forge-revise-instructions" && [ "$(grep -cx 60 "$C/sleep.log")" = 4 ]' \
+  "the run is not called clean, posts no approval watermark, and gave up after 5 tries 60s apart"
+check 'has "$C/completion.txt" "Could not read $VERDICT_UNREAD on" && ! has "$C/completion.txt" "approved" && ! has "$C/completion.txt" "reported no remaining issues" && [ "$(cat "$C/quiet.txt")" = "⚠️ Could not read $VERDICT_UNREAD" ] && [ "$(reactions "$C" add)" = warning ]' \
+  "Report says the verdict could not be read and never that the reviewer approved (got $(cat "$C/quiet.txt"))"
+
+C=$(unread_case unread_first_head first)
+touch "$C/head_fail_all"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && grep -qxF "read_failed=the head commit" "$C/out" && ! has "$C/run.log" "and nothing left to address" && has "$C/completion.txt" "Could not read the head commit on"' \
+  "an unreadable head at the gate is reported the same way, never as clean"
+
+C=$(unread_case unread_no_change no_change)
+echo 2 > "$C/comments_fail_from"
+run_case "$C"
+check '[ "$(cat "$C/dstp_count")" = 1 ] && grep -qxF "read_failed=$VERDICT_UNREAD" "$C/out" && [ ! -f "$C/git_commits.jsonl" ] && [ ! -f "$C/git_refs.jsonl" ]' \
+  "after a no-change round a failed comments read at the gate stops the run, with no empty commit"
+check '[[ "$(head -1 "$C/completion.txt")" == "⚠️ Could not read $VERDICT_UNREAD on <https://github.com/o/r/pull/7|PR #7> (issue <https://github.com/o/r/issues/1213|#1213>), so Forge stopped revising. Nothing was committed."* ]] && [ "$(cat "$C/quiet.txt")" = "⚠️ Could not read $VERDICT_UNREAD" ] && [ "$(reactions "$C" add)" = warning ]' \
+  "the no-change completion leads with the verdict it could not read, with a warning (got $(head -1 "$C/completion.txt"))"
+check 'grep "^api --method PATCH repos/o/r/issues/comments/55 " "$C/gh.log" | grep -qF "body=🔨 Could not read $VERDICT_UNREAD on #7, so Forge stopped revising. Nothing was committed."' \
+  "the issue comment leads the same way"
+
+C=$(unread_case unread_no_change_head no_change)
+rm -f "$C/head_override"
+touch "$C/head_fail_all"
+run_case "$C"
+check '[ "$(cat "$C/dstp_count")" = 1 ] && grep -qxF "read_failed=the head commit" "$C/out" && [ ! -f "$C/git_commits.jsonl" ] && [[ "$(head -1 "$C/completion.txt")" == "⚠️ Could not read the head commit on <https://github.com/o/r/pull/7|PR #7>"* ]]' \
+  "after a no-change round an unreadable head stops the run the same way (got $(head -1 "$C/completion.txt"))"
+
+C=$(unread_case gate_retry first)
+echo "gh: Bad Gateway (HTTP 502)" > "$C/comments_fail_2"
+run_case "$C"
+check '! grep -q "^read_failed=" "$C/out" && [ "$(grep -cx 60 "$C/sleep.log")" = 1 ] && has "$C/run.log" "Could not read the AI reviews of the head commit; not treating that as clean. Retrying in 60s (attempt 2 of 5)" && grep -q "^review_state=approved$" "$C/out"' \
+  "one 502 at the gate is retried, and the approval is then read"
+check 'has "$C/completion.txt" "The AI reviewer approved this PR" && [ "$(reactions "$C" add)" = white_check_mark ]' \
+  "after the retry the run ends as before, with the approval reported"
+
+C=$(unread_case gate_404 first)
+echo "gh: Not Found (HTTP 404)" > "$C/comments_fail_2"
+run_case "$C"
+check 'grep -qxF "read_failed=$VERDICT_UNREAD" "$C/out" && ! grep -qsx 60 "$C/sleep.log"' \
+  "a 4xx at the gate is not retried"
 
 check '! grep -qE "permission-actions: write|actions: \"write\"" "$WF"' \
   "the write App token never asks for actions: write"
