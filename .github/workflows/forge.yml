@@ -1799,10 +1799,11 @@ jobs:
           # the next round before it looks at states, #197), handoff (request
           # changes or block merge, and every finding repeats one Forge had
           # declined before the review finished), changes (request changes
-          # or block merge otherwise), unknown (no verdict to read). key is
-          # filter_reviews' $worked form. Returns 1 when <head> is not a SHA
-          # or the comments cannot be parsed: an unread verdict must never
-          # read as no verdict (#196).
+          # or block merge otherwise), unknown (the verdict marker says
+          # unknown, or there is neither a marker nor a Recommendation line
+          # to read). key is filter_reviews' $worked form. Returns 1 when
+          # <head> is not a SHA or the comments cannot be parsed: an unread
+          # verdict must never read as no verdict (#196).
           head_review_state() {
             local comments="$1" head="$2"
             [[ "$head" =~ ^[0-9a-f]{7,40}$ ]] || return 1
@@ -1826,13 +1827,17 @@ jobs:
                     | del(.repeated))
             ' 2>/dev/null || return 1
           }
-          # One word for a head_review_state result: none (no verdict on the
-          # head), changes, handoff, or approved.
+          # One word for a head_review_state result: none (no AI review of the
+          # head), changes, handoff, unknown (a review of the head has no
+          # verdict Forge can parse, and none asks for changes), or approved.
+          # unknown wins over approved: one engine's approval says nothing
+          # about another engine's review (#203).
           review_overall() {
             printf '%s' "$1" | jq -r '
               if type != "array" then "none"
               elif any(.[]; .state == "changes") then "changes"
               elif any(.[]; .state == "handoff") then "handoff"
+              elif any(.[]; .state == "unknown") then "unknown"
               elif any(.[]; .state == "approved") then "approved"
               else "none" end
             ' 2>/dev/null || echo none
@@ -1865,15 +1870,17 @@ jobs:
           # (head_review_state), REVIEW_STATE (review_overall), REVIEW_STOP,
           # and REVIEW_HEAD, the head it judged (<head>, or the PR's head
           # read here when <head> is not a SHA). Returns 0 when the loop is
-          # done (every AI reviewer approved the head, or none gave a verdict
-          # on it, as before), 2 when Forge should ask for a fresh review,
+          # done (each AI reviewer of the head approved it, or there is no AI
+          # review of it, as before), 2 when Forge should ask for a fresh review,
           # and 1 when the PR goes to a person, with REVIEW_STOP saying why:
           # handoff (every finding repeats one Forge declined), fresh_used
           # (Forge already asked once for this code), rounds (no round left
           # to read the fresh review), out_of_time (no time for CI plus a
           # review). Returns 3 when the head or its AI reviews could not be
           # read, with REVIEW_UNREAD naming what (#196): a verdict Forge
-          # could not read is not the same as no verdict. Returns 4, before
+          # could not read is not the same as no verdict. A head review
+          # whose verdict cannot be parsed, with none asking for changes,
+          # returns 3 the same way (#203). Returns 4, before
           # it looks at any state, when an AI review finished after the
           # round read the PR and the next round would work it (#197),
           # with REVIEW_LATE counting its items.
@@ -1928,6 +1935,12 @@ jobs:
             case "$REVIEW_STATE" in
               none|approved) return 0 ;;
               handoff) REVIEW_STOP=handoff; return 1 ;;
+              unknown)
+                REVIEW_UNREAD="the AI review verdict for the latest commit"
+                REVIEW_STATE=unread
+                REVIEW_STOP=unread
+                return 3
+                ;;
             esac
             if [[ " ${FRESH_ASKED} " == *" ${head} "* ]]; then
               REVIEW_STOP=fresh_used
@@ -2673,7 +2686,7 @@ jobs:
           #
           # A round with nothing left to address is done only when the latest
           # review of the head from each AI reviewer approves it, or no
-          # reviewer gave a verdict on the head (review_gate). When the
+          # reviewer reviewed the head (review_gate). When the
           # reviewer still asks for changes on code Forge answered without a
           # push, Forge pushes one empty commit so it looks again
           # (ask_fresh_review), at most once per reviewed head and counted as
@@ -3256,6 +3269,7 @@ jobs:
                      else " (\($t[0:5] | join("; "))\(if ($t | length) > 5 then "; and \(($t | length) - 5) more" else "" end))" end)
                   + ". "
                   + (if .state == "handoff" then "Forge replied that they do not hold. A person needs to decide." else $why end)
+                elif .state == "unknown" then "\($who) PR Review reviewed the latest commit, but Forge could not read its verdict."
                 else empty end
             ' 2>/dev/null | tr -d '\r' | slack_escape || true)
             case "${REVIEW_STATE:-}" in

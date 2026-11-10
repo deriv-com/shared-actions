@@ -2061,6 +2061,78 @@ run_case "$C"
 check 'grep -qxF "read_failed=$VERDICT_UNREAD" "$C/out" && ! grep -qsx 60 "$C/sleep.log"' \
   "a 4xx at the gate is not retried"
 
+# --- a head review with no verdict to parse is not an approval (#203) -------
+# head_review_state gives such a review the state unknown. review_overall
+# used to answer none for it, or approved beside another engine's approval,
+# so the run ended clean. marker: the verdict marker ai-pr-review.yml writes
+# when it cannot read the Recommendation line. bare: no marker and no
+# Recommendation line, as in a review from before the marker.
+unparsed_review() {  # unparsed_review <id> <head char> <created_at> <updated_at> <marker|bare>
+  local head; head=$(sha_of "$2")
+  jq -nc --argjson id "$1" --arg h "$head" --arg cr "$3" --arg up "$4" --arg form "$5" '
+    {id: $id, user: {login: "github-actions[bot]", type: "Bot"}, created_at: $cr, updated_at: $up,
+     html_url: "https://github.com/o/r/pull/7#issuecomment-\($id)",
+     body: ("<!-- deriv-pr-review-anthropic -->\n## 🤖 Claude PR Review Complete\n\nThe review stopped before its recommendation.\n\n"
+       + "<!-- reviewed-commit: \($h) -->"
+       + (if $form == "marker" then "\n<!-- deriv-pr-review-verdict: unknown; findings=0 -->" else "" end))}'
+}
+kimi_approval() {  # kimi_approval <id> <head char> <created_at> <updated_at>  -> an approving Kimi review
+  claude_review "$1" "$2" approve "$3" "$4" \
+    | jq -c '.body |= (sub("deriv-pr-review-anthropic"; "deriv-pr-review-kimi") | sub("Claude PR Review"; "Kimi PR Review"))'
+}
+# first: the review is older than the run's watermark, so an earlier run
+# answered it and nothing is open (the "nothing left" caller). no_change: it
+# finished after the watermark, so a round answers it and changes nothing
+# (the no-change caller). approved: Kimi approved the same head after the
+# watermark, so the round reads a pure approval.
+unparsed_case() {  # unparsed_case <name> <first|no_change> <marker|bare> [approved]  -> prints the case dir
+  local c r; c=$(quiet_case "$1")
+  if [ "$2" = no_change ]; then
+    r=$(unparsed_review 7980 a 2026-10-28T10:00:00Z 2026-10-28T10:01:00Z "$3")
+    touch "$c/dstp_no_change"
+    sha_of a > "$c/head_override"
+    model_reply "$c/model_reply.txt" "$(reply_items ai:7980 skipped "The review lists no findings, so there is nothing to change")"
+  else
+    r=$(unparsed_review 7980 a 2026-10-23T15:00:00Z 2026-10-23T15:01:00Z "$3")
+  fi
+  jq --argjson r "$r" '. + [$r]' "$c/pr_comments.json" > "$c/x" && mv "$c/x" "$c/pr_comments.json"
+  if [ "${4:-}" = approved ]; then
+    jq --argjson r "$(kimi_approval 7981 a 2026-10-28T10:05:00Z 2026-10-28T10:06:00Z)" \
+      '. + [$r]' "$c/pr_comments.json" > "$c/x" && mv "$c/x" "$c/pr_comments.json"
+  fi
+  printf '%s' "$c"
+}
+UNPARSED_LINE="Claude PR Review reviewed the latest commit, but Forge could not read its verdict."
+KIMI_LINE="Kimi PR Review approved the latest commit."
+
+C=$(unparsed_case unparsed_first first marker)
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && grep -qxF "read_failed=$VERDICT_UNREAD" "$C/out" && grep -q "^revise_trouble=1$" "$C/out" && grep -q "^review_state=unread$" "$C/out"' \
+  "nothing left, and the head review's verdict marker says unknown: the run stops as unread"
+check '! has "$C/run.log" "and nothing left to address" && has "$C/completion.txt" "Could not read $VERDICT_UNREAD on" && has "$C/completion.txt" "$UNPARSED_LINE" && ! has "$C/completion.txt" "approved" && ! has "$C/completion.txt" "reported no remaining issues" && [ "$(cat "$C/quiet.txt")" = "⚠️ Could not read $VERDICT_UNREAD" ] && [ "$(reactions "$C" add)" = warning ]' \
+  "the run is not called clean, and Report names the review it could not read a verdict from"
+
+C=$(unparsed_case unparsed_first_approved first bare approved)
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && grep -qxF "read_failed=$VERDICT_UNREAD" "$C/out" && grep -q "^review_state=unread$" "$C/out" && ! has "$C/run.log" "and nothing left to address"' \
+  "a head review with no verdict marker and no Recommendation line beside a Kimi approval does not end the run as clean"
+check '! grep "POST" "$C/gh.log" | grep -q "forge-revise-instructions" && has "$C/completion.txt" "Could not read $VERDICT_UNREAD on" && has "$C/completion.txt" "$UNPARSED_LINE" && has "$C/completion.txt" "$KIMI_LINE" && ! has "$C/completion.txt" "The AI reviewer approved this PR" && [ "$(reactions "$C" add)" = warning ]' \
+  "the run posts no approval watermark, and Report says what each reviewer did with a warning"
+
+C=$(unparsed_case unparsed_no_change no_change bare)
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ "$(cat "$C/dstp_count")" = 1 ] && grep -qxF "read_failed=$VERDICT_UNREAD" "$C/out" && grep -q "^review_state=unread$" "$C/out" && [ ! -f "$C/git_commits.jsonl" ] && [ ! -f "$C/git_refs.jsonl" ]' \
+  "after a no-change round, a head review with no verdict marker and no Recommendation line stops the run, with no empty commit"
+check '[[ "$(head -1 "$C/completion.txt")" == "⚠️ Could not read $VERDICT_UNREAD on <https://github.com/o/r/pull/7|PR #7> (issue <https://github.com/o/r/issues/1213|#1213>), so Forge stopped revising. Nothing was committed."* ]] && has "$C/completion.txt" "$UNPARSED_LINE" && [ "$(reactions "$C" add)" = warning ]' \
+  "the no-change completion leads with the verdict it could not read (got $(head -1 "$C/completion.txt"))"
+
+C=$(unparsed_case unparsed_no_change_approved no_change marker approved)
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ "$(cat "$C/dstp_count")" = 1 ] && grep -qxF "read_failed=$VERDICT_UNREAD" "$C/out" && grep -q "^review_state=unread$" "$C/out" && [ ! -f "$C/git_commits.jsonl" ] && [ ! -f "$C/git_refs.jsonl" ]' \
+  "after a no-change round, an unknown verdict marker beside a Kimi approval stops the run, with no empty commit"
+check 'has "$C/completion.txt" "Could not read $VERDICT_UNREAD on" && has "$C/completion.txt" "$UNPARSED_LINE" && has "$C/completion.txt" "$KIMI_LINE" && [ "$(cat "$C/quiet.txt")" = "⚠️ Could not read $VERDICT_UNREAD" ] && [ "$(reactions "$C" add)" = warning ]' \
+  "Report leads with the verdict it could not read and still names the approval"
+
 # --- a review that finishes after the round's read is answered (#197) -------
 # An approval can carry a Still open item. One that finishes after the round
 # read the PR used to end the loop as approved, unanswered, and the round's
