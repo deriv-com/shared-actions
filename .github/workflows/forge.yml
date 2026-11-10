@@ -867,8 +867,29 @@ jobs:
               local pr
               pr=$(github_pr_url "$(printf '%s' "$RESULT" | jq -r '.pr_url // empty')")
               [ -n "$pr" ] && echo "pr_url=$pr" >> "$GITHUB_OUTPUT"
+              keep_plan "$(printf '%s' "$RESULT" | jq -r '.plan_path // empty' 2>/dev/null || true)"
             fi
             return 0
+          }
+
+          # The plan dstp wrote, for Report to post in the Slack thread as
+          # plan.md (#158 step 6). plan_path in dstp's result is relative to
+          # the checkout. Only a plain markdown file inside it is kept, never
+          # a symlink, at most 1 MB, through the same scrub as the logs.
+          keep_plan() {
+            local path="$1" size
+            [ -n "$path" ] || return 0
+            if ! [[ "$path" =~ ^[A-Za-z0-9._/-]+\.md$ ]] || [[ "$path" == /* ]] || [[ "$path" == *..* ]] \
+              || [ -L "$path" ] || ! [ -f "$path" ]; then
+              echo "dstp named a plan Forge will not post: ${path:0:200}"
+              return 0
+            fi
+            size=$(wc -c < "$path" | tr -d ' ')
+            if [ "$size" -gt 1048576 ]; then
+              echo "The plan is ${size} bytes; not posting it to Slack"
+              return 0
+            fi
+            scrub_secrets < "$path" > /tmp/forge-plan.md || rm -f /tmp/forge-plan.md
           }
 
           # The run id forge-agent registered for this dispatch (forge_run_id)
@@ -3388,6 +3409,21 @@ jobs:
             done
             return 0
           }
+          # The scrub for dstp log text that leaves the run: the tail in the
+          # issue comment and failure.log in the Slack thread. Actions' secret
+          # masking applies to neither, so this is their only protection. `sk-`
+          # is broad on purpose (the LiteLLM gateway key has no `ant` infix);
+          # `fk_` covers the Forge CI service key; `xox*` covers the Slack
+          # token this step holds.
+          scrub_log() {
+            sed -E \
+              -e 's/gh[pousr]_[A-Za-z0-9]{20,}/***/g' \
+              -e 's/github_pat_[A-Za-z0-9_]{20,}/***/g' \
+              -e 's/sk-[A-Za-z0-9_-]{20,}/***/g' \
+              -e 's/fk_[A-Za-z0-9_-]{20,}/***/g' \
+              -e 's/xox[abposr]-[A-Za-z0-9-]{10,}/***/g' \
+              -e 's#x-access-token:[^@]*@#x-access-token:***@#g'
+          }
           # fail_snippet <log tail>: why a failed run failed, as one
           # Slack-escaped line of at most 180 characters, or nothing. A Verify
           # failed, spec-coverage or unrecognized_model line is quoted as is.
@@ -3776,18 +3812,10 @@ jobs:
             LABEL="forge:done"
           else
             # The log tail goes into an issue comment via the API, where Actions' secret
-            # masking does NOT apply — this scrub is the only protection. `sk-` is broad on
-            # purpose (the LiteLLM gateway key has no `ant` infix); `fk_` covers the Forge
-            # CI service key; `xox*` covers the Slack token this step holds.
-            TAIL=$(tail -c 3000 /tmp/forge.log 2>/dev/null | sed -E \
-              -e 's/gh[pousr]_[A-Za-z0-9]{20,}/***/g' \
-              -e 's/github_pat_[A-Za-z0-9_]{20,}/***/g' \
-              -e 's/sk-[A-Za-z0-9_-]{20,}/***/g' \
-              -e 's/fk_[A-Za-z0-9_-]{20,}/***/g' \
-              -e 's/xox[abposr]-[A-Za-z0-9-]{10,}/***/g' \
-              -e 's#x-access-token:[^@]*@#x-access-token:***@#g' \
-              || echo "no output captured")
+            # masking does NOT apply, so scrub_log is the only protection.
+            TAIL=$(tail -c 3000 /tmp/forge.log 2>/dev/null | scrub_log || echo "no output captured")
             BODY=$(printf '🔨 Forge failed. [Full log](%s)\n\n<details><summary>Last output</summary>\n\n```\n%s\n```\n\n</details>\n\nRe-apply the `forge` label to retry.\n\nTook %s.' "$RUN_URL" "$TAIL" "$TOOK")
+            RUN_FAILED=1
             LABEL="forge:failed"
             REACTION="x"
             [ "${OUTCOME:-}" = "cancelled" ] && REACTION="octagonal_sign"
@@ -3873,6 +3901,53 @@ jobs:
             echo "Posted the outcome to Slack."
           else
             echo "::warning::Slack post failed: $(printf '%s' "$RESPONSE" | jq -r '.error // "unknown"')"
+          fi
+
+          # Run files in the thread, under the completion (#158 step 6): the
+          # plan dstp wrote (plan.md, kept by Run Forge's keep_plan) and, on a
+          # failed run, the end of the dstp log (failure.log), through
+          # scrub_log like the issue comment's tail. Slack's external upload, with
+          # files:write: get an upload URL, send the bytes, then share the file
+          # in the thread. Best effort: a failed upload is a warning.
+          slack_upload() {  # slack_upload <file> <filename> <title>
+            local file="$1" name="$2" title="$3" size got url id err shared
+            [ -s "$file" ] || return 0
+            size=$(wc -c < "$file" | tr -d ' ')
+            got=$(curl -sS --connect-timeout 10 --max-time 30 \
+                -X POST https://slack.com/api/files.getUploadURLExternal \
+                -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+                --data-urlencode "filename=${name}" \
+                --data-urlencode "length=${size}" || echo '{"ok":false,"error":"curl_failed"}')
+            url=$(printf '%s' "$got" | jq -r 'if .ok == true then .upload_url // "" else "" end' 2>/dev/null || true)
+            id=$(printf '%s' "$got" | jq -r 'if .ok == true then .file_id // "" else "" end' 2>/dev/null || true)
+            if ! [[ "$url" =~ ^https://files\.slack\.com/[A-Za-z0-9/._~%-]+$ ]] || ! [[ "$id" =~ ^F[A-Z0-9]+$ ]]; then
+              err=$(printf '%s' "$got" | jq -r '.error // "no upload URL"' 2>/dev/null | tr -cd 'a-z0-9_ ' | cut -c1-60 || true)
+              echo "::warning::Could not post ${name} to Slack: ${err:-no upload URL}"
+              return 0
+            fi
+            if ! curl -sS --fail --connect-timeout 10 --max-time 60 -X POST "$url" --data-binary @"$file" >/dev/null; then
+              echo "::warning::Could not post ${name} to Slack: the upload failed"
+              return 0
+            fi
+            shared=$(jq -n --arg id "$id" --arg title "$title" --arg channel "$SLACK_CHANNEL" --arg thread_ts "$SLACK_THREAD_TS" \
+                '{files: [{id: $id, title: $title}], channel_id: $channel, thread_ts: $thread_ts}' \
+              | curl -sS --connect-timeout 10 --max-time 30 \
+                  -X POST https://slack.com/api/files.completeUploadExternal \
+                  -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+                  -H 'Content-type: application/json; charset=utf-8' \
+                  --data @- || echo '{"ok":false,"error":"curl_failed"}')
+            if [ "$(printf '%s' "$shared" | jq -r '.ok' 2>/dev/null || true)" = "true" ]; then
+              echo "Posted ${name} to Slack."
+            else
+              echo "::warning::Could not post ${name} to Slack: $(printf '%s' "$shared" | jq -r '.error // "unknown"' 2>/dev/null | tr -cd 'a-z0-9_' | cut -c1-60 || true)"
+            fi
+            return 0
+          }
+          slack_upload /tmp/forge-plan.md plan.md "The plan dstp wrote for ${GITHUB_REPOSITORY}#${ISSUE_NUMBER}"
+          if [ "${RUN_FAILED:-0}" = "1" ] && [ -s /tmp/forge.log ]; then
+            # The last 256 KB, which holds the failing step's own output.
+            tail -c 262144 /tmp/forge.log | scrub_log > /tmp/forge-failure.log 2>/dev/null || rm -f /tmp/forge-failure.log
+            slack_upload /tmp/forge-failure.log failure.log "The end of the dstp log for ${GITHUB_REPOSITORY}#${ISSUE_NUMBER}"
           fi
 
           # Swap Forge's status emoji on the requester's message. Best effort:
