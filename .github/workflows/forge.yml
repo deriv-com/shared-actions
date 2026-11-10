@@ -64,7 +64,11 @@ on:
   workflow_call:
     inputs:
       issue_number:
-        description: "Issue number to work on"
+        description: >-
+          Issue number to work on. For revise and update it may be the number
+          of an open PR from a branch of this repository: Forge then works on
+          that PR directly, labels and comments on it, and never adds a
+          closing line to its description. auto refuses a PR.
         required: true
         type: string
 
@@ -117,7 +121,8 @@ on:
         description: >-
           dstp subcommand. `auto` opens the first PR. `revise` applies later
           changes: AI PR Review comments (`<!-- deriv-pr-review-`), CI
-          failures, and human Slack notes posted on the issue as
+          failures, and human Slack notes posted on the issue (or on the PR
+          that issue_number names) as
           `<!-- forge-slack-revise -->`. `update` only brings the PR branch
           up to date with its base (dstp update; see update_base and
           resolve_conflicts_unattended). Callers must pass this through
@@ -2402,7 +2407,11 @@ jobs:
               jq -r --argjson allowed "$allowed" "${CLEAN_JQ}"'.pr_body | if . == null then "" else clean($allowed; 20000) end' "$reply" \
                 | scrub_secrets > "$body_file"
               if grep -q '[^[:space:]]' "$body_file"; then
-                if ! grep -qiE "(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#${ISSUE_NUMBER}([^0-9]|$)" "$body_file"; then
+                # A PR as the work item (#173) closes nothing: a closing line
+                # would name the PR itself, and linking an issue here would
+                # make the merge close it.
+                if [ -z "${WORK_PR_URL:-}" ] \
+                  && ! grep -qiE "(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#${ISSUE_NUMBER}([^0-9]|$)" "$body_file"; then
                   printf '\n---\nCloses #%s\n' "$ISSUE_NUMBER" >> "$body_file"
                 fi
                 if [ -s "$current" ] && jq -e --rawfile new "$body_file" \
@@ -2621,6 +2630,33 @@ jobs:
             return 0
           }
 
+          # A PR as the work item (#173). GitHub numbers issues and PRs
+          # together, so issue_number can name a PR, and the issues API then
+          # answers with a pull_request key. revise and update work on that
+          # PR directly: a PR that closes no issue has no issue to be found
+          # through. The labels and the run comment already go to
+          # issue_number, so they land on the PR. Prints the PR's state
+          # (open or closed) for a PR and nothing for an issue. Returns 1
+          # when the work item could not be read.
+          work_item_pr_state() {
+            local info
+            info=$(gate_read "#${ISSUE_NUMBER}" gh_read api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}") || return 1
+            printf '%s' "$info" | jq -er 'if type != "object" then error("not an object")
+              elif (.pull_request // null) == null then ""
+              else (.state // "unknown" | tostring) end' 2>/dev/null || return 1
+          }
+          WORK_PR_URL=""
+          WORK_PR_STATE=""
+          if WORK_PR_STATE=$(work_item_pr_state); then
+            if [ -n "$WORK_PR_STATE" ]; then
+              WORK_PR_URL="https://github.com/${GITHUB_REPOSITORY}/pull/${ISSUE_NUMBER}"
+              echo "work_pr=1" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            WORK_PR_STATE=""
+            echo "Could not read #${ISSUE_NUMBER}, so it is treated as an issue"
+          fi
+
           # Issue-URL dstp revise only reads QA sub-issues and refuses PR
           # comments. A later Slack/AI revise must use the open PR's branch.
           if [ "$COMMAND" = "revise" ] || [ "$COMMAND" = "update" ]; then
@@ -2630,14 +2666,33 @@ jobs:
             else
               slack_progress "Revising the open PR"
             fi
-            find_open_pr
-            PR_URL=$(github_pr_url "$FOUND_PR_URL")
             STATUS=0
+            FOUND_PR_URL=""
+            FORK_PR_URL=""
+            if [ -z "$WORK_PR_URL" ]; then
+              find_open_pr
+            elif [ "$WORK_PR_STATE" != "open" ]; then
+              echo "PR #${ISSUE_NUMBER} is ${WORK_PR_STATE}; cannot ${COMMAND}"
+            else
+              # The same fork check find_open_pr makes (#195): Forge pushes
+              # to refs/heads/<head branch> of this repository.
+              HEAD_RC=0
+              pr_head_branch "$WORK_PR_URL" >/dev/null || HEAD_RC=$?
+              if [ "$HEAD_RC" -eq 2 ]; then
+                FORK_PR_URL="$WORK_PR_URL"
+              else
+                FOUND_PR_URL="$WORK_PR_URL"
+              fi
+            fi
+            PR_URL=$(github_pr_url "$FOUND_PR_URL")
             if [ -z "$PR_URL" ]; then
-              if [ -n "$FORK_PR_URL" ]; then
+              if [ -n "$FORK_PR_URL" ] && [ -n "$WORK_PR_URL" ]; then
+                echo "PR #${ISSUE_NUMBER} is from a fork; Forge works only on branches in this repository, so it cannot ${COMMAND}"
+                echo "pr_from_fork=$FORK_PR_URL" >> "$GITHUB_OUTPUT"
+              elif [ -n "$FORK_PR_URL" ]; then
                 echo "The open PR for issue #${ISSUE_NUMBER} (${FORK_PR_URL}) is from a fork; Forge works only on branches in this repository, so it cannot ${COMMAND}"
                 echo "pr_from_fork=$FORK_PR_URL" >> "$GITHUB_OUTPUT"
-              else
+              elif [ -z "$WORK_PR_URL" ]; then
                 echo "No open PR linked to issue #${ISSUE_NUMBER}; cannot revise"
               fi
               echo "pr_unresolved=1" >> "$GITHUB_OUTPUT"
@@ -2664,6 +2719,12 @@ jobs:
                 settle_after_update "$PR_URL" "$HEAD_BEFORE"
               fi
             fi
+          elif [ -n "$WORK_PR_URL" ]; then
+            # auto builds a new PR from an issue. A PR is no spec, and a run
+            # on it would open a second PR for the same change.
+            echo "#${ISSUE_NUMBER} is a pull request, and auto builds a PR from an issue; refusing"
+            echo "auto_on_pr=1" >> "$GITHUB_OUTPUT"
+            STATUS=1
           else
             slack_progress "Opening the PR"
             run_dstp "$COMMAND" || STATUS=$?
@@ -3013,6 +3074,8 @@ jobs:
           PR_URL: ${{ steps.forge.outputs.pr_url }}
           PR_UNRESOLVED: ${{ steps.forge.outputs.pr_unresolved }}
           PR_FROM_FORK: ${{ steps.forge.outputs.pr_from_fork }}
+          WORK_PR: ${{ steps.forge.outputs.work_pr }}
+          AUTO_ON_PR: ${{ steps.forge.outputs.auto_on_pr }}
           NO_CHANGE: ${{ steps.forge.outputs.no_change }}
           NO_CHANGE_REASON: ${{ steps.forge.outputs.no_change_reason }}
           REVISE_TROUBLE: ${{ steps.forge.outputs.revise_trouble }}
@@ -3185,6 +3248,15 @@ jobs:
           }
           WHO=$(render_who "${REQUESTED_BY:-}")
           ISSUE_LINK="<${ISSUE_URL}|#${ISSUE_NUMBER}>"
+          # ISSUE_OF follows the PR in a headline. A PR as the work item
+          # (#173) has no issue to name, so the completion names the PR alone.
+          ISSUE_OF=" (issue ${ISSUE_LINK})"
+          WORK_NOUN="issue"
+          if [ "${WORK_PR:-}" = "1" ]; then
+            ISSUE_LINK="<https://github.com/${GITHUB_REPOSITORY}/pull/${ISSUE_NUMBER}|PR #${ISSUE_NUMBER}>"
+            ISSUE_OF=""
+            WORK_NOUN="PR"
+          fi
 
           # The job this run did, so each mode gets its own wording. A
           # conflicts-only run (update) never says "Fix pushed"; a combined
@@ -3451,14 +3523,33 @@ jobs:
           REACTION=""
           SLACK_TEXT=""
           NL=$'\n'
-          # The only open PR that closes the issue is from a fork, so Run
-          # Forge stopped before dstp (find_open_pr). It goes into Slack and
-          # the issue comment, so only a GitHub pull URL is used.
+          # The only open PR that closes the issue, or the PR given as the
+          # work item (#173), is from a fork, so Run Forge stopped before
+          # dstp. It goes into Slack and the issue comment, so only a GitHub
+          # pull URL is used.
           FORK_URL=""
           if [[ "${PR_FROM_FORK:-}" =~ ^https://github.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[1-9][0-9]*$ ]]; then
             FORK_URL="$PR_FROM_FORK"
           fi
-          if [ -n "$FORK_URL" ]; then
+          if [ "${AUTO_ON_PR:-}" = "1" ]; then
+            # A PR as the work item of an auto run (#173): auto builds a PR
+            # from an issue, so Run Forge refused before dstp.
+            FACTS="#${ISSUE_NUMBER} is a pull request. Forge opens a PR from an issue, so it did not start."
+            QUIET="⚠️ Needs an issue to build from"
+            REACTION="warning"
+            BODY=$(printf '🔨 %s\n\nAsk Forge to revise or update this PR, or ask it to work on the issue instead.\n\nTook %s.' "$FACTS" "$TOOK")
+            LABEL="forge:failed"
+            SLACK_TEXT=$(printf '%s⚠️ %s is a pull request. Forge opens a PR from an issue, so it did not start. Ask Forge to revise or update the PR, or ask it to work on the issue instead.\nTook %s.' "$WHO" "$ISSUE_LINK" "$TOOK")
+          elif [ -n "$FORK_URL" ] && [ "${WORK_PR:-}" = "1" ]; then
+            VERB="revise"
+            [ "$MODE" = "update" ] && VERB="update"
+            FACTS="This PR is from a fork. Forge works only on branches in this repository, so there is nothing to ${VERB}."
+            QUIET="⚠️ PR is from a fork"
+            REACTION="warning"
+            BODY=$(printf '🔨 %s\n\nOpen the PR from a branch in this repository and ask again.\n\nTook %s.' "$FACTS" "$TOOK")
+            LABEL="forge:failed"
+            SLACK_TEXT=$(printf '%s⚠️ %s is from a fork. Forge works only on branches in this repository, so there is nothing to %s. Open the PR from a branch in this repository and ask again.\nTook %s.' "$WHO" "$ISSUE_LINK" "$VERB" "$TOOK")
+          elif [ -n "$FORK_URL" ]; then
             VERB="revise"
             [ "$MODE" = "update" ] && VERB="update"
             FORK_NUM="${FORK_URL##*/}"
@@ -3468,6 +3559,16 @@ jobs:
             BODY=$(printf '🔨 %s\n\nOpen the PR from a branch in this repository and ask again.\n\nTook %s.' "$FACTS" "$TOOK")
             LABEL="forge:failed"
             SLACK_TEXT=$(printf '%s⚠️ The open PR for issue %s, <%s|PR #%s>, is from a fork. Forge works only on branches in this repository, so there is nothing to %s. Open the PR from a branch in this repository and ask again.\nTook %s.' "$WHO" "$ISSUE_LINK" "$FORK_URL" "$FORK_NUM" "$VERB" "$TOOK")
+          elif [ "${PR_UNRESOLVED:-}" = "1" ] && [ "${WORK_PR:-}" = "1" ]; then
+            # A PR as the work item that is closed or merged (#173).
+            VERB="revise"
+            [ "$MODE" = "update" ] && VERB="update"
+            FACTS="This PR is not open, so there is nothing to ${VERB}."
+            QUIET="⚠️ PR is not open"
+            REACTION="warning"
+            BODY=$(printf '🔨 %s\n\nTook %s.' "$FACTS" "$TOOK")
+            LABEL="forge:failed"
+            SLACK_TEXT=$(printf '%s⚠️ %s is not open, so there is nothing to %s.\nTook %s.' "$WHO" "$ISSUE_LINK" "$VERB" "$TOOK")
           elif [ "${PR_UNRESOLVED:-}" = "1" ]; then
             VERB="revise"
             [ "$MODE" = "update" ] && VERB="update"
@@ -3504,7 +3605,7 @@ jobs:
             TARGET_SLACK="$ISSUE_LINK"
             TARGET_MD="this issue"
             if [ -n "$PR_SLACK" ]; then
-              TARGET_SLACK="${PR_SLACK} (issue ${ISSUE_LINK})"
+              TARGET_SLACK="${PR_SLACK}${ISSUE_OF}"
               TARGET_MD="#${PR_NUM}"
             fi
             HEAD_SLACK="Checked ${TARGET_SLACK}."
@@ -3655,7 +3756,7 @@ jobs:
             DETAILS_SLACK=$(detail_lines '• ' "$STOP" "$CONFLICT_LINE" "$CI_LINE" "$SCAN_LINE" "$AI_LINE" "$OFFER" "$TROUBLE")
             DETAILS_MD=$(detail_lines '- ' "$STOP" "$CONFLICT_LINE" "$CI_LINE" "$SCAN_LINE" "$AI_LINE" "$OFFER" "$TROUBLE")
             BODY=$(printf '🔨 %s\n\n%s\nTook %s.' "$(headline "#${PR_NUM}" "")" "${DETAILS_MD:+$DETAILS_MD$NL}" "$TOOK")
-            SLACK_TEXT=$(printf '%s%s%s\n%sTook %s.' "$WHO" "${EMOJI:+$EMOJI }" "$(headline "$PR_SLACK" " (issue ${ISSUE_LINK})")" "${DETAILS_SLACK:+$DETAILS_SLACK$NL}" "$TOOK")
+            SLACK_TEXT=$(printf '%s%s%s\n%sTook %s.' "$WHO" "${EMOJI:+$EMOJI }" "$(headline "$PR_SLACK" "$ISSUE_OF")" "${DETAILS_SLACK:+$DETAILS_SLACK$NL}" "$TOOK")
             REACTION="white_check_mark"
             [ "$EMOJI" = "⚠️" ] && REACTION="warning"
             LABEL="forge:done"
@@ -3738,16 +3839,16 @@ jobs:
             # A stopped dstp run (conflict, red verify, a blocked call) leads.
             [ -n "$STOP" ] && EMOJI="⚠️"
             if [ "$MODE" = "revise" ] && [ "${PUSHED:-}" != "1" ] && { [ -n "$STOP" ] || [ "${REVISE_TROUBLE:-}" = "1" ]; }; then
-              HEAD_SLACK="Could not revise ${PR_SLACK} (issue ${ISSUE_LINK})."
+              HEAD_SLACK="Could not revise ${PR_SLACK}${ISSUE_OF}."
               HEAD_MD="Could not revise #${PR_NUM}."
             elif [ "$MODE" = "auto" ]; then
               HEAD_SLACK="Opened ${PR_SLACK} for issue ${ISSUE_LINK}."
               HEAD_MD="Opened #${PR_NUM}."
             elif [ "${PUSHED:-}" = "1" ]; then
-              HEAD_SLACK="Updated ${PR_SLACK} (issue ${ISSUE_LINK})."
+              HEAD_SLACK="Updated ${PR_SLACK}${ISSUE_OF}."
               HEAD_MD="Updated #${PR_NUM}."
             else
-              HEAD_SLACK="Checked ${PR_SLACK} (issue ${ISSUE_LINK})."
+              HEAD_SLACK="Checked ${PR_SLACK}${ISSUE_OF}."
               HEAD_MD="Checked #${PR_NUM}."
             fi
             DETAILS_SLACK=$(detail_lines '• ' "$STOP" "$CONFLICT_LINE" "$DONE" "$ITEMS_SUMMARY" "$FACTS" ${REVIEW_LINES[@]+"${REVIEW_LINES[@]}"} "$IGNORED_LINE" "$NOT_OURS" "$TROUBLE")
@@ -3756,7 +3857,7 @@ jobs:
             if [ -n "${READ_FAILED:-}" ]; then
               EMOJI="⚠️"
               READ_WHAT=$(printf '%s' "$READ_FAILED" | slack_escape | cut -c1-100)
-              HEAD_SLACK="Could not read ${READ_WHAT} on ${PR_SLACK} (issue ${ISSUE_LINK}), so Forge stopped revising."
+              HEAD_SLACK="Could not read ${READ_WHAT} on ${PR_SLACK}${ISSUE_OF}, so Forge stopped revising."
               HEAD_MD="Could not read ${READ_WHAT} on #${PR_NUM}, so Forge stopped revising."
             fi
             BODY=$(printf '🔨 %s\n\n%s\nTook %s.' "$HEAD_MD" "${DETAILS_MD:+$DETAILS_MD$NL}" "$TOOK")
@@ -3808,10 +3909,10 @@ jobs:
             FAIL_SNIPPET=$(fail_snippet "$TAIL")
             if [ -n "$FAIL_SNIPPET" ]; then
               QUIET="❌ Failed · ${FAIL_SNIPPET}"
-              SLACK_TEXT=$(printf '%s❌ Failed on %s: %s\nThe <%s|run log> has the details, and the error is also on the issue.\nTook %s.' "$WHO" "$ISSUE_LINK" "$FAIL_SNIPPET" "$RUN_URL" "$TOOK")
+              SLACK_TEXT=$(printf '%s❌ Failed on %s: %s\nThe <%s|run log> has the details, and the error is also on the %s.\nTook %s.' "$WHO" "$ISSUE_LINK" "$FAIL_SNIPPET" "$RUN_URL" "$WORK_NOUN" "$TOOK")
             else
               QUIET="❌ Failed"
-              SLACK_TEXT=$(printf '%s❌ Failed on %s. The <%s|run log> has the details, and the error is also on the issue.\nTook %s.' "$WHO" "$ISSUE_LINK" "$RUN_URL" "$TOOK")
+              SLACK_TEXT=$(printf '%s❌ Failed on %s. The <%s|run log> has the details, and the error is also on the %s.\nTook %s.' "$WHO" "$ISSUE_LINK" "$RUN_URL" "$WORK_NOUN" "$TOOK")
             fi
           fi
 

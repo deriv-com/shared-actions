@@ -864,6 +864,14 @@ case "$args" in
     fi
     cat "$S/pr_comments.json" ;;
   "api repos/o/r/issues/1213/comments --paginate") cat "$S/issue_comments.json" ;;
+  "api repos/o/r/issues/1213"|"api repos/o/r/issues/7")
+    # The work item read (#173). work_item.json overrides, work_item_fail
+    # fails it with that file as gh's stderr. By default 1213 is an issue
+    # and 7 is PR 7, open.
+    if [ -f "$S/work_item_fail" ]; then cat "$S/work_item_fail" >&2; exit 1
+    elif [ -f "$S/work_item.json" ]; then cat "$S/work_item.json"
+    elif [ "${args##*/}" = 7 ]; then echo '{"number": 7, "state": "open", "pull_request": {"url": "https://api.github.com/repos/o/r/pulls/7"}}'
+    else echo '{"number": 1213, "state": "open"}'; fi ;;
   "api repos/o/r/pulls/7/reviews --paginate") cat "$S/reviews.json" ;;
   "api --method POST repos/o/r/pulls/7/comments/"*"/replies --input -")
     id="${args#api --method POST repos/o/r/pulls/7/comments/}"; id="${id%%/*}"
@@ -1117,14 +1125,16 @@ report_env_args() {  # report_env_args <case dir>
 }
 
 run_case() {  # run_case <case dir>
-  local c="$1" rc=0 cmd
+  local c="$1" rc=0 cmd num
   cmd=$(cat "$c/command" 2>/dev/null || echo revise)
+  # issue_number: the work item, 1213 (an issue) unless the case names PR 7.
+  num=$(cat "$c/issue_number" 2>/dev/null || echo 1213)
   step_script "Run Forge" "$c" > "$c/run-forge.sh"
   step_script "Report outcome" "$c" > "$c/report.sh"
   : > "$c/out"
   env -i IGNORED_SCAN_JQ="$IGNORED_SCAN_JQ" IGNORED_CHECKS_RE="$IGNORED_CHECKS_RE" PATH="$FAKE_BIN:$PATH" HOME="$c/home" GIT_CONFIG_GLOBAL="$c/home/gitconfig" \
     FAKE_STATE="$c" GITHUB_OUTPUT="$c/out" GITHUB_ENV="$c/env" \
-    GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=1 ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
+    GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=1 ISSUE_NUMBER="$num" ISSUE_URL="https://github.com/o/r/issues/$num" \
     FORGE_COMMAND="$cmd" FAST_LANE=false TIMEOUT_MINUTES="$(cat "$c/timeout_minutes" 2>/dev/null || echo 90)" \
     AI_REVIEWS_ONLY="$(cat "$c/ai_reviews_only" 2>/dev/null || echo false)" \
     CLAUDE_BIN="$FAKE_BIN/claude" FORGE_CLI="$c/cli.js" \
@@ -1136,7 +1146,7 @@ run_case() {  # run_case <case dir>
   local -a renv=()
   while IFS= read -r kv; do renv+=("$kv"); done < <(report_env_args "$c")
   env -i IGNORED_SCAN_JQ="$IGNORED_SCAN_JQ" IGNORED_CHECKS_RE="$IGNORED_CHECKS_RE" PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
-    GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 ISSUE_URL=https://github.com/o/r/issues/1213 \
+    GITHUB_REPOSITORY=o/r ISSUE_NUMBER="$num" ISSUE_URL="https://github.com/o/r/issues/$num" \
     GH_TOKEN=ghs_faketoken COMMENT_ID=55 OUTCOME=success FORGE_COMMAND="$cmd" \
     SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake SLACK_MENTION_TS=3.3 \
     RUN_URL=https://github.com/o/r/actions/runs/1 \
@@ -2205,6 +2215,62 @@ check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && [ ! -f "$C
 
 check '! grep -qE "permission-actions: write|actions: \"write\"" "$WF"' \
   "the write App token never asks for actions: write"
+
+# --- a PR as the work item (#173) -------------------------------------------
+# For revise and update, issue_number may name a PR that closes no issue, as
+# DocSmith's docs-sync PRs do. The run works on that PR without looking for
+# one that closes an issue, labels and comments on it, and adds no closing
+# line to a description it rewrites.
+C=$(quiet_case pr_work_item)
+echo 7 > "$C/issue_number"
+jq --argjson r "$(claude_review 8000 a request-changes 2026-10-28T10:00:00Z 2026-10-28T10:01:00Z "$TITLE_FINDING")" \
+  '. + [$r]' "$C/pr_comments.json" > "$C/x" && mv "$C/x" "$C/pr_comments.json"
+echo '{"title": "docs: sync the API docs", "body": "Updates the WebSocket API docs from the backend schemas."}' > "$C/pr.json"
+model_reply "$C/model_reply.txt" "$(reply_items ai:8000:finding:0 fixed "Rewrote the PR title and description to match the docs the latest commit changes" "$NEW_TITLE" "$NEW_BODY")"
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && grep -q "^work_pr=1$" "$C/out" && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out" && has "$C/instruction.1.md" "$TITLE_FINDING"' \
+  "a PR given as the work item is revised"
+check '! grep -q "closedByPullRequestsReferences" "$C/gh.log" && ! grep -q "^pr list --state open" "$C/gh.log"' \
+  "the run looks for no PR that closes an issue"
+check 'has "$C/pr_edit_body.md" "$NEW_BODY" && ! grep -qiE "(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#" "$C/pr_edit_body.md" && ! grep -qx -- "---" "$C/pr_edit_body.md"' \
+  "the rewritten description gets no closing line (got $(tail -2 "$C/pr_edit_body.md" 2>/dev/null | tr "\n" " "))"
+check 'grep -q "^issue edit 7 --repo o/r .*--add-label forge:done$" "$C/gh.log" && grep "^api --method PATCH repos/o/r/issues/comments/55 " "$C/gh.log" | grep -qF "body=🔨 Updated #7."' \
+  "the labels and the run comment go on the PR"
+check '[[ "$(head -1 "$C/completion.txt")" == "Updated <https://github.com/o/r/pull/7|PR #7>." ]] && ! has "$C/completion.txt" "(issue"' \
+  "the completion names the PR alone (got $(head -1 "$C/completion.txt"))"
+
+C=$(quiet_case pr_work_fork)
+echo 7 > "$C/issue_number"
+echo '{"headRefName": "feature", "isCrossRepository": true, "headRepository": {"name": "r"}, "headRepositoryOwner": {"login": "someone"}}' > "$C/head_repo_7.json"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && grep -qxF "pr_from_fork=https://github.com/o/r/pull/7" "$C/out" && grep -q "^pr_unresolved=1$" "$C/out"' \
+  "a PR from a fork given as the work item is refused before dstp"
+check '[ "$(head -1 "$C/completion.txt")" = "⚠️ <https://github.com/o/r/pull/7|PR #7> is from a fork. Forge works only on branches in this repository, so there is nothing to revise. Open the PR from a branch in this repository and ask again." ] && grep -q "^issue edit 7 --repo o/r .*--add-label forge:failed$" "$C/gh.log"' \
+  "the completion says the PR is from a fork, and the PR is labelled forge:failed (got $(head -1 "$C/completion.txt"))"
+
+C=$(quiet_case pr_work_closed)
+echo 7 > "$C/issue_number"
+echo '{"number": 7, "state": "closed", "pull_request": {"url": "https://api.github.com/repos/o/r/pulls/7", "merged_at": "2026-10-28T09:00:00Z"}}' > "$C/work_item.json"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && grep -q "^pr_unresolved=1$" "$C/out" && ! grep -q "^pr_from_fork=" "$C/out" && [ "$(head -1 "$C/completion.txt")" = "⚠️ <https://github.com/o/r/pull/7|PR #7> is not open, so there is nothing to revise." ]' \
+  "a closed PR given as the work item is refused before dstp (got $(head -1 "$C/completion.txt"))"
+
+C=$(quiet_case pr_work_auto)
+echo 7 > "$C/issue_number"
+echo auto > "$C/command"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && grep -q "^auto_on_pr=1$" "$C/out" && ! grep -q "^pr_url=" "$C/out" && grep -q "^issue edit 7 --repo o/r .*--add-label forge:failed$" "$C/gh.log"' \
+  "auto with a PR as the work item is refused before dstp"
+check '[ "$(head -1 "$C/completion.txt")" = "⚠️ <https://github.com/o/r/pull/7|PR #7> is a pull request. Forge opens a PR from an issue, so it did not start. Ask Forge to revise or update the PR, or ask it to work on the issue instead." ]' \
+  "the completion says why auto did not start (got $(head -1 "$C/completion.txt"))"
+
+C=$(quiet_case work_item_unread)
+echo "gh: Not Found (HTTP 404)" > "$C/work_item_fail"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && has "$C/run.log" "Could not read #1213, so it is treated as an issue" && grep -q "closedByPullRequestsReferences" "$C/gh.log" && ! grep -q "^work_pr=" "$C/out" && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out"' \
+  "a work item that cannot be read is treated as an issue, as before"
+check '[ "$(grep -cx "api repos/o/r/issues/1213" "$C/gh.log")" = 1 ] && ! grep -qsx 60 "$C/sleep.log"' \
+  "a 4xx on the work item read is not retried"
 
 # --- behavioral: a failed run's Slack copy and who it tags -------------------
 # Report runs as-is on a failed run against a fake Slack, with the log of
