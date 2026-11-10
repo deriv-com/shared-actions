@@ -880,12 +880,18 @@ jobs:
           # The plan dstp wrote, for Report to post in the Slack thread as
           # plan.md (#158 step 6). plan_path in dstp's result is relative to
           # the checkout. Only a plain markdown file inside it is kept, never
-          # a symlink, at most 1 MB, through the same scrub as the logs.
+          # a symlink, at most 1 MB, through the same scrub as the logs. A
+          # symlinked directory on the way could still lead out of the
+          # checkout, so the file's real directory must be inside the
+          # checkout's real path.
           keep_plan() {
-            local path="$1" size
+            local path="$1" size root dir
             [ -n "$path" ] || return 0
+            root=$(pwd -P)
+            dir=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P) || dir=""
             if ! [[ "$path" =~ ^[A-Za-z0-9._/-]+\.md$ ]] || [[ "$path" == /* ]] || [[ "$path" == *..* ]] \
-              || [ -L "$path" ] || ! [ -f "$path" ]; then
+              || [ -L "$path" ] || ! [ -f "$path" ] || [ -z "$dir" ] \
+              || { [ "$dir" != "$root" ] && [[ "$dir" != "$root"/* ]]; }; then
               echo "dstp named a plan Forge will not post: ${path:0:200}"
               return 0
             fi

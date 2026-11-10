@@ -2399,6 +2399,12 @@ done
 GOT=$(plan_case symlink docs/link.md "ln -s ../../outside.md docs/link.md")
 check '[[ "$GOT" == "none dstp named a plan Forge will not post: docs/link.md" ]]' \
   "keep_plan refuses a symlink, even to a markdown file (got $GOT)"
+GOT=$(plan_case symlink_dir outer/outside.md "ln -s .. outer")
+check '[[ "$GOT" == "none dstp named a plan Forge will not post: outer/outside.md" ]]' \
+  "keep_plan refuses a plan under a symlinked directory that leads out of the checkout (got $GOT)"
+GOT=$(plan_case symlink_dir_inside alias/2026-11-10-fix.md "ln -s docs/spec-to-pr/plans alias")
+check '[ "$GOT" = "kept " ]' \
+  "keep_plan keeps a plan under a symlinked directory that stays inside the checkout (got $GOT)"
 GOT=$(plan_case big docs/big.md "head -c 1048577 /dev/zero | tr '\\0' x > docs/big.md")
 check '[ "$GOT" = "none The plan is 1048577 bytes; not posting it to Slack" ]' \
   "keep_plan refuses a plan over 1 MB (got $GOT)"
