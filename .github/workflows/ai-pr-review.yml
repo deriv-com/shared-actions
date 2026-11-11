@@ -1497,7 +1497,7 @@ jobs:
         id: engine-antigravity
         if: steps.engine.outputs.engine == 'antigravity'
         timeout-minutes: 60
-        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_antigravity@master
+        uses: deriv-com/shared-actions/.github/actions/ai_review_engine_antigravity@smoke/antigravity-base
         with:
           repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
