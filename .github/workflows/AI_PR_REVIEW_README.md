@@ -402,8 +402,9 @@ assuming parity:
   first, denies every other tool, and logs every decision to
   `PATH_GUARD_LOG`. Because `agy` 1.5.5 treats an exit-0 hook with empty
   stdout as allow, the `hooks.json` wrapper validates that stdout contains
-  an explicit allow/deny JSON decision and emits JSON `deny` otherwise. An
-  empty `PATH_GUARD_LOG` fails the job closed without retrying. Every `agy`
+  an explicit allow/deny JSON decision and emits JSON `deny` otherwise. If a
+  review was produced while `PATH_GUARD_LOG` is empty, the engine fails the
+  job closed and discards the output. Every `agy`
   invocation runs with an isolated `HOME` under `runner.temp` (the runner's
   real `~/.gemini` is untouched), and read-only pristine copies of
   `settings.json` and `hooks.json` are hash-checked and restored before each

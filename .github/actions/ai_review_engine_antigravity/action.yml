@@ -727,9 +727,8 @@ runs:
         # Neither review_context_path nor pr_diff_path is inline in the prompt,
         # so any genuine review run made at least one `read_file` call during
         # the producing attempt, which must have fired the match-all PreToolUse
-        # hook. Fail closed here — without retrying — if the log is empty, so a
-        # broken hook never gets a second unconfined run and an unread reply is
-        # never handed to the caller.
+        # hook. Fail closed if a review was produced while the log is empty, so
+        # an unconfined or unread reply is never handed to the caller.
         if [[ ! -s "$PATH_GUARD_LOG" ]]; then
           echo "❌ Antigravity engine: the review was produced but the path guard never ran (no decisions logged at $PATH_GUARD_LOG)."
           echo "   The PreToolUse hook in hooks.json is a required confinement boundary; refusing to hand an unconfined or unread review to the caller."
