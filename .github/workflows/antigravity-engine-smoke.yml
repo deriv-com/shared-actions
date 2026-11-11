@@ -2,8 +2,8 @@ name: Antigravity Engine Smoke Test (throwaway)
 
 # Throwaway caller for smoke-testing the antigravity engine against live
 # LiteLLM using gemini-4-argon while gemini-4-carbon is not yet deployed on
-# the proxy. Commit 1 omits antigravity_effort to exercise the empty-knob
-# `medium` (default) path. Not for merge.
+# the proxy. Commit 2 sets antigravity_effort: high and exercises follow-up
+# review mode. Not for merge.
 
 on:
   pull_request:
@@ -19,6 +19,7 @@ jobs:
     with:
       engine: antigravity
       model: gemini-4-argon
+      antigravity_effort: high
     secrets:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
