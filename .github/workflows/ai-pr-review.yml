@@ -60,7 +60,7 @@ on:
         default: ""
         type: string
       cli_version:
-        description: "[engine-specific: kimi, grok, codex, muse, antigravity] Exact CLI version to install (`@moonshot-ai/kimi-code` for kimi, `@xai-official/grok` for grok, `@openai/codex` for codex, Muse Code for muse — Meta distributes it only via the dev.meta.ai installer, so the muse engine pins by asserting `muse --version` after install — and Antigravity CLI `agy` for antigravity, installed via antigravity.google/cli/install.sh and pinned by asserting `agy --version` after install). Pinned deliberately — `latest` risks both breaking changes and unreviewed code in a privileged job. Empty resolves to the per-engine pin in the 'Resolve and validate engine' step; bump it there via PR. Ignored when engine is `anthropic`."
+        description: "[engine-specific: kimi, grok, codex, muse, antigravity] Exact CLI version to install (`@moonshot-ai/kimi-code` for kimi, `@xai-official/grok` for grok, `@openai/codex` for codex, Muse Code for muse — Meta distributes it only via the dev.meta.ai installer, so the muse engine pins by asserting `muse --version` after install — and Antigravity CLI `agy` for antigravity, fetched from Google's immutable GCS release archive and verified against committed SHA-512 digests before extraction). Pinned deliberately — `latest` risks both breaking changes and unreviewed code in a privileged job. Empty resolves to the per-engine pin in the 'Resolve and validate engine' step; bump it there via PR. Ignored when engine is `anthropic`."
         required: false
         default: ""
         type: string
@@ -364,7 +364,7 @@ jobs:
               # native Gemini `/v1beta/models/<model>:streamGenerateContent`
               # endpoint. The Antigravity engine ignores max_context_size (`agy`
               # sets `maxTokens: 1048576` in `customModelsConfig`); cli_version
-              # pins `agy` by assertion after install.
+              # pins the SHA-512-verified GCS release archive in action.yml.
               DEFAULT_MODEL="gemini-4-carbon"
               METRICS_AGENT="antigravity_review"
               ARTIFACT_PREFIX="antigravity-review"

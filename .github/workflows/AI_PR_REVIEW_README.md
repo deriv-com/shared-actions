@@ -19,7 +19,7 @@ engine is pluggable: pick `kimi`, `anthropic`, `grok`, `codex`, `muse`, or `anti
 - 🧹 Exactly one review comment per engine per PR — a "working on it" comment is posted first, then **edited** into the finished review (same comment URL). The previous review is deleted only after that edit, so a failed or cancelled run never leaves the PR without its last completed review
 - 🔌 Pluggable engine (`kimi` | `anthropic` | `grok` | `codex` | `muse` | `antigravity`), each a composite action with its own CLI and sandbox
 - 🔒 The model gets **no shell tool** (codex excepted: a sandboxed shell with no network and no GitHub token, see Engines; muse and antigravity go further — no write tool either, the engine captures the CLI's stdout as the review) and no comment tool, and PR-supplied agent config is stripped before it starts. Only same-repo PRs are reviewed (the job is skipped for forks), the checkout keeps no git credentials on disk (`persist-credentials: false`, and the Anthropic engine keeps origin token-free then re-checks `.git/config`), and a PR that adds or retargets a symlink is refused before any engine runs
-- 🧱 The Kimi and Anthropic engines confine the model's `Read`/`Grep`/`Glob` to the PR checkout and its `Write` to the single output file with a shared, unit-tested **PreToolUse path guard** (match-all, fail-closed, unknown tools denied), while the Antigravity engine runs its own read-only **PreToolUse path guard** (`agy-path-guard.js`) on top of `settings.json` permission denials; all three fail the job if a review was produced while the guard never ran
+- 🧱 The Kimi, Anthropic, and Antigravity engines confine the model's file access with the shared, unit-tested **PreToolUse path guard** (`.github/actions/ai_review_path_guard/path-guard.js` — match-all, fail-closed, unknown tools denied): Kimi and Anthropic scope `Read`/`Grep`/`Glob` to the PR checkout and `Write` to the single output file, while Antigravity (`--cli=antigravity`) allows **only** `read_file` on the PR checkout minus `.git/` plus context/diff on top of `settings.json` permission denials; all three fail the job if a review was produced while the guard never ran
 - 🛡️ The post step refuses to publish a review containing the LLM API key, the job's GitHub token, anything shaped like a GitHub token, or the on-disk shapes of git credential plumbing (comment bodies are not covered by Actions secret masking; the failure message names the exact pattern that hit), and truncates bodies over GitHub's 65,536-character comment limit instead of failing
 - ✅ Respects `Click2Fix - Acknowledge` comments from the posting bot or accounts with repo standing — acknowledged suggestions are never raised again
 - 📚 Gives the model the context it cannot fetch itself: the issues the PR closes (the Spec axis compares against what was asked, not only the description), the discussion by accounts with repo standing (a point a reviewer settled is not raised again) plus Forge's replies for the author (weighed as the author's side, re-checked against the code), the PR's current title and description, and the base branch's `AGENTS.md` / `CLAUDE.md` for the changed paths plus `.github/ai-review-rules.md`. Guidance and rules are read from the base commit, never from the PR, so a PR still cannot instruct its own reviewer
@@ -67,17 +67,17 @@ from `claude-pr-review.yml` that omits it would silently switch LLM vendor.
 
 | | `kimi` | `anthropic` | `grok` | `codex` | `muse` | `antigravity` |
 |---|---|---|---|---|---|---|
-| Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) | `@xai-official/grok` CLI — Grok Build (npm, pinned) | `@openai/codex` CLI (npm, pinned) | Meta Muse Code CLI (native binary via the `dev.meta.ai` installer, **pinned by version assertion** — see below) | Google Antigravity CLI `agy` (native binary via `antigravity.google/cli/install.sh`, **pinned by version assertion** — see below) |
+| Runtime | `@moonshot-ai/kimi-code` CLI (npm, pinned) | `anthropics/claude-code-action` (pinned by SHA) | `@xai-official/grok` CLI — Grok Build (npm, pinned) | `@openai/codex` CLI (npm, pinned) | Meta Muse Code CLI (native binary via the `dev.meta.ai` installer, **pinned by version assertion** — see below) | Google Antigravity CLI `agy` (native binary from Google's immutable GCS release archive, **pinned by SHA-512** — see below) |
 | Default model | `kimi-k3.1-pro` | `claude-sonnet-5-5` | `grok-4.7` | `gpt-6.1-sol` | `meta-muse-wonder-1.0` | `gemini-4-carbon` |
 | `base_url` sent | proxy origin **+ `/v1`** | proxy origin, **`/v1` stripped** | proxy origin **+ `/v1`** | proxy origin **+ `/v1`** | proxy origin **+ `/v1`**, pinned in Muse Code `settings.json` as `endpoint_transport` (a `--base-url` flag makes the CLI withhold its key); the CLI posts `{base_url}/responses` | proxy origin, **`/v1` and `/v1beta` stripped** (`GOOGLE_GEMINI_BASE_URL`); `agy` posts `{origin}/v1beta/models/{model}:streamGenerateContent?alt=sse` |
-| Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (+ Claude Code's permission-free `Grep`/`Glob`; the only GitHub MCP server agent mode mounts here is `github_file_ops`, denied by name and by the guard — see below) | `Read`, `Grep`, `Write`/`Edit` **output dir only** | Codex's unified exec + `apply_patch` (no per-file Read/Grep/Glob tools to scope) | `read_file`, `search` only (`--disable-shell --disable-write`); the review is the CLI's final reply, captured from stdout by the engine | Read-only file/search tools (`read_file` / `view_file` / `list_dir` / `find_by_name` / `grep_search`); review captured from `agy -p --output-format json` stdout |
+| Tools granted | `Read`, `Write`, `Grep`, `Glob` | `Read`, `Write` (+ Claude Code's permission-free `Grep`/`Glob`; the only GitHub MCP server agent mode mounts here is `github_file_ops`, denied by name and by the guard — see below) | `Read`, `Grep`, `Write`/`Edit` **output dir only** | Codex's unified exec + `apply_patch` (no per-file Read/Grep/Glob tools to scope) | `read_file`, `search` only (`--disable-shell --disable-write`); the review is the CLI's final reply, captured from stdout by the engine | `read_file` only (the sole file-read tool `agy` exposes on the wire); review captured from `agy -p --output-format json` stdout |
 | Shell | none (absent from `[tools] enabled`; the deny rule is intent only, and the path guard denies it too) | none (`--allowedTools` omits Bash, `--disallowedTools` re-denies it, the path guard denies it too) | none (`dontAsk` + `--tools` allowlist + `--deny Bash`) | sandboxed (`exec` runs commands inside the sandbox; `network_access=false` + `approval_policy=never` keep them off the network and un-escalatable) | none (the shell tool is removed by `--disable-shell`; the OS sandbox stays on around the file tools) | none (`command(*)` denied in `settings.json` and `run_command` denied by the `PreToolUse` path guard) |
-| `Read` scope | PR checkout minus `.git/`, plus the context/diff/output files (**PreToolUse path guard**) | same guard, same scope (registered via the action's `settings` input) | **unscoped** (`--sandbox read-only` limits writes, not reads) | **unscoped** (`workspace-write` sandbox limits writes and network, not reads) | **unscoped** (reads must reach the context/diff in `/tmp`; no write tool exists to abuse what was read — see the Muse subsection) | PR checkout minus `.git/`, plus the context and diff files (`allowNonWorkspaceAccess: false` + `permissions.allow` + **`agy-path-guard.js` PreToolUse hook**) |
-| `Write` scope | exactly the output file (path guard) | exactly the output file (path guard) | output directory only (`dontAsk`; Grok deny-wins, so no catch-all deny) | checkout + `/tmp` (`workspace-write`, `$TMPDIR` excluded); `CODEX_HOME` sits outside both, and the review must resolve under `/tmp` | **none** — the model cannot write; the engine captures stdout under `runner.temp` and copies it to the output file itself | **none** — `write_file(*)` denied in `settings.json` and all write/edit tools denied by `agy-path-guard.js`; the engine extracts `.response` under `runner.temp` and copies it to `output_path` |
+| `Read` scope | PR checkout minus `.git/`, plus the context/diff/output files (**PreToolUse path guard**) | same guard, same scope (registered via the action's `settings` input) | **unscoped** (`--sandbox read-only` limits writes, not reads) | **unscoped** (`workspace-write` sandbox limits writes and network, not reads) | **unscoped** (reads must reach the context/diff in `/tmp`; no write tool exists to abuse what was read — see the Muse subsection) | PR checkout minus `.git/`, plus the context and diff files (`allowNonWorkspaceAccess: false` + `permissions.allow` + shared **`path-guard.js --cli=antigravity` PreToolUse hook**) |
+| `Write` scope | exactly the output file (path guard) | exactly the output file (path guard) | output directory only (`dontAsk`; Grok deny-wins, so no catch-all deny) | checkout + `/tmp` (`workspace-write`, `$TMPDIR` excluded); `CODEX_HOME` sits outside both, and the review must resolve under `/tmp` | **none** — the model cannot write; the engine captures stdout under `runner.temp` and copies it to the output file itself | **none** — `write_file(*)` denied in `settings.json` and all write/edit tools denied by `path-guard.js --cli=antigravity`; the engine extracts `.response` under `runner.temp` and copies it to `output_path` |
 | GitHub token in the CLI process | none | **yes** — claude-code-action spawns the CLI with `GITHUB_TOKEN`/`GH_TOKEN` in its env for its own MCP servers; the path guard's `/proc` denial and the post-step scan are what stand between that and the PR | none | none | none | none |
 | `.git/config` after the run | untouched (`persist-credentials: false`) | origin stays token-free: `use_commit_signing: true` plus `allowed_non_write_users: _never` so the action writes a helper under `_actions/` instead of embedding the token in origin; base-branch fetch also authenticates from env-only git config; asserted clean **before**, re-checked **after** (that helper is the only allowed exception) | untouched | untouched (`persist-credentials: false`; no token in the step) | untouched (`persist-credentials: false`; no token in any step) | untouched (`persist-credentials: false`; no token in any step) |
 | Base-branch config restored | no | **yes** — the action fetches the PR's base branch and restores `.claude/`, `.mcp.json`, `CLAUDE.md`, `.gitmodules`, `.husky`, … from it after the strip step removed the PR's copies (maintainer-merged versions, never the PR's); `.claude/settings.json` from there is still not loaded (`--setting-sources user`) | no | no | no | no |
-| Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `.mcp.json` / `.cursorrules`; dirs `.grok/`, `.claude/`, `.claude-plugin/`, `.agents/`, `.cursor/rules/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CODEX.md` / `CLAUDE.md` / `CLAUDE.local.md` / `.cursorrules`; dirs `.codex/`, `.claude/`, `.agents/`, `.cursor/rules/`; plus `$HOME/.codex` on persistent runners | Case-insensitive `AGENTS.md` / `AGENT.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `.mcp.json` / `.cursorrules`; dirs `.muse/`, `.claude/`, `.claude-plugin/`, `.agents/` (incl. committed memory Muse Code reads even when untrusted), `.codex/`, `.cursor/rules/`; plus the isolated home is wiped so no `~/.config/muse` survives | Case-insensitive `AGENTS.md` / `AGENT.md` / `GEMINI.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `CODEX.md` / `.mcp.json` / `.cursorrules`; dirs `.agents/`, `.agent/`, `.gemini/`, `.antigravity/`, `.antigravitycli/`, `.claude/`, `.claude-plugin/`, `.codex/`, `.muse/`, `.grok/`, `.cursor/rules/`; plus `~/.gemini/{antigravity-cli,config,skills,AGENTS.md,GEMINI.md}` |
+| Config stripped | `CLAUDE.md`, `AGENTS.md`, `KIMI.md`, `.kimi-code/` | `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, `.claude/`, `.claude-plugin/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `.mcp.json` / `.cursorrules`; dirs `.grok/`, `.claude/`, `.claude-plugin/`, `.agents/`, `.cursor/rules/` | Case-insensitive `AGENTS.md` / `AGENT.md` / `CODEX.md` / `CLAUDE.md` / `CLAUDE.local.md` / `.cursorrules`; dirs `.codex/`, `.claude/`, `.agents/`, `.cursor/rules/`; plus `$HOME/.codex` on persistent runners | Case-insensitive `AGENTS.md` / `AGENT.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `.mcp.json` / `.cursorrules`; dirs `.muse/`, `.claude/`, `.claude-plugin/`, `.agents/` (incl. committed memory Muse Code reads even when untrusted), `.codex/`, `.cursor/rules/`; plus the isolated home is wiped so no `~/.config/muse` survives | Case-insensitive `AGENTS.md` / `AGENT.md` / `GEMINI.md` / `CLAUDE.md` / `CLAUDE.local.md` / `KIMI.md` / `CODEX.md` / `.mcp.json` / `.cursorrules`; dirs `.agents/`, `.agent/`, `.gemini/`, `.antigravity/`, `.antigravitycli/`, `.claude/`, `.claude-plugin/`, `.codex/`, `.muse/`, `.grok/`, `.cursor/rules/`; isolated `HOME` under `runner.temp` wiped per run (runner's real `~/.gemini` untouched) |
 | Applicable inputs | all, incl. `max_context_size`, `cli_version`, `provider_type`; except `effort`, `reasoning_effort`, `muse_reasoning_effort`, `antigravity_effort`; **only** engine honouring `thinking_effort` | all except `max_context_size`, `cli_version`, `provider_type`, `thinking_effort`, `reasoning_effort`, `muse_reasoning_effort`, `antigravity_effort`; **only** engine honouring `effort` | all except `provider_type`, `thinking_effort`, `effort`, `reasoning_effort`, `muse_reasoning_effort`, `antigravity_effort` | all except `max_context_size`, `provider_type`, `effort`, `thinking_effort`, `muse_reasoning_effort`, `antigravity_effort`; **only** engine honouring `reasoning_effort` | all except `max_context_size`, `provider_type`, `thinking_effort`, `effort`, `reasoning_effort`, `antigravity_effort`; **only** engine honouring `muse_reasoning_effort` | all except `max_context_size`, `provider_type`, `thinking_effort`, `effort`, `reasoning_effort`, `muse_reasoning_effort`; **only** engine honouring `antigravity_effort` |
 | `agent` reported | `ai_review` | `claude_review` | `grok_review` | `codex_review` | `muse_review` | `antigravity_review` |
 | Artifact | `ai-review-summary-*` | `claude-review-summary-*` | `grok-review-summary-*` | `codex-review-summary-*` | `muse-review-summary-*` | `antigravity-review-summary-*` |
@@ -121,25 +121,29 @@ input value mean two different things.
 **How each engine's sandbox actually holds.** Be precise about this rather than
 assuming parity:
 
-- **The path guard (Kimi and Anthropic)** —
+- **The path guard (Kimi, Anthropic, and Antigravity)** —
   `.github/actions/ai_review_path_guard/path-guard.js`, one script, unit-tested
   by `path-guard.test.js` in `lint-actions.yml`, registered as a **match-all
-  PreToolUse hook** in both engines. `Read`, `Grep` and `Glob` may touch the PR
-  checkout minus `.git/`; `Read` may also open the caller's context, diff and
-  output files; `Write` may touch exactly the output file; every other tool
-  name is denied; `Read`/`Write` without a path are denied; symlinks are
-  resolved first. It accepts both CLIs' argument names (`path` for Kimi Code,
-  `file_path` for Claude Code's Read/Write) and refuses a call that carries both
-  with different values. It is match-all and denies unknown tools on purpose:
-  in both CLIs a hook only blocks on exit 2 and a call the matcher does not
-  fire for is simply allowed, so a matcher listing four tool names would be
-  silently switched off by a CLI bump that renamed one. The guard requires only
-  `node:` builtins and reads nothing from the checkout, because both CLIs treat
-  a hook that times out or cannot start as allow (hence the `|| exit 2` in both
-  hook commands). Every decision is appended to a log outside the checkout, and
-  each engine **fails the job if a review was written while that log is empty**
-  — a hook that never fired means the plumbing changed and the model ran
-  unconfined, and that review is not posted.
+  PreToolUse hook** in all three engines. In Kimi and Anthropic (default mode),
+  `Read`, `Grep` and `Glob` may touch the PR checkout minus `.git/`; `Read` may
+  also open the caller's context, diff and output files; `Write` may touch
+  exactly the output file; every other tool name is denied; `Read`/`Write`
+  without a path are denied; symlinks are resolved first. It accepts both CLIs'
+  argument names (`path` for Kimi Code, `file_path` for Claude Code's
+  Read/Write) and refuses a call that carries both with different values. In
+  Antigravity (`--cli=antigravity`), it speaks `agy`'s JSON stdout contract and
+  allows **only** `read_file` (`args.Path`) on the PR checkout minus `.git/`
+  plus context and diff. It is match-all and denies unknown tools on purpose:
+  in Kimi and Claude Code a hook only blocks on exit 2 and a call the matcher
+  does not fire for is simply allowed, so a matcher listing four tool names
+  would be silently switched off by a CLI bump that renamed one. The guard
+  requires only `node:` builtins and reads nothing from the checkout, because
+  the CLIs treat a hook that times out, cannot start, or (in `agy`) exits 0
+  with empty stdout as allow (hence `|| exit 2` in Kimi/Anthropic and the
+  stdout-validating wrapper in Antigravity). Every decision is appended to a
+  log outside the checkout, and each engine **fails the job if a review was
+  written while that log is empty** — a hook that never fired means the
+  plumbing changed and the model ran unconfined, and that review is not posted.
 - **Kimi** — Bash is absent from `[tools] enabled`, which is what removes it;
   the guard denies it independently. The guard is copied into `$HOME/.kimi-code`
   by the configure step. The `[[permission.rules]]` in the same config are **not
@@ -373,8 +377,8 @@ assuming parity:
   level. The engine pins Muse Code 1.4.13 by assertion (see above).
 
 - **Antigravity** — combines Muse's read-only stdout-capture delivery with
-  Kimi/Anthropic's **PreToolUse path-guard** confinement, so neither write
-  tools nor unscoped `/proc` reads exist. `agy -p --output-format json
+  the shared **PreToolUse path-guard** confinement, so neither write tools
+  nor unscoped `/proc` reads exist. `agy -p --output-format json
   --disable-slash-commands --print-timeout 25m` prints a single JSON
   envelope to stdout; the engine verifies `.status == "SUCCESS"`, an empty
   `.finished_reason` (refusing partial `print_timeout` / `interrupted` /
@@ -386,20 +390,27 @@ assuming parity:
   caller's context and diff paths (both raw and canonical `realpath`, since
   `agy` canonicalises before matching allow-rules), and denies `command(*)`,
   `write_file(*)`, `read_file(.git/)`, `read_url(*)`, `execute_url(*)`, and
-  `mcp(*)`; (2) `$HOME/.gemini/config/hooks.json` registers
-  `ai_review_engine_antigravity/agy-path-guard.js` (unit-tested in
-  `lint-actions.yml`) as a match-all (`"*"`) `PreToolUse` hook that
-  allow-lists only `read_file` / `view_file` (PR checkout minus `.git/`,
-  plus context and diff) and `list_dir` / `find_by_name` / `grep_search`
-  (PR checkout minus `.git/`), resolves symlinks first, denies every write,
-  shell, web, subagent, task, schedule, MCP, or unknown tool, and logs
-  every decision to `PATH_GUARD_LOG`. An empty `PATH_GUARD_LOG` fails the
-  job closed. Because `agy` normalises and rewrites `settings.json` on
-  startup, read-only pristine copies of `settings.json` and `hooks.json` are
-  hash-checked and restored before each attempt, alongside re-running the
-  hash-checked strip script.
+  `mcp(*)`; (2) `$HOME/.gemini/config/hooks.json` registers the shared
+  `ai_review_path_guard/path-guard.js --cli=antigravity` script (unit-tested
+  in `lint-actions.yml`) as a match-all (`"*"`) `PreToolUse` hook. Verified
+  against `agy` 1.5.5 wire captures across Gemini 4 and Gemini 3.x:
+  `read_file` (`args.Path`) is the CLI's only file-read tool (IDE tools such
+  as `grep_search`, `find_by_name`, `list_dir`, and `view_file` do not exist
+  in `agy`, and `read_file` on a directory fails with `path is a directory,
+  not a file`). The guard allows only `read_file` inside `GITHUB_WORKSPACE`
+  (minus `.git/`) or on `CONTEXT_PATH` / `DIFF_PATH`, resolves symlinks
+  first, denies every other tool, and logs every decision to
+  `PATH_GUARD_LOG`. Because `agy` 1.5.5 treats an exit-0 hook with empty
+  stdout as allow, the `hooks.json` wrapper validates that stdout contains
+  an explicit allow/deny JSON decision and emits JSON `deny` otherwise. An
+  empty `PATH_GUARD_LOG` fails the job closed without retrying. Every `agy`
+  invocation runs with an isolated `HOME` under `runner.temp` (the runner's
+  real `~/.gemini` is untouched), and read-only pristine copies of
+  `settings.json` and `hooks.json` are hash-checked and restored before each
+  attempt (`agy` normalises `settings.json` on startup), alongside
+  re-running the hash-checked strip script.
 
-  **Routing to LiteLLM and pinning.** `settings.json` sets
+  **Routing to LiteLLM and source-pinned archive.** `settings.json` sets
   `modelProvider: "gemini"` and registers the selected `model` under
   `customModelsConfig.customModels` as `gemini-api://<model>` with
   `TOOL_FORMATTER_TYPE_NONE` (verified against `agy` 1.5.5: its built-in
@@ -407,15 +418,17 @@ assuming parity:
   `gemini-api://<model>` makes `agy` send
   `POST /v1beta/models/<model>:streamGenerateContent?alt=sse` to
   `GOOGLE_GEMINI_BASE_URL` with `x-goog-api-key: $GEMINI_API_KEY`, working
-  for `gemini-4-carbon` and custom proxy aliases alike). Trailing `/v1` and
-  `/v1beta` suffixes are stripped from `base_url` so the shared
-  `https://litellmsa.deriv.ai/v1` default targets LiteLLM's native
-  `/v1beta/models/...` Gemini route. Google distributes `agy` via
-  `https://antigravity.google/cli/install.sh` (which verifies the tarball's
-  SHA-512 against Google's release manifest); the install step downloads
-  `install.sh` over pinned HTTPS (never piped into bash), logs its SHA-256,
-  freezes background self-updates with `AGY_CLI_DISABLE_AUTO_UPDATE=true`,
-  and asserts `agy --version` equals `cli_version` (`1.5.5`).
+  for `gemini-4-carbon`, `gemini-4-argon`, and custom proxy aliases alike).
+  Trailing `/v1` and `/v1beta` suffixes are stripped from `base_url` so the
+  shared `https://litellmsa.deriv.ai/v1` default targets LiteLLM's native
+  `/v1beta/models/...` Gemini route. Rather than invoking the floating
+  `install.sh` script (which pulls the newest release and would break CI on
+  upstream releases), the install step downloads the immutable build-stamped
+  `1.5.5` tarball directly from `storage.googleapis.com/antigravity-public`,
+  verifies its SHA-512 against the committed digest **before** extracting or
+  executing anything, freezes background self-updates with
+  `AGY_CLI_DISABLE_AUTO_UPDATE=true`, and asserts `agy --version` equals
+  `cli_version` (`1.5.5`).
 
   This engine honours **`antigravity_effort`** (`low` | `medium` | `high`,
   empty = `medium`, Gemini 4 Carbon's documented default): validated at
@@ -469,7 +482,7 @@ still the same engine, not a new one.
 | `model` | Model ID; resolved per engine when empty | ❌ | per engine |
 | `base_url` | LLM API endpoint; `/v1` added or stripped per engine | ❌ | `https://litellmsa.deriv.ai/v1` |
 | `max_context_size` | **[kimi, grok]** Context window in tokens. Must match the model, or the CLI over-packs and the API rejects the request | ❌ | per engine (`1048576` kimi, `500000` grok) |
-| `cli_version` | **[kimi, grok, codex, muse, antigravity]** Exact CLI version (`@moonshot-ai/kimi-code`, `@xai-official/grok`, `@openai/codex`, Muse Code via `dev.meta.ai`, or Antigravity CLI `agy` via `antigravity.google` — the latter two pinned by asserting `--version`) | ❌ | per engine (`2.3.2` kimi, `1.0.5` grok, `0.160.0` codex, `1.4.13` muse, `1.5.5` antigravity) |
+| `cli_version` | **[kimi, grok, codex, muse, antigravity]** Exact CLI version (`@moonshot-ai/kimi-code`, `@xai-official/grok`, `@openai/codex`, Muse Code via `dev.meta.ai` asserted by `--version`, or Antigravity CLI `agy` pinned by SHA-512 GCS archive) | ❌ | per engine (`2.3.2` kimi, `1.0.5` grok, `0.160.0` codex, `1.4.13` muse, `1.5.5` antigravity) |
 | `reasoning_effort` | **[codex]** Reasoning effort for the review turn: `minimal`, `low`, `medium`, `high`, or `xhigh`. Empty sends no override | ❌ | empty (model default) |
 | `effort` | **[anthropic]** Effort for the review turn: `low`, `medium`, `high`, `xhigh`, or `max`. Empty sends no override | ❌ | empty (model default) |
 | `muse_reasoning_effort` | **[muse]** Reasoning effort for the review turn: `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Empty sends no override | ❌ | empty (CLI default `high`) |
@@ -499,11 +512,13 @@ file and the inlined copy together. The contract test fails if they differ.
 would pull both breaking changes and unreviewed code into a job holding
 `LLM_API_KEY` and a write-scoped `GITHUB_TOKEN`. Bump it by PR. The
 Anthropic engine's action SHA is pinned the same way but *inside* the
-action, because `uses:` accepts no expressions. Muse Code and Google
-Antigravity CLI have no npm package to pin — they ship via `dev.meta.ai`
-and `antigravity.google` installers — so the Muse and Antigravity engines
-pin by asserting the installed `--version` and disabling each CLI's
-background self-updater (see Engines, Muse and Antigravity).
+action, because `uses:` accepts no expressions. Muse Code has no package or
+versioned archive to pin — Meta distributes it only through `dev.meta.ai` —
+so the Muse engine pins by asserting `muse --version` and disabling the
+launcher's self-update, whereas the Antigravity engine fetches Google's
+immutable build-stamped GCS tarball directly, verifies its committed
+SHA-512 before extracting, and disables `agy`'s background updater (see
+Engines, Muse and Antigravity).
 
 ## Secrets
 

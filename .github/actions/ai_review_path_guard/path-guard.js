@@ -1,63 +1,34 @@
 #!/usr/bin/env node
 'use strict';
-// PreToolUse path guard for the AI review engines (Kimi Code and Claude Code).
+// PreToolUse path guard for the AI review engines:
+//   - Default mode (no flags): Kimi Code and Claude Code (`stdin` carries
+//     `{ tool_name, tool_input }`; exit 0 allows, exit 2 + stderr denies).
+//   - `--cli=antigravity`: Google Antigravity CLI `agy` (`stdin` carries
+//     `{ toolCall: { name, args } }`; `stdout` emits `{"decision":"allow"}`
+//     or `{"decision":"deny","reason":"..."}`).
 //
-// The Kimi engine copies this file into $HOME/.kimi-code and registers it in
-// config.toml as a PreToolUse hook with a match-all matcher; the Anthropic
-// engine copies it under $RUNNER_TEMP and registers it through the
-// claude-code-action `settings` input, also match-all. Either CLI runs it
-// before EVERY tool call with the call's JSON on stdin:
-//   { "tool_name": "Read", "tool_input": { "path": "..." }, "cwd": "...", ... }
-// Exit 0 allows the call. Exit 2 denies it and hands stderr to the model as the
-// reason. Anything unexpected also exits 2: this guard fails closed.
-//
-// Why a hook at all: kimi-code does not apply `[[permission.rules]]`
-// when run as `kimi -p` (found on kimi-code 0.34.0 against a mock model
-// endpoint while fixing HackerOne #4037167; re-verified on kimi-code 2.3.2 —
-// a bare `deny Read` still read files and a bare `deny Write` still wrote
-// into the checkout), and Claude Code's `--allowedTools` has no path scope
-// for Read at all. In both engines this is the only thing confining paths,
-// and the CLI process's own environment (readable through /proc without it)
-// carries the LLM key — and, for Claude Code, the job's GitHub token.
-//
-// Why match-all and an explicit tool allow-list: in both CLIs a hook only
-// blocks on exit 2; a call the matcher does not fire for is simply allowed. If
-// a CLI bump renamed a tool or its path argument, a matcher listing four
-// literal names would silently stop firing and the guard would be gone with no
-// error. So the matcher is match-all, any tool other than Read/Grep/Glob/Write
-// is denied here (the engine's own tool allow-list is the primary control
-// removing them; this is the independent second one), and Read/Write without a
-// string path are denied rather than waved through. Every decision this script
-// makes is explicit; there is no "unknown, so allow".
-//
-// Allow-list, not deny-list:
-//   Read / Grep / Glob  -> inside GITHUB_WORKSPACE, never through a `.git` segment
-//   Read                -> additionally CONTEXT_PATH, DIFF_PATH and OUTPUT_PATH
-//   Write               -> exactly OUTPUT_PATH, nothing else
-//   Grep / Glob         -> may omit the path (the CLI then searches its cwd,
-//                          which the run step pins to the workspace)
-//   anything else       -> denied
-// The path argument is `path` (Kimi Code, and Grep/Glob in both CLIs) or
-// `file_path` (Claude Code's Read/Write). Both present and different is denied:
-// the guard must know which one the tool will act on.
-// $RUNNER_TEMP (where actions/checkout parks a token), $HOME, /proc, `~` and
-// everything else fall outside that by construction. Symlinks are resolved
-// before the comparison so a link inside the checkout cannot alias a file
-// outside it.
+// Why a hook at all:
+//   - Kimi Code (`kimi -p`) ignores `[[permission.rules]]` in print mode
+//     (verified on 0.34.0 and 2.3.2 while fixing HackerOne #4037167).
+//   - Claude Code's `--allowedTools` has no path scope for `Read`, and its
+//     CLI environment carries the job's GitHub token.
+//   - Antigravity CLI (`agy -p`) runs in a strictly read-only posture
+//     (`settings.json` denies `command(*)`, `write_file(*)`, `read_file(.git/)`,
+//     `read_url(*)`, `execute_url(*)`, `mcp(*)`); this hook is the independent
+//     second layer confining `read_file` to the checkout (minus `.git/`) plus
+//     `CONTEXT_PATH` / `DIFF_PATH` and proving via `PATH_GUARD_LOG` that the
+//     hook ran. (Verified against `agy` 1.5.5 wire captures across Gemini 4 and
+//     Gemini 3.x: `read_file` with `args.Path` is the CLI's only file-read tool;
+//     IDE-only tools like `grep_search`, `find_by_name`, `list_dir`, and
+//     `view_file` do not exist in `agy`.)
 //
 // Audit trail: when PATH_GUARD_LOG is set, every decision appends one line
-// (`allow<TAB>Read`) to that file, which lives outside the checkout. The
-// engines' verify step fails the job if the file is missing or empty after a
-// run that produced a review — a hook that never fired means the CLI's hook
-// plumbing changed and the model ran unconfined. Writing the line can never
-// change the decision: a logging failure is ignored here and surfaces there.
+// (`allow<TAB><tool>` or `deny<TAB><tool>`) to that file outside the checkout.
+// Each engine's post-run check fails the job if the log is missing or empty.
 //
-// Self-contained on purpose. Both CLIs treat a hook that times out or cannot
-// start as ALLOW, and this process runs with the attacker-controlled checkout
-// as its cwd. So: `node:` builtins only (they never consult node_modules), no
-// reading of repo files, and the script itself lives outside the checkout.
-// Node's package.json scope lookup walks UP from this file's directory, never
-// down into the checkout. Keep it that way.
+// Self-contained on purpose: `node:` builtins only (never consults
+// `node_modules`), no reading of repo files, and installed outside the PR
+// checkout.
 //
 // Tests: path-guard.test.js (run with `node --test`).
 
@@ -65,7 +36,11 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+const cliArgs = process.argv.slice(2);
+const isAntigravity = cliArgs.length === 1 && cliArgs[0] === '--cli=antigravity';
+
 let tool = '';
+let decided = false;
 
 function record(decision) {
   const logPath = process.env.PATH_GUARD_LOG;
@@ -76,18 +51,37 @@ function record(decision) {
     // Deliberately ignored: see "Audit trail" above.
   }
 }
+
 function deny(reason) {
+  if (decided) return;
+  decided = true;
   record('deny');
-  process.stderr.write(reason + '\n');
+  const msg = String(reason);
+  if (isAntigravity) {
+    process.stdout.write(JSON.stringify({ decision: 'deny', reason: msg }) + '\n');
+    process.exit(0);
+  }
+  process.stderr.write(msg + '\n');
   process.exit(2);
 }
+
 function allow() {
+  if (decided) return;
+  decided = true;
   record('allow');
+  if (isAntigravity) {
+    process.stdout.write(JSON.stringify({ decision: 'allow' }) + '\n');
+  }
   process.exit(0);
 }
+
 process.on('uncaughtException', function (err) {
   deny('path guard: internal error: ' + (err && err.message ? err.message : String(err)));
 });
+
+if (cliArgs.length > 0 && !isAntigravity) {
+  deny('path guard: unrecognized CLI arguments: ' + cliArgs.join(' '));
+}
 
 // realpath of the longest existing prefix: resolves symlinks anywhere in the
 // path, and still works for an output file that does not exist yet.
@@ -105,24 +99,90 @@ function canonical(p) {
     }
   }
 }
+
 function within(child, parent) {
   const rel = path.relative(parent, child);
   return rel === '' || (!path.isAbsolute(rel) && rel.split(path.sep)[0] !== '..');
 }
+
 function hasGitSegment(rel) {
   return rel.split(path.sep).some(function (seg) { return seg.toLowerCase() === '.git'; });
 }
+
 // ripgrep matches these relative to the search root, so neither shape is ever
 // needed for a legitimate search; refuse them rather than reason about
 // ripgrep's anchoring rules.
 function unsafeGlob(g) {
   return typeof g === 'string' && (path.isAbsolute(g) || g.split(/[\\/]/).indexOf('..') !== -1);
 }
+
 function present(v) {
   return v !== undefined && v !== null;
 }
 
+function expandTilde(raw) {
+  if (raw === '~' || raw.startsWith('~/')) {
+    return path.join(os.homedir(), raw.slice(1));
+  }
+  return raw;
+}
+
+function allowIfInsideCheckoutMinusGit(raw, wsRaw, ws, target) {
+  const lexicalWs = path.resolve(wsRaw);
+  const lexicalTarget = path.resolve(wsRaw, expandTilde(raw));
+  if (within(target, ws)) {
+    if (within(lexicalTarget, lexicalWs) && hasGitSegment(path.relative(lexicalWs, lexicalTarget))) {
+      deny(tool + ' denied: ' + raw + ' is inside .git/, which is not part of the code under review.');
+    }
+    if (hasGitSegment(path.relative(ws, target))) {
+      deny(tool + ' denied: ' + raw + ' is inside .git/, which is not part of the code under review.');
+    }
+    allow();
+  }
+}
+
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+if (!input || typeof input !== 'object' || Array.isArray(input)) {
+  deny('path guard: hook payload must be a JSON object.');
+}
+
+if (isAntigravity) {
+  const toolCall = input.toolCall;
+  if (!toolCall || typeof toolCall !== 'object' || Array.isArray(toolCall)) {
+    deny('path guard: missing toolCall object in Antigravity hook payload.');
+  }
+  tool = typeof toolCall.name === 'string' ? toolCall.name : '';
+  if (tool !== 'read_file') {
+    deny('path guard: tool "' + tool + '" is not permitted in this review. Only read_file is.');
+  }
+  const agyArgs = toolCall.args;
+  if (!agyArgs || typeof agyArgs !== 'object' || Array.isArray(agyArgs)) {
+    deny('read_file denied: toolCall.args must be an object.');
+  }
+  const wsRaw = process.env.GITHUB_WORKSPACE;
+  if (!wsRaw) deny('path guard: GITHUB_WORKSPACE is not set');
+  const ws = canonical(wsRaw);
+  const readableFiles = [process.env.CONTEXT_PATH, process.env.DIFF_PATH]
+    .filter(function (p) { return typeof p === 'string' && p.length > 0; })
+    .map(canonical);
+
+  const OTHER_PATH_KEYS = ['AbsolutePath', 'DirectoryPath', 'SearchDirectory', 'SearchPath', 'TargetFile', 'path', 'file_path'];
+  for (const k of OTHER_PATH_KEYS) {
+    if (present(agyArgs[k]) && agyArgs[k] !== agyArgs.Path) {
+      deny('read_file denied: unexpected or conflicting path argument `' + k + '`.');
+    }
+  }
+
+  const raw = agyArgs.Path;
+  if (!present(raw)) deny('read_file denied: a `Path` argument is required.');
+  if (typeof raw !== 'string' || raw.length === 0) deny('read_file denied: `Path` must be a non-empty string.');
+
+  const target = canonical(path.resolve(wsRaw, expandTilde(raw)));
+  if (readableFiles.indexOf(target) !== -1) allow();
+  allowIfInsideCheckoutMinusGit(raw, wsRaw, ws, target);
+  deny('read_file denied: ' + raw + ' resolves outside the PR checkout (' + ws + '). Only the checked-out repository, the review context and the pre-fetched diff may be read.');
+}
+
 tool = String(input.tool_name || '');
 const args = input.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
 
@@ -166,21 +226,14 @@ if (!present(raw)) {
   deny(tool + ' denied: a `path` argument is required.');
 }
 if (typeof raw !== 'string') deny(tool + ' denied: path must be a string.');
-let expanded = raw;
-if (expanded === '~' || expanded.startsWith('~/')) expanded = path.join(os.homedir(), expanded.slice(1));
 // The CLI resolves relative paths against its cwd, which the run step pins to
 // the workspace.
-const target = canonical(path.resolve(wsRaw, expanded));
+const target = canonical(path.resolve(wsRaw, expandTilde(raw)));
 
 if (tool === 'Write') {
   if (target === outFile) allow();
   deny('Write denied: ' + raw + '. This review may only write its single output file, ' + outFile + '.');
 }
 if (tool === 'Read' && readableFiles.indexOf(target) !== -1) allow();
-if (within(target, ws)) {
-  if (hasGitSegment(path.relative(ws, target))) {
-    deny(tool + ' denied: ' + raw + ' is inside .git/, which is not part of the code under review.');
-  }
-  allow();
-}
+allowIfInsideCheckoutMinusGit(raw, wsRaw, ws, target);
 deny(tool + ' denied: ' + raw + ' resolves outside the PR checkout (' + ws + '). Only the checked-out repository, the review context and the pre-fetched diff may be read.');

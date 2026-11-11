@@ -308,3 +308,119 @@ test("the script uses only node: builtins", () => {
   assert.ok(requires.length > 0);
   for (const r of requires) assert.match(r, /^node:/, `${r} is not a node: builtin`);
 });
+
+// ---------------------------------------------------------------------------
+// Antigravity CLI (`--cli=antigravity`) contract tests
+// ---------------------------------------------------------------------------
+function runAgy(fx, toolName, args, opts = {}) {
+  const payload = opts.rawStdin !== undefined
+    ? opts.rawStdin
+    : JSON.stringify({
+        conversationId: "conv-1",
+        workspacePaths: [fx.ws],
+        modelName: "gemini-4-carbon",
+        stepIdx: 1,
+        toolCall: { id: "call-1", name: toolName, args },
+      });
+  const cliFlags = opts.cliFlags || ["--cli=antigravity"];
+  const r = spawnSync(process.execPath, [GUARD, ...cliFlags], {
+    input: payload,
+    cwd: fx.ws,
+    env: opts.env || fx.env,
+    encoding: "utf8",
+  });
+  let json = null;
+  try {
+    json = JSON.parse(r.stdout);
+  } catch (_) {
+    json = null;
+  }
+  return { code: r.status, stdout: r.stdout, stderr: r.stderr, json };
+}
+
+function expectAgyAllow(fx, toolName, args, opts) {
+  const r = runAgy(fx, toolName, args, opts);
+  assert.strictEqual(r.code, 0, `expected exit 0, got ${r.code} (${r.stderr})`);
+  assert.ok(r.json, `expected JSON on stdout, got: ${r.stdout}`);
+  assert.strictEqual(r.json.decision, "allow", `expected allow for ${toolName}(${JSON.stringify(args)}), got: ${r.stdout}`);
+}
+
+function expectAgyDeny(fx, toolName, args, reasonPart, opts) {
+  const r = runAgy(fx, toolName, args, opts);
+  assert.strictEqual(r.code, 0, `expected structured JSON exit 0, got ${r.code}`);
+  assert.ok(r.json, `expected JSON on stdout, got: ${r.stdout}`);
+  assert.strictEqual(r.json.decision, "deny", `expected deny for ${toolName}(${JSON.stringify(args)}), got: ${r.stdout}`);
+  if (reasonPart) assert.match(r.json.reason, reasonPart);
+}
+
+test("Antigravity (--cli=antigravity): read_file allows workspace files and CONTEXT_PATH/DIFF_PATH, but NOT OUTPUT_PATH", () => {
+  expectAgyAllow(fx, "read_file", { Path: "src/a.ts" });
+  expectAgyAllow(fx, "read_file", { Path: path.join(fx.ws, "src", "a.ts"), StartLine: 1, EndLine: 20 });
+  expectAgyAllow(fx, "read_file", { Path: ".github/workflows/x.yml" });
+  expectAgyAllow(fx, "read_file", { Path: fx.env.CONTEXT_PATH });
+  expectAgyAllow(fx, "read_file", { Path: fx.env.DIFF_PATH });
+  // Antigravity is strictly read-only and never writes OUTPUT_PATH directly.
+  expectAgyDeny(fx, "read_file", { Path: fx.outFile }, /outside the PR checkout/);
+});
+
+test("Antigravity (--cli=antigravity): denies .git/, /proc, RUNNER_TEMP, HOME, traversal, and escaping symlinks", () => {
+  expectAgyDeny(fx, "read_file", { Path: ".git/config" }, /inside \.git\//);
+  expectAgyDeny(fx, "read_file", { Path: path.join(fx.ws, ".git", "config") }, /inside \.git\//);
+  expectAgyDeny(fx, "read_file", { Path: "pkg/.git/HEAD" }, /inside \.git\//);
+  expectAgyDeny(fx, "read_file", { Path: ".GIT/config" }, /inside \.git\//);
+  expectAgyDeny(fx, "read_file", { Path: "/proc/self/environ" }, /outside the PR checkout/);
+  expectAgyDeny(fx, "read_file", { Path: path.join(fx.runnerTemp, "git-credentials-abc.config") }, /outside/);
+  expectAgyDeny(fx, "read_file", { Path: "../_temp/git-credentials-abc.config" }, /outside/);
+  expectAgyDeny(fx, "read_file", { Path: "~/.kimi-code/config.toml" }, /outside/);
+  expectAgyDeny(fx, "read_file", { Path: "~" }, /outside/);
+  expectAgyDeny(fx, "read_file", { Path: "escape-link" }, /outside/);
+  expectAgyDeny(fx, "read_file", { Path: path.join(fx.ws, "escape-dir", "git-credentials-abc.config") }, /outside/);
+});
+
+test("Antigravity (--cli=antigravity): denies every non-read_file tool (including write, shell, web, subagent, and IDE tools)", () => {
+  for (const t of [
+    "write_file",
+    "edit_file",
+    "run_command",
+    "manage_task",
+    "schedule",
+    "search_web",
+    "invoke_subagent",
+    "define_subagent",
+    "manage_subagents",
+    "send_message",
+    "ask_question",
+    "grep_search",
+    "find_by_name",
+    "list_dir",
+    "view_file",
+    "Read",
+    "",
+  ]) {
+    expectAgyDeny(fx, t, { Path: "src/a.ts" }, /not permitted in this review\. Only read_file is\./);
+  }
+});
+
+test("Antigravity (--cli=antigravity): fails closed on missing/conflicting Path, bad payloads, unknown CLI flags, and logs decisions", () => {
+  expectAgyDeny(fx, "read_file", {}, /`Path` argument is required/);
+  expectAgyDeny(fx, "read_file", { Path: "" }, /non-empty string/);
+  expectAgyDeny(fx, "read_file", { Path: 42 }, /non-empty string/);
+  expectAgyDeny(fx, "read_file", { Path: "src/a.ts", file_path: "/etc/hosts" }, /conflicting path argument/);
+  expectAgyDeny(fx, "read_file", {}, /internal error/, { rawStdin: "not json" });
+  expectAgyDeny(fx, "read_file", {}, /missing toolCall/, { rawStdin: JSON.stringify({ tool_name: "Read", tool_input: { path: "src/a.ts" } }) });
+
+  const noWs = { ...fx.env };
+  delete noWs.GITHUB_WORKSPACE;
+  expectAgyDeny(fx, "read_file", { Path: "src/a.ts" }, /GITHUB_WORKSPACE is not set/, { env: noWs });
+
+  const badFlag = runAgy(fx, "read_file", { Path: "src/a.ts" }, { cliFlags: ["--cli=unknown"] });
+  assert.strictEqual(badFlag.code, 2);
+  assert.match(badFlag.stderr, /unrecognized CLI arguments/);
+
+  const logPath = path.join(fx.runnerTemp, "agy-guard.log");
+  const logEnv = { ...fx.env, PATH_GUARD_LOG: logPath };
+  expectAgyAllow(fx, "read_file", { Path: "src/a.ts" }, { env: logEnv });
+  expectAgyDeny(fx, "run_command", { CommandLine: "id" }, /not permitted/, { env: logEnv });
+  assert.deepStrictEqual(fs.readFileSync(logPath, "utf8").split("\n"), ["allow\tread_file", "deny\trun_command", ""]);
+  fs.rmSync(logPath);
+});
