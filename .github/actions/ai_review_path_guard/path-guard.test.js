@@ -16,7 +16,7 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 
 const GUARD = path.join(__dirname, "path-guard.js");
 
@@ -423,4 +423,33 @@ test("Antigravity (--cli=antigravity): fails closed on missing/conflicting Path,
   expectAgyDeny(fx, "run_command", { CommandLine: "id" }, /not permitted/, { env: logEnv });
   assert.deepStrictEqual(fs.readFileSync(logPath, "utf8").split("\n"), ["allow\tread_file", "deny\trun_command", ""]);
   fs.rmSync(logPath);
+});
+
+test("Antigravity (--cli=antigravity): broken stdout pipe (EPIPE) in deny() and allow() exits 2 instead of 0", async () => {
+  function runWithBrokenStdout(stdinObj) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [GUARD, "--cli=antigravity"], {
+        cwd: fx.ws,
+        env: fx.env,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      child.on("error", reject);
+      // Destroy the parent's read end of stdout first so fs.writeSync(1, ...) hits EPIPE.
+      child.stdout.destroy();
+      setTimeout(() => {
+        child.stdin.end(JSON.stringify(stdinObj));
+      }, 20);
+      child.on("exit", (code) => resolve(code));
+    });
+  }
+
+  const denyCode = await runWithBrokenStdout({
+    toolCall: { id: "c1", name: "run_command", args: { CommandLine: "id" } },
+  });
+  assert.strictEqual(denyCode, 2, `deny() on broken stdout must exit 2, got ${denyCode}`);
+
+  const allowCode = await runWithBrokenStdout({
+    toolCall: { id: "c2", name: "read_file", args: { Path: "src/a.ts" } },
+  });
+  assert.strictEqual(allowCode, 2, `allow() on broken stdout must exit 2, got ${allowCode}`);
 });

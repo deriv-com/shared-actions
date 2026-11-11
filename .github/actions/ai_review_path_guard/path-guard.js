@@ -73,8 +73,10 @@
 // Self-contained on purpose. Kimi Code and Claude Code treat a hook that times
 // out or cannot start as ALLOW (hence `|| exit 2` in their hook commands), and
 // `agy` 1.5.5 treats an exit-0 hook with empty stdout as ALLOW (while failing
-// closed on non-zero exit or hook timeout; its `hooks.json` command wraps node
-// with `timeout 20` and validates stdout). This process runs with the
+// closed on non-zero exit — verified with `command: "exit 2"` -> `JSON hook
+// ... failed: command failed: exit status 2` — or hook timeout — verified with
+// `timeout: 1` + `sleep 2` -> `signal: killed`; its `hooks.json` command wraps
+// node with `timeout 20` and validates stdout). This process runs with the
 // attacker-controlled checkout as its cwd. So: `node:` builtins only (they
 // never consult node_modules), no reading of repo files, and the script itself
 // lives outside the checkout. Node's package.json scope lookup walks UP from
@@ -101,20 +103,22 @@ function record(decision) {
   }
 }
 
-// Every call site relies on deny() and allow() never returning. Writes are
-// wrapped in try/catch so a broken pipe or stream error cannot throw into
-// uncaughtException before process.exit terminates the process.
+// Every call site relies on deny() and allow() never returning. Synchronous
+// fs.writeSync(1/2, ...) flushes before process.exit and throws synchronously
+// on EPIPE/EBADF, wrapped in try/catch so a write failure exits 2 rather than
+// throwing into uncaughtException or exiting 0 with empty stdout in
+// `--cli=antigravity` mode.
 function deny(reason) {
   record('deny');
   const msg = String(reason);
   try {
     if (isAntigravity) {
-      process.stdout.write(JSON.stringify({ decision: 'deny', reason: msg }) + '\n');
+      fs.writeSync(1, JSON.stringify({ decision: 'deny', reason: msg }) + '\n');
     } else {
-      process.stderr.write(msg + '\n');
+      fs.writeSync(2, msg + '\n');
     }
   } catch (e) {
-    // Fall through to unconditional exit below.
+    process.exit(2);
   }
   process.exit(isAntigravity ? 0 : 2);
 }
@@ -123,7 +127,7 @@ function allow() {
   record('allow');
   if (isAntigravity) {
     try {
-      process.stdout.write(JSON.stringify({ decision: 'allow' }) + '\n');
+      fs.writeSync(1, JSON.stringify({ decision: 'allow' }) + '\n');
     } catch (e) {
       process.exit(2);
     }

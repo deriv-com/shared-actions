@@ -139,9 +139,10 @@ assuming parity:
   would be silently switched off by a CLI bump that renamed one. The guard
   requires only `node:` builtins and reads nothing from the checkout: Kimi
   and Claude Code treat a hook that times out or cannot start as allow (hence
-  `|| exit 2` in their hook commands), while `agy` 1.5.5 kills timed-out
-  hooks (`timeout` in seconds) and fails closed on non-zero exit or timeout
-  (`signal: killed`), treating only an exit-0 hook with empty stdout as allow
+  `|| exit 2` in their hook commands), while `agy` 1.5.5 fails closed on both
+  non-zero exit (`command: "exit 2"` -> `exit status 2`) and hook timeout
+  (`timeout: 1` + `sleep 2` -> `signal: killed`, with `timeout` in seconds),
+  treating only an exit-0 hook with empty stdout (`command: "true"`) as allow
   (hence the `timeout 20` + stdout-validating wrapper in Antigravity). Every
   decision is appended to a log outside the checkout, and each engine **fails
   the job if a review was written while that log is empty** — a hook that
@@ -404,10 +405,13 @@ assuming parity:
   (minus `.git/`) or on `CONTEXT_PATH` / `DIFF_PATH`, resolves symlinks
   first, denies every other tool, and logs every decision to
   `PATH_GUARD_LOG`. Verified on `agy` 1.5.5: `hooks.json` `timeout: 30` is in
-  seconds and exceeding it fails closed (`signal: killed`), whereas an exit-0
-  hook with empty stdout is treated as allow; the `hooks.json` wrapper bounds
-  `node` with `timeout 20` (defense-in-depth below the 30s ceiling) and emits
-  JSON `deny` unless stdout contains an explicit allow/deny JSON decision. If
+  seconds (`sleep 0.25` + `deny` completes and denies), and both non-zero exit
+  (`command: "exit 2"` -> `exit status 2`) and exceeding `timeout`
+  (`timeout: 1` + `sleep 2` -> `signal: killed`) fail closed, whereas an
+  exit-0 hook with empty stdout (`command: "true"`) is treated as allow; the
+  `hooks.json` wrapper bounds `node` with `timeout 20` (defense-in-depth below
+  the 30s ceiling) and emits JSON `deny` unless stdout contains an explicit
+  allow/deny JSON decision. If
   a review was produced while `PATH_GUARD_LOG` is empty, the engine fails the
   job closed and discards the output. Every `agy`
   invocation runs with an isolated `HOME` under `runner.temp` (the runner's
