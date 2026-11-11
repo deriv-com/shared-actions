@@ -102,6 +102,9 @@ ANTH="$ROOT/.github/actions/ai_review_engine_anthropic/action.yml"
 GROK="$ROOT/.github/actions/ai_review_engine_grok/action.yml"
 CODEX="$ROOT/.github/actions/ai_review_engine_codex/action.yml"
 MUSE="$ROOT/.github/actions/ai_review_engine_muse/action.yml"
+AGY="$ROOT/.github/actions/ai_review_engine_antigravity/action.yml"
+AGY_GUARD="$ROOT/.github/actions/ai_review_engine_antigravity/agy-path-guard.js"
+AGY_GUARD_TEST="$ROOT/.github/actions/ai_review_engine_antigravity/agy-path-guard.test.js"
 GUARD="$ROOT/.github/actions/ai_review_path_guard/path-guard.js"
 GUARD_TEST="$ROOT/.github/actions/ai_review_path_guard/path-guard.test.js"
 
@@ -182,7 +185,7 @@ check 'grep -q "git/trees/" <<< "$SYMLINK_STEP" && grep -qF ".mode == \"120000\"
 check '! grep -q "recursive=1" <<< "$SYMLINK_STEP"' "symlink step walks non-recursive tree listings (the recursive form truncates silently)"
 FILE_SWEEP='-o \( -type f -o -type l \)'
 DIR_SWEEP='-o \( -type d -o -type l \)'
-for engine in "$KIMI" "$ANTH" "$GROK" "$CODEX" "$MUSE"; do
+for engine in "$KIMI" "$ANTH" "$GROK" "$CODEX" "$MUSE" "$AGY"; do
   name=$(basename "$(dirname "$engine")")
   check 'grep -qF -- "$FILE_SWEEP" "$engine"' "$name: instruction-file scrub matches symlinks"
   check 'grep -qF -- "$DIR_SWEEP" "$engine"' "$name: config-directory scrub matches symlinks"
@@ -201,7 +204,7 @@ check '[[ -f "$CODEX" ]]' "codex engine action.yml is committed"
 
 # Enum: resolve-step case arm, unknown-engine error list, and job name all name codex.
 check 'grep -qE "^            codex\)" "$WF"' "resolve step has a codex case arm"
-check 'grep -q "kimi, anthropic, grok, codex, muse" "$WF"' "unknown-engine error lists codex and muse"
+check 'grep -q "kimi, anthropic, grok, codex, muse, antigravity" "$WF"' "unknown-engine error lists codex, muse and antigravity"
 check 'grep -qF "inputs.engine == '\''codex'\'' && '\''Codex PR Review'\''" "$WF"' "job name resolves codex to Codex PR Review"
 check 'grep -q "DEFAULT_MODEL=\"gpt-6.1-sol\"" "$WF"' "codex arm pins DEFAULT_MODEL=gpt-6.1-sol"
 check 'grep -q "METRICS_AGENT=\"codex_review\"" "$WF"' "codex arm pins METRICS_AGENT=codex_review"
@@ -374,7 +377,7 @@ check 'grep -q "unset KIMI_MODEL_THINKING_EFFORT" "$KIMI"' "kimi engine unsets K
 # Posted **Effort:** line: resolved once, printed under **Model:**, stripped on follow-up.
 check 'grep -q "REVIEW_EFFORT_DISPLAY=" "$WF"' "resolve exports REVIEW_EFFORT_DISPLAY"
 check 'grep -qF "model default (no override sent)" "$WF"' "kimi empty effort display is model default (no override sent)"
-check '[[ "$(grep -cF "printf '\''\`%s\` (default)'\'' medium" "$WF")" -eq 2 ]]' "anthropic and codex empty effort display is medium (default)"
+check '[[ "$(grep -cF "printf '\''\`%s\` (default)'\'' medium" "$WF")" -eq 3 ]]' "anthropic, codex and antigravity empty effort display is medium (default)"
 check 'grep -qF "n/a (this engine has no effort override)" "$WF"' "grok effort display is n/a"
 effort_under_model() {
   awk '/printf '\''\*\*Model:\*\*/{m=NR} /printf '\''\*\*Effort:\*\*/{e=NR} END{exit !(m && e && e==m+1)}' <<< "$1"
@@ -540,9 +543,97 @@ check 'grep -q "installer delivered Muse Code" "$MUSE" && grep -q "cli_version p
 check 'grep -q "no review written to \$OUTPUT_PATH" "$MUSE"' "muse engine fails if no review was written"
 check 'ncgrep "strip script changed since the strip step" "$MUSE"' "muse verifies the strip script hash before each attempt"
 check '! joined_step_body "Install review CLI (Muse Code)" "$MUSE" | grep -cE "rm .*[$][{]?MUSE_ENGINE_WORK[}]?([\";]|/[\";]|:[^\"]*[\";]| |$)" >/dev/null' "muse install step never rm's the strip script's directory (any single command, continuations joined)"
-check 'grep -qF "`muse` (Meta Muse Code CLI)" "$WF"' "engine input description names muse"
+check 'grep -qF "\`muse\` (Meta Muse Code CLI)" "$WF"' "engine input description names muse"
 check 'grep -qF "meta-muse-wonder-1.0" "$README" && grep -qF "muse_review" "$README" && grep -qF "muse-review-summary-" "$README"' "README documents the muse engine"
 check 'grep -qE "^\| \`muse_reasoning_effort\`" "$README"' "README inputs table documents muse_reasoning_effort"
+
+# ---------------------------------------------------------------------------
+# Antigravity engine — the sixth engine (Google Antigravity CLI `agy`).
+# Read-only JSON envelope capture (`--output-format json`) + dual-layer
+# confinement (`settings.json` permission denials + `agy-path-guard.js`
+# PreToolUse hook) + Gemini effort validation (`low|medium|high`, empty ->
+# `medium`).
+# ---------------------------------------------------------------------------
+check '[[ -f "$AGY" ]]' "antigravity engine action.yml is committed"
+check '[[ -f "$AGY_GUARD" ]]' "antigravity PreToolUse path guard script is committed"
+check '[[ -f "$AGY_GUARD_TEST" ]]' "antigravity path guard has a node --test file (run by lint-actions test-scripts)"
+check 'node --check "$AGY_GUARD"' "antigravity path guard parses"
+check '! grep -oE "require\(['\''\"][^'\''\"]+" "$AGY_GUARD" | grep -v "node:" | grep -c . >/dev/null' "antigravity path guard requires only node: builtins"
+check 'grep -q "is not permitted in this review" "$AGY_GUARD"' "antigravity path guard denies any tool outside the read-only allowlist"
+check 'grep -q "PATH_GUARD_LOG" "$AGY_GUARD"' "antigravity path guard writes the decision log the engine verifies"
+
+AGY_DEFAULT_MODEL="gemini-4-carbon"
+AGY_CLI_VERSION="1.5.5"
+AGY_ARM="$(awk '/^            antigravity\)/{f=1} f && !d{print} f && /;;/{d=1}' "$WF")"
+AGY_MODEL_INPUT="$(awk '/^  model:/{f=1; next} f && !d && /^  [a-z_]+:/{d=1} f && !d{print}' "$AGY")"
+AGY_CLI_INPUT="$(awk '/^  cli_version:/{f=1; next} f && !d && /^  [a-z_]+:/{d=1} f && !d{print}' "$AGY")"
+check 'grep -qE "^            antigravity\)" "$WF"' "resolve step has an antigravity case arm"
+check 'grep -qF "inputs.engine == '\''antigravity'\'' && '\''Antigravity PR Review'\''" "$WF"' "job name resolves antigravity to Antigravity PR Review"
+check 'grep -qxF "              DEFAULT_MODEL=\"${AGY_DEFAULT_MODEL}\"" <<< "$AGY_ARM"' "antigravity arm pins DEFAULT_MODEL=${AGY_DEFAULT_MODEL}"
+check 'grep -qxF "              METRICS_AGENT=\"antigravity_review\"" <<< "$AGY_ARM"' "antigravity arm pins METRICS_AGENT=antigravity_review"
+check 'grep -qxF "              ARTIFACT_PREFIX=\"antigravity-review\"" <<< "$AGY_ARM"' "antigravity arm pins ARTIFACT_PREFIX=antigravity-review"
+check 'grep -qxF "              DEFAULT_CLI_VERSION=\"${AGY_CLI_VERSION}\"" <<< "$AGY_ARM"' "antigravity arm pins DEFAULT_CLI_VERSION=${AGY_CLI_VERSION}"
+check 'grep -qxF "              REVIEW_TITLE=\"Antigravity PR Review\"" <<< "$AGY_ARM"' "antigravity arm pins REVIEW_TITLE=Antigravity PR Review"
+check 'grep -qF "antigravity -> ${AGY_DEFAULT_MODEL}" "$WF"' "model input description names ${AGY_DEFAULT_MODEL} for antigravity"
+check 'grep -qxF "    default: \"${AGY_DEFAULT_MODEL}\"" <<< "$AGY_MODEL_INPUT"' "antigravity engine action defaults model to ${AGY_DEFAULT_MODEL}"
+check 'grep -qxF "    default: \"${AGY_CLI_VERSION}\"" <<< "$AGY_CLI_INPUT"' "antigravity engine action defaults cli_version to ${AGY_CLI_VERSION}"
+check 'grep -qE "^\| Default model \|.*\| \`${AGY_DEFAULT_MODEL}\` \|$" <<< "$README_MODEL_ROW"' "README engines table lists ${AGY_DEFAULT_MODEL} for antigravity"
+check 'grep -qF "\`${AGY_CLI_VERSION}\` antigravity)" "$README"' "README inputs table lists ${AGY_CLI_VERSION} for antigravity"
+check 'grep -qF "\`antigravity\` (Google Antigravity CLI)" "$WF"' "engine input description names antigravity"
+check 'grep -qF "antigravity_review" "$README" && grep -qF "antigravity-review-summary-" "$README"' "README documents the antigravity engine"
+check 'grep -qE "^\| \`antigravity_effort\`" "$README"' "README inputs table documents antigravity_effort"
+
+check 'grep -q "if: steps.engine.outputs.engine == '\''antigravity'\''" "$WF"' "antigravity dispatch step is if-gated on the engine output"
+check 'grep -q "ai_review_engine_antigravity@master" "$WF"' "antigravity dispatch references the engine by absolute @master path"
+check 'awk '\''/if: steps.engine.outputs.engine == .antigravity./{g=1} g && !d && /timeout-minutes: 60/{print; d=1}'\'' "$WF" | grep -c "timeout-minutes: 60" >/dev/null' "antigravity dispatch step carries timeout-minutes: 60"
+check 'grep -q "^      antigravity_effort:" "$WF"' "antigravity_effort input is declared"
+check 'awk '\''/^      antigravity_effort:/{f=1} f && !d && /default:/{print; d=1}'\'' "$WF" | grep -c "default: \"\"" >/dev/null' "antigravity_effort defaults to empty"
+check 'grep -qF "ANTIGRAVITY_EFFORT_INPUT: \${{ inputs.antigravity_effort }}" "$WF"' "resolve step reads antigravity_effort from the workflow input"
+check 'grep -q "echo \"antigravity_effort=\$ANTIGRAVITY_EFFORT\"" "$WF"' "resolve step emits antigravity_effort on the step outputs"
+check 'grep -q "antigravity_effort: \${{ steps.engine.outputs.antigravity_effort }}" "$WF"' "antigravity dispatch step passes antigravity_effort through"
+check 'grep -q "^  antigravity_effort:" "$AGY"' "antigravity engine declares the antigravity_effort input"
+
+ENUM_WF_AGY=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +low\|medium\|high\) ;;' | tr -d ' ;)' | sort -u)
+ENUM_AGY=$(grep -vE '^[[:space:]]*#' "$AGY" | grep -oE '^ +low\|medium\|high\) ;;' | tr -d ' ;)' | sort -u)
+check '[[ "$ENUM_WF_AGY" == "low|medium|high" && "$ENUM_WF_AGY" == "$ENUM_AGY" ]]' "antigravity_effort case arms match in the orchestrator and the engine ($ENUM_WF_AGY)"
+check 'grep -qF "low, medium, or high" "$WF" && grep -qF "low, medium, or high" "$AGY" && grep -qF "\`low\`, \`medium\`, or \`high\`" "$README"' "antigravity_effort descriptions list low, medium, or high"
+
+AGY_EFFORT_BLOCK=$(step_body "Run AI PR review (Antigravity CLI)" "$AGY" | awk '/EFFECTIVE_EFFORT="medium"/{f=1} f && !d{print} f && !d && /^        EFFORT_ARGS=/{d=1}' | sed 's/^        //')
+agy_effort_eval() { ANTIGRAVITY_EFFORT="$1" bash -c "{ $AGY_EFFORT_BLOCK"$'\n''} >/dev/null 2>&1 && printf "%s" "${EFFORT_ARGS[*]}"' 2>/dev/null; }
+check '[[ "$(agy_effort_eval "")" == "--effort medium" ]]' "antigravity engine maps empty antigravity_effort to --effort medium"
+check '[[ "$(agy_effort_eval "low")" == "--effort low" && "$(agy_effort_eval "high")" == "--effort high" ]]' "antigravity engine maps low and high onto --effort"
+check '! agy_effort_eval minimal >/dev/null && ! agy_effort_eval xhigh >/dev/null && ! agy_effort_eval max >/dev/null && ! agy_effort_eval bogus >/dev/null' "antigravity engine rejects minimal, xhigh, max and unknown values"
+
+WF_AGY_BLOCK=$(step_body "Resolve and validate engine" "$WF" | awk '/ANTIGRAVITY_EFFORT="\$\{ANTIGRAVITY_EFFORT_INPUT:-\}"/{f=1} f && !d{print} f && !d && /^          fi$/{d=1}' | sed 's/^ *//')
+wf_agy_effort_ok() { ANTIGRAVITY_EFFORT_INPUT="$1" bash -c "$WF_AGY_BLOCK" >/dev/null 2>&1; }
+check 'wf_agy_effort_ok "" && wf_agy_effort_ok low && wf_agy_effort_ok medium && wf_agy_effort_ok high' "orchestrator antigravity_effort validation accepts empty, low, medium and high"
+check '! wf_agy_effort_ok minimal && ! wf_agy_effort_ok xhigh && ! wf_agy_effort_ok max && ! wf_agy_effort_ok bogus' "orchestrator antigravity_effort validation rejects minimal, xhigh, max and unknown values"
+
+check '! grep -vE "^[[:space:]]*#" "$AGY" | grep -cE -- "--dangerously-skip-permissions|--remote-agent|--remote-control" >/dev/null' "antigravity engine never passes --dangerously-skip-permissions, --remote-agent or --remote-control"
+check '! grep -vE "^[[:space:]]*#" "$AGY" | grep -cF "install.sh |" >/dev/null' "antigravity installer is never piped into bash"
+check 'grep -qF -- "--proto '\''=https'\''" "$AGY" && grep -q "Antigravity CLI installer sha256" "$AGY"' "antigravity installer fetch pins HTTPS and logs the script hash"
+check 'joined_step_body "Install review CLI (Antigravity CLI)" "$AGY" | grep -F "bash \"\$INSTALLER\"" | grep -cF "HOME=\"\$AGY_ENGINE_HOME\"" >/dev/null' "antigravity installer runs with isolated HOME, not the runner's real home"
+check 'grep -qF "AGY_INSTALLER_DIR: \${{ runner.temp }}/antigravity-engine-installer" "$AGY" && grep -qF "INSTALLER=\"\$AGY_INSTALLER_DIR/install.sh\"" "$AGY" && joined_step_body "Install review CLI (Antigravity CLI)" "$AGY" | grep -F "rm -rf" | grep -cF "\"\$AGY_INSTALLER_DIR\"" >/dev/null' "antigravity installer script lives in its own wiped directory, not the install dir"
+check '! joined_step_body "Install review CLI (Antigravity CLI)" "$AGY" | grep -cE "rm .*[$][{]?AGY_ENGINE_WORK[}]?([\";]|/[\";]|:[^\"]*[\";]| |$)" >/dev/null' "antigravity install step never rm's the strip script's directory"
+check 'step_body "Install review CLI (Antigravity CLI)" "$AGY" | grep -cE "^ +AGY_CLI_DISABLE_AUTO_UPDATE: \"true\"" >/dev/null && step_body "Run AI PR review (Antigravity CLI)" "$AGY" | grep -cE "^ +AGY_CLI_DISABLE_AUTO_UPDATE: \"true\"" >/dev/null' "antigravity install and run steps freeze background self-update"
+check 'grep -q "installer delivered Antigravity CLI" "$AGY" && grep -q "cli_version pins" "$AGY"' "antigravity engine asserts the installed version equals cli_version"
+check 'grep -q "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020" "$AGY"' "antigravity engine pins setup-node to the shared SHA"
+check 'ncgrep "BASE_URL=\"\\\$\{BASE_URL%/v1beta\}\"" "$AGY" && ncgrep "BASE_URL=\"\\\$\{BASE_URL%/v1\}\"" "$AGY"' "antigravity strips trailing /v1beta and /v1 before GOOGLE_GEMINI_BASE_URL"
+check 'grep -q "GEMINI_API_KEY: \${{ inputs.api_key }}" "$AGY" && grep -q "GOOGLE_GEMINI_BASE_URL: \${{ steps.configure.outputs.base_url }}" "$AGY"' "antigravity run step maps api_key to GEMINI_API_KEY and base_url to GOOGLE_GEMINI_BASE_URL"
+check '! step_body "Run AI PR review (Antigravity CLI)" "$AGY" | grep -cE "^ *(GITHUB_TOKEN|GH_TOKEN):" >/dev/null' "antigravity engine run step env holds no GitHub token"
+check '! step_body "Run AI PR review (Antigravity CLI)" "$AGY" | grep -vE "^[[:space:]]*#" | grep -cF "inputs.model" >/dev/null' "antigravity run step uses the validated configure-step model, never raw inputs.model"
+check 'grep -qF "modelProvider: \"gemini\"" "$AGY" && grep -qF "allowNonWorkspaceAccess: false" "$AGY" && grep -qF "enableTerminalSandbox: true" "$AGY"' "antigravity settings pin modelProvider gemini, allowNonWorkspaceAccess false, and sandbox true"
+for deny_rule in "command(*)" "write_file(*)" "read_file(.git/)" "read_url(*)" "execute_url(*)" "mcp(*)"; do
+  check 'grep -vE "^[[:space:]]*#" "$AGY" | grep -cF -- "\"$deny_rule\"" >/dev/null' "antigravity settings.json denies $deny_rule"
+done
+check 'grep -qF "modelName: (\"gemini-api://\" + \$model)" "$AGY" && grep -qF "TOOL_FORMATTER_TYPE_NONE" "$AGY"' "antigravity settings register model in customModelsConfig as gemini-api://<model>"
+check 'grep -qF "PreToolUse:" "$AGY" && grep -qF "matcher: \"*\"" "$AGY" && grep -qF "path guard failed to execute" "$AGY"' "antigravity hooks.json registers a match-all PreToolUse hook with fail-closed fallback"
+check 'ncgrep "strip script changed since the strip step" "$AGY" && ncgrep "pristine settings\.json changed" "$AGY" && ncgrep "pristine hooks\.json changed" "$AGY"' "antigravity verifies strip script, settings.json and hooks.json hashes before each attempt"
+check 'awk "/cat > \"\\\$STRIP_SCRIPT\" <<.STRIP_EOF./{f=1;next} f && !d && /^ *STRIP_EOF/{d=1} f && !d{print}" "$AGY" | sed "s/^ *//" | bash -n' "antigravity strip script heredoc parses as bash"
+check 'grep -qF ".status == \"SUCCESS\" and ((.finished_reason // \"\") == \"\")" "$AGY"' "antigravity requires status SUCCESS and empty finished_reason on the JSON envelope"
+check 'ncgrep "if ! review_file_ok; then" "$AGY" && grep -q "no review written to \$OUTPUT_PATH" "$AGY"' "antigravity final check goes through review_file_ok and fails closed when missing"
+check 'step_body "Run AI PR review (Antigravity CLI)" "$AGY" | grep -c "\[\[ ! -s \"\$PATH_GUARD_LOG\" \]\]" >/dev/null' "antigravity run step fails closed if a review was produced without the path guard logging decisions"
+check 'ncgrep "::stop-commands::" "$AGY"' "antigravity diagnostic log dump is wrapped in ::stop-commands::"
 
 # The reasoning_effort, effort and thinking_effort enums are each duplicated
 # on purpose (the engines can be called directly). Extract Codex arms by the

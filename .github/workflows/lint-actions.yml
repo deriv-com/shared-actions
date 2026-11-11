@@ -21,6 +21,7 @@ on:
     paths:
       - '.github/workflows/**'
       - '.github/actions/**'
+      - '.github/prompts/**'
       - 'tests/ai-pr-review-contract.sh'
       - 'tests/docsync-guidance-contract.sh'
       - 'tests/forge-contract.sh'
