@@ -883,12 +883,15 @@ jobs:
           # a symlink, at most 1 MB, through the same scrub as the logs. A
           # symlinked directory on the way could still lead out of the
           # checkout, so the file's real directory must be inside the
-          # checkout's real path.
+          # checkout's real path. The "./" and "--" keep a leading "-" from
+          # being read as an option by dirname or cd, and keep CDPATH out:
+          # without them, dirname fails on "-/plan.md", cd "" stays in the
+          # checkout, and a plan under a symlinked "-" directory is kept.
           keep_plan() {
             local path="$1" size root dir
             [ -n "$path" ] || return 0
             root=$(pwd -P)
-            dir=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P) || dir=""
+            dir=$(cd "./$(dirname -- "$path")" 2>/dev/null && pwd -P) || dir=""
             if ! [[ "$path" =~ ^[A-Za-z0-9._/-]+\.md$ ]] || [[ "$path" == /* ]] || [[ "$path" == *..* ]] \
               || [ -L "$path" ] || ! [ -f "$path" ] || [ -z "$dir" ] \
               || { [ "$dir" != "$root" ] && [[ "$dir" != "$root"/* ]]; }; then
