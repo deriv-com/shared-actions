@@ -1,0 +1,746 @@
+name: ai_review_engine_antigravity
+description: >
+  AI PR review engine — Google Antigravity CLI (`agy`). Reads a pre-built
+  review context and a pre-fetched PR diff, reviews the checked-out code with
+  `read_file` confined by the shared PreToolUse path guard, and captures the
+  review markdown from `agy -p --output-format json`. It posts nothing: it is
+  given no GitHub token, no shell tool, and no write tool. The calling workflow
+  owns comment posting.
+
+# ENGINE CONTRACT (see .github/workflows/AI_PR_REVIEW_README.md)
+#
+# The caller guarantees: PR head is checked out; review_context_path and
+# pr_diff_path exist and are non-empty; the access gate has passed.
+#
+# This engine must: strip PR-supplied agent config FIRST, grant the model no
+# shell tool and no write tool, write the review to output_path, and fail with
+# an engine-named message if it wrote nothing. It must not post PR comments or
+# reach the GitHub API on the model's behalf.
+#
+# Composite-action gotchas that constrain this file:
+#   - The secrets context is not readable here, so api_key arrives as an input.
+#   - timeout-minutes is invalid on the steps below; the caller's dispatch
+#     step carries it.
+#   - All steps share one log group, so failures must name this engine.
+#
+# HOW THIS ENGINE IS CONFINED (verified against agy 1.5.5 wire captures and a
+# live LiteLLM run; re-verify every point on a cli_version bump):
+#   1. Read-only tool surface + stdout JSON capture. The model never writes
+#      output_path: `agy -p --output-format json` emits a single JSON envelope
+#      on stdout, and the ENGINE verifies `.status == "SUCCESS"`, an empty
+#      `.finished_reason` (rejecting partial `print_timeout` / `interrupted` /
+#      `error` turns), and a non-empty `.response` before writing output_path
+#      itself.
+#   2. Dual-layer tool and path confinement (both independent, both fail-closed):
+#      a) `settings.json` sets `allowNonWorkspaceAccess: false`,
+#         `enableTerminalSandbox: true`, `toolPermission: "request-review"`,
+#         `disableSlashCommands: true` (plus `historySize: 0` so no prompt
+#         history is written to disk and `notifications` / `showTips` /
+#         `showFeedbackSurvey: false` to suppress TUI noise), allows
+#         `read_file(...)` only for the caller's context and diff paths (both
+#         raw and canonical realpath, since `agy` resolves symlinks before
+#         matching `permissions.allow`), and denies `command(*)`,
+#         `write_file(*)`, `read_file(.git/)`, `read_url(*)`, `execute_url(*)`,
+#         and `mcp(*)`.
+#      b) `$HOME/.gemini/config/hooks.json` registers the shared
+#         `../ai_review_path_guard/path-guard.js --cli=antigravity` script
+#         (unit-tested in lint-actions.yml) as a match-all (`"*"`) `PreToolUse`
+#         hook. Verified on `agy` 1.5.5 wire captures across Gemini 4 and
+#         Gemini 3.x: `read_file` (`args.Path`) is the CLI's only file-read
+#         tool (`grep_search`, `find_by_name`, `list_dir`, and `view_file` are
+#         Antigravity IDE tools and do not exist in `agy`, and `read_file` on a
+#         directory fails with `path is a directory, not a file`). The guard
+#         allows only `read_file` inside `GITHUB_WORKSPACE` (minus `.git/`) or
+#         on `CONTEXT_PATH` / `DIFF_PATH`, denies every other tool, and logs
+#         every decision to `PATH_GUARD_LOG`. Verified on `agy` 1.5.5:
+#         `hooks.json` `timeout: 30` is in seconds (`sleep 0.25` + `deny` at
+#         `timeout: 30` completes and blocks with `tool call denied by pre-tool
+#         hook`, matching `antigravity.google/docs/hooks.md`), non-zero exit
+#         before timeout fails closed (`command: "exit 2"` blocks with `JSON
+#         hook ... failed: command failed: exit status 2`), and exceeding
+#         `timeout` fails closed (`timeout: 1` + `sleep 2` kills the hook and
+#         blocks with `JSON hook ... failed: command failed: signal: killed`).
+#         However, `agy` 1.5.5 DOES treat an exit-0 hook with empty stdout
+#         (`command: "true"`) as allow, so the `hooks.json` shell wrapper
+#         bounds `node` with `timeout 20` (defense-in-depth below the 30s hook
+#         ceiling) and emits JSON `deny` unless stdout contains
+#         `"decision":"allow"` or `"decision":"deny"`. After the run, an empty
+#         `PATH_GUARD_LOG` fails the job closed.
+#   3. Isolated home and pristine config restoration. Every `agy` invocation
+#      runs with `HOME` and `XDG_*` under `runner.temp/antigravity-engine-home`
+#      (outside `/tmp` and the checkout); the runner's real `$HOME` is never
+#      read or modified. Because `agy` normalizes and rewrites `settings.json`
+#      on startup, read-only pristine copies of `settings.json` and
+#      `hooks.json` are hash-checked and restored before each attempt,
+#      alongside re-running the hash-checked strip script.
+#   4. Routing to LiteLLM. `settings.json` sets `"modelProvider": "gemini"` and
+#      registers the selected `model` under `customModelsConfig.customModels`
+#      as `gemini-api://<model>` with `TOOL_FORMATTER_TYPE_NONE` (verified on
+#      `agy` 1.5.5: its built-in offline `modelProvider: "gemini"` catalog
+#      stopped at `gemini-4-argon`, and `gemini-api://<model>` makes `agy`
+#      request `POST /v1beta/models/<model>:streamGenerateContent?alt=sse` on
+#      `GOOGLE_GEMINI_BASE_URL` with `x-goog-api-key: $GEMINI_API_KEY`, working
+#      for `gemini-4-carbon`, `gemini-4-argon`, and custom proxy aliases). A
+#      trailing `/v1` or `/v1beta` is stripped from `base_url` so the shared
+#      `https://litellmsa.deriv.ai/v1` caller default hits LiteLLM's native
+#      `/v1beta/models/...` Gemini route instead of `/v1/v1beta/...`.
+#   5. Gemini effort handling. Gemini models (`gemini-4-carbon`,
+#      `gemini-4-argon`, `gemini-3.8-flash`) support `low`, `medium` (default
+#      on `gemini-4-carbon`), and `high`. Verified on `agy` 1.5.5: omitting
+#      `--effort` on a `customModelsConfig` entry sends `thinkingBudget: -1`,
+#      which Gemini 4 Carbon rejects with HTTP 400 (`thinking_budget` is
+#      unsupported on Gemini 4). When `antigravity_effort` is empty, the engine
+#      passes `--effort medium` so `agy` sends `thinkingLevel: "MEDIUM"`.
+#   6. Source-pinned archive + SHA-512 verification. Instead of running the
+#      floating `install.sh` bootstrapper (which always pulls the newest
+#      release and would break CI whenever Google ships a patch), the install
+#      step downloads the immutable build-stamped `1.5.5` tarball directly from
+#      `https://storage.googleapis.com/antigravity-public/antigravity-cli/...`,
+#      verifies its SHA-512 against the committed per-platform digest BEFORE
+#      extracting or executing a single instruction, runs with
+#      `AGY_CLI_DISABLE_AUTO_UPDATE=true`, and asserts `agy --version` equals
+#      `cli_version`.
+
+inputs:
+  review_context_path:
+    description: "Path to the pre-built review context markdown (instructions, PR metadata, previous review, acknowledged suggestions, required output format). Built by the caller."
+    required: false
+    default: "/tmp/review_context.md"
+  pr_diff_path:
+    description: "Path to the pre-fetched PR diff. Fetched by the caller with the trusted token so this engine needs neither a shell tool nor network access."
+    required: false
+    default: "/tmp/pr_diff.txt"
+  output_path:
+    description: "Path this engine MUST write the final review markdown to. Must resolve (after realpath, so `..` cannot escape) under /tmp. The model has no write tool; the engine extracts `.response` from `agy -p --output-format json` under runner.temp and copies it here itself, then refuses anything that is not a regular, singly-linked file under /tmp."
+    required: false
+    default: "/tmp/ai_review_output.txt"
+  repository:
+    description: "owner/repo of the PR under review (prompt preamble only)."
+    required: true
+  pr_number:
+    description: "Number of the PR under review (prompt preamble only)."
+    required: true
+  model:
+    description: "Model ID as the endpoint in base_url names it. Defaults to `gemini-4-carbon` (LiteLLM's Gemini 4 Carbon alias). Registered in `customModelsConfig` as `gemini-api://<model>` and passed to `agy` via `--model`."
+    required: false
+    default: "gemini-4-carbon"
+  base_url:
+    description: "LLM API base URL. A trailing `/v1` or `/v1beta` is stripped before setting `GOOGLE_GEMINI_BASE_URL` because `agy` appends `/v1beta/models/<model>:streamGenerateContent` itself — accepting `/v1` and stripping keeps one caller-facing default working across every engine."
+    required: false
+    default: "https://litellmsa.deriv.ai/v1"
+  api_key:
+    description: "API key for base_url (the LiteLLM virtual key). Composite actions cannot read the secrets context, so the caller must pass this explicitly. Mapped to `GEMINI_API_KEY` in the run step env and never written to disk."
+    required: true
+  antigravity_effort:
+    description: "[engine-specific: antigravity] Reasoning effort for the Antigravity review turn: low, medium, or high (the levels Gemini models support in Antigravity CLI and on the Gemini API; minimal and Claude-only higher tiers are rejected). Empty uses `medium` (Gemini 4 Carbon's default, passed explicitly as `--effort medium` so custom model entries send `thinkingLevel: MEDIUM` rather than `thinkingBudget: -1`). Other engines ignore this input."
+    required: false
+    default: ""
+  cli_version:
+    description: "Exact Antigravity CLI (`agy`) version to install. Must match the immutable GCS archive and SHA-512 digests committed in this file (`1.5.5`), with background updates frozen via `AGY_CLI_DISABLE_AUTO_UPDATE=true`. Bump via PR together with the archive URLs and SHA-512 hashes after re-verifying this file's confinement notes."
+    required: false
+    default: "1.5.5"
+
+outputs:
+  output_path:
+    description: "Path the review markdown was written to."
+    value: ${{ steps.run.outputs.output_path }}
+
+runs:
+  using: composite
+  steps:
+    # Security boundary, not hygiene. Antigravity CLI discovers `AGENTS.md`,
+    # `GEMINI.md`, `.agents/` (rules, skills, agents, plugins, `hooks.json`,
+    # `mcp_config.json`), and legacy `.agent/` in the workspace. Workspace
+    # `.agents/hooks.json` can execute arbitrary shell commands and
+    # `.agents/mcp_config.json` can launch local MCP servers — all PR-controlled
+    # if left in the checkout. The runner's real `$HOME` is NOT touched: every
+    # `agy` invocation below runs with an isolated `HOME` under `runner.temp`.
+    - name: Strip PR-supplied agent config (Antigravity CLI)
+      id: strip
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        STRIP_SCRIPT: ${{ runner.temp }}/antigravity-engine-bin/strip-agent-config.sh
+      run: |
+        mkdir -p "$(dirname "$STRIP_SCRIPT")"
+        cat > "$STRIP_SCRIPT" <<'STRIP_EOF'
+        # Executed with the checkout as the working directory.
+        # Recursive, case-insensitive, and symlink-aware (`-type l`) so neither
+        # nested instruction files nor symlinked `.agents` / `GEMINI.md` survive.
+        # `.git` is pruned so the sweep cannot corrupt the checkout.
+        find . -name .git -prune -o \( -type f -o -type l \) \
+          \( -iname 'agents.md' -o -iname 'agent.md' -o -iname 'gemini.md' \
+             -o -iname 'claude.md' -o -iname 'claude.local.md' \
+             -o -iname 'kimi.md' -o -iname 'codex.md' \
+             -o -iname '.mcp.json' -o -iname '.cursorrules' \) \
+          -print0 | xargs -0 -r rm -f
+        find . -name .git -prune -o \( -type d -o -type l \) \
+          \( -iname '.agents' -o -iname '.agent' -o -iname '.gemini' \
+             -o -iname '.antigravity' -o -iname '.antigravitycli' \
+             -o -iname '.claude' -o -iname '.claude-plugin' \
+             -o -iname '.codex' -o -iname '.muse' -o -iname '.grok' \) \
+          -print0 | xargs -0 -r rm -rf
+        find . -name .git -prune -o \( -type d -o -type l \) -ipath '*/.cursor/rules' \
+          -print0 | xargs -0 -r rm -rf
+        STRIP_EOF
+
+        bash -euo pipefail "$STRIP_SCRIPT"
+        echo "strip_sha256=$(sha256sum "$STRIP_SCRIPT" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        echo "✅ Stripped PR-supplied agent config (recursive)"
+
+    - name: Set up Node.js
+      # For the shared PreToolUse path guard (`../ai_review_path_guard/path-guard.js`).
+      # Pinned to the same commit SHA as the Kimi, Anthropic, Grok, and Codex engines.
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: "22"
+
+    - name: Install review CLI (Antigravity CLI)
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli_version }}
+        # Keep `AGY_ENGINE_WORK` intact — the strip step already wrote
+        # `strip-agent-config.sh` inside it. Install the CLI binary into a
+        # sibling `${AGY_ENGINE_WORK}-cli` directory and stage the archive in
+        # its own wiped directory.
+        AGY_ENGINE_WORK: ${{ runner.temp }}/antigravity-engine-bin
+        AGY_ENGINE_HOME: ${{ runner.temp }}/antigravity-engine-home
+        AGY_ARCHIVE_DIR: ${{ runner.temp }}/antigravity-engine-archive
+        AGY_CLI_DISABLE_AUTO_UPDATE: "true"
+      run: |
+        PINNED_VERSION="1.5.5"
+        PINNED_BUILD="1.5.5-6740358537805824"
+        if [[ "$CLI_VERSION" != "$PINNED_VERSION" ]]; then
+          echo "❌ Antigravity engine: cli_version is '$CLI_VERSION', but this engine's committed GCS archive and SHA-512 digests pin $PINNED_VERSION."
+          echo "   Bump PINNED_VERSION, PINNED_BUILD, and the SHA-512 hashes in action.yml via PR rather than downloading an unverified binary."
+          exit 1
+        fi
+
+        rm -rf "$AGY_ENGINE_HOME" "${AGY_ENGINE_WORK}-cli" "$AGY_ARCHIVE_DIR"
+        rm -f "$AGY_ENGINE_WORK/review-output.json" "$AGY_ENGINE_WORK/review-stdout.txt" \
+          "$AGY_ENGINE_WORK/cli.log" "$AGY_ENGINE_WORK/agy-diag.log"
+        mkdir -p "$AGY_ENGINE_HOME" "${AGY_ENGINE_WORK}-cli" "$AGY_ARCHIVE_DIR"
+
+        # Linux-only, matching every other review engine in this repository
+        # (jobs run on the Linux `github_claude_code_reviewer` runner group,
+        # and later steps rely on GNU coreutils `realpath -m` / `sha256sum` /
+        # `stat -c`).
+        os_name="$(uname -s)"
+        arch_name="$(uname -m)"
+        platform_key=""
+        case "${os_name}:${arch_name}" in
+          Linux:x86_64|Linux:amd64)
+            if [[ -f /lib/libc.musl-x86_64.so.1 ]] || { ldd /bin/ls 2>&1 || true; } | grep -c musl >/dev/null; then
+              platform_key="linux_amd64_musl"
+            else
+              platform_key="linux_amd64"
+            fi
+            ;;
+          Linux:aarch64|Linux:arm64)
+            if [[ -f /lib/libc.musl-aarch64.so.1 ]] || { ldd /bin/ls 2>&1 || true; } | grep -c musl >/dev/null; then
+              platform_key="linux_arm64_musl"
+            else
+              platform_key="linux_arm64"
+            fi
+            ;;
+          *)
+            echo "❌ Antigravity engine: unsupported runner platform ${os_name}/${arch_name} (Linux x86_64/arm64 required)"
+            exit 1
+            ;;
+        esac
+
+        GCS_BASE="https://storage.googleapis.com/antigravity-public/antigravity-cli/${PINNED_BUILD}"
+        case "$platform_key" in
+          linux_amd64)
+            ARCHIVE_URL="${GCS_BASE}/linux-x64/cli_linux_x64.tar.gz"
+            EXPECTED_SHA512="746a2bd73f83b65d9b44f2fc55d0f0f511ff7f89702846213eeabd76d06bc9c98576b424c2babc7b947f15e518447b946ba02dca260b778363c55c07a7f7a277"
+            ;;
+          linux_arm64)
+            ARCHIVE_URL="${GCS_BASE}/linux-arm/cli_linux_arm64.tar.gz"
+            EXPECTED_SHA512="eb3e025c125c1c60a1493a0c1d9cdf15e8372277d6d3b015e8d29e1bd095344eece5cbc2447f238148bd259d5f2daa0f75641adc0ac02b5fad57edc4ed842d59"
+            ;;
+          linux_amd64_musl)
+            ARCHIVE_URL="${GCS_BASE}/linux-x64-musl/cli_linux_x64_musl.tar.gz"
+            EXPECTED_SHA512="e5090658602abbe84f60d9c51e47032c9c78339cbdf37846ef310f1fbd0b1e5fd6e86e0de7216fe15a00667ddbb053ae29c2e3f1c298b2f1d88b73a241f0abbb"
+            ;;
+          linux_arm64_musl)
+            ARCHIVE_URL="${GCS_BASE}/linux-arm-musl/cli_linux_arm64_musl.tar.gz"
+            EXPECTED_SHA512="28cff66d31a31e2e938d16df2c618b7c70fe6642ceeb311517ac0e0381dc9a28de7a3308eabd230e9a4d3557182a4eedbd61bdba3c47ec346dd064f5a4cdf5e7"
+            ;;
+        esac
+
+        ARCHIVE_FILE="$AGY_ARCHIVE_DIR/agy.tar.gz"
+        if ! curl -fsSL --proto '=https' --tlsv1.2 "$ARCHIVE_URL" -o "$ARCHIVE_FILE"; then
+          echo "❌ Antigravity engine: failed to download release archive from $ARCHIVE_URL"
+          exit 1
+        fi
+
+        ACTUAL_SHA512="$(sha512sum "$ARCHIVE_FILE" | cut -d' ' -f1)"
+        if [[ "$ACTUAL_SHA512" != "$EXPECTED_SHA512" ]]; then
+          echo "❌ Antigravity engine: SHA-512 mismatch for $ARCHIVE_URL (got $ACTUAL_SHA512, expected $EXPECTED_SHA512). Refusing to extract."
+          rm -rf "$AGY_ARCHIVE_DIR"
+          exit 1
+        fi
+
+        tar -xzf "$ARCHIVE_FILE" -C "$AGY_ARCHIVE_DIR" antigravity
+        AGY_BIN="${AGY_ENGINE_WORK}-cli/agy"
+        mv "$AGY_ARCHIVE_DIR/antigravity" "$AGY_BIN"
+        chmod 0755 "$AGY_BIN"
+        rm -rf "$AGY_ARCHIVE_DIR"
+
+        [[ -x "$AGY_BIN" ]] || { echo "❌ Antigravity engine: extracted binary missing or not executable at $AGY_BIN"; exit 1; }
+
+        VERSION_OUT="$(
+          HOME="$AGY_ENGINE_HOME" \
+          XDG_CONFIG_HOME="$AGY_ENGINE_HOME/.config" \
+          XDG_DATA_HOME="$AGY_ENGINE_HOME/.local/share" \
+          XDG_CACHE_HOME="$AGY_ENGINE_HOME/.cache" \
+          AGY_CLI_DISABLE_AUTO_UPDATE="true" \
+            "$AGY_BIN" --version 2>&1 || true
+        )"
+        INSTALLED_VERSION="$(printf '%s' "$VERSION_OUT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | awk 'NR==1' || true)"
+        if [[ -z "$INSTALLED_VERSION" || "$INSTALLED_VERSION" != "$CLI_VERSION" ]]; then
+          echo "❌ Antigravity engine: binary reported '${VERSION_OUT:-<empty>}' (parsed '${INSTALLED_VERSION:-<none>}'), expected $CLI_VERSION."
+          exit 1
+        fi
+        echo "✅ Antigravity engine: Antigravity CLI $CLI_VERSION verified by SHA-512 and installed (auto-update disabled)"
+
+    - name: Configure review CLI (Antigravity CLI)
+      id: configure
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        AGY_ENGINE_HOME: ${{ runner.temp }}/antigravity-engine-home
+        AGY_ENGINE_WORK: ${{ runner.temp }}/antigravity-engine-bin
+        GUARD_DIR: ${{ runner.temp }}/antigravity-path-guard
+        OUTPUT_PATH: ${{ inputs.output_path }}
+        CONTEXT_PATH: ${{ inputs.review_context_path }}
+        DIFF_PATH: ${{ inputs.pr_diff_path }}
+        MODEL: ${{ inputs.model }}
+        INPUT_BASE_URL: ${{ inputs.base_url }}
+      run: |
+        # Output must resolve under /tmp so a caller cannot point it into the
+        # checked-out tree.
+        OUTPUT_REAL="$(realpath -m -- "$OUTPUT_PATH")"
+        case "$OUTPUT_REAL" in
+          /tmp/*) ;;
+          *)
+            echo "❌ Antigravity engine: output_path must resolve under /tmp: $OUTPUT_PATH (resolves to $OUTPUT_REAL)"
+            exit 1
+            ;;
+        esac
+
+        # Isolated HOME holds `settings.json` and `hooks.json` and must sit
+        # outside `/tmp`, `/var/tmp`, `$TMPDIR`, and the PR checkout.
+        HOME_REAL="$(realpath -m -- "$AGY_ENGINE_HOME")"
+        WS_REAL="$(realpath -m -- "$GITHUB_WORKSPACE")"
+        case "$HOME_REAL/" in
+          /tmp/*|/var/tmp/*|"$WS_REAL"/*)
+            echo "❌ Antigravity engine: AGY_ENGINE_HOME ($HOME_REAL) is inside /tmp or the checkout; refusing to place CLI config there."
+            exit 1
+            ;;
+        esac
+        if [[ -n "${TMPDIR:-}" ]] && [[ "$HOME_REAL/" == "$(realpath -m -- "$TMPDIR")"/* ]]; then
+          echo "❌ Antigravity engine: AGY_ENGINE_HOME ($HOME_REAL) is inside \$TMPDIR; refusing to place CLI config there."
+          exit 1
+        fi
+
+        # Strip trailing `/`, `/v1beta`, and `/v1`: `agy` appends
+        # `/v1beta/models/<model>:streamGenerateContent` to
+        # `GOOGLE_GEMINI_BASE_URL` itself.
+        BASE_URL="${INPUT_BASE_URL%/}"
+        BASE_URL="${BASE_URL%/v1beta}"
+        BASE_URL="${BASE_URL%/v1}"
+        BASE_URL="${BASE_URL%/}"
+
+        model_re='^[A-Za-z0-9._:/@-]+$'
+        base_url_re='^https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$'
+        if [[ ! $MODEL =~ $model_re ]]; then
+          echo "❌ Antigravity engine: model contains characters not allowed in a model id: '$MODEL'"
+          exit 1
+        fi
+        if [[ ! $BASE_URL =~ $base_url_re ]]; then
+          echo "❌ Antigravity engine: base_url must be an http(s) URL with no quotes, backslashes or whitespace: '$BASE_URL'"
+          exit 1
+        fi
+
+        # 1. Install and syntax-check the shared PreToolUse path guard outside
+        #    the checkout (`--cli=antigravity` mode).
+        rm -rf "$GUARD_DIR"
+        mkdir -p "$GUARD_DIR"
+        GUARD_JS="$GUARD_DIR/path-guard.js"
+        cp "$ACTION_PATH/../ai_review_path_guard/path-guard.js" "$GUARD_JS"
+        chmod 0444 "$GUARD_JS"
+        node --check "$GUARD_JS"
+        GUARD_SHA256="$(sha256sum "$GUARD_JS" | cut -d' ' -f1)"
+
+        # 2. Build `settings.json`. Include both raw and canonical paths for
+        #    `CONTEXT_PATH` and `DIFF_PATH` in `permissions.allow` because `agy`
+        #    canonicalises target paths before matching allow-rules when
+        #    `allowNonWorkspaceAccess` is `false`.
+        CONTEXT_REAL="$(realpath -m -- "$CONTEXT_PATH")"
+        DIFF_REAL="$(realpath -m -- "$DIFF_PATH")"
+        SETTINGS_DIR="$AGY_ENGINE_HOME/.gemini/antigravity-cli"
+        HOOKS_DIR="$AGY_ENGINE_HOME/.gemini/config"
+        mkdir -p "$SETTINGS_DIR" "$HOOKS_DIR"
+
+        jq -n \
+          --arg model "$MODEL" \
+          --arg ctx_raw "$CONTEXT_PATH" \
+          --arg ctx_real "$CONTEXT_REAL" \
+          --arg diff_raw "$DIFF_PATH" \
+          --arg diff_real "$DIFF_REAL" \
+          '{
+            modelProvider: "gemini",
+            allowNonWorkspaceAccess: false,
+            enableTerminalSandbox: true,
+            toolPermission: "request-review",
+            disableSlashCommands: true,
+            historySize: 0,
+            notifications: false,
+            showTips: false,
+            showFeedbackSurvey: false,
+            permissions: {
+              allow: (
+                [
+                  ("read_file(" + $ctx_raw + ")"),
+                  ("read_file(" + $ctx_real + ")"),
+                  ("read_file(" + $diff_raw + ")"),
+                  ("read_file(" + $diff_real + ")")
+                ] | unique
+              ),
+              deny: [
+                "command(*)",
+                "write_file(*)",
+                "read_file(.git/)",
+                "read_url(*)",
+                "execute_url(*)",
+                "mcp(*)"
+              ]
+            },
+            customModelsConfig: {
+              customModels: {
+                ($model): {
+                  modelName: ("gemini-api://" + $model),
+                  label: $model,
+                  maxTokens: 1048576,
+                  toolFormatterType: "TOOL_FORMATTER_TYPE_NONE"
+                }
+              }
+            }
+          }' > "$SETTINGS_DIR/settings.json"
+
+        # 3. Build `hooks.json`. Verified on `agy` 1.5.5 against a mock endpoint:
+        #    - `timeout: 30` is in seconds (`sleep 0.25` + `deny` at `timeout: 30`
+        #      completes and denies, matching `antigravity.google/docs/hooks.md`).
+        #    - Both non-zero exit (`command: "exit 2"` -> `JSON hook ... failed:
+        #      command failed: exit status 2`) and exceeding `timeout`
+        #      (`timeout: 1` + `sleep 2` -> `JSON hook ... failed: command
+        #      failed: signal: killed`) fail CLOSED.
+        #    - An exit-0 hook that prints nothing to stdout (`command: "true"`)
+        #      IS treated as ALLOW.
+        #    `HOOK_CMD` bounds `node` with `timeout 20` (defense-in-depth below
+        #    the 30s `hooks.json` ceiling so a hung guard still yields an
+        #    explicit JSON `deny` even if future `agy` timeout semantics change)
+        #    and emits JSON `deny` unless stdout contains `"decision":"allow"`
+        #    or `"decision":"deny"`.
+        HOOK_CMD="out=\$(timeout 20 node '${GUARD_JS}' --cli=antigravity 2>/dev/null) || out=''; case \"\$out\" in *'\"decision\":\"allow\"'*|*'\"decision\":\"deny\"'*) printf '%s\n' \"\$out\" ;; *) printf '%s\n' '{\"decision\":\"deny\",\"reason\":\"path guard failed to emit a valid decision\"}' ;; esac"
+        jq -n \
+          --arg cmd "$HOOK_CMD" \
+          '{
+            "ai-review-path-guard": {
+              PreToolUse: [
+                {
+                  matcher: "*",
+                  hooks: [
+                    {
+                      type: "command",
+                      command: $cmd,
+                      timeout: 30
+                    }
+                  ]
+                }
+              ]
+            }
+          }' > "$HOOKS_DIR/hooks.json"
+
+        # Keep read-only pristine copies (`agy` normalises `settings.json` on
+        # startup, dropping default-valued keys; restoring from pristine before
+        # each attempt guarantees identical settings across retries).
+        SETTINGS_PRISTINE="$AGY_ENGINE_WORK/settings.json.pristine"
+        HOOKS_PRISTINE="$AGY_ENGINE_WORK/hooks.json.pristine"
+        mkdir -p "$AGY_ENGINE_WORK"
+        rm -f "$SETTINGS_PRISTINE" "$HOOKS_PRISTINE"
+        install -m 0444 "$SETTINGS_DIR/settings.json" "$SETTINGS_PRISTINE"
+        install -m 0444 "$HOOKS_DIR/hooks.json" "$HOOKS_PRISTINE"
+
+        SETTINGS_SHA256="$(sha256sum "$SETTINGS_PRISTINE" | cut -d' ' -f1)"
+        HOOKS_SHA256="$(sha256sum "$HOOKS_PRISTINE" | cut -d' ' -f1)"
+
+        echo "🔧 Antigravity engine | model=$MODEL | base_url=$BASE_URL"
+        {
+          echo "base_url=$BASE_URL"
+          echo "model=$MODEL"
+          echo "guard_sha256=$GUARD_SHA256"
+          echo "settings_sha256=$SETTINGS_SHA256"
+          echo "hooks_sha256=$HOOKS_SHA256"
+        } >> "$GITHUB_OUTPUT"
+        echo "✅ Antigravity engine: settings, hooks, and shared PreToolUse path guard configured (home=$AGY_ENGINE_HOME)"
+
+    - name: Run AI PR review (Antigravity CLI)
+      id: run
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        AGY_ENGINE_HOME: ${{ runner.temp }}/antigravity-engine-home
+        AGY_BIN: ${{ runner.temp }}/antigravity-engine-bin-cli/agy
+        # Credentials stay in process env only (`GEMINI_API_KEY` + `modelProvider: "gemini"`
+        # is what `agy` reads) and are never written to disk.
+        GEMINI_API_KEY: ${{ inputs.api_key }}
+        GOOGLE_GEMINI_BASE_URL: ${{ steps.configure.outputs.base_url }}
+        AGY_CLI_DISABLE_AUTO_UPDATE: "true"
+        AGY_CLI_HIDE_LOGO: "1"
+        AGY_CLI_OSC7501: "off"
+        CI: "1"
+        CONTEXT_PATH: ${{ inputs.review_context_path }}
+        DIFF_PATH: ${{ inputs.pr_diff_path }}
+        OUTPUT_PATH: ${{ inputs.output_path }}
+        MODEL: ${{ steps.configure.outputs.model }}
+        ANTIGRAVITY_EFFORT: ${{ inputs.antigravity_effort }}
+        STRIP_SCRIPT: ${{ runner.temp }}/antigravity-engine-bin/strip-agent-config.sh
+        STRIP_SHA256: ${{ steps.strip.outputs.strip_sha256 }}
+        GUARD_JS: ${{ runner.temp }}/antigravity-path-guard/path-guard.js
+        GUARD_SHA256: ${{ steps.configure.outputs.guard_sha256 }}
+        PATH_GUARD_LOG: ${{ runner.temp }}/antigravity-path-guard/decisions.log
+        SETTINGS_PRISTINE: ${{ runner.temp }}/antigravity-engine-bin/settings.json.pristine
+        SETTINGS_SHA256: ${{ steps.configure.outputs.settings_sha256 }}
+        HOOKS_PRISTINE: ${{ runner.temp }}/antigravity-engine-bin/hooks.json.pristine
+        HOOKS_SHA256: ${{ steps.configure.outputs.hooks_sha256 }}
+        STAGE_JSON: ${{ runner.temp }}/antigravity-engine-bin/review-output.json
+        STAGE_TEXT: ${{ runner.temp }}/antigravity-engine-bin/review-stdout.txt
+        CLI_LOG: ${{ runner.temp }}/antigravity-engine-bin/cli.log
+        AGY_DIAG_LOG: ${{ runner.temp }}/antigravity-engine-bin/agy-diag.log
+      run: |
+        [[ -s "$CONTEXT_PATH" ]] || { echo "❌ Antigravity engine: missing or empty review context at $CONTEXT_PATH"; exit 1; }
+        [[ -s "$DIFF_PATH"    ]] || { echo "❌ Antigravity engine: missing or empty PR diff at $DIFF_PATH"; exit 1; }
+        [[ -x "$AGY_BIN"      ]] || { echo "❌ Antigravity engine: agy binary missing at $AGY_BIN (install step did not run?)"; exit 1; }
+
+        # Dual-validate `antigravity_effort` here as well as in the orchestrator
+        # because composite actions can be called directly at `@master`.
+        # Verified on `agy` 1.5.5: omitting `--effort` on a `customModelsConfig`
+        # entry sends `thinkingBudget: -1`, which Gemini 4 Carbon rejects with
+        # HTTP 400 (`thinking_budget` is unsupported on Gemini 4). Defaulting an
+        # empty knob to `medium` sends `thinkingLevel: "MEDIUM"` on the wire,
+        # matching Gemini 4 Carbon's documented default.
+        EFFECTIVE_EFFORT="medium"
+        if [[ -n "$ANTIGRAVITY_EFFORT" ]]; then
+          case "$ANTIGRAVITY_EFFORT" in
+            low|medium|high) ;;
+            *)
+              echo "❌ Antigravity engine: antigravity_effort must be one of low|medium|high (or empty), got '$ANTIGRAVITY_EFFORT'"
+              exit 1
+              ;;
+          esac
+          EFFECTIVE_EFFORT="$ANTIGRAVITY_EFFORT"
+          echo "🔧 Antigravity engine | antigravity_effort=$ANTIGRAVITY_EFFORT"
+        fi
+        EFFORT_ARGS=(--effort "$EFFECTIVE_EFFORT")
+
+        echo "🔧 Antigravity engine | model=$MODEL | effective_effort=$EFFECTIVE_EFFORT | agy_home=$AGY_ENGINE_HOME"
+
+        # Quoted heredoc: Actions substitutes `inputs.*` before bash parses the
+        # script, so no shell expansion happens in the prompt body. Do NOT place
+        # an empty Actions expression pair anywhere in this `run:` block.
+        cat > /tmp/review_prompt.txt <<'EOF'
+        REPO: ${{ inputs.repository }}
+        PR NUMBER: ${{ inputs.pr_number }}
+
+        Read ${{ inputs.review_context_path }} and follow it exactly. It
+        contains the full review instructions, PR context, previous review
+        (if any), acknowledged suggestions to skip, and the required output
+        format — plus a "Review Procedure" section telling you what else to
+        read, including the pre-fetched PR diff at ${{ inputs.pr_diff_path }}.
+        Files may be longer than one read window: keep reading with StartLine /
+        EndLine or ByteOffset until you reach the end. You have no network
+        access, no shell tool, and no write tool; everything you need is on
+        disk.
+
+        ONE DELIVERY OVERRIDE: the context's procedure tells you to write the
+        review to ${{ inputs.output_path }} with a Write tool. You have no
+        write tool in this engine, and you must NOT create Antigravity
+        artifacts. Instead, print the complete review as your final reply —
+        the caller captures your reply as the review. Do not wrap file paths in
+        `file://` links (use plain repo-relative `path:line` references), and
+        do not add a title, a **Model:** line, an **Effort:** line, or HTML
+        comments; start with the Summary section, exactly as the context's
+        output format requires. An analysis that is not your final reply is
+        lost and the job fails.
+        EOF
+
+        dump_agy_log() {
+          set +e +o pipefail
+          bytes_of() { wc -c < "$1" 2>/dev/null | tr -d '[:space:]' || echo '?'; }
+
+          echo "ℹ️  config: model=$MODEL base_url=$GOOGLE_GEMINI_BASE_URL effective_effort=$EFFECTIVE_EFFORT agy_home=$AGY_ENGINE_HOME"
+          echo "ℹ️  input bytes: context=$(bytes_of "$CONTEXT_PATH") diff=$(bytes_of "$DIFF_PATH") prompt=$(bytes_of /tmp/review_prompt.txt)"
+          if [[ -s "$STAGE_TEXT" ]]; then
+            echo "ℹ️  review text: PRESENT in staging ($(bytes_of "$STAGE_TEXT") bytes)"
+          else
+            echo "ℹ️  review text: ABSENT in staging"
+          fi
+          if [[ -s "$STAGE_JSON" ]]; then
+            STOP_TOKEN="agy-json-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+            echo "--- JSON envelope metadata ---"
+            echo "::stop-commands::$STOP_TOKEN"
+            jq -c '{status, finished_reason, error, denied_actions, num_turns, duration_seconds, usage}' "$STAGE_JSON" 2>/dev/null || head -c 1000 "$STAGE_JSON"
+            echo ""
+            echo "::$STOP_TOKEN::"
+          fi
+          for log_file in "$CLI_LOG" "$AGY_DIAG_LOG"; do
+            if [[ -s "$log_file" ]]; then
+              STOP_TOKEN="agy-log-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+              lines=$(wc -l < "$log_file" | tr -d '[:space:]')
+              echo "--- $log_file (last 100 of $lines lines) ---"
+              echo "::stop-commands::$STOP_TOKEN"
+              tail -n 100 "$log_file"
+              echo "::$STOP_TOKEN::"
+            fi
+          done
+          echo "ℹ️  Troubleshooting: a 404 or 400 on the first model call means LiteLLM is not"
+          echo "    serving the Gemini /v1beta/models/<model>:streamGenerateContent endpoint for"
+          echo "    '$MODEL' yet, or the virtual key is not authorised for that alias."
+        }
+
+        review_file_ok() {
+          [[ -e "$OUTPUT_PATH" || -L "$OUTPUT_PATH" ]] || return 1
+          if [[ -L "$OUTPUT_PATH" || ! -f "$OUTPUT_PATH" ]]; then
+            echo "❌ Antigravity engine: $OUTPUT_PATH is not a regular file (symlink or special file). Refusing it."
+            exit 1
+          fi
+          if [[ "$(stat -c %h -- "$OUTPUT_PATH")" -ne 1 ]]; then
+            echo "❌ Antigravity engine: $OUTPUT_PATH has more than one hard link. Refusing it."
+            exit 1
+          fi
+          case "$(realpath -e -- "$OUTPUT_PATH")" in
+            /tmp/*) ;;
+            *) echo "❌ Antigravity engine: $OUTPUT_PATH no longer resolves under /tmp. Refusing it."; exit 1 ;;
+          esac
+          [[ -s "$OUTPUT_PATH" ]]
+        }
+
+        pre_attempt_guard() {
+          [[ -n "$STRIP_SHA256" && -n "$GUARD_SHA256" && -n "$SETTINGS_SHA256" && -n "$HOOKS_SHA256" ]] || {
+            echo "❌ Antigravity engine: strip/configure step outputs missing"
+            exit 1
+          }
+          if [[ "$(sha256sum "$STRIP_SCRIPT" | cut -d' ' -f1)" != "$STRIP_SHA256" ]]; then
+            echo "❌ Antigravity engine: strip script changed since the strip step. Refusing to start the CLI."
+            exit 1
+          fi
+          bash -euo pipefail "$STRIP_SCRIPT"
+
+          if [[ "$(sha256sum "$GUARD_JS" | cut -d' ' -f1)" != "$GUARD_SHA256" ]]; then
+            echo "❌ Antigravity engine: path guard script changed since the configure step. Refusing to start the CLI."
+            exit 1
+          fi
+          if [[ "$(sha256sum "$SETTINGS_PRISTINE" | cut -d' ' -f1)" != "$SETTINGS_SHA256" ]]; then
+            echo "❌ Antigravity engine: pristine settings.json changed since the configure step. Refusing to start the CLI."
+            exit 1
+          fi
+          if [[ "$(sha256sum "$HOOKS_PRISTINE" | cut -d' ' -f1)" != "$HOOKS_SHA256" ]]; then
+            echo "❌ Antigravity engine: pristine hooks.json changed since the configure step. Refusing to start the CLI."
+            exit 1
+          fi
+
+          mkdir -p "$AGY_ENGINE_HOME/.gemini/antigravity-cli" "$AGY_ENGINE_HOME/.gemini/config"
+          install -m 0600 "$SETTINGS_PRISTINE" "$AGY_ENGINE_HOME/.gemini/antigravity-cli/settings.json"
+          install -m 0600 "$HOOKS_PRISTINE" "$AGY_ENGINE_HOME/.gemini/config/hooks.json"
+
+          if [[ "$(sha256sum "$AGY_ENGINE_HOME/.gemini/antigravity-cli/settings.json" | cut -d' ' -f1)" != "$SETTINGS_SHA256" ]]; then
+            echo "❌ Antigravity engine: restored settings.json hash mismatch. Refusing to start the CLI."
+            exit 1
+          fi
+          if [[ "$(sha256sum "$AGY_ENGINE_HOME/.gemini/config/hooks.json" | cut -d' ' -f1)" != "$HOOKS_SHA256" ]]; then
+            echo "❌ Antigravity engine: restored hooks.json hash mismatch. Refusing to start the CLI."
+            exit 1
+          fi
+
+          # Reset per attempt so the post-run check proves the producing attempt
+          # itself invoked the PreToolUse path guard.
+          : > "$PATH_GUARD_LOG"
+          : > "$STAGE_JSON"
+          : > "$STAGE_TEXT"
+          : > "$CLI_LOG"
+          : > "$AGY_DIAG_LOG"
+        }
+
+        rm -f "$OUTPUT_PATH"
+        REVIEW_PROMPT="$(cat /tmp/review_prompt.txt)"
+        ATTEMPT_REASON="not started"
+
+        for attempt in 1 2; do
+          pre_attempt_guard
+          ATTEMPT_REASON=""
+
+          HOME="$AGY_ENGINE_HOME" \
+          XDG_CONFIG_HOME="$AGY_ENGINE_HOME/.config" \
+          XDG_DATA_HOME="$AGY_ENGINE_HOME/.local/share" \
+          XDG_CACHE_HOME="$AGY_ENGINE_HOME/.cache" \
+          "$AGY_BIN" -p "$REVIEW_PROMPT" \
+            --model "$MODEL" \
+            "${EFFORT_ARGS[@]}" \
+            --output-format json \
+            --disable-slash-commands \
+            --print-timeout 25m \
+            --log-file "$AGY_DIAG_LOG" \
+            > "$STAGE_JSON" 2> "$CLI_LOG" < /dev/null && AGY_STATUS=0 || AGY_STATUS=$?
+
+          if [[ -s "$STAGE_JSON" ]] \
+             && jq -e 'type == "object" and .status == "SUCCESS" and ((.finished_reason // "") == "") and ((.response // "") | type == "string" and length > 0)' "$STAGE_JSON" >/dev/null 2>&1; then
+            jq -r '.response' "$STAGE_JSON" > "$STAGE_TEXT"
+            if [[ -s "$STAGE_TEXT" ]]; then
+              cp -- "$STAGE_TEXT" "$OUTPUT_PATH"
+              if review_file_ok; then
+                if [[ "$AGY_STATUS" -ne 0 ]]; then
+                  echo "⚠️  Antigravity engine: CLI exited $AGY_STATUS AFTER producing a complete SUCCESS envelope — keeping the review and continuing."
+                  ( dump_agy_log ) || true
+                fi
+                break
+              fi
+              rm -f "$OUTPUT_PATH"
+              ATTEMPT_REASON="staged response failed output_path regular-file check"
+            else
+              ATTEMPT_REASON="JSON envelope response extracted as zero bytes"
+            fi
+          else
+            ATTEMPT_REASON="CLI exited $AGY_STATUS without a complete SUCCESS JSON envelope"
+          fi
+
+          if [[ "$attempt" -eq 1 ]]; then
+            echo "⚠️  Antigravity engine: attempt 1 rejected ($ATTEMPT_REASON) — retrying once."
+            ( dump_agy_log ) || true
+            echo "🔁 Antigravity engine: attempt 2 of 2"
+          fi
+        done
+
+        if ! review_file_ok; then
+          echo "❌ Antigravity engine: no review written to $OUTPUT_PATH after 2 attempts (last failure: $ATTEMPT_REASON; last CLI exit: ${AGY_STATUS:-unknown})"
+          ( dump_agy_log ) || true
+          exit 1
+        fi
+
+        # Neither review_context_path nor pr_diff_path is inline in the prompt,
+        # so any genuine review run made at least one `read_file` call during
+        # the producing attempt, which must have fired the match-all PreToolUse
+        # hook. Fail closed if a review was produced while the log is empty, so
+        # an unconfined or unread reply is never handed to the caller.
+        if [[ ! -s "$PATH_GUARD_LOG" ]]; then
+          echo "❌ Antigravity engine: the review was produced but the path guard never ran (no decisions logged at $PATH_GUARD_LOG)."
+          echo "   The PreToolUse hook in hooks.json is a required confinement boundary; refusing to hand an unconfined or unread review to the caller."
+          rm -f -- "$OUTPUT_PATH"
+          exit 1
+        fi
+
+        echo "✅ Antigravity engine: path guard handled $(wc -l < "$PATH_GUARD_LOG" | tr -d ' ') tool call(s), $(grep -c '^deny' "$PATH_GUARD_LOG" || true) denied"
+        echo "✅ Antigravity engine: review written ($(wc -c < "$OUTPUT_PATH") bytes)"
+        echo "output_path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"
