@@ -1,0 +1,24 @@
+name: Antigravity Engine Round 2 Smoke (throwaway)
+
+# Throwaway caller re-verifying engine: antigravity at de80fd5 (timeout 20
+# hook wrapper + updated shared path-guard.js + Linux-only archive pin)
+# against live LiteLLM using gemini-4-argon. Not for merge.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  ai-review:
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@smoke/antigravity-r2-base
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    with:
+      engine: antigravity
+      model: gemini-4-argon
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+      AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
