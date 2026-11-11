@@ -52,11 +52,18 @@ description: >
 #         directory fails with `path is a directory, not a file`). The guard
 #         allows only `read_file` inside `GITHUB_WORKSPACE` (minus `.git/`) or
 #         on `CONTEXT_PATH` / `DIFF_PATH`, denies every other tool, and logs
-#         every decision to `PATH_GUARD_LOG`. Because `agy` 1.5.5 treats an
-#         exit-0 hook with empty stdout as allow, the `hooks.json` shell
-#         wrapper validates that stdout contains `"decision":"allow"` or
-#         `"decision":"deny"` and emits a JSON `deny` otherwise. After the run,
-#         an empty `PATH_GUARD_LOG` fails the job closed.
+#         every decision to `PATH_GUARD_LOG`. Verified on `agy` 1.5.5:
+#         `hooks.json` `timeout: 30` is in seconds (`sleep 0.25` + `deny` at
+#         `timeout: 30` completes and blocks with `tool call denied by pre-tool
+#         hook`, matching `antigravity.google/docs/hooks.md`), and exceeding
+#         `timeout` fails closed (`timeout: 1` + `sleep 2` kills the hook and
+#         blocks with `JSON hook ... failed: command failed: signal: killed`).
+#         However, `agy` 1.5.5 DOES treat an exit-0 hook with empty stdout as
+#         allow, so the `hooks.json` shell wrapper bounds `node` with
+#         `timeout 20` (defense-in-depth below the 30s hook ceiling) and emits
+#         JSON `deny` unless stdout contains `"decision":"allow"` or
+#         `"decision":"deny"`. After the run, an empty `PATH_GUARD_LOG` fails
+#         the job closed.
 #   3. Isolated home and pristine config restoration. Every `agy` invocation
 #      runs with `HOME` and `XDG_*` under `runner.temp/antigravity-engine-home`
 #      (outside `/tmp` and the checkout); the runner's real `$HOME` is never
@@ -212,6 +219,10 @@ runs:
           "$AGY_ENGINE_WORK/cli.log" "$AGY_ENGINE_WORK/agy-diag.log"
         mkdir -p "$AGY_ENGINE_HOME" "${AGY_ENGINE_WORK}-cli" "$AGY_ARCHIVE_DIR"
 
+        # Linux-only, matching every other review engine in this repository
+        # (jobs run on the Linux `github_claude_code_reviewer` runner group,
+        # and later steps rely on GNU coreutils `realpath -m` / `sha256sum` /
+        # `stat -c`).
         os_name="$(uname -s)"
         arch_name="$(uname -m)"
         platform_key=""
@@ -230,14 +241,8 @@ runs:
               platform_key="linux_arm64"
             fi
             ;;
-          Darwin:arm64|Darwin:aarch64)
-            platform_key="darwin_arm64"
-            ;;
-          Darwin:x86_64|Darwin:amd64)
-            platform_key="darwin_amd64"
-            ;;
           *)
-            echo "❌ Antigravity engine: unsupported runner platform ${os_name}/${arch_name}"
+            echo "❌ Antigravity engine: unsupported runner platform ${os_name}/${arch_name} (Linux x86_64/arm64 required)"
             exit 1
             ;;
         esac
@@ -260,14 +265,6 @@ runs:
             ARCHIVE_URL="${GCS_BASE}/linux-arm-musl/cli_linux_arm64_musl.tar.gz"
             EXPECTED_SHA512="28cff66d31a31e2e938d16df2c618b7c70fe6642ceeb311517ac0e0381dc9a28de7a3308eabd230e9a4d3557182a4eedbd61bdba3c47ec346dd064f5a4cdf5e7"
             ;;
-          darwin_arm64)
-            ARCHIVE_URL="${GCS_BASE}/darwin-arm/cli_mac_arm64.tar.gz"
-            EXPECTED_SHA512="ca6424867a4527698e54b805c2456605b905a49ffc9b664ae2ee0fd4510fcd7b82d9721b2622a1d46048156a44431dc894359177fae44207363c8c878687b647"
-            ;;
-          darwin_amd64)
-            ARCHIVE_URL="${GCS_BASE}/darwin-x64/cli_mac_x64.tar.gz"
-            EXPECTED_SHA512="54bbe42eee81d75d746ed560995bfa7cc9d14c601b4b1a3756f5e9c0f2b79ffb9ca64894368e326e211445de2075cf54ecaecb0c26ad79d231ed819feba3618d"
-            ;;
         esac
 
         ARCHIVE_FILE="$AGY_ARCHIVE_DIR/agy.tar.gz"
@@ -276,11 +273,7 @@ runs:
           exit 1
         fi
 
-        if command -v sha512sum >/dev/null 2>&1; then
-          ACTUAL_SHA512="$(sha512sum "$ARCHIVE_FILE" | cut -d' ' -f1)"
-        else
-          ACTUAL_SHA512="$(shasum -a 512 "$ARCHIVE_FILE" | cut -d' ' -f1)"
-        fi
+        ACTUAL_SHA512="$(sha512sum "$ARCHIVE_FILE" | cut -d' ' -f1)"
         if [[ "$ACTUAL_SHA512" != "$EXPECTED_SHA512" ]]; then
           echo "❌ Antigravity engine: SHA-512 mismatch for $ARCHIVE_URL (got $ACTUAL_SHA512, expected $EXPECTED_SHA512). Refusing to extract."
           rm -rf "$AGY_ARCHIVE_DIR"
@@ -435,11 +428,19 @@ runs:
             }
           }' > "$SETTINGS_DIR/settings.json"
 
-        # 3. Build `hooks.json`. Verified on `agy` 1.5.5: an exit-0 hook that
-        #    prints nothing to stdout is treated as ALLOW, so the wrapper
-        #    captures stdout and emits JSON `deny` unless the guard printed an
-        #    explicit `"decision":"allow"` or `"decision":"deny"` object.
-        HOOK_CMD="out=\$(node '${GUARD_JS}' --cli=antigravity 2>/dev/null) || out=''; case \"\$out\" in *'\"decision\":\"allow\"'*|*'\"decision\":\"deny\"'*) printf '%s\n' \"\$out\" ;; *) printf '%s\n' '{\"decision\":\"deny\",\"reason\":\"path guard failed to emit a valid decision\"}' ;; esac"
+        # 3. Build `hooks.json`. Verified on `agy` 1.5.5 against a mock endpoint:
+        #    - `timeout: 30` is in seconds (`sleep 0.25` + `deny` at `timeout: 30`
+        #      completes and denies, matching `antigravity.google/docs/hooks.md`),
+        #      and a hook killed at `timeout` fails CLOSED (`timeout: 1` +
+        #      `sleep 2` blocks with `JSON hook ... failed: command failed:
+        #      signal: killed`).
+        #    - An exit-0 hook that prints nothing to stdout IS treated as ALLOW.
+        #    `HOOK_CMD` bounds `node` with `timeout 20` (defense-in-depth below
+        #    the 30s `hooks.json` ceiling so a hung guard still yields an
+        #    explicit JSON `deny` even if future `agy` timeout semantics change)
+        #    and emits JSON `deny` unless stdout contains `"decision":"allow"`
+        #    or `"decision":"deny"`.
+        HOOK_CMD="out=\$(timeout 20 node '${GUARD_JS}' --cli=antigravity 2>/dev/null) || out=''; case \"\$out\" in *'\"decision\":\"allow\"'*|*'\"decision\":\"deny\"'*) printf '%s\n' \"\$out\" ;; *) printf '%s\n' '{\"decision\":\"deny\",\"reason\":\"path guard failed to emit a valid decision\"}' ;; esac"
         jq -n \
           --arg cmd "$HOOK_CMD" \
           '{
@@ -612,7 +613,7 @@ runs:
             echo "❌ Antigravity engine: $OUTPUT_PATH is not a regular file (symlink or special file). Refusing it."
             exit 1
           fi
-          if [[ "$(stat -c %h -- "$OUTPUT_PATH" 2>/dev/null || stat -f %l -- "$OUTPUT_PATH")" -ne 1 ]]; then
+          if [[ "$(stat -c %h -- "$OUTPUT_PATH")" -ne 1 ]]; then
             echo "❌ Antigravity engine: $OUTPUT_PATH has more than one hard link. Refusing it."
             exit 1
           fi

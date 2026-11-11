@@ -555,8 +555,10 @@ check 'grep -qE "^\| \`muse_reasoning_effort\`" "$README"' "README inputs table 
 check '[[ -f "$AGY" ]]' "antigravity engine action.yml is committed"
 check '[[ ! -e "$ROOT/.github/actions/ai_review_engine_antigravity/agy-path-guard.js" ]]' "antigravity uses the shared ai_review_path_guard script rather than a duplicate guard file"
 GUARD_NOCOMMENT="$(grep -vE '^[[:space:]]*//' "$GUARD")"
+AGY_GUARD_BRANCH="$(awk '/^if \(isAntigravity\) \{$/{f=1} f && !d{print} f && !d && /^\}$/{d=1}' <<< "$GUARD_NOCOMMENT")"
 check 'grep -qF -- "--cli=antigravity" <<< "$GUARD_NOCOMMENT"' "shared path guard implements --cli=antigravity mode"
-check 'grep -qF "if (tool !== '\''read_file'\'')" <<< "$GUARD_NOCOMMENT" && grep -qF "Only read_file is." <<< "$GUARD_NOCOMMENT"' "shared path guard in --cli=antigravity mode denies every tool other than read_file"
+check '[[ -n "$AGY_GUARD_BRANCH" ]] && grep -qF "if (tool !== '\''read_file'\'')" <<< "$AGY_GUARD_BRANCH" && grep -qF "Only read_file is." <<< "$AGY_GUARD_BRANCH"' "shared path guard isAntigravity branch denies every tool other than read_file"
+check '! grep -qF "let decided" <<< "$GUARD_NOCOMMENT" && ! awk "/^function (deny|allow)\\(/{f=1} f && /^}$/{f=0} f" <<< "$GUARD_NOCOMMENT" | grep -cE "^[[:space:]]*return([[:space:];]|$)" >/dev/null' "shared path guard deny() and allow() contain no return path"
 check 'grep -qF "fs.appendFileSync(logPath, decision +" <<< "$GUARD_NOCOMMENT"' "shared path guard appends decisions to PATH_GUARD_LOG in executable code"
 
 AGY_DEFAULT_MODEL="gemini-4-carbon"
@@ -594,7 +596,8 @@ ENUM_WF_AGY=$(grep -vE '^[[:space:]]*#' "$WF" | grep -oE '^ +low\|medium\|high\)
 ENUM_AGY=$(grep -vE '^[[:space:]]*#' "$AGY" | grep -oE '^ +low\|medium\|high\) ;;' | tr -d ' ;)' | sort -u)
 check '[[ "$ENUM_WF_AGY" == "low|medium|high" && "$ENUM_WF_AGY" == "$ENUM_AGY" ]]' "antigravity_effort case arms match in the orchestrator and the engine ($ENUM_WF_AGY)"
 AGY_TIER_CLAUSE="(the levels Gemini models support in Antigravity CLI and on the Gemini API; minimal and Claude-only higher tiers are rejected)"
-check 'grep -qF "low, medium, or high $AGY_TIER_CLAUSE" "$WF" && grep -qF "low, medium, or high $AGY_TIER_CLAUSE" "$AGY" && grep -qF "\`low\`, \`medium\`, or \`high\`" "$README"' "antigravity_effort descriptions use identical tier wording across workflow and engine"
+README_AGY_EFFORT_ROW="$(grep -E '^\| `antigravity_effort` \|' "$README")"
+check 'grep -qF "low, medium, or high $AGY_TIER_CLAUSE" "$WF" && grep -qF "low, medium, or high $AGY_TIER_CLAUSE" "$AGY" && grep -qF "\`low\`, \`medium\`, or \`high\`" <<< "$README_AGY_EFFORT_ROW"' "antigravity_effort descriptions use identical tier wording across workflow, engine and README row"
 
 AGY_EFFORT_BLOCK=$(step_body "Run AI PR review (Antigravity CLI)" "$AGY" | awk '/EFFECTIVE_EFFORT="medium"/{f=1} f && !d{print} f && !d && /^        EFFORT_ARGS=/{d=1}' | sed 's/^        //')
 agy_effort_eval() { ANTIGRAVITY_EFFORT="$1" bash -c "{ $AGY_EFFORT_BLOCK"$'\n''} >/dev/null 2>&1 && printf "%s" "${EFFORT_ARGS[*]}"' 2>/dev/null; }
@@ -615,6 +618,7 @@ AGY_RUN_CODE="$(step_body "Run AI PR review (Antigravity CLI)" "$AGY" | grep -vE
 check '! grep -cE "rm .*(\\\$HOME|~)/\\.gemini" <<< "$AGY_STRIP_CODE" >/dev/null' "antigravity strip step never deletes from the runner's real ~/.gemini"
 check '! grep -vE "^[[:space:]]*#" "$AGY" | grep -cE -- "--dangerously-skip-permissions|--remote-agent|--remote-control" >/dev/null' "antigravity engine never passes --dangerously-skip-permissions, --remote-agent or --remote-control"
 check '! grep -cF "install.sh" <<< "$AGY_INSTALL_CODE" >/dev/null' "antigravity install step never invokes floating install.sh"
+check '! grep -cE "Darwin|darwin_|shasum -a" <<< "$AGY_INSTALL_CODE" >/dev/null && ! grep -cF "stat -f" <<< "$AGY_RUN_CODE" >/dev/null' "antigravity install and run steps are Linux-only (no dead Darwin branches)"
 check 'grep -qxF "        PINNED_VERSION=\"${AGY_CLI_VERSION}\"" <<< "$AGY_INSTALL_CODE" && grep -qF "if [[ \"\$CLI_VERSION\" != \"\$PINNED_VERSION\" ]]; then" <<< "$AGY_INSTALL_CODE"' "antigravity install step rejects cli_version values that do not match PINNED_VERSION"
 check 'grep -qF "GCS_BASE=\"https://storage.googleapis.com/antigravity-public/antigravity-cli/\${PINNED_BUILD}\"" <<< "$AGY_INSTALL_CODE" && grep -qF -- "curl -fsSL --proto '\''=https'\'' --tlsv1.2 \"\$ARCHIVE_URL\" -o \"\$ARCHIVE_FILE\"" <<< "$AGY_INSTALL_CODE"' "antigravity install step downloads the pinned GCS archive over HTTPS/TLS1.2+"
 check 'awk '\''/if \[\[ "\$ACTUAL_SHA512" != "\$EXPECTED_SHA512" \]\]; then/{s=NR} /tar -xzf "\$ARCHIVE_FILE"/{t=NR} END{exit !(s && t && s < t)}'\'' <<< "$AGY_INSTALL_CODE"' "antigravity install step verifies committed SHA-512 before tar extraction"
@@ -637,13 +641,16 @@ check 'grep -qxF "                  modelName: (\"gemini-api://\" + \$model)," <
 check 'grep -qxF "              PreToolUse: [" <<< "$AGY_CONFIG_CODE" && grep -qxF "                  matcher: \"*\"," <<< "$AGY_CONFIG_CODE"' "antigravity configure step jq registers a match-all PreToolUse hook"
 
 # Behavioural: extract HOOK_CMD from the configure step and prove it fails closed
-# when node exits 0 with empty stdout, exits non-zero, or emits non-decision text,
-# while passing valid allow/deny JSON from the shared guard through unchanged.
+# when node exits 0 with empty stdout, exits non-zero, times out, or emits
+# non-decision text, while passing valid allow/deny JSON from the shared guard
+# through unchanged.
 AGY_HOOK_LINE="$(grep -E '^ +HOOK_CMD=' <<< "$AGY_CONFIG_CODE" | sed 's/^ *//')"
+check 'grep -qF "timeout 20 node" <<< "$AGY_HOOK_LINE" && grep -qxF "                      timeout: 30" <<< "$AGY_CONFIG_CODE"' "antigravity hook wrapper enforces a 20s deadline inside the 30s hooks.json ceiling"
 AGY_HOOK_TMP="$(mktemp -d)"
 printf '#!/usr/bin/env node\nprocess.exit(0);\n' > "$AGY_HOOK_TMP/silent0.js"
 printf '#!/usr/bin/env node\nprocess.exit(2);\n' > "$AGY_HOOK_TMP/crash2.js"
 printf '#!/usr/bin/env node\nprocess.stdout.write("hello\\n");\n' > "$AGY_HOOK_TMP/junk.js"
+printf '#!/usr/bin/env node\nsetTimeout(() => { process.stdout.write(JSON.stringify({decision:"allow"}) + "\\n"); }, 3000);\n' > "$AGY_HOOK_TMP/slow.js"
 mkdir -p "$AGY_HOOK_TMP/ws"
 printf 'ok\n' > "$AGY_HOOK_TMP/ws/f.txt"
 eval_agy_hook() {
@@ -654,9 +661,19 @@ eval_agy_hook() {
     GITHUB_WORKSPACE="$AGY_HOOK_TMP/ws" sh -c "$HOOK_CMD" <<< "$stdin_json"
   )
 }
+eval_agy_hook_short_timeout() {
+  local g="$1"
+  (
+    GUARD_JS="$g"
+    eval "$AGY_HOOK_LINE"
+    SHORT_CMD="${HOOK_CMD/timeout 20 /timeout 1 }"
+    [[ "$SHORT_CMD" != "$HOOK_CMD" ]] && GITHUB_WORKSPACE="$AGY_HOOK_TMP/ws" sh -c "$SHORT_CMD" <<< "{}"
+  )
+}
 check '[[ -n "$AGY_HOOK_LINE" ]] && [[ "$(eval_agy_hook "$AGY_HOOK_TMP/silent0.js" "{}" | jq -r .decision)" == "deny" ]]' "antigravity hook wrapper emits JSON deny when guard exits 0 with empty stdout"
 check '[[ "$(eval_agy_hook "$AGY_HOOK_TMP/crash2.js" "{}" | jq -r .decision)" == "deny" ]]' "antigravity hook wrapper emits JSON deny when guard exits non-zero"
 check '[[ "$(eval_agy_hook "$AGY_HOOK_TMP/junk.js" "{}" | jq -r .decision)" == "deny" ]]' "antigravity hook wrapper emits JSON deny when guard stdout is not a valid decision"
+check '[[ "$(eval_agy_hook_short_timeout "$AGY_HOOK_TMP/slow.js" | jq -r .decision)" == "deny" ]]' "antigravity hook wrapper emits JSON deny when guard exceeds its timeout deadline"
 check '[[ "$(eval_agy_hook "$GUARD" "{\"toolCall\":{\"name\":\"read_file\",\"args\":{\"Path\":\"f.txt\"}}}" | jq -r .decision)" == "allow" ]]' "antigravity hook wrapper passes allow JSON through from the shared guard"
 check '[[ "$(eval_agy_hook "$GUARD" "{\"toolCall\":{\"name\":\"run_command\",\"args\":{\"CommandLine\":\"id\"}}}" | jq -r .decision)" == "deny" ]]' "antigravity hook wrapper passes deny JSON through from the shared guard"
 rm -rf "$AGY_HOOK_TMP"

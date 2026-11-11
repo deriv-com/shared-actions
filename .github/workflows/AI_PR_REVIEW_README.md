@@ -137,13 +137,16 @@ assuming parity:
   in Kimi and Claude Code a hook only blocks on exit 2 and a call the matcher
   does not fire for is simply allowed, so a matcher listing four tool names
   would be silently switched off by a CLI bump that renamed one. The guard
-  requires only `node:` builtins and reads nothing from the checkout, because
-  the CLIs treat a hook that times out, cannot start, or (in `agy`) exits 0
-  with empty stdout as allow (hence `|| exit 2` in Kimi/Anthropic and the
-  stdout-validating wrapper in Antigravity). Every decision is appended to a
-  log outside the checkout, and each engine **fails the job if a review was
-  written while that log is empty** — a hook that never fired means the
-  plumbing changed and the model ran unconfined, and that review is not posted.
+  requires only `node:` builtins and reads nothing from the checkout: Kimi
+  and Claude Code treat a hook that times out or cannot start as allow (hence
+  `|| exit 2` in their hook commands), while `agy` 1.5.5 kills timed-out
+  hooks (`timeout` in seconds) and fails closed on non-zero exit or timeout
+  (`signal: killed`), treating only an exit-0 hook with empty stdout as allow
+  (hence the `timeout 20` + stdout-validating wrapper in Antigravity). Every
+  decision is appended to a log outside the checkout, and each engine **fails
+  the job if a review was written while that log is empty** — a hook that
+  never fired means the plumbing changed and the model ran unconfined, and
+  that review is not posted.
 - **Kimi** — Bash is absent from `[tools] enabled`, which is what removes it;
   the guard denies it independently. The guard is copied into `$HOME/.kimi-code`
   by the configure step. The `[[permission.rules]]` in the same config are **not
@@ -400,10 +403,12 @@ assuming parity:
   not a file`). The guard allows only `read_file` inside `GITHUB_WORKSPACE`
   (minus `.git/`) or on `CONTEXT_PATH` / `DIFF_PATH`, resolves symlinks
   first, denies every other tool, and logs every decision to
-  `PATH_GUARD_LOG`. Because `agy` 1.5.5 treats an exit-0 hook with empty
-  stdout as allow, the `hooks.json` wrapper validates that stdout contains
-  an explicit allow/deny JSON decision and emits JSON `deny` otherwise. If a
-  review was produced while `PATH_GUARD_LOG` is empty, the engine fails the
+  `PATH_GUARD_LOG`. Verified on `agy` 1.5.5: `hooks.json` `timeout: 30` is in
+  seconds and exceeding it fails closed (`signal: killed`), whereas an exit-0
+  hook with empty stdout is treated as allow; the `hooks.json` wrapper bounds
+  `node` with `timeout 20` (defense-in-depth below the 30s ceiling) and emits
+  JSON `deny` unless stdout contains an explicit allow/deny JSON decision. If
+  a review was produced while `PATH_GUARD_LOG` is empty, the engine fails the
   job closed and discards the output. Every `agy`
   invocation runs with an isolated `HOME` under `runner.temp` (the runner's
   real `~/.gemini` is untouched), and read-only pristine copies of
@@ -441,12 +446,13 @@ assuming parity:
   `antigravity_effort` explicitly passes `--effort medium` (`thinkingLevel:
   "MEDIUM"` on the wire). The other engines ignore the input.
 
-Changing either CLI's hook registration (the Kimi `[[hooks]]` block, the
-Anthropic `settings` JSON) or the guard's argument contract needs a
-verification run: a hook that stops firing is invisible until the
-empty-decision-log check fails the job, and a hook that fires but denies
-legitimate calls means the engine reviews and writes nothing. Do not "fix"
-either blind; the tests cover the guard's decisions, not the CLI's plumbing.
+Changing any CLI's hook registration (the Kimi `[[hooks]]` block, the
+Anthropic `settings` JSON, the Antigravity `hooks.json`) or the guard's
+argument contract needs a verification run: a hook that stops firing is
+invisible until the empty-decision-log check fails the job, and a hook that
+fires but denies legitimate calls means the engine reviews and writes nothing.
+Do not "fix" any of them blind; the tests cover the guard's decisions, not the
+CLI's plumbing.
 
 **Post-step guards, engine-neutral:** whatever the engine, the caller refuses to
 post a review containing the `LLM_API_KEY` value (Actions masks secrets in logs,
