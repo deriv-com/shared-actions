@@ -1,0 +1,23 @@
+name: Antigravity Gemini 4 Carbon Smoke (throwaway)
+
+# Throwaway caller smoke-testing engine: antigravity at 29ac485 against live
+# LiteLLM with its real default model (`gemini-4-carbon`, model input omitted)
+# and empty antigravity_effort (`medium` default). Not for merge.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  ai-review:
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@smoke/antigravity-carbon-base
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    with:
+      engine: antigravity
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+      AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
