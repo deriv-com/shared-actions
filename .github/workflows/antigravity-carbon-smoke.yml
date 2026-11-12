@@ -1,23 +1,55 @@
 name: Antigravity Gemini 4 Carbon Smoke (throwaway)
 
-# Throwaway caller smoke-testing engine: antigravity at 29ac485 against live
-# LiteLLM with its real default model (`gemini-4-carbon`, model input omitted)
-# and empty antigravity_effort (`medium` default). Not for merge.
-
 on:
   pull_request:
     types: [opened, synchronize, reopened]
 
 jobs:
-  ai-review:
-    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@smoke/antigravity-carbon-base
+  diagnose-litellm:
+    runs-on:
+      group: github_claude_code_reviewer
     permissions:
       contents: read
-      pull-requests: write
-      issues: write
-    with:
-      engine: antigravity
-    secrets:
-      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-      AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
-      AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
+    env:
+      API_KEY: ${{ secrets.LLM_API_KEY }}
+    steps:
+      - name: Probe LiteLLM Gemini models and streamGenerateContent payloads
+        run: |
+          set -euo pipefail
+          BASE="https://litellmsa.deriv.ai"
+
+          echo "=== 1. /v1/models matching gemini ==="
+          curl -sS "$BASE/v1/models" -H "Authorization: Bearer $API_KEY" \
+            | jq -r '.data[]?.id // empty' | sort | grep -iE 'gemini|carbon|argon' || echo "(no matching models)"
+
+          probe() {
+            local label="$1" url="$2" auth_mode="$3" payload="$4"
+            local code
+            if [[ "$auth_mode" == "xgoog" ]]; then
+              code=$(curl -sS -o /tmp/probe_out.txt -w "%{http_code}" -X POST "$url" \
+                -H "Content-Type: application/json" -H "x-goog-api-key: $API_KEY" -d "$payload")
+            else
+              code=$(curl -sS -o /tmp/probe_out.txt -w "%{http_code}" -X POST "$url" \
+                -H "Content-Type: application/json" -H "Authorization: Bearer $API_KEY" -d "$payload")
+            fi
+            echo "--- [$label] HTTP $code ---"
+            head -c 600 /tmp/probe_out.txt; echo ""
+          }
+
+          probe "chat/completions gemini-4-carbon" "$BASE/v1/chat/completions" "bearer" \
+            '{"model":"gemini-4-carbon","messages":[{"role":"user","content":"Reply OK"}],"max_tokens":16}'
+
+          probe "v1beta minimal gemini-4-carbon" "$BASE/v1beta/models/gemini-4-carbon:streamGenerateContent?alt=sse" "xgoog" \
+            '{"contents":[{"role":"user","parts":[{"text":"Reply OK"}]}]}'
+
+          probe "v1beta minimal gemini-4-argon" "$BASE/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse" "xgoog" \
+            '{"contents":[{"role":"user","parts":[{"text":"Reply OK"}]}]}'
+
+          probe "v1beta thinkingLevel MEDIUM + maxOutputTokens 65536" "$BASE/v1beta/models/gemini-4-carbon:streamGenerateContent?alt=sse" "xgoog" \
+            '{"contents":[{"role":"user","parts":[{"text":"Reply OK"}]}],"generationConfig":{"maxOutputTokens":65536,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"MEDIUM"}}}'
+
+          probe "v1beta thinkingLevel MEDIUM + maxOutputTokens 32768" "$BASE/v1beta/models/gemini-4-carbon:streamGenerateContent?alt=sse" "xgoog" \
+            '{"contents":[{"role":"user","parts":[{"text":"Reply OK"}]}],"generationConfig":{"maxOutputTokens":32768,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"MEDIUM"}}}'
+
+          probe "v1beta parametersJsonSchema tool" "$BASE/v1beta/models/gemini-4-carbon:streamGenerateContent?alt=sse" "xgoog" \
+            '{"contents":[{"role":"user","parts":[{"text":"Reply OK"}]}],"generationConfig":{"maxOutputTokens":32768,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"MEDIUM"}},"tools":[{"functionDeclarations":[{"name":"read_file","description":"Read file","parametersJsonSchema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"Path":{"type":"string"}},"required":["Path"]}}]}]}'
