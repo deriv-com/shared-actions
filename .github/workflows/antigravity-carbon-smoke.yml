@@ -1,0 +1,39 @@
+name: Antigravity Gemini 4 Carbon Smoke (throwaway)
+
+# Throwaway caller verifying /v1/models and smoke-testing engine: antigravity
+# at 29ac485 with its default model (`gemini-4-carbon`, model omitted) and
+# default effort (`medium`, antigravity_effort omitted). Not for merge.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  check-models:
+    runs-on:
+      group: github_claude_code_reviewer
+    permissions:
+      contents: read
+    env:
+      API_KEY: ${{ secrets.LLM_API_KEY }}
+    steps:
+      - name: Check Gemini model IDs on LiteLLM
+        run: |
+          set -euo pipefail
+          echo "=== Gemini / Carbon model IDs on https://litellmsa.deriv.ai/v1/models ==="
+          curl -sS "https://litellmsa.deriv.ai/v1/models" \
+            -H "Authorization: Bearer $API_KEY" \
+            | jq -r '.data[]?.id // empty' | sort | grep -iE 'gemini|carbon' || echo "(no matching models)"
+
+  ai-review:
+    uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@smoke/antigravity-carbon-base
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    with:
+      engine: antigravity
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+      AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
