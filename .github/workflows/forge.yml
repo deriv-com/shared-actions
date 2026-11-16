@@ -22,7 +22,7 @@ name: Forge — issue to PR
 #         requested_by:    { required: false, type: string }  # Slack user id, or U…/W…/S… ids to tag
 #         forge_run_id:    { required: false, type: string }  # run id forge-agent registered
 #         analysis_brief:  { required: false, type: string }
-#         command:         { required: false, type: string }  # auto (first open) or revise
+#         command:         { required: false, type: string }  # auto (first open), revise, update or pr-text
 #
 #   jobs:
 #     forge:
@@ -125,8 +125,13 @@ on:
           that issue_number names) as
           `<!-- forge-slack-revise -->`. `update` only brings the PR branch
           up to date with its base (dstp update; see update_base and
-          resolve_conflicts_unattended). Callers must pass this through
-          from workflow_dispatch.
+          resolve_conflicts_unattended). `pr-text` runs no dstp at all: the
+          pr-text job below applies a PR title/description edit, a reply to
+          the reviewers, and thread resolution that forge-agent requested in a
+          `<!-- forge-slack-pr-text … -->` comment on the issue, with this
+          workflow's write App (forge-agent's own App can only read PRs). It
+          needs slack_mention_ts. Callers must pass this through from
+          workflow_dispatch.
         required: false
         default: "auto"
         type: string
@@ -277,6 +282,10 @@ on:
 
 jobs:
   forge:
+    # pr-text is its own job below. Without this, the Run Forge `case` would
+    # fold the unknown command into auto and try to open a new PR.
+    if: inputs.command != 'pr-text'
+
     runs-on:
       group: ${{ inputs.runner_group }}
 
@@ -4110,3 +4119,243 @@ jobs:
             return 0
           }
           slack_react "$REACTION"
+
+  # ---- pr-text --------------------------------------------------------------
+  # forge-agent's GitHub App can read PRs but not write them, so it cannot edit
+  # a PR description, reply to a reviewer on a PR, or resolve a review thread.
+  # It asks for those instead: one `<!-- forge-slack-pr-text {json} -->`
+  # comment per request on the PR's tracking issue (its App can comment on
+  # issues), then a dispatch with command=pr-text and the Slack message it was
+  # answering as slack_mention_ts. This job applies every pending request for
+  # that message with the write App, marks each one applied, and posts the
+  # result in the Slack thread. No checkout, engine, model or labels.
+  #
+  # Trust: a request counts only when forge-gh-app[bot] wrote it, within the
+  # last hour, for this slack_mention_ts, and for an open PR that closes this
+  # issue. Request text is passed to gh as JSON (jq --arg / --input), never
+  # interpolated into the shell.
+  pr-text:
+    if: inputs.command == 'pr-text'
+
+    runs-on:
+      group: ${{ inputs.runner_group }}
+
+    timeout-minutes: 10
+
+    # Own group, so a queued pr-text never displaces a queued revise (GitHub
+    # keeps one pending run per group). Runs for one issue still serialize, so
+    # a second dispatch for the same message finds its requests already applied.
+    concurrency:
+      group: forge-pr-text-${{ github.repository }}-${{ inputs.issue_number }}
+      cancel-in-progress: false
+
+    permissions: {}
+
+    steps:
+      - name: Mint token for PR text
+        id: pr-text-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.CLIENT_ID_GHAPP_WRITE }}
+          private-key: ${{ secrets.PRIVATE_KEY_GHAPP_WRITE }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Apply PR text
+        env:
+          GH_TOKEN: ${{ steps.pr-text-token.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          SLACK_CHANNEL: ${{ inputs.slack_channel }}
+          SLACK_THREAD_TS: ${{ inputs.slack_thread_ts }}
+          SLACK_MENTION_TS: ${{ inputs.slack_mention_ts }}
+          SLACK_BOT_TOKEN: ${{ secrets.FORGE_SLACK_BOT_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          REQUESTER="forge-gh-app[bot]"
+          REPLY_MARKER='<!-- forge-revise-reply -->'
+          WATERMARK_BODY=$(printf '%s\n%s' '<!-- forge-revise-instructions -->' \
+            '<sub>Forge: the reviews and comments above this line are handled.</sub>')
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          WORK=$(mktemp -d)
+          trap 'rm -rf "$WORK"' EXIT
+
+          # One thread reply with the outcome. Skipped off the Slack path.
+          slack_say() {
+            [ -n "${SLACK_CHANNEL:-}" ] && [ -n "${SLACK_THREAD_TS:-}" ] && [ -n "${SLACK_BOT_TOKEN:-}" ] || return 0
+            jq -n --arg channel "$SLACK_CHANNEL" --arg ts "$SLACK_THREAD_TS" --arg text "$1" \
+                '{channel: $channel, thread_ts: $ts, text: $text, unfurl_links: false, unfurl_media: false}' \
+              | curl -sS --connect-timeout 5 --max-time 15 \
+                  -X POST https://slack.com/api/chat.postMessage \
+                  -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+                  -H 'Content-type: application/json; charset=utf-8' \
+                  --data @- >/dev/null \
+              || echo "::warning::Could not post the result to Slack"
+          }
+          fail() {
+            echo "::error::$1"
+            slack_say "I couldn't update the PR: $1 <${RUN_URL}|Run log>"
+            exit 1
+          }
+
+          if ! [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
+            fail "issue_number must be a positive integer."
+          fi
+          if ! [[ "${SLACK_MENTION_TS:-}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            fail "command=pr-text needs slack_mention_ts, the Slack message the request answers."
+          fi
+
+          if ! gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" --paginate \
+              > "$WORK/pages.json" 2> "$WORK/err"; then
+            cat "$WORK/err"
+            fail "I couldn't read the comments on #${ISSUE_NUMBER}."
+          fi
+          jq -s 'add // []' "$WORK/pages.json" > "$WORK/comments.json"
+
+          # Pending requests for this Slack message, oldest first. The JSON
+          # never contains ">" (forge-agent escapes it), so [^>]* ends at the
+          # closing "-->". An applied request is renamed
+          # forge-slack-pr-text-applied, which this pattern does not match.
+          jq -c --arg who "$REQUESTER" --arg ts "$SLACK_MENTION_TS" --argjson now "$(date -u +%s)" '
+            [ .[]
+              | select((.user.login // "") == $who and (.user.type // "") == "Bot")
+              | select(((.created_at // "1970-01-01T00:00:00Z") | fromdateiso8601) > ($now - 3600))
+              | .id as $id
+              | (.body // "") | capture("^<!-- forge-slack-pr-text (?<j>[^>]*) -->")
+              | (.j | try fromjson catch null)
+              | select(type == "object" and .v == 1 and .ts == $ts)
+              | select((.pr | type) == "number" and .pr > 0 and (.pr | floor) == .pr)
+              | . + {comment_id: $id}
+            ] | sort_by(.seq // 0) | .[]
+          ' "$WORK/comments.json" > "$WORK/requests.jsonl"
+
+          if [ ! -s "$WORK/requests.jsonl" ]; then
+            # A second dispatch for the same message: the first run applied it.
+            if jq -e --arg ts "$SLACK_MENTION_TS" \
+                'any(.[]; (.body // "") | test("^<!-- forge-slack-pr-text-applied \\{\"ts\":\"" + ($ts | gsub("\\."; "\\.")) + "\""))' \
+                "$WORK/comments.json" >/dev/null; then
+              echo "Every request for this Slack message is already applied."
+              exit 0
+            fi
+            fail "I found no pending request from Forge on #${ISSUE_NUMBER} for this message."
+          fi
+
+          THREADS_QUERY='query($o: String!, $r: String!, $n: Int!) { repository(owner: $o, name: $r) { pullRequest(number: $n) { state closingIssuesReferences(first: 50) { nodes { number } } reviewThreads(first: 100) { nodes { id isResolved } } } } }'
+          RESOLVE_MUTATION='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }'
+
+          SUMMARY=""
+          FAILED=0
+          # Requests on fd 3 and thread ids on fd 4, so no gh/curl call in
+          # the loops can read the list it is iterating.
+          while IFS= read -r req <&3; do
+            pr=$(jq -r '.pr' <<< "$req")
+            cid=$(jq -r '.comment_id' <<< "$req")
+            pr_link="<https://github.com/${GITHUB_REPOSITORY}/pull/${pr}|#${pr}>"
+            done_parts=()
+            problems=()
+
+            if ! gh api graphql -f query="$THREADS_QUERY" -f o="$OWNER" -f r="$REPO" -F n="$pr" \
+                > "$WORK/pr.json" 2> "$WORK/err"; then
+              cat "$WORK/err"
+              SUMMARY+="• ${pr_link}: I couldn't read the PR, so nothing was changed."$'\n'
+              FAILED=1
+              continue
+            fi
+            if ! jq -e --argjson issue "$ISSUE_NUMBER" '
+                .data.repository.pullRequest
+                | .state == "OPEN" and any(.closingIssuesReferences.nodes[]?; .number == $issue)
+              ' "$WORK/pr.json" >/dev/null; then
+              SUMMARY+="• ${pr_link}: skipped. It is not an open PR that closes #${ISSUE_NUMBER}."$'\n'
+              FAILED=1
+              continue
+            fi
+
+            # Title and/or description, capped like forge-agent caps them.
+            jq -c '
+              {}
+              + (if (.title | type) == "string" then {title: (.title | gsub("[\\r\\n]+"; " ") | .[0:256])} else {} end)
+              + (if (.body | type) == "string" then {body: (.body | .[0:65536])} else {} end)
+            ' <<< "$req" > "$WORK/patch.json"
+            if [ "$(jq 'length' "$WORK/patch.json")" -gt 0 ]; then
+              if gh api --method PATCH "repos/${GITHUB_REPOSITORY}/pulls/${pr}" --input "$WORK/patch.json" >/dev/null 2> "$WORK/err"; then
+                done_parts+=("updated the $(jq -r '[keys[] | if . == "body" then "description" else . end] | join(" and ")' "$WORK/patch.json")")
+              else
+                cat "$WORK/err"
+                problems+=("the title/description edit failed")
+              fi
+            fi
+
+            # The reply to the reviewers. HTML comments are dropped so model
+            # text cannot forge a Forge marker; the reply marker is added here.
+            if jq -e '(.reply | type) == "string" and (.reply | test("[^[:space:]]"))' <<< "$req" >/dev/null; then
+              if jq -c --arg marker "$REPLY_MARKER" \
+                  '{body: ($marker + "\n" + (.reply | gsub("<!--[\\s\\S]*?-->"; "") | gsub("<!--"; "") | .[0:20000]))}' <<< "$req" \
+                | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" --input - >/dev/null 2> "$WORK/err"; then
+                done_parts+=("replied to the review")
+              else
+                cat "$WORK/err"
+                problems+=("the reply was not posted")
+              fi
+            fi
+
+            if jq -e '.watermark == true' <<< "$req" >/dev/null; then
+              if ! jq -n --arg body "$WATERMARK_BODY" '{body: $body}' \
+                  | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" --input - >/dev/null 2> "$WORK/err"; then
+                cat "$WORK/err"
+                problems+=("the handled-reviews watermark was not posted")
+              fi
+            fi
+
+            # Resolve only threads that are on this PR and still open.
+            resolved=0
+            asked=0
+            while IFS= read -r tid <&4; do
+              [ -n "$tid" ] || continue
+              asked=$((asked + 1))
+              if gh api graphql -f query="$RESOLVE_MUTATION" -f id="$tid" >/dev/null 2> "$WORK/err"; then
+                resolved=$((resolved + 1))
+              else
+                cat "$WORK/err"
+              fi
+            done 4< <(jq -r --slurpfile pr "$WORK/pr.json" '
+              ([$pr[0].data.repository.pullRequest.reviewThreads.nodes[]? | select(.isResolved == false) | .id]) as $open
+              | (.threads // [])[]? | strings | select(. as $t | $open | index($t))
+            ' <<< "$req")
+            if [ "$resolved" -gt 0 ]; then
+              if [ "$resolved" -eq 1 ]; then done_parts+=("resolved 1 review thread"); else done_parts+=("resolved ${resolved} review threads"); fi
+            fi
+            if [ "$resolved" -lt "$asked" ]; then
+              problems+=("$((asked - resolved)) review thread(s) could not be resolved")
+            fi
+
+            # Mark the request applied: the payload goes, the audit line stays.
+            if ! jq -n --arg ts "$SLACK_MENTION_TS" --argjson seq "$(jq '.seq // 0' <<< "$req")" --argjson pr "$pr" --arg run "$RUN_URL" \
+                '{body: ("<!-- forge-slack-pr-text-applied " + ({ts: $ts, seq: $seq, pr: $pr} | tojson) + " -->\nForge applied this request to #\($pr) in [this run](\($run)).")}' \
+              | gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${cid}" --input - >/dev/null 2> "$WORK/err"; then
+              cat "$WORK/err"
+              echo "::warning::Could not mark request comment ${cid} applied; a later pr-text run for this message would apply it again."
+            fi
+
+            line="• ${pr_link}: "
+            if [ "${#done_parts[@]}" -gt 0 ]; then
+              line+=$(IFS=,; printf '%s' "${done_parts[*]}" | sed 's/,/, /g')
+            else
+              line+="nothing changed"
+            fi
+            if [ "${#problems[@]}" -gt 0 ]; then
+              line+=". Not done: $(IFS=,; printf '%s' "${problems[*]}" | sed 's/,/, /g')"
+              FAILED=1
+            fi
+            SUMMARY+="${line}."$'\n'
+          done 3< "$WORK/requests.jsonl"
+
+          printf '%s' "$SUMMARY"
+          if [ "$FAILED" = 1 ]; then
+            slack_say "$(printf 'Part of the PR update did not go through (<%s|run log>):\n%s' "$RUN_URL" "$SUMMARY")"
+            exit 1
+          fi
+          slack_say "$(printf 'Done:\n%s' "$SUMMARY")"

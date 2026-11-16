@@ -813,7 +813,7 @@ step_script() {  # step_script <step name> <case dir>
   awk -v s="      - name: $1" '
     $0 == s {f=1}
     f && /^        run: \|$/ {r=1; next}
-    r && /^      - name:/ {exit}
+    r && (/^      - name:/ || /^  [a-z][a-z0-9_-]*:$/ || /^  # ----/) {exit}
     r { sub(/^          /, ""); print }
   ' "$WF" | sed "s#/tmp/#$2/tmp/#g"
 }
