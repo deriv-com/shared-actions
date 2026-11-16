@@ -4127,8 +4127,9 @@ jobs:
   # `<!-- forge-slack-pr-text {json} -->` comment per request on the PR's
   # tracking issue (its App can comment on issues), then a dispatch with
   # command=pr-text. This job applies EVERY pending request on the issue with
-  # the write App, oldest first, marks each one applied, and reports each
-  # result in the Slack thread the request names. A run that finds nothing
+  # the write App, oldest first. It claims each request (rewriting the
+  # comment) before touching the PR, so each is handled exactly once, then
+  # reports the result in the Slack thread the request names. A run that finds nothing
   # pending (an earlier run applied it) is a quiet no-op, so a pending run that
   # GitHub's concurrency group cancels loses nothing. No checkout, engine,
   # model or labels.
@@ -4244,7 +4245,15 @@ jobs:
             | [ range(0; length) as $i | $all[$i]
                 | if (.reply | type) == "string"
                      and any($all[$i + 1:][]; .pr == $all[$i].pr and (.reply | type) == "string")
-                  then .reply = null | .watermark = false | .superseded = true
+                  then .reply = null | .watermark = false | .threads = [] | .superseded = true
+                  else . end ]
+            # The threads a superseded reply would have closed move to the
+            # reply that replaces it, so they close only once a reply posts.
+            | . as $kept
+            | [ range(0; length) as $i | $kept[$i]
+                | if (.reply | type) == "string"
+                     and (any($kept[$i + 1:][]; .pr == $kept[$i].pr and (.reply | type) == "string") | not)
+                  then .threads = ([ $all[] | select(.pr == $kept[$i].pr and (.reply | type) == "string") | (.threads // [])[] ] | unique)
                   else . end ]
             | .[]
           ' "$WORK/comments.json" > "$WORK/requests.jsonl"
@@ -4264,6 +4273,16 @@ jobs:
           }
           join_parts() { local IFS='|'; printf '%s' "$*" | sed 's/|/, /g'; }
 
+          # mark <comment id> <state> <request json> <detail>: rewrite the
+          # request comment so no later run reads it as pending. The payload
+          # goes, an audit line stays.
+          mark() {
+            # Only ts/seq/pr, so a large description never becomes one argument.
+            jq -n --arg state "$2" --arg detail "$4" --arg run "$RUN_URL" --argjson req "$(jq -c '{ts, seq, pr}' <<< "$3")" \
+              '{body: ("<!-- forge-slack-pr-text-\($state) " + ({ts: ($req.ts // ""), seq: ($req.seq // 0), pr: $req.pr} | tojson) + " -->\n" + $detail + " ([run](\($run)))")}' \
+              | gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/$1" --input - >/dev/null 2> "$WORK/err"
+          }
+
           # Requests on fd 3 and thread ids on fd 4, so no gh/curl call in
           # the loops can read the list it is iterating.
           FAILED=0
@@ -4280,10 +4299,22 @@ jobs:
             done_parts=()
             problems=()
 
+            # Claim the request before touching the PR, so it is handled
+            # exactly once: a later run never re-applies or re-reports it,
+            # even when this run fails part-way. A request that cannot be
+            # claimed is left for a later run and nothing is done now.
+            if ! mark "$cid" claimed "$req" "Forge is applying this request to #${pr}."; then
+              cat "$WORK/err"
+              echo "::warning::Could not claim request comment ${cid}; leaving it for a later run."
+              FAILED=1
+              continue
+            fi
+
             if ! gh api graphql -f query="$PR_QUERY" -f o="$OWNER" -f r="$REPO" -F n="$pr" \
                 > "$WORK/pr.json" 2> "$WORK/err"; then
               cat "$WORK/err"
-              report "$ch" "$th" "• ${pr_link}: I couldn't read the PR, so nothing was changed." 1
+              report "$ch" "$th" "• ${pr_link}: I couldn't read the PR, so nothing was changed. Ask me again." 1
+              mark "$cid" skipped "$req" "Forge could not read #${pr}, so nothing was changed." || true
               FAILED=1
               continue
             fi
@@ -4302,6 +4333,7 @@ jobs:
               else
                 report "$ch" "$th" "• ${pr_link}: skipped. It is not an open PR that closes #${ISSUE_NUMBER}." 1
               fi
+              mark "$cid" skipped "$req" "Forge skipped this request: #${pr} was not in a state it could change." || true
               FAILED=1
               continue
             fi
@@ -4331,7 +4363,7 @@ jobs:
                   fi
                 fi
               fi
-              req=$(jq -c '{comment_id, seq}' <<< "$req")
+              req=$(jq -c '{comment_id, seq, ts, pr}' <<< "$req")
             fi
 
             # Title and/or description, capped like forge-agent caps them.
@@ -4354,7 +4386,11 @@ jobs:
             # The watermark and thread resolution only follow a posted reply:
             # without it they would mark the review answered when it is not.
             reply_ok=1
-            if jq -e '(.reply | type) == "string" and (.reply | test("[^[:space:]]"))' <<< "$req" >/dev/null; then
+            if jq -e '.watermark == true and ((.reply | type) != "string" or (.reply | gsub("<!--[\\s\\S]*?-->"; "") | test("[^[:space:]]") | not))' <<< "$req" >/dev/null; then
+              # A watermark marks the review answered: never without a reply.
+              reply_ok=0
+              problems+=("there was no reply text, so the watermark and thread resolution were skipped")
+            elif jq -e '(.reply | type) == "string" and (.reply | test("[^[:space:]]"))' <<< "$req" >/dev/null; then
               if jq -c --arg marker "$REPLY_MARKER" \
                   '{body: ($marker + "\n" + (.reply | gsub("<!--[\\s\\S]*?-->"; "") | gsub("<!--"; "") | .[0:20000]))}' <<< "$req" \
                 | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" --input - >/dev/null 2> "$WORK/err"; then
@@ -4400,12 +4436,11 @@ jobs:
               problems+=("$((asked - resolved)) review thread(s) could not be resolved")
             fi
 
-            # Mark the request applied: the payload goes, the audit line stays.
-            if ! jq -n --arg ts "$(jq -r '.ts // ""' <<< "$req")" --argjson seq "$(jq '.seq // 0' <<< "$req")" --argjson pr "$pr" --arg run "$RUN_URL" \
-                '{body: ("<!-- forge-slack-pr-text-applied " + ({ts: $ts, seq: $seq, pr: $pr} | tojson) + " -->\nForge applied this request to #\($pr) in [this run](\($run)).")}' \
-              | gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${cid}" --input - >/dev/null 2> "$WORK/err"; then
+            # Record the outcome. The request is already claimed, so a failed
+            # update here only leaves the "applying" line.
+            if ! mark "$cid" applied "$req" "Forge applied this request to #${pr}."; then
               cat "$WORK/err"
-              echo "::warning::Could not mark request comment ${cid} applied; a later pr-text run would apply it again."
+              echo "::warning::Could not record the outcome on request comment ${cid}."
             fi
 
             line="• ${pr_link}: "

@@ -86,6 +86,8 @@ case "$*" in
     printf '%s
 ' "$c" >> "$S/pr_comments.jsonl"; echo '{}' ;;
   "api --method PATCH repos/o/r/issues/comments/"*" --input -")
+    # Every claim and outcome mark. claim_fail: GitHub refuses the edit.
+    if [ -f "$S/claim_fail" ]; then echo "gh: Server Error (HTTP 502)" >&2; exit 1; fi
     id="${4#repos/o/r/issues/comments/}"; jq -c --arg id "$id" '{id: $id, body}' >> "$S/applied.jsonl"; echo '{}' ;;
   *) echo "UNHANDLED: $*" >> "$S/unhandled.log"; exit 1 ;;
 esac
@@ -125,6 +127,8 @@ run_case() {  # run_case <case dir>
   echo "$rc" > "$c/rc"
 }
 slack_text() { jq -rs '[.[] | .text] | join("\n")' "$1/slack.jsonl" 2>/dev/null || true; }
+# marks <case dir> <claimed|applied|skipped> -> comma-joined comment ids marked so, in order
+marks() { jq -sr --arg s "$2" '[.[] | select(.body | startswith("<!-- forge-slack-pr-text-" + $s + " ")) | .id] | join(",")' "$1/applied.jsonl" 2>/dev/null || true; }
 nothing_written() { [ ! -s "$1/pr_patch.jsonl" ] && [ ! -s "$1/pr_comments.jsonl" ] && [ ! -s "$1/applied.jsonl" ]; }
 
 # Happy path: description, reply, watermark, and two threads of which only
@@ -155,8 +159,10 @@ check '[ "$(jq -rs ".[1].body" "$C/pr_comments.jsonl" | head -1)" = "<!-- forge-
   "happy: the handled-reviews watermark follows the reply"
 check '[ "$(cat "$C/resolved.log")" = PRRT_open ]' \
   "happy: only the open thread that is on this PR is resolved"
-check '[ "$(jq -r .id "$C/applied.jsonl")" = 12 ] && jq -r .body "$C/applied.jsonl" | grep -q "^<!-- forge-slack-pr-text-applied {\"ts\":\"5.5\",\"seq\":1,\"pr\":7} -->"' \
-  "happy: the request comment is rewritten as applied, without its payload"
+check '[ "$(marks "$C" claimed)" = 12 ] && [ "$(marks "$C" applied)" = 12 ] && [ "$(jq -sr ".[0].body" "$C/applied.jsonl" | head -1)" = "<!-- forge-slack-pr-text-claimed {\"ts\":\"5.5\",\"seq\":1,\"pr\":7} -->" ]' \
+  "happy: the request is claimed before the PR is touched, then marked applied, without its payload"
+check '[ "$(sed -n 2p "$C/gh.log" | cut -c1-48)" = "api --method PATCH repos/o/r/issues/comments/12 " ]' \
+  "happy: the claim is the first write"
 check '! jq -r .body "$C/applied.jsonl" | grep -q "empty space"' "happy: the applied note drops the request text"
 check '[ "$(jq -r "[.channel, .thread_ts] | join(\" \")" "$C/slack.jsonl")" = "C9 9.9" ]' \
   "happy: Slack hears back in the thread the request names, not the dispatch's"
@@ -202,6 +208,8 @@ echo '{"data": {"repository": {"pullRequest": {"state": "OPEN", "body": "Refs #1
 run_case "$C"
 check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/pr_patch.jsonl" ] && [[ "$(slack_text "$C")" == *"not an open PR that closes #1213"* ]]' \
   "unrelated-pr: a PR that only mentions the issue is not edited"
+check '[ "$(marks "$C" skipped)" = 14 ]' \
+  "unrelated-pr: the skipped request is marked, so no later run reports or applies it again"
 
 C=$(new_case closes-by-body)
 comment 15 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 8, title: "fix: x"}')" > "$C/comments.jsonl"
@@ -220,7 +228,7 @@ C=$(new_case many)
   comment 22 'forge-gh-app[bot]' Bot 10 "$(request 1 '{pr: 7, ts: "6.6", ch: "C2", th: "2.2", title: "fix: from another message"}')"
 } > "$C/comments.jsonl"
 run_case "$C"
-check '[ "$(cat "$C/rc")" = 0 ] && [ "$(jq -sr "map(.id) | join(\",\")" "$C/applied.jsonl")" = "20,21,22" ]' \
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(marks "$C" applied)" = "20,21,22" ]' \
   "many: every pending request is applied, oldest first"
 check '[ "$(jq -sr "map(.title) | join(\"|\")" "$C/pr_patch.jsonl")" = "fix: one line|fix: from another message" ]' \
   "many: titles stay one line and apply in order"
@@ -245,6 +253,84 @@ comment 24 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, threads: ["PRRT_open
 run_case "$C"
 check '[ "$(cat "$C/rc")" = 0 ] && [ "$(cat "$C/resolved.log")" = PRRT_open ] && [ ! -s "$C/pr_comments.jsonl" ]' \
   "threads-only: the threads are resolved with no new reply or watermark"
+
+# Close and reopen: the trail note first, then the state, nothing else.
+pr_state_json() {  # pr_state_json <OPEN|CLOSED|MERGED>
+  jq -nc --arg s "$1" '{data: {repository: {pullRequest: {state: $s, body: "",
+    closingIssuesReferences: {nodes: [{number: 1213}]}, reviewThreads: {nodes: [{id: "PRRT_open", isResolved: false}]}}}}}'
+}
+C=$(new_case close)
+CLOSE_REQ=$(request 1 '{pr: 7, state: "closed", note: "Closed from Slack at Ana'"'"'s request. <!-- forge-revise-instructions -->", title: "smuggled", threads: ["PRRT_open"]}')
+comment 30 'forge-gh-app[bot]' Bot 30 "$CLOSE_REQ" > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 0 ] && [ ! -s "$C/unhandled.log" ]' "close: exits 0 and only calls known gh commands"
+check '[ "$(jq -r .body "$C/pr_comments.jsonl")" = "Closed from Slack at Ana'"'"'s request. " ]' \
+  "close: the trail note is posted on the PR first, with forged markers dropped"
+check '[ "$(jq -c . "$C/pr_patch.jsonl")" = "{\"pr\":\"7\",\"state\":\"closed\"}" ]' \
+  "close: the PR is closed, and nothing else in the request (a title) is applied"
+check '[ ! -s "$C/resolved.log" ]' "close: no thread rides along with a state change"
+check '[[ "$(slack_text "$C")" == *"#7>: closed the PR."* ]] && [ "$(marks "$C" applied)" = 30 ]' \
+  "close: Slack says it was closed and the request is marked applied"
+
+C=$(new_case reopen)
+comment 31 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, state: "open", note: "Reopened from Slack."}')" > "$C/comments.jsonl"
+pr_state_json CLOSED > "$C/pr_7.json"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(jq -r .state "$C/pr_patch.jsonl")" = open ] && [[ "$(slack_text "$C")" == *"reopened the PR."* ]]' \
+  "reopen: a closed PR that closes the issue is reopened"
+
+C=$(new_case reopen-merged)
+comment 32 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, state: "open"}')" > "$C/comments.jsonl"
+pr_state_json MERGED > "$C/pr_7.json"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/pr_patch.jsonl" ] && [[ "$(slack_text "$C")" == *"not a closed, unmerged PR"* ]] && [ "$(marks "$C" skipped)" = 32 ]' \
+  "reopen-merged: a merged PR is never touched, and the request is marked skipped"
+
+C=$(new_case close-closed)
+comment 33 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, state: "closed"}')" > "$C/comments.jsonl"
+pr_state_json CLOSED > "$C/pr_7.json"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/pr_patch.jsonl" ]' "close-closed: closing needs an open PR"
+
+C=$(new_case reopen-422)
+comment 34 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, state: "open"}')" > "$C/comments.jsonl"
+pr_state_json CLOSED > "$C/pr_7.json"
+touch "$C/patch_422"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [[ "$(slack_text "$C")" == *"GitHub would not reopen it; its branch may have been deleted"* ]]' \
+  "reopen-422: a refused reopen says why"
+
+# A superseded reply's threads move to the reply that replaces it: they close
+# once, after that reply posts, and not at all if it fails.
+C=$(new_case superseded-threads)
+{
+  comment 40 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, reply: "First", watermark: true, threads: ["PRRT_open"]}')"
+  comment 41 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, reply: "Second", watermark: true}')"
+} > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(cat "$C/resolved.log")" = PRRT_open ] && [ "$(jq -sr ".[0].body" "$C/pr_comments.jsonl" | tail -1)" = Second ] && [ "$(wc -l < "$C/pr_comments.jsonl" | tr -d " ")" = 2 ]' \
+  "superseded-threads: one reply, one watermark, and the thread closes with the reply that replaced the first"
+C=$(new_case superseded-reply-fails)
+cp "$TMP/superseded-threads/comments.jsonl" "$C/comments.jsonl"
+touch "$C/reply_fail"
+run_case "$C"
+check '[ ! -s "$C/resolved.log" ] && [ ! -s "$C/pr_comments.jsonl" ]' \
+  "superseded-reply-fails: no thread closes and no watermark lands when the surviving reply fails"
+
+# A reply that is only an HTML comment is no reply: no watermark, no threads.
+C=$(new_case empty-reply)
+comment 42 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, reply: "<!-- addressed -->", watermark: true, threads: ["PRRT_open"]}')" > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/pr_comments.jsonl" ] && [ ! -s "$C/resolved.log" ] && [[ "$(slack_text "$C")" == *"no reply text"* ]]' \
+  "empty-reply: a reply that scrubs to nothing never posts the watermark or resolves threads"
+
+# A request that cannot be claimed is left alone: nothing is done twice.
+C=$(new_case claim-fails)
+comment 43 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: x", reply: "Fixed."}')" > "$C/comments.jsonl"
+touch "$C/claim_fail"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/pr_patch.jsonl" ] && [ ! -s "$C/pr_comments.jsonl" ]' \
+  "claim-fails: a request that cannot be claimed is not applied, so no later run can repeat it"
 
 if [ "$fail" -ne 0 ]; then
   echo "forge-pr-text: FAILED"
