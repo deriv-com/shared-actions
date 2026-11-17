@@ -79,7 +79,11 @@ case "$*" in
     jq -c --arg n "$n" '{pr: $n} + .' "$f" >> "$S/pr_patch.jsonl" ;;
   "api --method POST repos/o/r/issues/"*"/comments --input -")
     # reply_fail: GitHub refuses the reviewer reply (the comment with the reply marker).
+    # die_on_reply: the job is cancelled (SIGTERM) while the reply is posted.
     n="${4#repos/o/r/issues/}"; n="${n%/comments}"; c=$(jq -c --arg n "$n" '{pr: $n, body}')
+    if [ -f "$S/die_on_reply" ] && jq -e '.body | startswith("<!-- forge-revise-reply -->")' <<< "$c" >/dev/null; then
+      kill -TERM "$PPID"; sleep 1; exit 1
+    fi
     if [ -f "$S/reply_fail" ] && jq -e '.body | startswith("<!-- forge-revise-reply -->")' <<< "$c" >/dev/null; then
       echo "gh: Server Error (HTTP 502)" >&2; exit 1
     fi
@@ -159,7 +163,7 @@ check '[ "$(jq -rs ".[1].body" "$C/pr_comments.jsonl" | head -1)" = "<!-- forge-
   "happy: the handled-reviews watermark follows the reply"
 check '[ "$(cat "$C/resolved.log")" = PRRT_open ]' \
   "happy: only the open thread that is on this PR is resolved"
-check '[ "$(marks "$C" claimed)" = 12 ] && [ "$(marks "$C" applied)" = 12 ] && [ "$(jq -sr ".[0].body" "$C/applied.jsonl" | head -1)" = "<!-- forge-slack-pr-text-claimed {\"ts\":\"5.5\",\"seq\":1,\"pr\":7} -->" ]' \
+check '[ "$(marks "$C" claimed)" = 12 ] && [ "$(marks "$C" applied)" = 12 ] && [ "$(jq -sr ".[0].body" "$C/applied.jsonl" | head -1)" = "<!-- forge-slack-pr-text-claimed {\"ts\":\"5.5\",\"seq\":1,\"pr\":7,\"ch\":\"C9\",\"th\":\"9.9\"} -->" ]' \
   "happy: the request is claimed before the PR is touched, then marked applied, without its payload"
 check '[ "$(sed -n 2p "$C/gh.log" | cut -c1-48)" = "api --method PATCH repos/o/r/issues/comments/12 " ]' \
   "happy: the claim is the first write"
@@ -331,6 +335,46 @@ touch "$C/claim_fail"
 run_case "$C"
 check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/pr_patch.jsonl" ] && [ ! -s "$C/pr_comments.jsonl" ]' \
   "claim-fails: a request that cannot be claimed is not applied, so no later run can repeat it"
+
+# Forge's other comments on the issue (an analysis, an applied request) are
+# skipped, never a parse error: the request next to them is applied.
+C=$(new_case mixed-comments)
+{
+  comment 50 'forge-gh-app[bot]' Bot 40 '<!-- forge-analysis -->
+Analysis of the issue.'
+  comment 51 'forge-gh-app[bot]' Bot 35 '<!-- forge-slack-pr-text-applied {"ts":"1.1","seq":1,"pr":7} -->
+Forge applied this request to #7.'
+  comment 52 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: mixed"}')"
+} > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(jq -r .title "$C/pr_patch.jsonl")" = "fix: mixed" ] && [ "$(marks "$C" applied)" = 52 ]' \
+  "mixed-comments: Forge's other comments are skipped and the request is applied"
+
+# A run cancelled part-way reports what it claimed but did not finish, and
+# marks it interrupted, so it is neither lost silently nor applied twice.
+C=$(new_case cancelled)
+comment 53 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: x", reply: "Fixed.", watermark: true}')" > "$C/comments.jsonl"
+touch "$C/die_on_reply"
+run_case "$C"
+check '[ "$(cat "$C/rc")" != 0 ] && [ "$(marks "$C" interrupted)" = 53 ] && [ -z "$(marks "$C" applied)" ]' \
+  "cancelled: a claimed request the run did not finish is marked interrupted"
+check '[[ "$(slack_text "$C")" == *"stopped before it finished"* ]] && [ "$(jq -r .channel "$C/slack.jsonl" | head -1)" = C9 ]' \
+  "cancelled: the request's own thread is told to check the PR"
+
+# A claim left by a lost runner (no exit handler ran) is reported by the next
+# run, not re-applied.
+C=$(new_case stale-claim)
+comment 54 'forge-gh-app[bot]' Bot 2000 '<!-- forge-slack-pr-text-claimed {"ts":"5.5","seq":1,"pr":7,"ch":"C9","th":"9.9"} -->
+Forge is applying this request to #7.' > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(marks "$C" interrupted)" = 54 ] && [ ! -s "$C/pr_patch.jsonl" ] && [[ "$(slack_text "$C")" == *"stopped before it finished"* ]]' \
+  "stale-claim: an old unfinished claim is reported as interrupted and nothing is re-applied"
+C=$(new_case fresh-claim)
+comment 55 'forge-gh-app[bot]' Bot 60 '<!-- forge-slack-pr-text-claimed {"ts":"5.5","seq":1,"pr":7,"ch":"C9","th":"9.9"} -->
+Forge is applying this request to #7.' > "$C/comments.jsonl"
+run_case "$C"
+check '[ -z "$(marks "$C" interrupted)" ] && [ ! -s "$C/slack.jsonl" ]' \
+  "fresh-claim: a claim a running job may still be working on is left alone"
 
 if [ "$fail" -ne 0 ]; then
   echo "forge-pr-text: FAILED"
