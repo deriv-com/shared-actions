@@ -15,7 +15,6 @@ Everything here is consumed at `@master`, so **changes are live for every consum
 |---|---|---|---|
 | [`ai-pr-review.yml`](.github/workflows/ai-pr-review.yml) | Pluggable LLM PR review (`kimi` \| `anthropic` \| `grok` \| `codex` \| `muse` \| `antigravity`) | [AI_PR_REVIEW_README.md](.github/workflows/AI_PR_REVIEW_README.md) | ✅ active |
 | [`forge.yml`](.github/workflows/forge.yml) | Turns an issue into a verified PR (`auto`), or revises/updates an open PR (`revise` \| `update`) via `spec-to-pr` | [Forge](#forge-issue-to-pr) | ✅ active |
-| [`docsync-ai.yml`](.github/workflows/docsync-ai.yml) | Keeps docs in sync with code; scheduled, `@docbot` comment, and `claude_md_refresh` triggers | [Agent guidance file](#docsync-ai-agent-guidance-file) | ✅ active |
 | [`dependonme-bot.yml`](.github/workflows/dependonme-bot.yml) | Auto-fixes Dependabot security alerts and opens/auto-merges fix PRs | [DEPENDONME_BOT_README.md](.github/workflows/DEPENDONME_BOT_README.md) | ✅ active |
 | [`qa-checklist.yml`](.github/workflows/qa-checklist.yml) | Generates a QA checklist for a PR when someone comments `@checkmaite` | [QA_CHECKLIST_README.md](.github/workflows/QA_CHECKLIST_README.md) | ✅ active |
 | [`archive-on-merge.yml`](.github/workflows/archive-on-merge.yml) | Archives completed OpenSpec changes into a follow-up PR when a PR merges | [Archive on Merge](#archive-on-merge-openspec) | ✅ active |
@@ -28,7 +27,7 @@ Everything here is consumed at `@master`, so **changes are live for every consum
 | Workflow | Replacement | Notes |
 |---|---|---|
 | `claude-pr-review.yml` | `ai-pr-review.yml` with `engine: anthropic` | **Still a standalone duplicate** — converting it into a delegating shim is a tracked follow-up. See the [migration guide](.github/workflows/AI_PR_REVIEW_README.md#migrating-from-claude-pr-reviewyml). Do not delete until consumers are migrated and deprecation telemetry has been silent for 30 days. |
-| `docsync-ai.yml` and the `docsync_ai`, `docsync_ai_comment` actions | None | **Removed.** DocSync AI is decommissioned. A caller now fails with "workflow not found": delete the calling workflow (usually `.github/workflows/DocSyncAI.yml`) and its `DOCSYNC_*` secrets. |
+| `docsync-ai.yml` and the `docsync_ai`, `docsync_ai_comment`, `docsync_guidance_file` actions | None | **Removed.** DocSync AI is decommissioned. A caller now fails with "workflow not found": delete the calling workflow (usually `.github/workflows/DocSyncAI.yml`) and its `DOCSYNC_*` secrets. |
 
 Add a row here when deprecating anything. With no CHANGELOG and no release process, this table is the only coordination mechanism the repo has.
 
@@ -66,48 +65,10 @@ Example step usage in a consumer workflow:
 The remaining directories under `.github/actions/` implement internal building blocks for the reusable workflows above (prefer calling the parent workflow rather than invoking these directly):
 
 - **AI PR Review engines & guard** (called by [`ai-pr-review.yml`](.github/workflows/ai-pr-review.yml), documented in [AI_PR_REVIEW_README.md](.github/workflows/AI_PR_REVIEW_README.md)): [`ai_review_engine_kimi`](.github/actions/ai_review_engine_kimi/action.yml), [`ai_review_engine_anthropic`](.github/actions/ai_review_engine_anthropic/action.yml), [`ai_review_engine_grok`](.github/actions/ai_review_engine_grok/action.yml), [`ai_review_engine_codex`](.github/actions/ai_review_engine_codex/action.yml), [`ai_review_engine_muse`](.github/actions/ai_review_engine_muse/action.yml), [`ai_review_engine_antigravity`](.github/actions/ai_review_engine_antigravity/action.yml), plus [`ai_review_path_guard`](.github/actions/ai_review_path_guard/path-guard.js) (shared Node `PreToolUse` path guard script).
-- **DocSync AI internals** (called by [`docsync-ai.yml`](.github/workflows/docsync-ai.yml)): [`docsync_ai`](.github/actions/docsync_ai/action.yml), [`docsync_ai_comment`](.github/actions/docsync_ai_comment/action.yml), and [`docsync_guidance_file`](.github/actions/docsync_guidance_file/action.yml).
 
 ### Forge: issue to PR
 
 [`forge.yml`](.github/workflows/forge.yml) runs `deriv-com/spec-to-pr` against an issue (`command: auto`) or an open same-repo PR (`command: revise` | `update`), handling GitHub App token rotation, AI review wait/revise loops, base-branch updates, and optional Slack progress threads. Full caller header and input reference live at the top of [`forge.yml`](.github/workflows/forge.yml).
-
-### DocSync AI: agent guidance file
-
-DocSync AI updates root `README.md` plus one AI-agent guidance file. All three
-triggers (`scheduled`, `comment`, `claude_md_refresh`) pick that file the same
-way, through [`docsync_guidance_file`](.github/actions/docsync_guidance_file/):
-
-| Repository has | DocSync edits |
-|---|---|
-| A `CLAUDE.md` with real content | `CLAUDE.md` (unchanged behaviour) |
-| A `CLAUDE.md` whose only content is one import line, e.g. `@AGENTS.md` | The imported file. The shim is never edited. |
-| A `CLAUDE.md` symlink | The file it links to, if that file is inside the repository |
-| No `CLAUDE.md` | No guidance file (unchanged), unless `guidance_file` is set |
-| A shim with several imports, or one whose target is missing, outside the repo, or another shim | No guidance file. DocSync never falls back to the shim. |
-
-Optional inputs on `docsync-ai.yml`:
-
-- `guidance_file` sets the file explicitly, e.g. `AGENTS.md` in a repository
-  with no `CLAUDE.md`. The file must already exist and must not be a shim.
-- `guidance_max_bytes` sets a byte budget for that file. The model is told the
-  budget, and an update or refresh over it is dropped rather than opened as a
-  PR that the repository's own CI would reject. `0` (the default) means no limit.
-
-```yaml
-    uses: deriv-com/shared-actions/.github/workflows/docsync-ai.yml@master
-    with:
-      trigger_type: "scheduled"
-      base_branch: "master"
-      guidance_max_bytes: 16384 # optional: match the repo's own size check
-```
-
-`@docbot update only claude.md …` (or `… agents.md …`) targets the resolved file.
-
-**Limitation:** DocSync has no second, detailed-reference target. If a repository
-keeps `AGENTS.md` short and moves detail to a file such as
-`docs/agent-reference.md`, DocSync does not edit that file. Under a byte budget it
-skips updates that don't fit.
 
 ### App info (version stamp)
 
@@ -169,7 +130,7 @@ The detect/archive script is also available as a composite action:
 [`lint-actions.yml`](.github/workflows/lint-actions.yml) gates pull requests in this repository. Run the same checks locally before pushing (Node 22+ and Bash; zero `npm install` required):
 
 ```bash
-# 1. Node unit tests for composite action scripts (path guards, archive-on-merge, docsync resolver)
+# 1. Node unit tests for composite action scripts (path guards, archive-on-merge)
 node --test .github/actions/**/*.test.js
 
 # 2. Workflow & composite-action contract suites
