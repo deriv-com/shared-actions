@@ -91,8 +91,13 @@ case "$*" in
 ' "$c" >> "$S/pr_comments.jsonl"; echo '{}' ;;
   "api --method PATCH repos/o/r/issues/comments/"*" --input -")
     # Every claim and outcome mark. claim_fail: GitHub refuses the edit.
+    # applied_mark_fail: only the final "applied" mark is refused.
     if [ -f "$S/claim_fail" ]; then echo "gh: Server Error (HTTP 502)" >&2; exit 1; fi
-    id="${4#repos/o/r/issues/comments/}"; jq -c --arg id "$id" '{id: $id, body}' >> "$S/applied.jsonl"; echo '{}' ;;
+    id="${4#repos/o/r/issues/comments/}"; c=$(jq -c --arg id "$id" '{id: $id, body}')
+    if [ -f "$S/applied_mark_fail" ] && jq -e '.body | startswith("<!-- forge-slack-pr-text-applied ")' <<< "$c" >/dev/null; then
+      echo "applied" >> "$S/applied_mark_attempts"; echo "gh: Server Error (HTTP 502)" >&2; exit 1
+    fi
+    printf '%s\n' "$c" >> "$S/applied.jsonl"; echo '{}' ;;
   *) echo "UNHANDLED: $*" >> "$S/unhandled.log"; exit 1 ;;
 esac
 FAKE
@@ -163,7 +168,7 @@ check '[ "$(jq -rs ".[1].body" "$C/pr_comments.jsonl" | head -1)" = "<!-- forge-
   "happy: the handled-reviews watermark follows the reply"
 check '[ "$(cat "$C/resolved.log")" = PRRT_open ]' \
   "happy: only the open thread that is on this PR is resolved"
-check '[ "$(marks "$C" claimed)" = 12 ] && [ "$(marks "$C" applied)" = 12 ] && [ "$(jq -sr ".[0].body" "$C/applied.jsonl" | head -1)" = "<!-- forge-slack-pr-text-claimed {\"ts\":\"5.5\",\"seq\":1,\"pr\":7,\"ch\":\"C9\",\"th\":\"9.9\"} -->" ]' \
+check '[ "$(marks "$C" claimed)" = 12 ] && [ "$(marks "$C" applied)" = 12 ] && [ "$(jq -sr ".[0].body" "$C/applied.jsonl" | head -1)" = "<!-- forge-slack-pr-text-claimed {\"ts\":\"5.5\",\"seq\":1,\"pr\":7,\"ch\":\"C9\",\"th\":\"9.9\",\"rp\":true} -->" ]' \
   "happy: the request is claimed before the PR is touched, then marked applied, without its payload"
 check '[ "$(sed -n 2p "$C/gh.log" | cut -c1-48)" = "api --method PATCH repos/o/r/issues/comments/12 " ]' \
   "happy: the claim is the first write"
@@ -385,6 +390,31 @@ Forge is applying this request to #7.' > "$C/comments.jsonl"
 run_case "$C"
 check '[ -z "$(marks "$C" interrupted)" ] && [ ! -s "$C/slack.jsonl" ]' \
   "fresh-claim: a claim a running job may still be working on is left alone"
+
+# A closing reference to another repository's #1213 is not this issue.
+C=$(new_case cross-repo-close)
+comment 60 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: x"}')" > "$C/comments.jsonl"
+echo '{"data": {"repository": {"pullRequest": {"state": "OPEN", "body": "Closes other/repo#1213", "closingIssuesReferences": {"nodes": [{"number": 1213, "repository": {"nameWithOwner": "other/repo"}}]}, "reviewThreads": {"nodes": []}}}}}' > "$C/pr_7.json"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/pr_patch.jsonl" ] && [ "$(marks "$C" skipped)" = 60 ]' \
+  "cross-repo-close: a PR that closes another repository's #1213 is not edited"
+C=$(new_case same-repo-node)
+comment 61 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: y"}')" > "$C/comments.jsonl"
+echo '{"data": {"repository": {"pullRequest": {"state": "OPEN", "body": "", "closingIssuesReferences": {"nodes": [{"number": 1213, "repository": {"nameWithOwner": "O/R"}}]}, "reviewThreads": {"nodes": []}}}}}' > "$C/pr_7.json"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(jq -r .title "$C/pr_patch.jsonl")" = "fix: y" ]' \
+  "same-repo-node: a closing reference to this repository (any case) counts"
+
+# The final mark is retried once; if it still fails, Slack is told the
+# request may later be called interrupted by mistake.
+C=$(new_case mark-fails)
+comment 62 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: z"}')" > "$C/comments.jsonl"
+touch "$C/applied_mark_fail"
+run_case "$C"
+check '[ "$(wc -l < "$C/applied_mark_attempts" | tr -d " ")" = 2 ] && [ "$(jq -r .title "$C/pr_patch.jsonl")" = "fix: z" ]' \
+  "mark-fails: the final mark is tried twice and the edit itself still lands"
+check '[[ "$(slack_text "$C")" == *"I couldn'"'"'t mark the request done on #1213"* ]] && [ -z "$(marks "$C" interrupted)" ]' \
+  "mark-fails: Slack is told, and the run does not call its own finished request interrupted"
 
 if [ "$fail" -ne 0 ]; then
   echo "forge-pr-text: FAILED"

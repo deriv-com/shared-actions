@@ -4270,8 +4270,10 @@ jobs:
           mark() {
             # Only small fields, so a large description never becomes one
             # argument. ch/th stay, so an interrupted claim can still report.
-            jq -n --arg state "$2" --arg detail "$4" --arg run "$RUN_URL" --argjson req "$(jq -c '{ts, seq, pr, ch, th}' <<< "$3")" \
-              '{body: ("<!-- forge-slack-pr-text-\($state) " + ({ts: ($req.ts // ""), seq: ($req.seq // 0), pr: $req.pr, ch: ($req.ch // ""), th: ($req.th // "")} | tojson) + " -->\n" + $detail + " ([run](\($run)))")}' \
+            # rp: the request carries a reply, so forge-agent does not queue
+            # a second one while this run is still posting it.
+            jq -n --arg state "$2" --arg detail "$4" --arg run "$RUN_URL" --argjson req "$(jq -c '{ts, seq, pr, ch, th, rp: ((.reply | type) == "string")}' <<< "$3")" \
+              '{body: ("<!-- forge-slack-pr-text-\($state) " + ({ts: ($req.ts // ""), seq: ($req.seq // 0), pr: $req.pr, ch: ($req.ch // ""), th: ($req.th // ""), rp: $req.rp} | tojson) + " -->\n" + $detail + " ([run](\($run)))")}' \
               | gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/$1" --input - >/dev/null 2> "$WORK/err"
           }
 
@@ -4323,7 +4325,7 @@ jobs:
             exit 0
           fi
 
-          PR_QUERY='query($o: String!, $r: String!, $n: Int!) { repository(owner: $o, name: $r) { pullRequest(number: $n) { state body closingIssuesReferences(first: 50) { nodes { number } } reviewThreads(first: 100) { nodes { id isResolved } } } } }'
+          PR_QUERY='query($o: String!, $r: String!, $n: Int!) { repository(owner: $o, name: $r) { pullRequest(number: $n) { state body closingIssuesReferences(first: 50) { nodes { number repository { nameWithOwner } } } reviewThreads(first: 100) { nodes { id isResolved } } } } }'
           RESOLVE_MUTATION='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }'
 
           # report <channel> <thread ts> <line> <failed 0|1>
@@ -4374,9 +4376,12 @@ jobs:
             # an open PR. Either way the PR must close this issue: GitHub's
             # closing references, or a closing keyword in its description.
             want=$(jq -r 'if .state == "closed" or .state == "open" then .state else "" end' <<< "$req")
-            if ! jq -e --argjson issue "$ISSUE_NUMBER" --arg want "$want" '
+            # A closing reference to another repository's #N is not this issue.
+            if ! jq -e --argjson issue "$ISSUE_NUMBER" --arg want "$want" --arg repo "$GITHUB_REPOSITORY" '
                 .data.repository.pullRequest
-                | (any(.closingIssuesReferences.nodes[]?; .number == $issue)
+                | (any(.closingIssuesReferences.nodes[]?;
+                       .number == $issue
+                       and (((.repository.nameWithOwner // $repo) | ascii_downcase) == ($repo | ascii_downcase)))
                    or ((.body // "") | test("(?i)\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s+#\($issue)(?![0-9])")))
                   and (if $want == "open" then .state == "CLOSED" else .state == "OPEN" end)
               ' "$WORK/pr.json" >/dev/null; then
@@ -4496,14 +4501,22 @@ jobs:
 
             # Record the outcome. The request is already claimed, so a failed
             # update here only leaves the "applying" line.
-            if ! mark "$cid" applied "$req" "Forge applied this request to #${pr}."; then
+            # Retried once: a claim left behind would later be reported as
+            # interrupted, contradicting this run's result.
+            recorded=1
+            if ! mark "$cid" applied "$req" "Forge applied this request to #${pr}." \
+                && ! mark "$cid" applied "$req" "Forge applied this request to #${pr}."; then
               cat "$WORK/err"
               echo "::warning::Could not record the outcome on request comment ${cid}."
+              recorded=0
             fi
             echo "$cid" >> "$WORK/finished"
 
             line="• ${pr_link}: "
             if [ "${#done_parts[@]}" -gt 0 ]; then line+=$(join_parts "${done_parts[@]}"); else line+="nothing changed"; fi
+            if [ "$recorded" = 0 ]; then
+              line+=" (I couldn't mark the request done on #${ISSUE_NUMBER}, so a later \"stopped before it finished\" note about it is wrong)"
+            fi
             if [ "${#problems[@]}" -gt 0 ]; then
               report "$ch" "$th" "${line}. Not done: $(join_parts "${problems[@]}")." 1
               FAILED=1
