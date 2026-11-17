@@ -50,8 +50,35 @@ check 'awk "/^      command:/{f=1} f && /required:/{print; exit}" "$WF" | grep -
   "input 'command' stays optional"
 check 'awk "/^      command:/{f=1} f && /default:/{print; exit}" "$WF" | grep -q "default: \"auto\""' \
   "input 'command' defaults to auto"
-check 'awk "/^      node_version:/{f=1} f && /default:/{print; exit}" "$WF" | grep -qE "default: \"(24\.(2[2-9]|[3-9][0-9])|26\.)"' \
-  "input 'node_version' defaults to a Node line spec-to-pr 0.8.4+ runs on"
+# node_version's default must satisfy spec-to-pr 0.8.4's engines.node
+# (^24.22.3 || ^26.13.1). Compared numerically, with an optional leading ^.
+node_floor_ok() {  # node_floor_ok <version or ^version>
+  local v="${1#^}" M m p
+  [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+  M=${BASH_REMATCH[1]} m=${BASH_REMATCH[2]} p=${BASH_REMATCH[3]}
+  { (( M == 24 )) && (( m > 22 || (m == 22 && p >= 3) )); } ||
+    { (( M == 26 )) && (( m > 13 || (m == 13 && p >= 1) )); }
+}
+for v in 24.22.3 ^24.22.3 24.22.10 24.23.0 26.13.1 ^26.13.1 26.14.0; do
+  check "node_floor_ok '$v'" "node floor check accepts $v"
+done
+for v in 24.22.0 24.22.2 26.0.0 26.13.0 22.19.0 20.x 24 ^24; do
+  check "! node_floor_ok '$v'" "node floor check rejects $v"
+done
+NODE_DEFAULT=$(awk '/^      node_version:/{f=1} f && /default:/{print; exit}' "$WF" | sed -E 's/.*default: "([^"]*)".*/\1/')
+check 'node_floor_ok "$NODE_DEFAULT"' \
+  "input 'node_version' defaults to >=24.22.3 or >=26.13.1 (spec-to-pr 0.8.4 engines.node), got '$NODE_DEFAULT'"
+
+# The engine's Node check runs right after the engine fetch, before the gateway
+# and API preflights and the target repo's install.
+step_line() { grep -n "^      - name: $1" "$WF" | head -1 | cut -d: -f1; }
+check '[[ -n "$(step_line "Preflight — does this Node run the engine?")" ]]' "Node preflight step exists"
+check '(( $(step_line "Fetch the spec-to-pr engine") < $(step_line "Preflight — does this Node run the engine?") ))' \
+  "Node preflight runs after the engine fetch"
+check '(( $(step_line "Preflight — does this Node run the engine?") < $(step_line "Resolve the LLM gateway") ))' \
+  "Node preflight runs before the gateway resolve"
+check '(( $(step_line "Preflight — does this Node run the engine?") < $(step_line "Install dependencies") ))' \
+  "Node preflight runs before install_command"
 check 'awk "/^      slack_message_ts:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
   "input 'slack_message_ts' stays optional"
 check 'awk "/^      slack_mention_ts:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
@@ -819,6 +846,29 @@ step_script() {  # step_script <step name> <case dir>
     r { sub(/^          /, ""); print }
   ' "$WF" | sed "s#/tmp/#$2/tmp/#g"
 }
+
+# --- behavioral: the Node preflight against fake engines -------------------
+node_preflight_case() {  # node_preflight_case <old|ok|bad>  -> "<exit> <output>"
+  local d="$TMP_BEHAVIOR/node-preflight-$1" rc=0 out
+  mkdir -p "$d/forge-engine"
+  if [[ "$1" != old ]]; then
+    mkdir -p "$d/forge-engine/src/lib/setup"
+    printf 'module.exports = { supportedRange: "^24.22.3 || ^26.13.1", assertSupportedNode() { %s } };\n' \
+      "$([[ "$1" == bad ]] && echo 'throw new Error("unsupported");')" > "$d/forge-engine/src/lib/setup/runtime.js"
+  fi
+  step_script "Preflight — does this Node run the engine?" "$d" > "$d/step.sh"
+  out=$(RUNNER_TEMP="$d" ENGINE_TAG=v9.9.9 bash "$d/step.sh" 2>&1) || rc=$?
+  printf '%s %s' "$rc" "$out"
+}
+NP_OLD=$(node_preflight_case old)
+NP_OK=$(node_preflight_case ok)
+NP_BAD=$(node_preflight_case bad)
+check '[[ "$NP_OLD" == "0 "*"no Node runtime check"* ]]' "Node preflight skips an engine without the runtime check"
+check '[[ "$NP_OK" == "0 Node "*"satisfies spec-to-pr v9.9.9"* ]]' "Node preflight passes when the engine accepts this Node"
+check '[[ "$NP_BAD" == "1 ::error::spec-to-pr v9.9.9 needs Node ^24.22.3 || ^26.13.1, but this job runs Node "* ]]' \
+  "Node preflight fails with an ::error naming the engine's range"
+check '[[ "$NP_BAD" == *"Set node_version in the calling workflow"*"pin engine_ref"* ]]' \
+  "Node preflight error names both fixes"
 
 FAKE_BIN="$TMP_BEHAVIOR/bin"
 mkdir -p "$FAKE_BIN"

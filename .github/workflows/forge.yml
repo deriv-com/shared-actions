@@ -40,6 +40,7 @@ name: Forge — issue to PR
 #         analysis_brief:  ${{ github.event.inputs.analysis_brief }}
 #         command:         ${{ github.event.inputs.command || 'auto' }}
 #         install_command: "npm ci"          # whatever your CI runs
+#         node_version:    "^24.22.3"        # must satisfy the engine's engines.node
 #       secrets:
 #         CLIENT_ID_GHAPP_WRITE:   ${{ secrets.CLIENT_ID_GHAPP_WRITE }}
 #         PRIVATE_KEY_GHAPP_WRITE: ${{ secrets.PRIVATE_KEY_GHAPP_WRITE }}
@@ -165,11 +166,14 @@ on:
       node_version:
         description: >-
           Node version for the target repo's toolchain. The spec-to-pr engine
-          runs on it too, and from spec-to-pr 0.8.4 the engine refuses to start
-          on anything but Node ^24.22.3 or ^26.13.1. A repo that still needs an
-          older Node must also pin engine_ref to "v0.8.3".
+          runs on it too, so it must satisfy the engines.node of the release
+          engine_ref resolves to (0.8.4 and later: ^24.22.3 || ^26.13.1); the
+          job checks this right after fetching the engine and stops if not. A
+          repo that must stay on an older Node can pin engine_ref to an older
+          release (v0.8.3 runs on Node 20 and later), but then gets no later
+          engine fixes, and inputs that need a newer engine fail the run.
         required: false
-        default: "24.22.3"
+        default: "^24.22.3"
         type: string
       install_command:
         description: >-
@@ -213,7 +217,9 @@ on:
         # v0.8.x tag, and each new v0.8.x tag rolls out to them with no PR here.
         # spec-to-pr ships features in 0.8.x patches, so this is "newest 0.8.x",
         # not "bug fixes only". Bump the range deliberately for a new minor
-        # (0.x) / major (1.x+).
+        # (0.x) / major (1.x+). A 0.8.x patch can also raise the engine's Node
+        # floor (0.8.4 did), so node_version's default has to track the newest
+        # 0.8.x engines.node.
         default: "^0.8.0"
         type: string
       fast_lane:
@@ -562,6 +568,31 @@ jobs:
             echo "FORGE_CLI=$DIR/bin/cli.js"
             echo "CLAUDE_BIN=$CLAUDE_BIN"
           } >> "$GITHUB_ENV"
+
+      - name: Preflight — does this Node run the engine?
+        # spec-to-pr checks its own Node floor (engines.node) only when dstp
+        # starts, which is after the gateway preflight and install_command. Ask
+        # the fetched engine now, so a node_version it cannot run on stops the
+        # job in seconds with the fix named. Engines without the check (0.8.3
+        # and older, which run on Node 20 and later) skip it.
+        env:
+          ENGINE_TAG: ${{ steps.engine.outputs.engine_tag }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/forge-engine"
+          if [ ! -f src/lib/setup/runtime.js ]; then
+            echo "Engine ${ENGINE_TAG:-?} has no Node runtime check (spec-to-pr 0.8.3 or older); skipping."
+            exit 0
+          fi
+          node -e '
+            const rt = require("./src/lib/setup/runtime");
+            const tag = process.env.ENGINE_TAG || "this engine";
+            try { rt.assertSupportedNode(); } catch {
+              console.log(`::error::spec-to-pr ${tag} needs Node ${rt.supportedRange}, but this job runs Node ${process.versions.node}. Set node_version in the calling workflow to a supported version, or pin engine_ref to a release that runs on this Node.`);
+              process.exit(1);
+            }
+            console.log(`Node ${process.versions.node} satisfies spec-to-pr ${tag} (${rt.supportedRange}).`);
+          '
 
       - name: Resolve the LLM gateway
         # Deriv serves Claude through a LiteLLM gateway, not a direct Anthropic

@@ -70,6 +70,8 @@ The remaining directories under `.github/actions/` implement internal building b
 
 [`forge.yml`](.github/workflows/forge.yml) runs `deriv-com/spec-to-pr` against an issue (`command: auto`) or an open same-repo PR (`command: revise` | `update`), handling GitHub App token rotation, AI review wait/revise loops, base-branch updates, and optional Slack progress threads. Full caller header and input reference live at the top of [`forge.yml`](.github/workflows/forge.yml).
 
+The engine runs on the job's `node_version` (default `^24.22.3`). From spec-to-pr 0.8.4 it needs Node `^24.22.3 || ^26.13.1`, and the job stops right after fetching the engine, naming the fix, if `node_version` doesn't satisfy it.
+
 ### App info (version stamp)
 
 [`generate_app_info`](.github/actions/generate_app_info/) creates or updates an
