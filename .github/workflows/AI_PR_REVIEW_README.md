@@ -571,8 +571,7 @@ A consumer repo can keep standing rules for this review in `.github/ai-review-ru
 third-party ref in this workflow is SHA-pinned, so this is a deliberate
 exception, for two reasons: a SHA cannot be referenced before the commit that
 introduces it exists, and pinning would make every engine change a two-commit
-dance (change, then re-pin). It also matches house style — `docsync-ai.yml` does
-the same for its composite actions.
+dance (change, then re-pin).
 
 The consequence worth knowing: a consumer pinning `ai-pr-review.yml` to a tag or
 SHA does **not** pin the engine code that actually executes. Given how privileged
