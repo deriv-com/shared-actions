@@ -163,9 +163,13 @@ on:
 
       # --- per-repo tuning --------------------------------------------------
       node_version:
-        description: "Node version for the target repo's toolchain"
+        description: >-
+          Node version for the target repo's toolchain. The spec-to-pr engine
+          runs on it too, and from spec-to-pr 0.8.4 the engine refuses to start
+          on anything but Node ^24.22.3 or ^26.13.1. A repo that still needs an
+          older Node must also pin engine_ref to "v0.8.3".
         required: false
-        default: "20.x"
+        default: "24.22.3"
         type: string
       install_command:
         description: >-

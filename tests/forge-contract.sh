@@ -50,6 +50,8 @@ check 'awk "/^      command:/{f=1} f && /required:/{print; exit}" "$WF" | grep -
   "input 'command' stays optional"
 check 'awk "/^      command:/{f=1} f && /default:/{print; exit}" "$WF" | grep -q "default: \"auto\""' \
   "input 'command' defaults to auto"
+check 'awk "/^      node_version:/{f=1} f && /default:/{print; exit}" "$WF" | grep -qE "default: \"(24\.(2[2-9]|[3-9][0-9])|26\.)"' \
+  "input 'node_version' defaults to a Node line spec-to-pr 0.8.4+ runs on"
 check 'awk "/^      slack_message_ts:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
   "input 'slack_message_ts' stays optional"
 check 'awk "/^      slack_mention_ts:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
