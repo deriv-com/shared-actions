@@ -2418,6 +2418,29 @@ check 'grep -q "keep_plan .*plan_path" "$WF"' \
 check 'grep -qF "TAIL=\$(tail -c 3000 /tmp/forge.log 2>/dev/null | scrub_log" "$WF" && grep -qF "tail -c 262144 /tmp/forge.log | scrub_log" "$WF"' \
   "the issue comment's tail and failure.log share one scrub"
 
+# --- unknown commands are refused, never folded into auto ------------------
+# The claim step stops before any label or comment; Run Forge is the backstop.
+C=$(new_case unknown-claim)
+step_script "Claim the issue" "$C" > "$C/claim.sh"
+rc=0
+env -i PATH="$FAKE_BIN:$PATH" HOME="$C/home" FAKE_STATE="$C" GITHUB_OUTPUT="$C/out" \
+  GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 FORGE_COMMAND=pr_text GH_TOKEN=ghs_faketoken \
+  bash -e "$C/claim.sh" > "$C/claim.log" 2>&1 || rc=$?
+check '[ "$rc" != 0 ] && has "$C/claim.log" "Unknown command '"'"'pr_text'"'"'" && [ ! -s "$C/gh.log" ]' \
+  "the claim step refuses an unknown command before any label or comment"
+for ok in "" auto revise update; do
+  C=$(new_case "known-claim-${ok:-empty}")
+  step_script "Claim the issue" "$C" | sed -n '1,/^esac$/p' > "$C/claim-head.sh"
+  rc=0
+  env -i PATH="$PATH" FORGE_COMMAND="$ok" bash -e "$C/claim-head.sh" > /dev/null 2>&1 || rc=$?
+  check '[ "$rc" = 0 ]' "the claim step accepts command '${ok:-<empty>}'"
+done
+C=$(new_case unknown-run)
+echo pr_text > "$C/command"
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" != 0 ] && has "$C/run.log" "Unknown command '"'"'pr_text'"'"'" && [ ! -f "$C/dstp_ran" ]' \
+  "Run Forge refuses an unknown command and never runs dstp as auto"
+
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"
   exit 1
