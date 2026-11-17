@@ -32,8 +32,8 @@ on:
 
 jobs:
   ai-review:
-    # Absolute path at @master rather than a local `./` path, matching
-    # docsync-ai.yml. It also keeps this caller identical in shape to the
+    # Absolute path at @master rather than a local `./` path. It keeps this
+    # caller identical in shape to the
     # consumer repos', so dogfooding exercises the same resolution path they use.
     uses: deriv-com/shared-actions/.github/workflows/ai-pr-review.yml@master
 

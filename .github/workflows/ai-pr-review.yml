@@ -1390,7 +1390,7 @@ jobs:
       # Engines are referenced by absolute deriv-com/shared-actions path, NOT
       # `./.github/actions/...`: inside a reusable workflow a local path resolves
       # against the CALLER's repo, which would break every external consumer.
-      # Same house style as docsync-ai.yml. Note this also means a PR branch
+      # Note this also means a PR branch
       # still pulls engines from @master — to test an engine change pre-merge,
       # temporarily point these refs at @<branch> and revert before merging.
       #
