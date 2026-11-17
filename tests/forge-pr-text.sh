@@ -327,6 +327,11 @@ comment 42 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, reply: "<!-- address
 run_case "$C"
 check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/pr_comments.jsonl" ] && [ ! -s "$C/resolved.log" ] && [[ "$(slack_text "$C")" == *"no reply text"* ]]' \
   "empty-reply: a reply that scrubs to nothing never posts the watermark or resolves threads"
+C=$(new_case blank-reply-no-watermark)
+comment 44 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, reply: "   ", threads: ["PRRT_open"]}')" > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/pr_comments.jsonl" ] && [ ! -s "$C/resolved.log" ] && [[ "$(slack_text "$C")" == *"no reply text"* ]]' \
+  "blank-reply-no-watermark: a whitespace-only reply resolves no thread, even without a watermark"
 
 # A request that cannot be claimed is left alone: nothing is done twice.
 C=$(new_case claim-fails)
@@ -344,6 +349,11 @@ C=$(new_case mixed-comments)
 Analysis of the issue.'
   comment 51 'forge-gh-app[bot]' Bot 35 '<!-- forge-slack-pr-text-applied {"ts":"1.1","seq":1,"pr":7} -->
 Forge applied this request to #7.'
+  comment 56 'forge-gh-app[bot]' Bot 34 '<!-- forge-slack-pr-text-skipped {"ts":"1.1","seq":2,"pr":7} -->
+Forge skipped this request.'
+  comment 57 'forge-gh-app[bot]' Bot 33 '<!-- forge-slack-pr-text-interrupted {"ts":"1.1","seq":3,"pr":7} -->
+Forge stopped before it finished.'
+  comment 58 'forge-gh-app[bot]' Bot 32 'A plain comment with no marker at all.'
   comment 52 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: mixed"}')"
 } > "$C/comments.jsonl"
 run_case "$C"

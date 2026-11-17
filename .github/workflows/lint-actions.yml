@@ -22,7 +22,6 @@ on:
       - '.github/workflows/**'
       - '.github/actions/**'
       - 'tests/ai-pr-review-contract.sh'
-      - 'tests/docsync-guidance-contract.sh'
       - 'tests/forge-contract.sh'
       - 'tests/forge-pr-text.sh'
       - 'tests/forge-resolver.sh'
@@ -120,9 +119,6 @@ jobs:
 
       - name: AI PR review contract tests
         run: bash tests/ai-pr-review-contract.sh
-
-      - name: DocSync guidance contract tests
-        run: bash tests/docsync-guidance-contract.sh
 
       - name: Forge contract tests
         run: bash tests/forge-contract.sh

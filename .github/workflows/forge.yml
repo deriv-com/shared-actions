@@ -4234,6 +4234,9 @@ jobs:
               | select((.user.login // "") == $who and (.user.type // "") == "Bot")
               | select(((.created_at // "1970-01-01T00:00:00Z") | fromdateiso8601) > ($now - 86400))
               | .id as $id | .created_at as $at | (.body // "") as $text
+              # Only request comments reach capture: the guard keeps any other
+              # comment a plain skip on any jq version.
+              | select($text | test("^<!-- forge-slack-pr-text "))
               | ($text | capture("^<!-- forge-slack-pr-text (?<j>[^>]*) -->") | .j | try fromjson catch null)
               | select(type == "object" and .v == 1)
               | select((.pr | type) == "number" and .pr > 0 and (.pr | floor) == .pr)
@@ -4281,7 +4284,8 @@ jobs:
             | select(((.updated_at // .created_at // "1970-01-01T00:00:00Z") | fromdateiso8601) < ($now - 1200))
             | select(((.created_at // "1970-01-01T00:00:00Z") | fromdateiso8601) > ($now - 86400))
             | .id as $id
-            | (.body // "") | capture("^<!-- forge-slack-pr-text-claimed (?<j>[^>]*) -->") | .j
+            | (.body // "") | select(test("^<!-- forge-slack-pr-text-claimed "))
+            | capture("^<!-- forge-slack-pr-text-claimed (?<j>[^>]*) -->") | .j
             | (try fromjson catch null)
             | select(type == "object" and (.pr | type) == "number")
             | . + {comment_id: $id}
@@ -4435,8 +4439,13 @@ jobs:
             # The watermark and thread resolution only follow a posted reply:
             # without it they would mark the review answered when it is not.
             reply_ok=1
-            if jq -e '.watermark == true and ((.reply | type) != "string" or (.reply | gsub("<!--[\\s\\S]*?-->"; "") | test("[^[:space:]]") | not))' <<< "$req" >/dev/null; then
-              # A watermark marks the review answered: never without a reply.
+            # Reply text: a string with something left once HTML comments go.
+            # A request that names a reply (or asks for the watermark, which
+            # marks the review answered) without any text gets no watermark
+            # and no resolved thread. A threads-only request has no reply key:
+            # Forge's reply is already on the PR.
+            if jq -e '((.reply | type) == "string" or .watermark == true)
+                and ((.reply | type) != "string" or (.reply | gsub("<!--[\\s\\S]*?-->"; "") | test("[^[:space:]]") | not))' <<< "$req" >/dev/null; then
               reply_ok=0
               problems+=("there was no reply text, so the watermark and thread resolution were skipped")
             elif jq -e '(.reply | type) == "string" and (.reply | test("[^[:space:]]"))' <<< "$req" >/dev/null; then
