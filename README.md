@@ -175,7 +175,6 @@ node --test .github/actions/**/*.test.js
 # 2. Workflow & composite-action contract suites
 bash tests/ai-pr-review-contract.sh
 bash tests/qa-checklist-contract.sh
-bash tests/docsync-guidance-contract.sh
 bash tests/forge-contract.sh
 bash tests/forge-resolver.sh
 
