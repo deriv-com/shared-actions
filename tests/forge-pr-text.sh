@@ -622,6 +622,14 @@ From a newer Forge.'
 run_case "$C"
 check '[ "$(marks "$C" skipped)" = "96,97" ] && [ ! -s "$C/pr_patch.jsonl" ] && [[ "$(slack_text "$C")" == *"could not be read"* ]]' \
   "malformed: unreadable requests are marked skipped and their thread told"
+check '[ "$(cat "$C/rc")" = 1 ]' "malformed: a run that only met unreadable requests fails, so Actions shows it"
+C=$(new_case malformed-mark-fails)
+comment 101 'forge-gh-app[bot]' Bot 30 '<!-- forge-slack-pr-text {"v":2,"ts":"5.5","seq":1,"pr":7,"ch":"C9","th":"9.9"} -->
+From a newer Forge.' > "$C/comments.jsonl"
+touch "$C/claim_fail"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [[ "$(slack_text "$C")" == *"could not be read"* ]] && grep -q "::warning::Could not mark unreadable request comment 101" "$C/run.log"' \
+  "malformed-mark-fails: the thread is still told when the request cannot be marked, and the run fails"
 
 # A claim taken late in the request's day, then lost, is still reported.
 C=$(new_case late-claim)

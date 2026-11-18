@@ -4458,21 +4458,25 @@ jobs:
           ' "$WORK/comments.json" > "$WORK/parsed.jsonl"
           jq -c 'select(.malformed | not)' "$WORK/parsed.jsonl" > "$WORK/pending.jsonl"
 
-          # Unreadable requests: claimed and marked skipped, and their thread
-          # (or the dispatch's) told to ask again.
+          # Unreadable requests: marked skipped, and their thread (or the
+          # dispatch's) told to ask again. The thread is told even when the
+          # mark fails; that request then stays pending, and a later run reads
+          # and reports it again.
           while IFS= read -r req <&3; do
             cid=$(jq -r '.comment_id' <<< "$req")
-            if mark_final "$cid" skipped "$req" "Forge could not read this request, so nothing was changed."; then
-              report "$req" "• A Forge request on #${ISSUE_NUMBER} could not be read (it was incomplete or from another Forge version), so nothing was changed. Ask me again." 1
-            else
+            if ! mark_final "$cid" skipped "$req" "Forge could not read this request, so nothing was changed."; then
               cat "$WORK/err"
+              echo "::warning::Could not mark unreadable request comment ${cid}; it stays pending."
             fi
+            report "$req" "• A Forge request on #${ISSUE_NUMBER} could not be read (it was incomplete or from another Forge version), so nothing was changed. Ask me again." 1
             FAILED=1
           done 3< <(jq -c 'select(.malformed == true)' "$WORK/parsed.jsonl")
 
+          # Nothing left to apply. A run that only met unreadable requests
+          # still fails, so Actions shows it.
           if [ ! -s "$WORK/pending.jsonl" ]; then
-            echo "Nothing pending on #${ISSUE_NUMBER}: an earlier run applied every request."
-            exit 0
+            [ "$FAILED" = 1 ] || echo "Nothing pending on #${ISSUE_NUMBER}: an earlier run applied every request."
+            exit "$FAILED"
           fi
 
           # Claim every request before touching any PR, so each is handled
