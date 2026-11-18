@@ -166,9 +166,11 @@ on:
         description: >-
           Node version for the target repo's toolchain and the spec-to-pr
           engine: anything actions/setup-node takes (a version, a range or an
-          alias). Empty (the default) means the Node the engine release names,
-          so it moves with engine_ref. The job stops early, before any install,
-          if node_version doesn't satisfy the engine's package.json engines.node.
+          alias). The target repo's install and verify commands also run on
+          this Node (running the engine on its own Node is #217). Empty (the
+          default) means the Node the engine release names, so it moves with
+          engine_ref. The job stops early, before any install, if node_version
+          doesn't satisfy the engine's package.json engines.node.
         required: false
         default: ""
         type: string
@@ -528,11 +530,11 @@ jobs:
         # The caller's node_version wins. Otherwise the engine release names its
         # own Node (src/assets/upstream-versions.json .node.default), so the
         # default moves with engine_ref and nothing here copies the engine's
-        # floor. If that file exists but names no usable default, setup-node
-        # gets the release's package.json engines.node range and installs the
-        # newest Node that satisfies it. Only a release without the file (one
-        # from before it existed; those ran on Node 20 and later) gets 20.x.
-        # jq/bash only: no Node has been set up yet.
+        # floor. If the release names no usable default, setup-node gets its
+        # package.json engines.node range and installs a Node that satisfies it
+        # (setup-node prefers versions cached on the runner). Only a release
+        # with neither gets 20.x (releases from before upstream-versions.json
+        # ran on Node 20 and later). jq/bash only: no Node has been set up yet.
         env:
           NODE_VERSION: ${{ inputs.node_version }}
           ENGINE_TAG: ${{ steps.engine.outputs.engine_tag }}
@@ -541,11 +543,17 @@ jobs:
           set -euo pipefail
           DIR="$RUNNER_TEMP/forge-engine"
           VERSIONS="$DIR/src/assets/upstream-versions.json"
-          ENGINE_ID="${ENGINE_TAG:-${ENGINE_SHA:-}}"
-          ENGINE="spec-to-pr ${ENGINE_ID:0:12}"
-          [ -n "$ENGINE_ID" ] || ENGINE="the fetched spec-to-pr release"
+          # The same release label as the preflight: the tag, else the SHA's
+          # first 12 characters.
+          if [ -n "${ENGINE_TAG:-}" ]; then
+            ENGINE="spec-to-pr $ENGINE_TAG"
+          elif [ -n "${ENGINE_SHA:-}" ]; then
+            ENGINE="spec-to-pr ${ENGINE_SHA:0:12}"
+          else
+            ENGINE="the fetched spec-to-pr release"
+          fi
           # fail <message>: one ::error line, also kept as a step output for
-          # Report and in the job summary.
+          # Report and in the job summary (same header as the preflight).
           fail() {
             echo "::error::$1"
             echo "error=$1" >> "$GITHUB_OUTPUT"
@@ -569,31 +577,49 @@ jobs:
           if [ -n "$NODE_VERSION" ]; then
             usable "$NODE_VERSION" \
               || fail "node_version has characters setup-node never takes (\$, backticks, ;, &, parentheses, quotes or backslashes). Use a version, a range such as ^24.22.3, or an alias such as lts/jod."
-            PICK="$NODE_VERSION" SOURCE=input
-            echo "Node $PICK: from the node_version input"
-          elif [ ! -f "$VERSIONS" ]; then
-            PICK=20.x SOURCE=fallback
-            echo "Node $PICK: $ENGINE has no src/assets/upstream-versions.json, so it names no Node of its own (releases from before that file ran on Node 20 and later)"
-          else
+            echo "Node $NODE_VERSION: from the node_version input"
+            {
+              echo "version=$NODE_VERSION"
+              echo "source=input"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -f "$VERSIONS" ]; then
             DEFAULT=$(jq -r '(.node.default)? // empty | strings' "$VERSIONS" 2>/dev/null) \
               || fail "$ENGINE has a src/assets/upstream-versions.json that is not valid JSON, so the job cannot tell which Node it needs. Set node_version in the calling workflow, or pin engine_ref to another release."
             if [ -n "$DEFAULT" ] && usable "$DEFAULT"; then
-              PICK="$DEFAULT" SOURCE=engine-default
-              echo "Node $PICK: $ENGINE names it as its own Node (upstream-versions.json .node.default)"
-            else
-              if [ -n "$DEFAULT" ]; then
-                WHAT="a .node.default that setup-node cannot take"
-              else
-                WHAT="no .node.default string"
-              fi
-              RANGE=$(jq -r '(.engines.node)? // empty | strings' "$DIR/package.json" 2>/dev/null) \
-                || fail "$ENGINE has a package.json that is missing or not valid JSON, so the job cannot tell which Node it needs. Pin engine_ref to another release."
-              if [ -z "$RANGE" ] || ! usable "$RANGE"; then
-                fail "$ENGINE has $WHAT in src/assets/upstream-versions.json and no usable engines.node in package.json, so the job cannot tell which Node it needs. Set node_version in the calling workflow."
-              fi
-              PICK="$RANGE" SOURCE=engines-node
-              echo "::warning::$ENGINE has $WHAT in src/assets/upstream-versions.json, so setup-node gets its package.json engines.node ($RANGE) and installs the newest Node that satisfies it."
+              echo "Node $DEFAULT: $ENGINE names it as its own Node (upstream-versions.json .node.default)"
+              {
+                echo "version=$DEFAULT"
+                echo "source=engine-default"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
             fi
+            if [ -n "$DEFAULT" ]; then
+              WHAT="a .node.default that setup-node cannot take in src/assets/upstream-versions.json"
+            else
+              WHAT="no .node.default string in src/assets/upstream-versions.json"
+            fi
+          else
+            WHAT="no src/assets/upstream-versions.json"
+          fi
+
+          # No usable default: the release's own engines.node range.
+          RANGE=$(jq -r '(.engines.node)? // empty | strings' "$DIR/package.json" 2>/dev/null) \
+            || fail "$ENGINE has a package.json that is missing or not valid JSON, so the job cannot tell which Node it needs. Pin engine_ref to another release."
+          if [ -n "$RANGE" ] && usable "$RANGE"; then
+            PICK="$RANGE" SOURCE=engines-node
+            if [ -f "$VERSIONS" ]; then
+              echo "::warning::$ENGINE has $WHAT, so setup-node gets its package.json engines.node ($RANGE) and installs a Node that satisfies it (setup-node prefers versions cached on the runner)."
+            else
+              echo "Node $RANGE: $ENGINE has $WHAT, so setup-node gets its package.json engines.node and installs a Node that satisfies it (setup-node prefers versions cached on the runner)"
+            fi
+          elif [ ! -f "$VERSIONS" ]; then
+            PICK=20.x SOURCE=fallback
+            echo "Node $PICK: $ENGINE has $WHAT and no usable engines.node, so it names no Node of its own (releases from before upstream-versions.json ran on Node 20 and later)"
+          else
+            fail "$ENGINE has $WHAT and no usable engines.node in package.json, so the job cannot tell which Node it needs. Set node_version in the calling workflow."
           fi
           {
             echo "version=$PICK"
@@ -611,13 +637,15 @@ jobs:
         # gateway preflight and install_command. Check the fetched release's
         # package.json engines.node now, before any npm ci, so a Node it cannot
         # run on stops the job in seconds with the fix named. When setup-node
-        # was handed engines.node itself, the Node it installed satisfies it by
-        # construction and there is nothing to check. Otherwise the exact Node
-        # installed is compared with a small checker that reads the forms
-        # engines.node uses (a || b, ^x.y.z, >=x[.y[.z]], x.x); any other form
-        # is warned about and let through, and dstp's own check still applies.
-        # A failure is also kept as a step output, which Report posts as the
-        # reason, and in the job summary.
+        # was handed engines.node itself, the Node it installed (setup-node
+        # prefers versions cached on the runner) satisfies it by construction,
+        # and a release that declares no engines.node has nothing to check.
+        # Otherwise the exact Node installed is compared with a small checker
+        # that reads the forms engines.node uses (a || b, ^x.y.z, >=x[.y[.z]],
+        # x.x). As in npm semver, a prerelease Node satisfies none of them. Any
+        # other form is warned about and let through, and dstp's own check
+        # still applies. A failure is also kept as a step output, which Report
+        # posts as the reason, and in the job summary.
         env:
           ENGINE_TAG: ${{ steps.engine.outputs.engine_tag }}
           ENGINE_SHA: ${{ steps.engine.outputs.engine_sha }}
@@ -630,13 +658,22 @@ jobs:
           const fs = require("fs");
           const env = process.env;
           const dir = `${env.RUNNER_TEMP}/forge-engine`;
-          const id = env.ENGINE_TAG || (env.ENGINE_SHA || "").slice(0, 12);
-          const engine = id ? `spec-to-pr ${id}` : "the fetched spec-to-pr release";
+          // The same release label as the pick: the tag, else the SHA's first
+          // 12 characters.
+          const engine = env.ENGINE_TAG
+            ? `spec-to-pr ${env.ENGINE_TAG}`
+            : env.ENGINE_SHA
+              ? `spec-to-pr ${env.ENGINE_SHA.slice(0, 12)}`
+              : "the fetched spec-to-pr release";
           const have = process.versions.node;
+          // Engine-supplied text is printed on one line, so no part of it can
+          // start a line and run as a workflow command.
+          const oneLine = (text) => String(text).replace(/[\r\n]+/g, " ");
 
-          // fail: one ::error line, also kept for Report and the job summary.
+          // fail: one ::error line, also kept for Report and the job summary
+          // (same header as the pick).
           const fail = (text) => {
-            const msg = String(text).replace(/[\r\n]+/g, " ");
+            const msg = oneLine(text);
             console.log(`::error::${msg}`);
             if (env.GITHUB_OUTPUT) fs.appendFileSync(env.GITHUB_OUTPUT, `error=${msg}\n`);
             if (env.GITHUB_STEP_SUMMARY) {
@@ -656,6 +693,16 @@ jobs:
           const field = (obj, ...keys) =>
             keys.reduce((o, k) => (o && typeof o === "object" ? o[k] : undefined), obj);
 
+          // upstream-versions.json is checked whenever the release ships it,
+          // whatever path picked the Node.
+          let versions = {};
+          if (fs.existsSync(`${dir}/src/assets/upstream-versions.json`)) {
+            const read = readJson("src/assets/upstream-versions.json");
+            if (read.error) {
+              fail(`${engine} has a src/assets/upstream-versions.json that is not valid JSON (${read.error}). Pin engine_ref to another release.`);
+            }
+            versions = read.value;
+          }
           if (env.NODE_SOURCE === "engines-node") {
             console.log(`setup-node installed Node ${have} from the engines.node of ${engine} (${env.NODE_PICKED}); nothing more to check.`);
             process.exit(0);
@@ -664,21 +711,24 @@ jobs:
           if (pkg.error) {
             fail(`${engine} has a package.json that is missing or not valid JSON (${pkg.error}), so the job cannot check which Node it runs on. Pin engine_ref to another release.`);
           }
-          const range = field(pkg.value, "engines", "node");
-          if (typeof range !== "string" || !range.trim()) {
+          const rawRange = field(pkg.value, "engines", "node");
+          if (typeof rawRange !== "string" || !rawRange.trim()) {
             console.log(`${engine} declares no engines.node; nothing to check.`);
             process.exit(0);
           }
+          const range = oneLine(rawRange);
 
-          // A prerelease or build suffix (24.0.0-rc.1) is dropped, so every
-          // part is a number.
-          const v = have.replace(/[-+].*$/, "").split(".").map(Number);
+          // npm semver: a prerelease (24.0.0-rc.1) satisfies none of these plain
+          // forms, and build metadata (+...) is ignored.
+          const core = have.replace(/\+.*$/, "");
+          const prerelease = core.includes("-");
+          const v = core.replace(/-.*$/, "").split(".").map(Number);
           const cmp = (a, b) => {
             for (let i = 0; i < 3; i++) if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) - (b[i] || 0);
             return 0;
           };
           // true / false, or null when this checker does not read the form.
-          const sat = (c) => {
+          const form = (c) => {
             let m;
             if ((m = /^\^(\d+)\.(\d+)\.(\d+)$/.exec(c))) {
               const w = m.slice(1).map(Number);
@@ -693,6 +743,10 @@ jobs:
               return v[0] === Number(m[1]) && (m[2] === undefined || m[2] === "x" || v[1] === Number(m[2]));
             return null;
           };
+          const sat = (c) => {
+            const ok = form(c);
+            return ok === null ? null : ok && !prerelease;
+          };
           const results = range.split("||").map((c) => sat(c.trim()));
           if (results.includes(true)) {
             console.log(`Node ${have} satisfies ${engine} (engines.node ${range}).`);
@@ -704,23 +758,19 @@ jobs:
           }
 
           let rollback = "";
-          if (fs.existsSync(`${dir}/src/assets/upstream-versions.json`)) {
-            const versions = readJson("src/assets/upstream-versions.json");
-            const target = versions.error ? undefined : field(versions.value, "node", "rollbackTargets", String(v[0]));
-            if (versions.error) {
-              rollback = ` Its src/assets/upstream-versions.json is not valid JSON, so no release for Node ${v[0]} can be named.`;
-            } else if (typeof target === "string" || typeof target === "number") {
-              rollback = ` To stay on Node ${v[0]}, pin engine_ref to v${String(target).replace(/^v/, "")}, the last release that runs on it.`;
-            }
+          const target = field(versions, "node", "rollbackTargets", String(v[0]));
+          if (typeof target === "string" || typeof target === "number") {
+            rollback = ` To stay on Node ${v[0]}, pin engine_ref to v${String(target).replace(/^v/, "")}, the last release that runs on it.`;
           }
+          const gave = `gave Node ${have}${prerelease ? ", a prerelease, which npm semver does not match against a plain range" : ""}`;
           const needs = `${engine} needs Node ${range} (its package.json engines.node)`;
           if (env.NODE_VERSION_INPUT) {
-            fail(`${needs}, but node_version "${env.NODE_VERSION_INPUT}" gave Node ${have}. Set node_version to a version in that range, or leave it empty to run the Node the engine release names.${rollback}`);
+            fail(`${needs}, but node_version "${env.NODE_VERSION_INPUT}" ${gave}. Set node_version to a version in that range, or leave it empty to run the Node the engine release names.${rollback}`);
           }
           const named = env.NODE_SOURCE === "fallback"
-            ? "the Node 20.x fallback (this release has no src/assets/upstream-versions.json)"
+            ? "the Node 20.x fallback (this release names no Node of its own)"
             : `the Node this release names for itself (${env.NODE_PICKED})`;
-          fail(`${needs}, but ${named} gave Node ${have}, which does not satisfy it. Set node_version in the calling workflow to a version in that range, or pin engine_ref to another release.${rollback}`);
+          fail(`${needs}, but ${named} ${gave}, which does not satisfy it. Set node_version in the calling workflow to a version in that range, or pin engine_ref to another release.${rollback}`);
           JS
 
       - name: Install the spec-to-pr engine's dependencies
@@ -4150,7 +4200,9 @@ jobs:
             # installed or dstp started. Its message names the fix, so it is
             # the reason, not the empty dstp log.
             NODE_REASON=$(printf '%s' "$NODE_ERROR" | tr -d '\r' | cut -c1-1000)
-            BODY=$(printf '🔨 Forge stopped before it started: %s\n\n[Full log](%s)\n\nRe-apply the `forge` label to retry.\n\nTook %s.' "$NODE_REASON" "$RUN_URL" "$TOOK")
+            # A Node stop is deterministic: re-labelling with the same caller
+            # config fails the same way, so the hint is to fix the config.
+            BODY=$(printf '🔨 Forge stopped before it started: %s\n\n[Full log](%s)\n\nFix `node_version` or `engine_ref` in the calling workflow, then re-apply the `forge` label.\n\nTook %s.' "$NODE_REASON" "$RUN_URL" "$TOOK")
             RUN_FAILED=1
             LABEL="forge:failed"
             REACTION="x"
