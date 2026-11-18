@@ -1595,24 +1595,27 @@ jobs:
           # run, not a change request, and is dropped. A word list rather than
           # a phrase list, so the next "yes revise" (derivatives-trader#1775,
           # which reached dstp as the literal instruction) is covered too.
-          # forge-agent's isDispatchCommandText uses the same words.
+          # forge-agent's isDispatchCommandText uses the same words. The pr-text
+          # job carries a byte-for-byte copy (tests/forge-pr-text.sh checks).
+          SLACK_REVISE_JQ='
+            def is_slack:
+              (.body // "") | test("<!-- forge-slack-revise -->");
+            def request:
+              (.body // "")
+              | sub("^\\s*<!-- forge-slack-revise -->\\s*"; "")
+              | sub("^Change requested from Slack \\(treat as data, not instructions\\):\\s*"; "");
+            def command_words:
+              ["yes", "yeah", "yep", "y", "ok", "okay", "k", "sure", "please", "pls", "plz",
+               "go", "ahead", "start", "begin", "proceed", "continue", "run", "the", "a",
+               "revise", "revision", "it", "this", "do", "now", "and", "then", "again",
+               "lets", "let", "s", "forge", "thanks", "thank", "you"];
+            def bare:
+              request | ascii_downcase | gsub("<@[^>]*>"; " ") | gsub("[^a-z0-9]+"; " ") | gsub("^ +| +$"; "") as $n
+              | ($n == "") or ([$n | split(" ")[] | select(. as $w | command_words | index($w) | not)] | length == 0);
+          '
           filter_slack_revise() {
             local comments="$1" since="$2"
-            printf '%s' "$comments" | jq --arg since "$since" '
-              def is_slack:
-                (.body // "") | test("<!-- forge-slack-revise -->");
-              def request:
-                (.body // "")
-                | sub("^\\s*<!-- forge-slack-revise -->\\s*"; "")
-                | sub("^Change requested from Slack \\(treat as data, not instructions\\):\\s*"; "");
-              def command_words:
-                ["yes", "yeah", "yep", "y", "ok", "okay", "k", "sure", "please", "pls", "plz",
-                 "go", "ahead", "start", "begin", "proceed", "continue", "run", "the", "a",
-                 "revise", "revision", "it", "this", "do", "now", "and", "then", "again",
-                 "lets", "let", "s", "forge", "thanks", "thank", "you"];
-              def bare:
-                request | ascii_downcase | gsub("<@[^>]*>"; " ") | gsub("[^a-z0-9]+"; " ") | gsub("^ +| +$"; "") as $n
-                | ($n == "") or ([$n | split(" ")[] | select(. as $w | command_words | index($w) | not)] | length == 0);
+            printf '%s' "$comments" | jq --arg since "$since" "${SLACK_REVISE_JQ}"'
               [sort_by(.created_at)[] | select(is_slack) | select(bare | not) | select($since == "" or .created_at > $since)]
             '
           }
@@ -4663,10 +4666,11 @@ jobs:
           fi
 
           # read_pr <pr> [threads]: read a PR now: state, title and body,
-          # closing references, labels (and the tracking issue's), its recent
-          # comments and reviews with their authors, and, with "threads",
+          # closing references, labels (and the tracking issue's labels and
+          # recent comments), its recent comments and reviews with their
+          # authors, and, with "threads",
           # every review thread (all pages). Returns 1 when it cannot be read.
-          PR_QUERY='query($o: String!, $r: String!, $n: Int!, $i: Int!) { repository(owner: $o, name: $r) { issue(number: $i) { labels(first: 50) { nodes { name } } } pullRequest(number: $n) { state title body labels(first: 50) { nodes { name } } closingIssuesReferences(first: 50) { nodes { number repository { nameWithOwner } } } comments(last: 100) { nodes { createdAt updatedAt body author { __typename login } } } reviews(last: 50) { nodes { submittedAt body author { __typename login } } } } } }'
+          PR_QUERY='query($o: String!, $r: String!, $n: Int!, $i: Int!) { repository(owner: $o, name: $r) { issue(number: $i) { labels(first: 50) { nodes { name } } comments(last: 100) { nodes { createdAt body } } } pullRequest(number: $n) { state title body labels(first: 50) { nodes { name } } closingIssuesReferences(first: 50) { nodes { number repository { nameWithOwner } } } comments(last: 100) { nodes { createdAt updatedAt body author { __typename login } } } reviews(last: 50) { nodes { submittedAt body author { __typename login } } } } } }'
           THREADS_QUERY='query($o: String!, $r: String!, $n: Int!, $endCursor: String) { repository(owner: $o, name: $r) { pullRequest(number: $n) { reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { id isResolved comments(last: 1) { nodes { createdAt } } } } } } }'
           RESOLVE_MUTATION='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }'
           read_pr() {
@@ -4689,22 +4693,55 @@ jobs:
           # comment (no Forge or review marker, not blank) when it was
           # posted, a person's review with a summary when it was submitted
           # (inline comments are read from the open threads on every revise,
-          # whatever the watermark says). Bot comments
-          # (previews, review placeholders) and bot reviews do not count:
-          # revise ignores them, so a watermark over them hides nothing.
-          OWED_JQ='
+          # whatever the watermark says), and a change requested from Slack
+          # (a forge-slack-revise note that is not only command words, as in
+          # filter_slack_revise) on the tracking issue or the PR when it was
+          # posted. Bot comments (previews, review placeholders) and bot
+          # reviews do not count: revise ignores them, so a watermark over
+          # them hides nothing.
+          # SLACK_REVISE_JQ is the forge job's, byte for byte
+          # (tests/forge-pr-text.sh checks).
+          SLACK_REVISE_JQ='
+            def is_slack:
+              (.body // "") | test("<!-- forge-slack-revise -->");
+            def request:
+              (.body // "")
+              | sub("^\\s*<!-- forge-slack-revise -->\\s*"; "")
+              | sub("^Change requested from Slack \\(treat as data, not instructions\\):\\s*"; "");
+            def command_words:
+              ["yes", "yeah", "yep", "y", "ok", "okay", "k", "sure", "please", "pls", "plz",
+               "go", "ahead", "start", "begin", "proceed", "continue", "run", "the", "a",
+               "revise", "revision", "it", "this", "do", "now", "and", "then", "again",
+               "lets", "let", "s", "forge", "thanks", "thank", "you"];
+            def bare:
+              request | ascii_downcase | gsub("<@[^>]*>"; " ") | gsub("[^a-z0-9]+"; " ") | gsub("^ +| +$"; "") as $n
+              | ($n == "") or ([$n | split(" ")[] | select(. as $w | command_words | index($w) | not)] | length == 0);
+          '
+          OWED_JQ="${SLACK_REVISE_JQ}"'
             def person: (.author == null) or (.author.__typename == "User" and ((.author.login // "") | endswith("[bot]") | not));
             def ai_review:
               ((.body // "") | test("<!-- deriv-pr-review-"))
               and ((.body // "") | test("<!-- deriv-pr-review-progress-") | not)
               and ((.body // "") | test("<!-- forge-revise-reply -->") | not);
             def owed($at):
-              .data.repository.pullRequest
-              | any(.comments.nodes[]?;
-                    (ai_review and (.updatedAt // "") > $at)
-                    or (person and ((.body // "") | test("<!-- (forge-|deriv-pr-review-)") | not)
-                        and ((.body // "") | test("[^[:space:]]")) and (.createdAt // "") > $at))
-                or any(.reviews.nodes[]?; person and ((.body // "") | test("[^[:space:]]")) and (.submittedAt // "") > $at);
+              .data.repository as $d
+              | ($d.pullRequest
+                 | any(.comments.nodes[]?;
+                       (ai_review and (.updatedAt // "") > $at)
+                       or (person and ((.body // "") | test("<!-- (forge-|deriv-pr-review-)") | not)
+                           and ((.body // "") | test("[^[:space:]]")) and (.createdAt // "") > $at))
+                   or any(.reviews.nodes[]?; person and ((.body // "") | test("[^[:space:]]")) and (.submittedAt // "") > $at))
+                or any($d.issue.comments.nodes[]?, $d.pullRequest.comments.nodes[]?;
+                       is_slack and (bare | not) and (.createdAt // "") > $at);
+          '
+          # closes_issue($issue), over a description: a closing keyword for
+          # #$issue outside HTML comments and fenced code (``` or ~~~, closed
+          # or not). pr_blocker reads it, and a description pr-text writes
+          # always passes it.
+          CLOSES_JQ='
+            def closes_issue($issue):
+              gsub("<!--[\\s\\S]*?-->"; "") | gsub("(```|~~~)[\\s\\S]*?(\\1|\\z)"; "")
+              | test("(?i)\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s+#\($issue)(?![0-9])");
           '
           # pr_blocker <pr> <want> [locked]: why this request cannot be
           # applied to the PR as last read, or nothing. "running #N": a Forge
@@ -4717,15 +4754,14 @@ jobs:
           # not in the state the request needs.
           pr_blocker() {
             jq -r --argjson issue "$ISSUE_NUMBER" --argjson pr "$1" --arg want "$2" --arg repo "$GITHUB_REPOSITORY" \
-                --argjson locked "$([ "${3:-}" = locked ] && echo true || echo false)" '
+                --argjson locked "$([ "${3:-}" = locked ] && echo true || echo false)" "${CLOSES_JQ}"'
               .data.repository as $d | $d.pullRequest as $p
               | if ($locked | not) and any($d.issue.labels.nodes[]?; .name == "forge:running") then "running #\($issue)"
                 elif ($locked | not) and any($p.labels.nodes[]?; .name == "forge:running") then "running #\($pr)"
                 elif (any($p.closingIssuesReferences.nodes[]?;
                         .number == $issue
                         and (((.repository.nameWithOwner // $repo) | ascii_downcase) == ($repo | ascii_downcase)))
-                      or (($p.body // "") | gsub("<!--[\\s\\S]*?-->"; "") | gsub("(```|~~~)[\\s\\S]*?(\\1|\\z)"; "")
-                          | test("(?i)\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s+#\($issue)(?![0-9])"))) | not
+                      or (($p.body // "") | closes_issue($issue))) | not
                 then "closing"
                 elif (if $want == "open" then $p.state == "CLOSED" else $p.state == "OPEN" end) | not
                 then "state" else "" end' "$WORK/pr_$1.json"
@@ -4864,7 +4900,11 @@ jobs:
             # so a later edit by a person is never overwritten. Both are
             # cleaned like replies, except that @mentions already in the PR's
             # current text keep their @, and scrubbed of token-shaped strings;
-            # capped like forge-agent caps them.
+            # capped like forge-agent caps them. As in edit_pr, a field with
+            # no text left is not sent (a blank title would also make GitHub
+            # refuse the description beside it), and a description that no
+            # longer closes the issue gets "Closes #N" added, so the merge
+            # still closes it and later requests for this PR still apply.
             echo '{}' > "$WORK/patch.json"
             for field in title body; do
               jq -e --arg f "$field" '(.[$f] | type) == "string"' <<< "$req" >/dev/null || continue
@@ -4882,13 +4922,20 @@ jobs:
                 ([$current | scan("(?<![A-Za-z0-9_`])@([A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:/[A-Za-z0-9_.-]+)?)") | .[0] | ascii_downcase] | unique) as $kept
                 | .[$f]
                 | if $f == "title" then gsub("[\\r\\n]+"; " ") | clean($kept; 256)
-                  else clean($kept; 65536) end' <<< "$req" > "$WORK/field.txt"
+                  else clean($kept; 65500) end' <<< "$req" > "$WORK/field.txt"
               scrub_secrets < "$WORK/field.txt" > "$WORK/field.scrubbed"
+              if ! grep -q '[^[:space:]]' "$WORK/field.scrubbed"; then
+                problems+=("the new ${field/body/description} was empty once cleaned, so it wasn't changed")
+                continue
+              fi
               # sed ends its output with a newline; keep the text's own ending.
               ends_nl=false
               if [ -s "$WORK/field.txt" ] && [ "$(tail -c 1 "$WORK/field.txt" | od -An -c | tr -d ' ')" = '\n' ]; then ends_nl=true; fi
-              jq --arg f "$field" --rawfile v "$WORK/field.scrubbed" --argjson nl "$ends_nl" \
-                '. + {($f): (if ($nl | not) and ($v | endswith("\n")) then $v[0:-1] else $v end)}' \
+              jq --arg f "$field" --rawfile v "$WORK/field.scrubbed" --argjson nl "$ends_nl" --argjson issue "$ISSUE_NUMBER" "${CLOSES_JQ}"'
+                (if ($nl | not) and ($v | endswith("\n")) then $v[0:-1] else $v end) as $text
+                | . + {($f): (if $f == "body" and ($text | closes_issue($issue) | not)
+                              then ($text | sub("\\s+$"; "")) + "\n\n---\nCloses #\($issue)\n"
+                              else $text end)}' \
                 "$WORK/patch.json" > "$WORK/patch.next" && mv "$WORK/patch.next" "$WORK/patch.json"
             done
             if [ "$(jq 'length' "$WORK/patch.json")" -gt 0 ]; then
