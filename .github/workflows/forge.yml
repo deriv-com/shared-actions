@@ -49,7 +49,7 @@ name: Forge — issue to PR
 #         DSTP_FORGE_SERVICE_KEY:  ${{ secrets.DSTP_FORGE_SERVICE_KEY }}  # Forge CI ingest (fk_…)
 #         FORGE_SLACK_BOT_TOKEN:   ${{ secrets.FORGE_SLACK_BOT_TOKEN }}   # Slack path only
 #
-# The four `forge*` labels are created automatically on first run, so a new
+# The five `forge*` labels are created automatically on first run, so a new
 # caller repo needs no manual setup beyond the secrets above.
 #
 # Portability notes — why this is parameterised the way it is:
@@ -4266,6 +4266,9 @@ jobs:
           SLACK_THREAD_TS: ${{ inputs.slack_thread_ts }}
           SLACK_BOT_TOKEN: ${{ secrets.FORGE_SLACK_BOT_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # The forge job's timeout: a forge:running older than this (plus
+          # a margin for Report) has no run left to remove it.
+          FORGE_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
         run: |
           set -euo pipefail
 
@@ -4686,17 +4689,21 @@ jobs:
             rm -f "$WORK/pr_$1.json"
             return 1
           }
-          # owed($at), over a PR as read: is there a review or comment newer
-          # than $at that the revise job would act on? The same filters as
-          # filter_reviews, filter_human_comments and filter_review_bodies:
-          # an AI review counts when it finished (updatedAt), a person's
-          # comment (no Forge or review marker, not blank) when it was
-          # posted, a person's review with a summary when it was submitted
-          # (inline comments are read from the open threads on every revise,
-          # whatever the watermark says), and a change requested from Slack
-          # (a forge-slack-revise note that is not only command words, as in
-          # filter_slack_revise) on the tracking issue or the PR when it was
-          # posted. Bot comments (previews, review placeholders) and bot
+          # held($at; $since), over a PR as read: why a watermark must not
+          # cover it, or "". "activity": a review or comment newer than the
+          # request ($at) that the revise job would act on, by the filters of
+          # filter_reviews, filter_human_comments and filter_review_bodies: an
+          # AI review counts when it finished (updatedAt), a person's comment
+          # (no Forge or review marker, not blank) when it was posted, a
+          # person's review with a summary when it was submitted (inline
+          # comments are read from the open threads on every revise, whatever
+          # the watermark says). Older ones are what forge-agent read when it
+          # drafted the reply. "slack": a change requested from Slack (a
+          # forge-slack-revise note that is not only command words, as in
+          # filter_slack_revise) on the tracking issue or the PR, posted after
+          # the last watermark ($since, last_watermark: watermark_since's
+          # rule): a reply does not make a code change, so it is pending until
+          # a revise posts its own watermark, however old. Bot comments (previews, review placeholders) and bot
           # reviews do not count: revise ignores them, so a watermark over
           # them hides nothing.
           # SLACK_REVISE_JQ is the forge job's, byte for byte
@@ -4723,25 +4730,37 @@ jobs:
               ((.body // "") | test("<!-- deriv-pr-review-"))
               and ((.body // "") | test("<!-- deriv-pr-review-progress-") | not)
               and ((.body // "") | test("<!-- forge-revise-reply -->") | not);
-            def owed($at):
+            def last_watermark:
+              [ .data.repository.pullRequest.comments.nodes[]?
+                | select((.body // "") | test("<!-- forge-revise-instructions -->")) | .createdAt // "" ] | max // "";
+            def newer_activity($at):
+              .data.repository.pullRequest
+              | any(.comments.nodes[]?;
+                    (ai_review and (.updatedAt // "") > $at)
+                    or (person and ((.body // "") | test("<!-- (forge-|deriv-pr-review-)") | not)
+                        and ((.body // "") | test("[^[:space:]]")) and (.createdAt // "") > $at))
+                or any(.reviews.nodes[]?; person and ((.body // "") | test("[^[:space:]]")) and (.submittedAt // "") > $at);
+            def pending_slack($since):
               .data.repository as $d
-              | ($d.pullRequest
-                 | any(.comments.nodes[]?;
-                       (ai_review and (.updatedAt // "") > $at)
-                       or (person and ((.body // "") | test("<!-- (forge-|deriv-pr-review-)") | not)
-                           and ((.body // "") | test("[^[:space:]]")) and (.createdAt // "") > $at))
-                   or any(.reviews.nodes[]?; person and ((.body // "") | test("[^[:space:]]")) and (.submittedAt // "") > $at))
-                or any($d.issue.comments.nodes[]?, $d.pullRequest.comments.nodes[]?;
-                       is_slack and (bare | not) and (.createdAt // "") > $at);
+              | any($d.issue.comments.nodes[]?, $d.pullRequest.comments.nodes[]?;
+                    is_slack and (bare | not) and ($since == "" or (.createdAt // "") > $since));
+            def held($at; $since):
+              if newer_activity($at) then "activity" elif pending_slack($since) then "slack" else "" end;
           '
           # closes_issue($issue), over a description: a closing keyword for
           # #$issue outside HTML comments and fenced code (``` or ~~~, closed
           # or not). pr_blocker reads it, and a description pr-text writes
-          # always passes it.
+          # always passes it. open_fence: the fence a description leaves
+          # open (the first marker left once closed pairs are gone, the one
+          # closes_issue runs to the end), or "", so it can be closed before
+          # a closing line is added.
           CLOSES_JQ='
             def closes_issue($issue):
               gsub("<!--[\\s\\S]*?-->"; "") | gsub("(```|~~~)[\\s\\S]*?(\\1|\\z)"; "")
               | test("(?i)\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s+#\($issue)(?![0-9])");
+            def open_fence:
+              gsub("<!--[\\s\\S]*?-->"; "") | gsub("(```|~~~)[\\s\\S]*?\\1"; "")
+              | (first(match("```|~~~"; "g") | .string) // "");
           '
           # pr_blocker <pr> <want> [locked]: why this request cannot be
           # applied to the PR as last read, or nothing. "running #N": a Forge
@@ -4782,6 +4801,43 @@ jobs:
           }
 
           for pr in $(jq -r '.pr' "$WORK/claimed.jsonl" | sort -un); do read_pr "$pr" || true; done
+
+          # A forge:running no Forge run can still hold: only Report removes
+          # it, so a run that died before Report (or whose label edit failed)
+          # leaves it, and every request here would be skipped for good. One
+          # added longer ago than the forge job's timeout plus 15 minutes is
+          # removed with a warning, as the forge job removes a stale
+          # forge:pr-text. When the label's history cannot be read it counts
+          # as a live run. stale_running <number>: 0 once removed.
+          stale_running() {
+            local t age limit=${FORGE_TIMEOUT_MINUTES:-90}
+            [[ "$limit" =~ ^[0-9]+$ ]] || limit=90
+            t=$(gh api "repos/${GITHUB_REPOSITORY}/issues/$1/events?per_page=100" --paginate \
+                  --jq '.[] | select(.event == "labeled" and .label.name == "forge:running") | .created_at' 2> "$WORK/err") \
+              || { cat "$WORK/err"; return 1; }
+            t="${t##*$'\n'}"
+            [ -n "$t" ] || return 1
+            age=$(( $(date -u +%s) - $(jq -rn --arg t "$t" '$t | fromdateiso8601') ))
+            [ "$age" -gt $(( (limit + 15) * 60 )) ] || return 1
+            echo "::warning::forge:running has been on #$1 since $t, longer than a Forge run can last (timeout_minutes + 15), so no run is left to remove it. Removing it."
+            if ! gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/$1/labels/forge%3Arunning" >/dev/null 2> "$WORK/err"; then
+              cat "$WORK/err"
+              echo "::warning::Could not remove the stale forge:running from #$1."
+              return 1
+            fi
+          }
+          cleared=0
+          for n in $(for pr in $(jq -r '.pr' "$WORK/claimed.jsonl" | sort -un); do
+                       [ -f "$WORK/pr_${pr}.json" ] || continue
+                       jq -r --argjson pr "$pr" --argjson issue "$ISSUE_NUMBER" '
+                         (if any(.data.repository.issue.labels.nodes[]?; .name == "forge:running") then $issue else empty end),
+                         (if any(.data.repository.pullRequest.labels.nodes[]?; .name == "forge:running") then $pr else empty end)' "$WORK/pr_${pr}.json"
+                     done | sort -un); do
+            if stale_running "$n"; then cleared=1; fi
+          done
+          if [ "$cleared" = 1 ]; then
+            for pr in $(jq -r '.pr' "$WORK/claimed.jsonl" | sort -un); do read_pr "$pr" || true; done
+          fi
 
           # Which claimed requests can be applied, from that first read. The
           # others are skipped and reported now. The reply, cleaned like the
@@ -4899,12 +4955,18 @@ jobs:
             # of the title and body then), compared with the PR as just read,
             # so a later edit by a person is never overwritten. Both are
             # cleaned like replies, except that @mentions already in the PR's
-            # current text keep their @, and scrubbed of token-shaped strings;
-            # capped like forge-agent caps them. As in edit_pr, a field with
-            # no text left is not sent (a blank title would also make GitHub
-            # refuse the description beside it), and a description that no
-            # longer closes the issue gets "Closes #N" added, so the merge
-            # still closes it and later requests for this PR still apply.
+            # current text keep their @, and scrubbed of token-shaped strings.
+            # The title is capped at 256 like forge-agent's; the description
+            # at 65500, under forge-agent's 65536, so a closing line still
+            # fits. Like edit_pr, a field with no text left is not sent (a
+            # blank title would also make GitHub refuse the description beside
+            # it), and a description that does not close the issue gets
+            # "Closes #N" added (after closing a fence it leaves open), so the
+            # merge still closes it and later requests for this PR still
+            # apply. Unlike edit_pr, the test is closes_issue, which ignores
+            # keywords in comments and code so it agrees with pr_blocker, and
+            # there is no "the PR is the work item" case: forge-agent always
+            # files a pr-text request on the issue the PR closes.
             echo '{}' > "$WORK/patch.json"
             for field in title body; do
               jq -e --arg f "$field" '(.[$f] | type) == "string"' <<< "$req" >/dev/null || continue
@@ -4934,9 +4996,17 @@ jobs:
               jq --arg f "$field" --rawfile v "$WORK/field.scrubbed" --argjson nl "$ends_nl" --argjson issue "$ISSUE_NUMBER" "${CLOSES_JQ}"'
                 (if ($nl | not) and ($v | endswith("\n")) then $v[0:-1] else $v end) as $text
                 | . + {($f): (if $f == "body" and ($text | closes_issue($issue) | not)
-                              then ($text | sub("\\s+$"; "")) + "\n\n---\nCloses #\($issue)\n"
+                              then ($text | sub("\\s+$"; "")) as $t | ($t | open_fence) as $o
+                                | $t + (if $o == "" then "" else "\n" + $o end) + "\n\n---\nCloses #\($issue)\n"
                               else $text end)}' \
                 "$WORK/patch.json" > "$WORK/patch.next" && mv "$WORK/patch.next" "$WORK/patch.json"
+              # What is written must close the issue, or the merge would not
+              # and pr_blocker would refuse every later request for this PR.
+              if [ "$field" = body ] \
+                  && ! jq -e --argjson issue "$ISSUE_NUMBER" "${CLOSES_JQ}"'.body | closes_issue($issue)' "$WORK/patch.json" >/dev/null; then
+                jq 'del(.body)' "$WORK/patch.json" > "$WORK/patch.next" && mv "$WORK/patch.next" "$WORK/patch.json"
+                problems+=("the new description wouldn't close #${ISSUE_NUMBER}, so it wasn't changed")
+              fi
             done
             if [ "$(jq 'length' "$WORK/patch.json")" -gt 0 ]; then
               if gh api --method PATCH "repos/${GITHUB_REPOSITORY}/pulls/${pr}" --input "$WORK/patch.json" >/dev/null 2> "$WORK/err"; then
@@ -4972,18 +5042,25 @@ jobs:
               fi
             fi
 
-            # A review or comment the revise job would act on (OWED_JQ), newer
-            # than the request, is not covered by this reply: the watermark
+            # A review or comment the revise job would act on, newer than the
+            # request, or a Slack change request no revise has handled yet
+            # (OWED_JQ's held) is not covered by this reply: the watermark
             # would mark it handled, so it is not posted, and a thread with a
             # comment after the request stays open. The PR is read again once
-            # the watermark is up: something that finished in between has an
+            # the watermark is up: something that arrived in between has an
             # earlier time than the watermark, so the watermark is removed.
             # It also is when that read fails: it stays only once the read
-            # shows nothing owed. Anything finishing after that read is newer
-            # than the watermark, and revise sees it.
+            # shows nothing owed. The re-check measures Slack notes from the
+            # same last watermark as before (the new one is now the latest).
+            # Anything arriving after that read is newer than the watermark,
+            # and revise sees it.
             if [ "$reply_ok" = 1 ] && jq -e '.watermark == true' <<< "$req" >/dev/null; then
-              if jq -e --arg at "$asked_at" "${OWED_JQ}"' owed($at)' "$WORK/pr_${pr}.json" >/dev/null; then
+              since=$(jq -r "${OWED_JQ}"' last_watermark' "$WORK/pr_${pr}.json")
+              held=$(jq -r --arg at "$asked_at" --arg since "$since" "${OWED_JQ}"' held($at; $since)' "$WORK/pr_${pr}.json")
+              if [ "$held" = activity ]; then
                 problems+=("a newer review or comment arrived after Forge wrote this, so it is still marked as owed")
+              elif [ "$held" = slack ]; then
+                problems+=("a change requested from Slack hasn't been made yet, so the reviews stay marked as owed until Forge revises")
               elif ! wm_id=$(jq -n --arg body "$WATERMARK_BODY" '{body: $body}' \
                   | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" --input - --jq '.id' 2> "$WORK/err"); then
                 cat "$WORK/err"
@@ -4994,8 +5071,8 @@ jobs:
                     > "$WORK/after_${pr}.json" 2> "$WORK/err"; then
                   cat "$WORK/err"
                   why="Forge couldn't check the PR again after marking the reviews handled"
-                elif jq -e --arg at "$asked_at" "${OWED_JQ}"' owed($at)' "$WORK/after_${pr}.json" >/dev/null; then
-                  why="a newer review arrived while Forge marked the reviews handled"
+                elif [ -n "$(jq -r --arg at "$asked_at" --arg since "$since" "${OWED_JQ}"' held($at; $since)' "$WORK/after_${pr}.json")" ]; then
+                  why="a newer review, comment or Slack change request arrived while Forge marked the reviews handled"
                 fi
                 if [ -n "$why" ]; then
                   if gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/${wm_id}" >/dev/null 2> "$WORK/err"; then
@@ -5054,11 +5131,13 @@ jobs:
               recorded=false
             fi
             echo "$cid" >> "$WORK/finished"
-            jq -nc --argjson req "$req" --argjson recorded "$recorded" \
+            # The request (its description included) goes in on stdin: as one
+            # argument it could pass Linux's 128 KiB limit per argument.
+            jq -c --argjson recorded "$recorded" \
               --arg done "$(printf '%s\n' ${done_parts[@]+"${done_parts[@]}"})" \
               --arg problems "$(printf '%s\n' ${problems[@]+"${problems[@]}"})" \
-              '{req: $req, recorded: $recorded, done: ($done | split("\n") | map(select(. != ""))), problems: ($problems | split("\n") | map(select(. != "")))}' \
-              >> "$WORK/results.jsonl"
+              '{req: ., recorded: $recorded, done: ($done | split("\n") | map(select(. != ""))), problems: ($problems | split("\n") | map(select(. != "")))}' \
+              <<< "$req" >> "$WORK/results.jsonl"
           done 3< "$WORK/requests.jsonl"
 
           unlock_all
