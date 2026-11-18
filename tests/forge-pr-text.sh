@@ -35,13 +35,15 @@ check '[ "$MINT" = "permission-actions: read permission-issues: write permission
   "pr-text mints the write App token with only issues and pull-requests write, plus actions read for stale claims (got: $MINT)"
 check '[[ "$PR_TEXT_JOB" == *"group: forge-pr-text-"* ]]' \
   "pr-text has its own concurrency group, so it never displaces a queued revise"
-check '! printf "%s\n" "$PR_TEXT_JOB" | grep -qE "actions/checkout|spec-to-pr|claude"' \
+check '! grep -E "actions/checkout|spec-to-pr|claude" <<< "$PR_TEXT_JOB" >/dev/null' \
   "pr-text checks out nothing and runs no engine or model"
-check 'grep -q "\`pr-text\`" "$WF"' "the command input documents pr-text"
+COMMAND_INPUT=$(awk '/^      command:$/ {f=1; print; next} f && /^      [a-z_]+:$/ {exit} f {print}' "$WF")
+check '[[ "$COMMAND_INPUT" == *"\`pr-text\`"* ]] && [[ "$COMMAND_INPUT" == *"Slack"* ]]' \
+  "the command input documents pr-text, and that any other command is rejected with a Slack reply"
 
 # --- behavioral --------------------------------------------------------------
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+trap '[ -n "${KEEP_TMP:-}" ] || rm -rf "$TMP"' EXIT
 step_script() {  # step_script <step name>
   awk -v s="      - name: $1" '
     $0 == s {f=1}
@@ -51,7 +53,7 @@ step_script() {  # step_script <step name>
   ' "$WF"
 }
 step_script "Apply PR text" > "$TMP/apply.sh"
-check '[ -s "$TMP/apply.sh" ] && grep -q "forge-gh-app\[bot\]" "$TMP/apply.sh"' \
+check '[ -s "$TMP/apply.sh" ] && grep -xF '"'"'REQUESTER="forge-gh-app[bot]"'"'"' "$TMP/apply.sh" >/dev/null' \
   "the Apply PR text step is found and only trusts forge-gh-app[bot]"
 
 BIN="$TMP/bin"
@@ -77,9 +79,11 @@ case "$*" in
       closingIssuesReferences: {nodes: [{number: 1213}]},
       reviewThreads: {nodes: [{id: "PRRT_open", isResolved: false}, {id: "PRRT_done", isResolved: true}]}}}}}')
     fi
+    if [ -f "$S/state_$n" ]; then export FAKE_PR_STATE; FAKE_PR_STATE=$(cat "$S/state_$n"); else unset FAKE_PR_STATE; fi
     pr=$(jq -c --argjson issue_running "$([ -f "$S/forge_running" ] && echo true || echo false)" \
               --argjson pr_running "$([ -f "$S/pr_running_$n" ] && echo true || echo false)" '
-      .data.repository.issue.labels.nodes = (if $issue_running then [{name: "forge:running"}] else [] end)
+      .data.repository.pullRequest.state = ($ENV.FAKE_PR_STATE // .data.repository.pullRequest.state)
+      | .data.repository.issue.labels.nodes = (if $issue_running then [{name: "forge:running"}] else [] end)
       | .data.repository.pullRequest.labels.nodes = (if $pr_running then [{name: "forge:running"}] else [] end)' <<< "$pr")
     if [ "$3" = "--paginate" ]; then
       jq -c '.data.repository.pullRequest.reviewThreads.nodes[]?' <<< "$pr"
@@ -87,13 +91,43 @@ case "$*" in
     else
       printf '%s\n' "$pr"
     fi ;;
+  # Labels. labels_<n> lists issue/PR n's labels; lock_fail refuses adding
+  # forge:pr-text, unlock_fail removing it.
+  "label create "*) echo ok ;;
+  # The claim step's label read. labels_read_fail fails it; clear_after_<k>
+  # drops forge:pr-text once it has been read k times.
+  "api repos/o/r/issues/"*"/labels?per_page=100 --jq "*)
+    n="${2#repos/o/r/issues/}"; n="${n%%/*}"; touch "$S/labels_$n"
+    echo read >> "$S/label_reads"
+    if [ -f "$S/labels_read_fail" ]; then echo "gh: Server Error (HTTP 502)" >&2; exit 1; fi
+    for f in "$S"/clear_after_*; do
+      [ -e "$f" ] || continue
+      if [ "$(wc -l < "$S/label_reads" | tr -d ' ')" -ge "${f##*clear_after_}" ]; then
+        grep -vxF forge:pr-text "$S/labels_$n" > "$S/labels_$n.next" || true; mv "$S/labels_$n.next" "$S/labels_$n"
+      fi
+    done
+    cat "$S/labels_$n" ;;
+  "api --method POST repos/o/r/issues/"*"/labels -f labels[]="*|"api --method DELETE repos/o/r/issues/"*"/labels/"*)
+    n="${4#repos/o/r/issues/}"; n="${n%%/*}"; touch "$S/labels_$n"
+    if [ "$3" = POST ]; then op=--add-label; l="${@: -1}"; l="${l#labels[]=}"; else op=--remove-label; l="${4##*/}"; l="${l//%3A/:}"; fi
+    printf '%s %s %s\n' "$op" "$n" "$l" >> "$S/labels.log"
+    if [ "$op" = --add-label ]; then
+      if [ -f "$S/lock_fail" ]; then echo "gh: Server Error (HTTP 502)" >&2; exit 1; fi
+      grep -qxF "$l" "$S/labels_$n" || echo "$l" >> "$S/labels_$n"
+    else
+      if [ -f "$S/unlock_fail" ]; then echo "gh: Server Error (HTTP 502)" >&2; exit 1; fi
+      grep -vxF "$l" "$S/labels_$n" > "$S/labels_$n.next" || true; mv "$S/labels_$n.next" "$S/labels_$n"
+    fi ;;
   "api graphql -f query=mutation"*) id="${@: -1}"; echo "${id#id=}" >> "$S/resolved.log"; echo '{}' ;;
   "api --method PATCH repos/o/r/pulls/"*" --input "*)
     # The edit goes in as a file, a state change on stdin. patch_422: GitHub
     # refuses the change (a reopen whose branch is gone).
     n="${4#repos/o/r/pulls/}"; f="${@: -1}"; [ "$f" = - ] && f=/dev/stdin
     if [ -f "$S/patch_422" ]; then echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; fi
-    jq -c --arg n "$n" '{pr: $n} + .' "$f" >> "$S/pr_patch.jsonl" ;;
+    jq -c --arg n "$n" '{pr: $n} + .' "$f" >> "$S/pr_patch.jsonl"
+    # A state change sticks for later reads of the PR.
+    st=$(jq -rs '.[-1] | select(.pr == "'"$n"'") | .state // empty | ascii_upcase' "$S/pr_patch.jsonl")
+    [ -z "$st" ] || echo "$st" > "$S/state_$n" ;;
   "api --method POST repos/o/r/issues/"*"/comments --input -")
     # reply_fail: GitHub refuses the reviewer reply (the comment with the reply marker).
     # die_on_reply: the job is cancelled (SIGTERM) while the reply is posted.
@@ -193,15 +227,15 @@ check '[ "$(jq -r "keys | join(\",\")" "$C/pr_patch.jsonl")" = "body,pr" ]' "hap
 REPLY=$(jq -rs '.[0].body' "$C/pr_comments.jsonl")
 check '[[ "$REPLY" == "<!-- forge-revise-reply -->"$'"'"'\n'"'"'"Updated the description."* ]] && [[ "$REPLY" != *"forge-revise-instructions"* ]]' \
   "happy: the reply carries the reply marker and a forged marker in the text is dropped"
-check '[ "$(jq -rs ".[1].body" "$C/pr_comments.jsonl" | head -1)" = "<!-- forge-revise-instructions -->" ]' \
+check '[ "$(jq -rs ".[1].body | split(\"\\n\")[0]" "$C/pr_comments.jsonl")" = "<!-- forge-revise-instructions -->" ]' \
   "happy: the handled-reviews watermark follows the reply"
 check '[ "$(cat "$C/resolved.log")" = PRRT_open ]' \
   "happy: only the open thread that is on this PR is resolved"
-check '[ "$(marks "$C" claimed)" = 12 ] && [ "$(marks "$C" applied)" = 12 ] && [ "$(jq -sr ".[0].body" "$C/applied.jsonl" | head -1)" = "<!-- forge-slack-pr-text-claimed {\"ts\":\"5.5\",\"seq\":1,\"pr\":7,\"ch\":\"C9\",\"th\":\"9.9\",\"rp\":true,\"run\":0,\"attempt\":1} -->" ]' \
+check '[ "$(marks "$C" claimed)" = 12 ] && [ "$(marks "$C" applied)" = 12 ] && [ "$(jq -sr ".[0].body | split(\"\\n\")[0]" "$C/applied.jsonl")" = "<!-- forge-slack-pr-text-claimed {\"ts\":\"5.5\",\"seq\":1,\"pr\":7,\"ch\":\"C9\",\"th\":\"9.9\",\"rp\":true,\"run\":0,\"attempt\":1} -->" ]' \
   "happy: the request is claimed before the PR is touched, then marked applied, without its payload"
 check '[ "$(grep -m1 "^api --method" "$C/gh.log" | cut -c1-48)" = "api --method PATCH repos/o/r/issues/comments/12 " ]' \
   "happy: the claim is the first write"
-check '! jq -r .body "$C/applied.jsonl" | grep -q "empty space"' "happy: the applied note drops the request text"
+check '[[ "$(jq -r .body "$C/applied.jsonl")" != *"empty space"* ]]' "happy: the applied note drops the request text"
 check '[ "$(jq -r "[.channel, .thread_ts] | join(\" \")" "$C/slack.jsonl")" = "C9 9.9" ]' \
   "happy: Slack hears back in the thread the request names, not the dispatch's"
 SLACK=$(slack_text "$C")
@@ -269,9 +303,11 @@ C=$(new_case many)
 run_case "$C"
 check '[ "$(cat "$C/rc")" = 0 ] && [ "$(marks "$C" applied)" = "20,21,22" ]' \
   "many: every pending request is applied, oldest first"
-check '[ "$(jq -sr "map(.title) | join(\"|\")" "$C/pr_patch.jsonl")" = "fix: one line|fix: from another message" ]' \
-  "many: titles stay one line and apply in order"
-check '[ "$(jq -sr "map(.body | split(\"\n\")[0]) | join(\"|\")" "$C/pr_comments.jsonl")" = "<!-- forge-revise-reply -->|<!-- forge-revise-instructions -->" ] && [ "$(jq -sr ".[0].body" "$C/pr_comments.jsonl" | tail -1)" = "Second reply" ]' \
+check '[ "$(jq -sr "map(.title) | join(\"|\")" "$C/pr_patch.jsonl")" = "fix: from another message" ]' \
+  "many: only the last title to a PR is written"
+check '[[ "$(slack_text "$C")" == *"your title edit wasn'"'"'t applied: a newer title to #7 from Forge replaced it"* ]]' \
+  "many: the request whose title was replaced is told so"
+check '[ "$(jq -sr "map(.body | split(\"\n\")[0]) | join(\"|\")" "$C/pr_comments.jsonl")" = "<!-- forge-revise-reply -->|<!-- forge-revise-instructions -->" ] && [ "$(jq -sr ".[0].body | split(\"\\n\")[-1]" "$C/pr_comments.jsonl")" = "Second reply" ]' \
   "many: only the last reply to a PR is posted, with one watermark"
 check '[ "$(jq -sr "map(.channel) | sort | join(\",\")" "$C/slack.jsonl")" = "C2,C9" ]' \
   "many: each Slack thread hears about its own requests"
@@ -303,7 +339,8 @@ CLOSE_REQ=$(request 1 '{pr: 7, state: "closed", note: "Closed from Slack at Ana'
 comment 30 'forge-gh-app[bot]' Bot 30 "$CLOSE_REQ" > "$C/comments.jsonl"
 run_case "$C"
 check '[ "$(cat "$C/rc")" = 0 ] && [ ! -s "$C/unhandled.log" ]' "close: exits 0 and only calls known gh commands"
-check '[ "$(jq -r .body "$C/pr_comments.jsonl")" = "Closed from Slack at Ana'"'"'s request. " ]' \
+check '[ "$(jq -r .body "$C/pr_comments.jsonl")" = "<!-- forge-slack-pr-text-note -->
+Closed from Slack at Ana'"'"'s request. " ]' \
   "close: the trail note is posted on the PR first, with forged markers dropped"
 check '[ "$(jq -c . "$C/pr_patch.jsonl")" = "{\"pr\":\"7\",\"state\":\"closed\"}" ]' \
   "close: the PR is closed, and nothing else in the request (a title) is applied"
@@ -347,7 +384,7 @@ C=$(new_case superseded-threads)
   comment 41 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, reply: "Second", watermark: true}')"
 } > "$C/comments.jsonl"
 run_case "$C"
-check '[ "$(cat "$C/rc")" = 0 ] && [ "$(cat "$C/resolved.log")" = PRRT_open ] && [ "$(jq -sr ".[0].body" "$C/pr_comments.jsonl" | tail -1)" = Second ] && [ "$(wc -l < "$C/pr_comments.jsonl" | tr -d " ")" = 2 ]' \
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(cat "$C/resolved.log")" = PRRT_open ] && [ "$(jq -sr ".[0].body | split(\"\\n\")[-1]" "$C/pr_comments.jsonl")" = Second ] && [ "$(wc -l < "$C/pr_comments.jsonl" | tr -d " ")" = 2 ]' \
   "superseded-threads: one reply, one watermark, and the thread closes with the reply that replaced the first"
 C=$(new_case superseded-reply-fails)
 cp "$TMP/superseded-threads/comments.jsonl" "$C/comments.jsonl"
@@ -403,7 +440,7 @@ touch "$C/die_on_reply"
 run_case "$C"
 check '[ "$(cat "$C/rc")" != 0 ] && [ "$(marks "$C" interrupted)" = 53 ] && [ -z "$(marks "$C" applied)" ]' \
   "cancelled: a claimed request the run did not finish is marked interrupted"
-check '[[ "$(slack_text "$C")" == *"stopped before it finished"* ]] && [ "$(jq -r .channel "$C/slack.jsonl" | head -1)" = C9 ]' \
+check '[[ "$(slack_text "$C")" == *"stopped before it finished"* ]] && [ "$(jq -rs ".[0].channel" "$C/slack.jsonl")" = C9 ]' \
   "cancelled: the request's own thread is told to check the PR"
 
 # A claim left by a lost runner (no exit handler ran) is reported by the next
@@ -467,7 +504,7 @@ C=$(new_case claim-fails-winner)
 } > "$C/comments.jsonl"
 touch "$C/claim_fail_73"
 run_case "$C"
-check '[ "$(jq -sr ".[0].body" "$C/pr_comments.jsonl" | tail -1)" = First ] && [ "$(cat "$C/resolved.log")" = PRRT_open ]' \
+check '[ "$(jq -sr ".[0].body | split(\"\\n\")[-1]" "$C/pr_comments.jsonl")" = First ] && [ "$(cat "$C/resolved.log")" = PRRT_open ]' \
   "claim-fails-winner: the claimed request keeps its reply and threads when the later one cannot be claimed"
 check '[[ "$(slack_text "$C")" == *"I couldn'"'"'t start this change"* ]] && [ -z "$(marks "$C" claimed | grep 73)" ]' \
   "claim-fails-winner: the unclaimed request's thread is told, and it stays pending"
@@ -480,7 +517,8 @@ C=$(new_case state-with-reply)
 } > "$C/comments.jsonl"
 run_case "$C"
 check '[ "$(jq -sr "map(.body) | join(\"|\")" "$C/pr_comments.jsonl")" = "<!-- forge-revise-reply -->
-Answer|Closed." ] && [ "$(cat "$C/resolved.log")" = PRRT_open ] && [ "$(jq -r .state "$C/pr_patch.jsonl")" = closed ]' \
+Answer|<!-- forge-slack-pr-text-note -->
+Closed." ] && [ "$(cat "$C/resolved.log")" = PRRT_open ] && [ "$(jq -r .state "$C/pr_patch.jsonl")" = closed ]' \
   "state-with-reply: the earlier reply and thread survive, and the close posts only its note"
 
 # Slack's ok:false is a visible warning.
@@ -636,7 +674,7 @@ C=$(new_case late-claim)
 comment_edited 98 108000 1500 '<!-- forge-slack-pr-text-claimed {"ts":"5.5","seq":1,"pr":7,"ch":"C9","th":"9.9","rp":true,"run":0} -->
 Forge is applying this request to #7.' > "$C/comments.jsonl"
 run_case "$C"
-check '[ "$(marks "$C" interrupted)" = 98 ] && jq -r .body "$C/applied.jsonl" | grep -q "\"rp\":true"' \
+check '[ "$(marks "$C" interrupted)" = 98 ] && [[ "$(jq -r .body "$C/applied.jsonl")" == *"\"rp\":true"* ]]' \
   "late-claim: a claim judged by its claim time is reported, and its rp is kept"
 
 # A superseded request that also edited the title says both.
@@ -648,6 +686,173 @@ C=$(new_case superseded-with-title)
 run_case "$C"
 check '[[ "$(slack_text "$C")" == *"updated the title, your reply wasn'"'"'t posted: a newer reply to #7 from Forge replaced it"* ]]' \
   "superseded-with-title: the title edit and the replaced reply are both reported"
+
+# --- review round (Ako and Kimi, #214) ---------------------------------------
+# The lock: forge:pr-text goes on the issue and the PR after the claim and
+# before any PR is read, and comes off on every exit.
+C="$TMP/happy"
+check '[ "$(cat "$C/labels.log")" = "--add-label 1213 forge:pr-text
+--add-label 7 forge:pr-text
+--remove-label 1213 forge:pr-text
+--remove-label 7 forge:pr-text" ]' "lock: forge:pr-text is set on the issue and the PR, then removed"
+FIRST_CLAIM=$(grep -n -m1 "^api --method PATCH repos/o/r/issues/comments/" "$C/gh.log" | cut -d: -f1)
+FIRST_LOCK=$(grep -n -m1 "^api --method POST repos/o/r/issues/1213/labels" "$C/gh.log" | cut -d: -f1)
+FIRST_READ=$(grep -n -m1 "^api graphql" "$C/gh.log" | cut -d: -f1)
+check '[ "$FIRST_CLAIM" -lt "$FIRST_LOCK" ] && [ "$FIRST_LOCK" -lt "$FIRST_READ" ]' \
+  "lock: taken after the claim and before the first PR read (claim $FIRST_CLAIM, lock $FIRST_LOCK, read $FIRST_READ)"
+C="$TMP/cancelled"
+check '! grep -xF forge:pr-text "$C/labels_1213" "$C/labels_7" >/dev/null && [ "$(grep -c -- "--remove-label" "$C/labels.log")" = 2 ]' \
+  "lock: a cancelled run still removes forge:pr-text"
+
+C=$(new_case lock-fails)
+comment 110 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: x", reply: "Done."}')" > "$C/comments.jsonl"
+touch "$C/lock_fail"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/pr_patch.jsonl" ] && [ ! -s "$C/pr_comments.jsonl" ] && [ "$(marks "$C" skipped)" = 110 ] && ! grep "^api graphql" "$C/gh.log" >/dev/null' \
+  "lock-fails: without the lock no PR is read or written, and the request is skipped"
+check '[[ "$(slack_text "$C")" == *"couldn'"'"'t take the lock"* ]]' "lock-fails: Slack is told"
+
+C=$(new_case issue-running)
+comment 111 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: x"}')" > "$C/comments.jsonl"
+touch "$C/forge_running"
+run_case "$C"
+check '[ ! -s "$C/pr_patch.jsonl" ] && [ "$(marks "$C" skipped)" = 111 ] && ! grep -xF forge:pr-text "$C/labels_1213" >/dev/null' \
+  "issue-running: pr-text backs off from a Forge run on the issue and releases its lock"
+
+# Each request reads the PR again, so one that reopens the PR lets a later
+# edit through, and one that closes it stops a later edit.
+C=$(new_case reopen-then-edit)
+{
+  comment 112 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, state: "open", note: "Reopened."}')"
+  comment 113 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, title: "fix: after reopen"}')"
+} > "$C/comments.jsonl"
+pr_state_json CLOSED > "$C/pr_7.json"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(jq -sr "map(.state // .title) | join(\"|\")" "$C/pr_patch.jsonl")" = "open|fix: after reopen" ] && [ "$(marks "$C" applied)" = "112,113" ]' \
+  "reopen-then-edit: the edit after a reopen lands"
+C=$(new_case close-then-edit)
+{
+  comment 114 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, state: "closed", note: "Closed."}')"
+  comment 115 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, title: "fix: after close"}')"
+} > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(jq -sr "map(.state // .title) | join(\"|\")" "$C/pr_patch.jsonl")" = closed ] && [ "$(marks "$C" skipped)" = 115 ]' \
+  "close-then-edit: an edit after a close in the same run is skipped"
+
+# The trail note a reopen posts is Forge's own, not a newer comment: a reply
+# in the same run still gets its watermark.
+C=$(new_case reopen-then-reply)
+{
+  comment 127 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, state: "open", note: "Reopened."}')"
+  comment 128 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, reply: "Fixed.", watermark: true}')"
+} > "$C/comments.jsonl"
+jq -n '{data: {repository: {pullRequest: {state: "CLOSED", body: "", closingIssuesReferences: {nodes: [{number: 1213}]},
+  comments: {nodes: [{updatedAt: (now | todate), body: "<!-- forge-slack-pr-text-note -->\nReopened."}]}, reviewThreads: {nodes: []}}}}}' > "$C/pr_7.json"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(jq -sr "map(.body | split(\"\\n\")[0]) | join(\"|\")" "$C/pr_comments.jsonl")" = "<!-- forge-slack-pr-text-note -->|<!-- forge-revise-reply -->|<!-- forge-revise-instructions -->" ]' \
+  "reopen-then-reply: Forge's own trail note does not hold back the watermark"
+
+# Two description edits to one PR: only the last is written.
+C=$(new_case two-bodies)
+{
+  comment 116 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, body: "first body"}')"
+  comment 117 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, body: "second body"}')"
+} > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(jq -sr "map(.body) | join(\"|\")" "$C/pr_patch.jsonl")" = "second body" ] && [ "$(marks "$C" applied)" = "116,117" ]' \
+  "two-bodies: only the last description is written"
+check '[[ "$(slack_text "$C")" == *"your description edit wasn'"'"'t applied: a newer description to #7 from Forge replaced it"* ]]' \
+  "two-bodies: the first request is told its edit was replaced"
+
+# A superseded reply whose replacement fails is a failure, not "replaced".
+C=$(new_case superseded-winner-fails)
+{
+  comment 118 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, reply: "First"}')"
+  comment 119 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, reply: "Second"}')"
+} > "$C/comments.jsonl"
+touch "$C/reply_fail"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [[ "$(slack_text "$C")" == *"your reply wasn'"'"'t posted, and the newer reply to #7 that replaced it did not land either"* ]]' \
+  "superseded-winner-fails: the replaced request reports the failure"
+
+# Requests of the wrong shape are reported, and the others still apply.
+C=$(new_case bad-shapes)
+{
+  comment 120 'forge-gh-app[bot]' Bot 40 '<!-- forge-slack-pr-text {"v":1,"seq":1,"pr":7,"title":"a>b"} -->
+Forge is updating the PR (requested from Slack).'
+  comment 121 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, reply: "x", threads: "PRRT_open"}')"
+  comment 122 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, title: "t", base: "abc"}')"
+  comment 123 'forge-gh-app[bot]' Bot 10 "$(request 1 '{pr: 8, title: "fix: ok"}')"
+} > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [ "$(marks "$C" skipped)" = "120,121,122" ] && [ "$(jq -sr "map(\"\(.pr):\(.title)\") | join(\"|\")" "$C/pr_patch.jsonl")" = "8:fix: ok" ]' \
+  "bad-shapes: a raw > in the JSON, a threads string and a base string are reported; the valid request applies"
+
+# A title or description keeps the @mentions already in it; new ones lose their @.
+C=$(new_case mentions)
+comment 124 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "ping @carol and @dave", body: "cc @alice and @bob"}')" > "$C/comments.jsonl"
+jq -n '{data: {repository: {pullRequest: {state: "OPEN", title: "for @Dave", body: "cc @alice", closingIssuesReferences: {nodes: [{number: 1213}]}, reviewThreads: {nodes: []}}}}}' > "$C/pr_7.json"
+run_case "$C"
+check '[ "$(jq -r .body "$C/pr_patch.jsonl")" = "cc @alice and bob" ] && [ "$(jq -r .title "$C/pr_patch.jsonl")" = "ping carol and @dave" ]' \
+  "mentions: existing mentions keep their @, new ones lose it"
+
+# A closing keyword inside an HTML comment or fenced code does not count.
+C=$(new_case closes-in-comment)
+comment 125 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 8, title: "fix: x"}')" > "$C/comments.jsonl"
+jq -n '{data: {repository: {pullRequest: {state: "OPEN", body: "<!-- Closes #1213 -->\n```\nFixes #1213\n```\nRelated to #1213", closingIssuesReferences: {nodes: []}, reviewThreads: {nodes: []}}}}}' > "$C/pr_8.json"
+run_case "$C"
+check '[ ! -s "$C/pr_patch.jsonl" ] && [ "$(marks "$C" skipped)" = 125 ] && [[ "$(slack_text "$C")" == *"not an open PR that closes #1213"* ]]' \
+  "closes-in-comment: a closing keyword in a comment or code block is not a closing reference"
+
+C=$(new_case one-line-title)
+comment 126 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: one\nline"}')" > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(jq -r .title "$C/pr_patch.jsonl")" = "fix: one line" ]' "one-line-title: a title stays one line"
+
+# The forge job's half of the handshake: "Claim the issue" waits while
+# forge:pr-text is on the issue, after setting forge:running.
+CLAIM=$(step_script "Claim the issue")
+check '[[ "$CLAIM" == *"forge:pr-text|"* ]]' "the claim step creates the forge:pr-text label"
+check 'awk '"'"'/--add-label "forge:running"/ {a=NR} /^wait_for_pr_text$/ {w=NR} END {exit !(a && w > a)}'"'"' <<< "$CLAIM"' \
+  "the claim step waits for pr-text only after setting forge:running"
+awk '/^wait_for_pr_text\(\) \{$/ {f=1} f {print} f && /^}$/ {exit}' <<< "$CLAIM" > "$TMP/wait.sh"
+echo wait_for_pr_text >> "$TMP/wait.sh"
+wait_case() {  # wait_case <name> [setup...] -> case dir
+  local c rc=0
+  c=$(new_case "$1"); shift
+  : > "$c/labels_1213"
+  for s in "$@"; do eval "$s"; done
+  env -i PATH="$BIN:$PATH" FAKE_STATE="$c" GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 \
+    PR_TEXT_WAIT_SECONDS=0 PR_TEXT_WAIT_POLLS=3 bash -euo pipefail "$TMP/wait.sh" > "$c/run.log" 2>&1 || rc=$?
+  echo "$rc" > "$c/rc"
+  printf '%s' "$c"
+}
+reads() { wc -l < "$1/label_reads" | tr -d ' '; }
+C=$(wait_case wait-none)
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(reads "$C")" = 1 ] && [ ! -s "$C/labels.log" ]' "wait: no forge:pr-text, no wait"
+C=$(wait_case wait-clears 'echo forge:pr-text > "$c/labels_1213"' 'touch "$c/clear_after_3"')
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(reads "$C")" = 3 ] && [ ! -s "$C/labels.log" ] && [ "$(grep -c "waiting for it to finish" "$C/run.log")" = 1 ]' \
+  "wait: waits while forge:pr-text is on the issue and goes ahead once it is removed"
+C=$(wait_case wait-stale 'echo forge:pr-text > "$c/labels_1213"')
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(reads "$C")" = 4 ] && [ "$(cat "$C/labels.log")" = "--remove-label 1213 forge:pr-text" ] && grep -F "::warning::forge:pr-text stayed on #1213" "$C/run.log" >/dev/null' \
+  "wait: a forge:pr-text left past pr-text's timeout is removed with a warning"
+C=$(wait_case wait-read-fails 'touch "$c/labels_read_fail"')
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(reads "$C")" = 4 ] && grep -F "::warning::Could not read the labels on #1213" "$C/run.log" >/dev/null' \
+  "wait: a label read that fails counts as the lock still held"
+
+# A rejected command tells the Slack thread, with the command defanged.
+step_script "Check the command" > "$TMP/check.sh"
+C=$(new_case rejected-command)
+rc=0
+env -i PATH="$BIN:$PATH" FAKE_STATE="$C" FORGE_COMMAND='pr_text`<!here>' ISSUE_NUMBER=1213 \
+  SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake bash -e "$TMP/check.sh" > "$C/run.log" 2>&1 || rc=$?
+REJECT=$(slack_text "$C")
+check '[ "$rc" = 1 ] && [[ "$REJECT" == *"Forge didn'"'"'t start on #1213: \`pr_texthere\` is not a Forge command"* ]] && [[ "$REJECT" != *"<!here>"* ]] && [ "$(jq -r .thread_ts "$C/slack.jsonl")" = 1.1 ]' \
+  "rejected-command: the Slack thread is told, with the command defanged (got: $REJECT)"
+C=$(new_case rejected-command-no-slack)
+rc=0
+env -i PATH="$BIN:$PATH" FAKE_STATE="$C" FORGE_COMMAND=bogus ISSUE_NUMBER=1213 bash -e "$TMP/check.sh" > "$C/run.log" 2>&1 || rc=$?
+check '[ "$rc" = 1 ] && [ ! -e "$C/slack.jsonl" ]' "rejected-command: no Slack call without a thread"
 
 if [ "$fail" -ne 0 ]; then
   echo "forge-pr-text: FAILED"

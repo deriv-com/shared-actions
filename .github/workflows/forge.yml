@@ -131,7 +131,9 @@ on:
           forge-agent requested in a
           `<!-- forge-slack-pr-text … -->` comment on the issue, with this
           workflow's write App (forge-agent's own App can only read PRs).
-          Callers must pass this through from workflow_dispatch.
+          Any other value is rejected before anything runs, and the Slack
+          thread is told. Callers must pass this through from
+          workflow_dispatch.
         required: false
         default: "auto"
         type: string
@@ -321,20 +323,35 @@ jobs:
     steps:
       # An unknown command stops the job here, before any token, label or
       # comment, and Report (gated on this step) posts nothing: it is never
-      # folded into auto, which would open a new PR. pr-text never reaches
-      # this job (it has its own).
+      # folded into auto, which would open a new PR. The Slack thread, if
+      # any, is told. pr-text never reaches this job (it has its own).
       - name: Check the command
         id: command
         env:
           FORGE_COMMAND: ${{ inputs.command }}
+          SLACK_BOT_TOKEN: ${{ secrets.FORGE_SLACK_BOT_TOKEN }}
         run: |
           case "${FORGE_COMMAND:-}" in
-            ""|auto|revise|update) ;;
-            *)
-              echo "::error::Unknown command '${FORGE_COMMAND}'. Use auto, revise, update or pr-text (callers must pass command through from workflow_dispatch)."
-              exit 1
-              ;;
+            ""|auto|revise|update) exit 0 ;;
           esac
+          echo "::error::Unknown command '${FORGE_COMMAND}'. Use auto, revise, update or pr-text (callers must pass command through from workflow_dispatch)."
+          # The Slack thread that asked hears why nothing started. The command
+          # is shown cut short and without backticks or Slack markup.
+          if [ -n "${SLACK_CHANNEL:-}" ] && [ -n "${SLACK_THREAD_TS:-}" ] && [ -n "${SLACK_BOT_TOKEN:-}" ]; then
+            shown=$(printf '%s' "$FORGE_COMMAND" | tr -cd '[:alnum:] ._:/-' | cut -c1-40)
+            if resp=$(jq -n --arg channel "$SLACK_CHANNEL" --arg ts "$SLACK_THREAD_TS" \
+                  --arg text "Forge didn't start on #${ISSUE_NUMBER}: \`${shown}\` is not a Forge command (auto, revise, update or pr-text). This is a bug in the caller's workflow." \
+                  '{channel: $channel, thread_ts: $ts, text: $text, unfurl_links: false, unfurl_media: false}' \
+                | curl -sS --connect-timeout 5 --max-time 15 -X POST https://slack.com/api/chat.postMessage \
+                    -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+                    -H 'Content-type: application/json; charset=utf-8' --data @-); then
+              jq -e '.ok == true' <<< "$resp" >/dev/null 2>&1 \
+                || echo "::warning::Slack did not post the rejection: $(jq -r '.error // "unreadable response"' <<< "$resp" 2>/dev/null)"
+            else
+              echo "::warning::Could not post the rejection to Slack (the request failed)."
+            fi
+          fi
+          exit 1
 
       # Before any token is minted: Run Forge measures job time and token age
       # from here, so the token's age is overstated and never understated.
@@ -420,6 +437,7 @@ jobs:
           forge:running|fbca04|Forge is working on this
           forge:done|0e8a16|Forge opened a PR
           forge:failed|b60205|Forge failed — see the run log
+          forge:pr-text|c5def5|Forge is applying a PR change
           LABELS
 
           # Swap the trigger label for the in-flight one. On the dispatch path
@@ -428,6 +446,35 @@ jobs:
           # both entry points, and the board still shows `forge:running` either way.
           gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
             --remove-label "forge" --add-label "forge:running"
+
+          # The handshake with the pr-text job, which applies PR edits, replies
+          # and closes queued from Slack. forge:running is set just above,
+          # before this check; pr-text sets forge:pr-text on the issue (and on
+          # each PR it touches) before it checks for forge:running. So the two
+          # never write at once: when both start together, pr-text backs off
+          # and this run waits for its release. A label left by a pr-text run
+          # that died is removed after 10 minutes (pr-text's timeout). A label
+          # read that fails counts as the label still being there.
+          wait_for_pr_text() {
+            local i=0 labels
+            while :; do
+              if labels=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels?per_page=100" --jq '.[].name' 2>&1); then
+                grep -qxF 'forge:pr-text' <<< "$labels" || return 0
+              else
+                echo "::warning::Could not read the labels on #${ISSUE_NUMBER}: ${labels}"
+              fi
+              if [ "$i" -ge "${PR_TEXT_WAIT_POLLS:-60}" ]; then
+                echo "::warning::forge:pr-text stayed on #${ISSUE_NUMBER} for 10 minutes, so the pr-text run that set it likely stopped without removing it. Removing it and going ahead."
+                gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/forge%3Apr-text" >/dev/null \
+                  || echo "::warning::Could not remove forge:pr-text from #${ISSUE_NUMBER}."
+                return 0
+              fi
+              [ "$i" -gt 0 ] || echo "A Forge PR change from Slack is being applied on #${ISSUE_NUMBER}; waiting for it to finish."
+              i=$((i + 1))
+              sleep "${PR_TEXT_WAIT_SECONDS:-10}"
+            done
+          }
+          wait_for_pr_text
 
           VIA=""
           if [ -n "${SLACK_THREAD_TS:-}" ]; then
@@ -4180,6 +4227,9 @@ jobs:
     # Own group, so a queued pr-text never displaces a queued revise (GitHub
     # keeps one pending run per group). Runs for one issue serialize, and each
     # applies everything pending, so a cancelled pending run drops nothing.
+    # A forge run on the same issue is kept out by a label handshake instead
+    # (forge:pr-text against forge:running; see "Apply PR text" and the forge
+    # job's "Claim the issue").
     concurrency:
       group: forge-pr-text-${{ github.repository }}-${{ inputs.issue_number }}
       cancel-in-progress: false
@@ -4234,8 +4284,9 @@ jobs:
 
           # The forge job's cleaning for model text, copied verbatim
           # (tests/forge-pr-text.sh fails if the copies differ): mentions lose
-          # their @ (no one is on the allow-list here), mass mentions and HTML
-          # comments go, and token-shaped strings are masked.
+          # their @ unless allowed (a reply allows none; a title or description
+          # allows the mentions already in the PR's current one), mass mentions
+          # and HTML comments go, and token-shaped strings are masked.
           CLEAN_JQ='
             def clean($allowed; $max):
               (. // "") | tostring
@@ -4351,15 +4402,91 @@ jobs:
             slack_say "$c" "$t" "The Forge run applying a change to <https://github.com/${GITHUB_REPOSITORY}/pull/${p}|#${p}> stopped before it finished, so part of it may not be done. Check the PR and ask me again if something is missing. <${RUN_URL}|Run log>"
           }
 
+          # One result per request, kept until every request has run, so a
+          # request that lost its reply or edit to a later one can say whether
+          # the later one actually landed.
+          : > "$WORK/results.jsonl"
+          FINALIZED=0
+          finalize_lines() {
+            [ "$FINALIZED" = 0 ] || return 0
+            FINALIZED=1
+            local rec req pr line field what x
+            local -a parts problems
+            while IFS= read -r rec <&6; do
+              req=$(jq -c '.req' <<< "$rec")
+              pr=$(jq -r '.req.pr' <<< "$rec")
+              parts=(); problems=()
+              while IFS= read -r x; do parts+=("$x"); done < <(jq -r '.done[]' <<< "$rec")
+              while IFS= read -r x; do problems+=("$x"); done < <(jq -r '.problems[]' <<< "$rec")
+              # A field a later request took over: done if the later one
+              # landed it, a problem if it did not.
+              for field in reply title body; do
+                jq -e --arg f "$field" '.req["superseded_" + $f] == true' <<< "$rec" >/dev/null || continue
+                case "$field" in
+                  reply) what="your reply wasn't posted" ;;
+                  title) what="your title edit wasn't applied" ;;
+                  *) what="your description edit wasn't applied" ;;
+                esac
+                if [ -f "$WORK/landed_${field}_${pr}" ]; then
+                  parts+=("${what}: a newer ${field/body/description} to #${pr} from Forge replaced it")
+                else
+                  problems+=("${what}, and the newer ${field/body/description} to #${pr} that replaced it did not land either")
+                fi
+              done
+              line="• <https://github.com/${GITHUB_REPOSITORY}/pull/${pr}|#${pr}>: "
+              if [ "${#parts[@]}" -gt 0 ]; then line+=$(join_parts "${parts[@]}"); else line+="nothing changed"; fi
+              if jq -e '.recorded == false' <<< "$rec" >/dev/null; then
+                line+=" (I couldn't mark the request done on #${ISSUE_NUMBER}, so a later \"stopped before it finished\" note about it is wrong)"
+              fi
+              if [ "${#problems[@]}" -gt 0 ]; then
+                report "$req" "${line}. Not done: $(join_parts "${problems[@]}")." 1
+                FAILED=1
+              else
+                report "$req" "${line}." 0
+              fi
+            done 6< "$WORK/results.jsonl"
+          }
+
+          # The handshake with the forge job. pr-text sets its own label,
+          # forge:pr-text, on the tracking issue and on every PR it will touch
+          # before it reads any of them; the forge job's claim step sets
+          # forge:running and then waits while its work item carries
+          # forge:pr-text. Each side sets its flag before it checks the
+          # other's, so the two never write at the same time: whichever labels
+          # second backs off (pr-text skips; the forge run waits for the
+          # release). Released on every exit.
+          # Labels go through the issues REST API, which takes a PR number
+          # as well as an issue's.
+          : > "$WORK/locked"
+          lock() {  # lock <number>
+            if gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/$1/labels" -f 'labels[]=forge:pr-text' >/dev/null 2> "$WORK/err"; then
+              echo "$1" >> "$WORK/locked"
+            else
+              cat "$WORK/err"
+              return 1
+            fi
+          }
+          unlock_all() {
+            local n
+            while IFS= read -r n; do
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/${n}/labels/forge%3Apr-text" >/dev/null 2>&1 \
+                || echo "::warning::Could not remove forge:pr-text from #${n}; the next Forge run on it waits up to 10 minutes, then removes it."
+            done < <(sort -u "$WORK/locked")
+            : > "$WORK/locked"
+          }
+
           # On any exit (an error, a cancel or the job timeout): ignore further
-          # signals (a cancel sends SIGINT then SIGTERM), report the requests
-          # this run claimed but did not finish, send what finished, clean up.
+          # signals (a cancel sends SIGINT then SIGTERM), release the lock
+          # (no PR is written after this), report the requests this run
+          # claimed but did not finish, send what finished, clean up.
           on_exit() {
             trap '' TERM INT
+            unlock_all || true
             local r
             while IFS= read -r r; do
               grep -qx "$(jq -r '.comment_id' <<< "$r")" "$WORK/finished" || interrupted "$r"
             done < "$WORK/claimed.jsonl"
+            finalize_lines || true
             send_reports || true
             rm -rf "$WORK"
           }
@@ -4404,7 +4531,7 @@ jobs:
             | select($claimed < ($now - 1200) and $claimed > ($now - 604800))
             | .id as $id
             | (.body // "") | select(test("^<!-- forge-slack-pr-text-claimed "))
-            | capture("^<!-- forge-slack-pr-text-claimed (?<j>[^>]*) -->") | .j
+            | (first(capture("^<!-- forge-slack-pr-text-claimed (?<j>[^>]*) -->") | .j) // null)
             | (try fromjson catch null)
             | select(type == "object" and (.pr | type) == "number")
             | . + {comment_id: $id}
@@ -4426,32 +4553,44 @@ jobs:
           done 3< "$WORK/stale.jsonl"
 
           # Every pending request, oldest first. Only request comments reach
-          # capture: the guard keeps any other comment a plain skip on any jq
-          # version. The JSON never contains ">" (forge-agent escapes it), so
-          # [^>]* ends at the closing "-->". A description travels raw after
-          # BODY_DELIM, so it is not inflated by JSON escaping. A close/reopen
-          # request carries only its note: any edit, reply, thread or
-          # watermark on it is dropped here. A request comment that cannot be
-          # read (bad JSON, another version, a description section missing) is
-          # listed separately, so it is reported rather than dropped silently.
+          # capture, and a comment capture cannot read (a raw ">" in the JSON,
+          # no closing "-->") becomes null rather than vanishing, so it is
+          # reported as unreadable. The JSON never contains ">" (forge-agent
+          # escapes it), so [^>]* ends at the closing "-->". A description
+          # travels raw after BODY_DELIM, so it is not inflated by JSON
+          # escaping. Every field must have the shape forge-agent writes; a
+          # request that does not (or another version, or a description
+          # section missing) is listed separately and reported, not dropped
+          # and never fed to the steps below. A close/reopen request carries
+          # only its note: any edit, reply, thread or watermark on it is
+          # dropped here.
           jq -c --arg who "$REQUESTER" --arg delim "$BODY_DELIM" --argjson now "$(date -u +%s)" '
+            def str_or_null: . == null or type == "string";
+            def well_formed($parts):
+              type == "object" and .v == 1
+              and (.pr | type) == "number" and .pr > 0 and (.pr | floor) == .pr
+              and (.title | str_or_null) and (.reply | str_or_null) and (.note | str_or_null)
+              and (.body == null or .body == true)
+              and (.state == null or .state == "closed" or .state == "open")
+              and (.watermark == null or (.watermark | type) == "boolean")
+              and (.threads == null or ((.threads | type) == "array" and all(.threads[]; type == "string")))
+              and (.base == null or ((.base | type) == "object" and all(.base[]; type == "string")))
+              and (.body != true or ($parts | length) >= 2);
             [ .[]
               | select((.user.login // "") == $who and (.user.type // "") == "Bot")
               | select(((.created_at // "1970-01-01T00:00:00Z") | fromdateiso8601) > ($now - 86400))
               | .id as $id | .created_at as $at | (.body // "") as $text
               | select($text | test("^<!-- forge-slack-pr-text "))
-              | ($text | capture("^<!-- forge-slack-pr-text (?<j>[^>]*) -->") | .j | try fromjson catch null) as $p
+              | ($text | first(capture("^<!-- forge-slack-pr-text (?<j>[^>]*) -->") | .j) // null | try fromjson catch null) as $p
               | ($text | split($delim)) as $parts
-              | if ($p | type) == "object" and $p.v == 1
-                   and ($p.pr | type) == "number" and $p.pr > 0 and ($p.pr | floor) == $p.pr
-                   and ($p.body != true or ($parts | length) >= 2)
+              | if ($p | well_formed($parts))
                 then $p
                   | (if .body == true then .body = ($parts[1:] | join($delim)) else .body = null end)
                   | if .state == "closed" or .state == "open" then .reply = null | .threads = [] | .watermark = false | .title = null | .body = null else . end
                   | . + {comment_id: $id, created_at: $at}
                 else
                   {malformed: true, comment_id: $id, created_at: $at}
-                  + (if ($p | type) == "object" then ($p | {ts, seq, pr, ch, th}) else {} end)
+                  + (if ($p | type) == "object" then ($p | {ts, seq, ch, th} + (if (.pr | type) == "number" then {pr} else {} end)) else {} end)
                 end
             ]
             | sort_by([.created_at, (.seq // 0)]) | .[]
@@ -4483,108 +4622,146 @@ jobs:
           # exactly once: a later run never re-applies or re-reports it, even
           # when this run fails part-way. An unclaimed request stays pending,
           # and its thread is told.
-          : > "$WORK/requests.raw.jsonl"
           while IFS= read -r req <&3; do
             cid=$(jq -r '.comment_id' <<< "$req")
-            if mark "$cid" claimed "$req" "Forge is applying this request to #$(jq -r '.pr' <<< "$req")."; then
+            pr=$(jq -r '.pr' <<< "$req")
+            if mark "$cid" claimed "$req" "Forge is applying this request to #${pr}."; then
               printf '%s\n' "$req" >> "$WORK/claimed.jsonl"
-              printf '%s\n' "$req" >> "$WORK/requests.raw.jsonl"
             else
               cat "$WORK/err"
               echo "::warning::Could not claim request comment ${cid}; it stays pending."
-              report "$req" "• <https://github.com/${GITHUB_REPOSITORY}/pull/$(jq -r '.pr' <<< "$req")|#$(jq -r '.pr' <<< "$req")>: I couldn't start this change (GitHub refused the claim). The next Forge PR change on #${ISSUE_NUMBER} may still apply it, so check the PR before asking again." 1
+              report "$req" "• <https://github.com/${GITHUB_REPOSITORY}/pull/${pr}|#${pr}>: I couldn't start this change (GitHub refused the claim). The next Forge PR change on #${ISSUE_NUMBER} may still apply it, so check the PR before asking again." 1
               FAILED=1
             fi
           done 3< "$WORK/pending.jsonl"
+          [ -s "$WORK/claimed.jsonl" ] || exit "$FAILED"
 
-          # Each PR is read once, right before its requests are applied: its
-          # state, title and body, closing references, labels (and the
-          # tracking issue's), the newest review or comment from anyone but
-          # Forge, and every review thread (all pages).
+          # Take the lock before any PR is read. A lock that cannot be set
+          # means no PR is written: every claimed request is skipped.
+          gh label create "forge:pr-text" --repo "$GITHUB_REPOSITORY" --color c5def5 \
+            --description "Forge is applying a PR change" --force >/dev/null 2>&1 || true
+          LOCKED=1
+          for n in "$ISSUE_NUMBER" $(jq -r '.pr' "$WORK/claimed.jsonl" | sort -un); do
+            lock "$n" || { LOCKED=0; break; }
+          done
+          if [ "$LOCKED" = 0 ]; then
+            while IFS= read -r req <&3; do
+              skip "$req" "Forge skipped this request: it could not take its lock on #${ISSUE_NUMBER}." "• <https://github.com/${GITHUB_REPOSITORY}/pull/$(jq -r '.pr' <<< "$req")|#$(jq -r '.pr' <<< "$req")>: I couldn't take the lock that keeps a Forge run from writing at the same time, so nothing was changed. Ask me again."
+            done 3< "$WORK/claimed.jsonl"
+            exit 1
+          fi
+
+          # read_pr <pr>: read a PR now: state, title and body, closing
+          # references, labels (and the tracking issue's), the newest review
+          # or comment from anyone but Forge, and every review thread (all
+          # pages). Returns 1 when it cannot be read.
           PR_QUERY='query($o: String!, $r: String!, $n: Int!, $i: Int!) { repository(owner: $o, name: $r) { issue(number: $i) { labels(first: 50) { nodes { name } } } pullRequest(number: $n) { state title body labels(first: 50) { nodes { name } } closingIssuesReferences(first: 50) { nodes { number repository { nameWithOwner } } } comments(last: 100) { nodes { updatedAt body } } reviews(last: 50) { nodes { submittedAt } } } } }'
           THREADS_QUERY='query($o: String!, $r: String!, $n: Int!, $endCursor: String) { repository(owner: $o, name: $r) { pullRequest(number: $n) { reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { id isResolved comments(last: 1) { nodes { createdAt } } } } } } }'
           RESOLVE_MUTATION='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }'
-          for pr in $(jq -r '.pr' "$WORK/requests.raw.jsonl" | sort -un); do
-            if gh api graphql -f query="$PR_QUERY" -f o="$OWNER" -f r="$REPO" -F n="$pr" -F i="$ISSUE_NUMBER" \
-                  > "$WORK/pr_${pr}.json" 2> "$WORK/err" \
-                && gh api graphql --paginate -f query="$THREADS_QUERY" -f o="$OWNER" -f r="$REPO" -F n="$pr" \
-                  --jq '.data.repository.pullRequest.reviewThreads.nodes[]' > "$WORK/threads_${pr}.jsonl" 2>> "$WORK/err"; then
-              :
-            else
-              cat "$WORK/err"
-              rm -f "$WORK/pr_${pr}.json"
+          read_pr() {
+            if gh api graphql -f query="$PR_QUERY" -f o="$OWNER" -f r="$REPO" -F n="$1" -F i="$ISSUE_NUMBER" \
+                  > "$WORK/pr_$1.json" 2> "$WORK/err" \
+                && gh api graphql --paginate -f query="$THREADS_QUERY" -f o="$OWNER" -f r="$REPO" -F n="$1" \
+                  --jq '.data.repository.pullRequest.reviewThreads.nodes[]' > "$WORK/threads_$1.jsonl" 2>> "$WORK/err"; then
+              return 0
             fi
-          done
+            cat "$WORK/err"
+            rm -f "$WORK/pr_$1.json"
+            return 1
+          }
+          # pr_blocker <pr> <want>: why this request cannot be applied to the
+          # PR as last read, or nothing. "running #N": a Forge run on the
+          # tracking issue or on the PR (the lock makes this a backstop).
+          # "closing": the PR does not close this issue (no closing reference
+          # to this repository's #N, and no closing keyword in the description
+          # outside HTML comments and fenced code). "state": the PR is not in
+          # the state the request needs.
+          pr_blocker() {
+            jq -r --argjson issue "$ISSUE_NUMBER" --argjson pr "$1" --arg want "$2" --arg repo "$GITHUB_REPOSITORY" '
+              .data.repository as $d | $d.pullRequest as $p
+              | if any($d.issue.labels.nodes[]?; .name == "forge:running") then "running #\($issue)"
+                elif any($p.labels.nodes[]?; .name == "forge:running") then "running #\($pr)"
+                elif (any($p.closingIssuesReferences.nodes[]?;
+                        .number == $issue
+                        and (((.repository.nameWithOwner // $repo) | ascii_downcase) == ($repo | ascii_downcase)))
+                      or (($p.body // "") | gsub("<!--[\\s\\S]*?-->"; "") | gsub("```[\\s\\S]*?```"; "")
+                          | test("(?i)\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s+#\($issue)(?![0-9])"))) | not
+                then "closing"
+                elif (if $want == "open" then $p.state == "CLOSED" else $p.state == "OPEN" end) | not
+                then "state" else "" end' "$WORK/pr_$1.json"
+          }
+          # blocked_skip <request> <pr> <want> <blocker>: skip with the reason.
+          blocked_skip() {
+            local link="<https://github.com/${GITHUB_REPOSITORY}/pull/$2|#$2>"
+            case "$4" in
+              "running "*)
+                skip "$1" "Forge skipped this request: a Forge run was working on ${4#running }." "• ${link}: a Forge run is working on ${4#running } right now, so nothing was changed. Ask me again when it finishes." ;;
+              *)
+                if [ "$3" = open ]; then
+                  skip "$1" "Forge skipped this request: #$2 was not in a state it could change." "• ${link}: skipped. It is not a closed, unmerged PR that closes #${ISSUE_NUMBER}."
+                else
+                  skip "$1" "Forge skipped this request: #$2 was not in a state it could change." "• ${link}: skipped. It is not an open PR that closes #${ISSUE_NUMBER}."
+                fi ;;
+            esac
+          }
 
-          # Which claimed requests can be applied: the PR was read, no Forge
-          # run is working on the tracking issue or the PR (re-checked here,
-          # right before the writes; the pr-text and forge jobs keep separate
-          # concurrency groups so a pr-text never cancels a waiting revise),
-          # and the PR is in the state the request needs and closes this
-          # issue. The others are skipped and reported now.
+          for pr in $(jq -r '.pr' "$WORK/claimed.jsonl" | sort -un); do read_pr "$pr" || true; done
+
+          # Which claimed requests can be applied, from that first read. The
+          # others are skipped and reported now. The reply, cleaned like the
+          # revise job's replies, decides whether this request can replace an
+          # earlier reply: one that is empty once cleaned never does.
           : > "$WORK/eligible.jsonl"
+          : > "$WORK/state_changes"
           while IFS= read -r req <&3; do
             pr=$(jq -r '.pr' <<< "$req")
-            pr_link="<https://github.com/${GITHUB_REPOSITORY}/pull/${pr}|#${pr}>"
-            if [ ! -f "$WORK/pr_${pr}.json" ]; then
-              skip "$req" "Forge could not read #${pr}, so nothing was changed." "• ${pr_link}: I couldn't read the PR, so nothing was changed. Ask me again."
-              continue
-            fi
-            busy=$(jq -r --argjson issue "$ISSUE_NUMBER" --argjson pr "$pr" '
-              .data.repository
-              | if any(.issue.labels.nodes[]?; .name == "forge:running") then "#\($issue)"
-                elif any(.pullRequest.labels.nodes[]?; .name == "forge:running") then "#\($pr)"
-                else "" end' "$WORK/pr_${pr}.json")
-            if [ -n "$busy" ]; then
-              skip "$req" "Forge skipped this request: a Forge run was working on ${busy}." "• ${pr_link}: a Forge run is working on ${busy} right now, so nothing was changed. Ask me again when it finishes."
-              continue
-            fi
-            # A close/reopen request carries `state`; everything else needs
-            # an open PR. Either way the PR must close this issue: a closing
-            # reference to this repository's #N, or a closing keyword in its
-            # description. Another repository's #N is not this issue.
+            cid=$(jq -r '.comment_id' <<< "$req")
             want=$(jq -r 'if .state == "closed" or .state == "open" then .state else "" end' <<< "$req")
-            if ! jq -e --argjson issue "$ISSUE_NUMBER" --arg want "$want" --arg repo "$GITHUB_REPOSITORY" '
-                .data.repository.pullRequest
-                | (any(.closingIssuesReferences.nodes[]?;
-                       .number == $issue
-                       and (((.repository.nameWithOwner // $repo) | ascii_downcase) == ($repo | ascii_downcase)))
-                   or ((.body // "") | test("(?i)\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s+#\($issue)(?![0-9])")))
-                  and (if $want == "open" then .state == "CLOSED" else .state == "OPEN" end)
-              ' "$WORK/pr_${pr}.json" >/dev/null; then
-              if [ "$want" = open ]; then
-                skip "$req" "Forge skipped this request: #${pr} was not in a state it could change." "• ${pr_link}: skipped. It is not a closed, unmerged PR that closes #${ISSUE_NUMBER}."
-              else
-                skip "$req" "Forge skipped this request: #${pr} was not in a state it could change." "• ${pr_link}: skipped. It is not an open PR that closes #${ISSUE_NUMBER}."
-              fi
+            if [ ! -f "$WORK/pr_${pr}.json" ]; then
+              skip "$req" "Forge could not read #${pr}, so nothing was changed." "• <https://github.com/${GITHUB_REPOSITORY}/pull/${pr}|#${pr}>: I couldn't read the PR, so nothing was changed. Ask me again."
               continue
             fi
-            # The reply, cleaned like the revise job's replies, decides whether
-            # this request can replace an earlier reply: one that is empty
-            # once cleaned never does.
+            blocker=$(pr_blocker "$pr" "$want")
+            # A PR in the wrong state may be put right by an earlier request
+            # in this run (a reopen before an edit); the re-read before this
+            # request's writes decides.
+            if [ "$blocker" = state ] && grep -xF "$pr" "$WORK/state_changes" >/dev/null; then
+              blocker=""
+            fi
+            if [ -n "$blocker" ]; then
+              blocked_skip "$req" "$pr" "$want" "$blocker"
+              continue
+            fi
+            if [ -n "$want" ]; then echo "$pr" >> "$WORK/state_changes"; fi
             has_reply=false
             if jq -e '(.reply | type) == "string"' <<< "$req" >/dev/null; then
-              clean_text "$req" reply > "$WORK/reply_$(jq -r '.comment_id' <<< "$req").txt"
-              if grep -q '[^[:space:]]' "$WORK/reply_$(jq -r '.comment_id' <<< "$req").txt"; then has_reply=true; fi
+              clean_text "$req" reply > "$WORK/reply_${cid}.txt"
+              if grep -q '[^[:space:]]' "$WORK/reply_${cid}.txt"; then has_reply=true; fi
             fi
             jq -c --argjson has "$has_reply" '. + {has_reply: $has}' <<< "$req" >> "$WORK/eligible.jsonl"
-          done 3< "$WORK/requests.raw.jsonl"
+          done 3< "$WORK/claimed.jsonl"
 
-          # When several eligible requests reply on one PR, only the last reply
-          # with text is posted. Its request takes over the threads and the
+          # Several eligible requests on one PR: only the last reply with text
+          # is posted, and only the last title and the last description are
+          # written. The reply's request takes over the threads and the
           # watermark the others asked for, so they still close and land only
-          # once a reply posts. The others are told their reply was replaced.
+          # once a reply posts. Each request that lost a field to a later one
+          # is told, once the later one has run.
           jq -c -s '
             . as $all
             | def replies($p): [ $all[] | select(.pr == $p and (.reply | type) == "string") ];
+            def later($i; f): any($all[$i + 1:][]; .pr == $all[$i].pr and f);
             [ range(0; length) as $i | $all[$i]
-              | if (.reply | type) == "string"
-                   and any($all[$i + 1:][]; .pr == $all[$i].pr and .has_reply)
-                then .reply = null | .has_reply = false | .watermark = false | .threads = [] | .superseded = true
-                elif .has_reply
-                then .threads = ([ replies(.pr)[] | (.threads // [])[] ] | unique)
-                     | .watermark = any(replies(.pr)[]; .watermark == true)
-                else . end ]
+              | (if (.reply | type) == "string" and later($i; .has_reply)
+                 then .reply = null | .has_reply = false | .watermark = false | .threads = [] | .superseded_reply = true
+                 elif .has_reply
+                 then .threads = ([ replies(.pr)[] | (.threads // [])[] ] | unique)
+                      | .watermark = any(replies(.pr)[]; .watermark == true)
+                 else . end)
+              | (if (.title | type) == "string" and later($i; (.title | type) == "string")
+                 then .title = null | .superseded_title = true else . end)
+              | (if (.body | type) == "string" and later($i; (.body | type) == "string")
+                 then .body = null | .superseded_body = true else . end) ]
             | .[]
           ' "$WORK/eligible.jsonl" > "$WORK/requests.jsonl"
 
@@ -4594,17 +4771,29 @@ jobs:
             pr=$(jq -r '.pr' <<< "$req")
             cid=$(jq -r '.comment_id' <<< "$req")
             asked_at=$(jq -r '.created_at' <<< "$req")
-            pr_link="<https://github.com/${GITHUB_REPOSITORY}/pull/${pr}|#${pr}>"
+            want=$(jq -r 'if .state == "closed" or .state == "open" then .state else "" end' <<< "$req")
             done_parts=()
             problems=()
-            want=$(jq -r 'if .state == "closed" or .state == "open" then .state else "" end' <<< "$req")
+
+            # Re-read the PR right before this request: an earlier request in
+            # this run may have reopened, closed or edited it.
+            if ! read_pr "$pr"; then
+              skip "$req" "Forge could not read #${pr}, so nothing was changed." "• <https://github.com/${GITHUB_REPOSITORY}/pull/${pr}|#${pr}>: I couldn't read the PR, so nothing was changed. Ask me again."
+              continue
+            fi
+            blocker=$(pr_blocker "$pr" "$want")
+            if [ -n "$blocker" ]; then
+              blocked_skip "$req" "$pr" "$want" "$blocker"
+              continue
+            fi
 
             # Close or reopen: the trail note Forge wrote first, then the
-            # state. A note that does not post leaves the PR alone.
+            # state. A note that does not post leaves the PR alone. Its marker
+            # keeps it from counting as a newer comment for a later request.
             if [ -n "$want" ]; then
               note=$(clean_text "$req" note)
               if [[ "$note" =~ [^[:space:]] ]]; then
-                if ! jq -n --arg body "$note" '{body: $body}' \
+                if ! jq -n --arg body "$note" '{body: ("<!-- forge-slack-pr-text-note -->\n" + $body)}' \
                   | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" --input - >/dev/null 2> "$WORK/err"; then
                   cat "$WORK/err"
                   problems+=("the trail note was not posted, so the PR was left as it was")
@@ -4627,30 +4816,29 @@ jobs:
 
             # Title and/or description. Each is written only if it is still
             # what forge-agent read when it drafted the request (base: sha256
-            # of the title and body then), compared with the PR as this run
-            # read it, so a later edit by a person or another run is never
-            # overwritten. Both are scrubbed of token-shaped strings, and the
-            # description of Forge and review markers; capped like
-            # forge-agent caps them.
-            : > "$WORK/patch.json"
+            # of the title and body then), compared with the PR as just read,
+            # so a later edit by a person is never overwritten. Both are
+            # cleaned like replies, except that @mentions already in the PR's
+            # current text keep their @, and scrubbed of token-shaped strings;
+            # capped like forge-agent caps them.
             echo '{}' > "$WORK/patch.json"
             for field in title body; do
               jq -e --arg f "$field" '(.[$f] | type) == "string"' <<< "$req" >/dev/null || continue
+              jq -j --arg f "$field" '.data.repository.pullRequest[$f] // ""' "$WORK/pr_${pr}.json" > "$WORK/current.txt"
               base=$(jq -r --arg f "$field" '.base[$f] // ""' <<< "$req")
-              if [ -n "$base" ]; then
-                jq -j --arg f "$field" '.data.repository.pullRequest[$f] // ""' "$WORK/pr_${pr}.json" > "$WORK/current.txt"
-                if [ "$(sha256_of "$WORK/current.txt")" != "$base" ]; then
-                  if [ "$field" = body ]; then
-                    problems+=("the description changed after Forge drafted this, so it wasn't overwritten")
-                  else
-                    problems+=("the title changed after Forge drafted this, so it wasn't overwritten")
-                  fi
-                  continue
+              if [ -n "$base" ] && [ "$(sha256_of "$WORK/current.txt")" != "$base" ]; then
+                if [ "$field" = body ]; then
+                  problems+=("the description changed after Forge drafted this, so it wasn't overwritten")
+                else
+                  problems+=("the title changed after Forge drafted this, so it wasn't overwritten")
                 fi
+                continue
               fi
-              jq -j --arg f "$field" '.[$f]
-                | if $f == "title" then gsub("[\\r\\n]+"; " ") | .[0:256]
-                  else gsub("<!--\\s*(forge-|deriv-pr-review-)[\\s\\S]*?-->"; "") | .[0:65536] end' <<< "$req" > "$WORK/field.txt"
+              jq -j --arg f "$field" --rawfile current "$WORK/current.txt" "${CLEAN_JQ}"'
+                ([$current | scan("(?<![A-Za-z0-9_`])@([A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:/[A-Za-z0-9_.-]+)?)") | .[0] | ascii_downcase] | unique) as $kept
+                | .[$f]
+                | if $f == "title" then gsub("[\\r\\n]+"; " ") | clean($kept; 256)
+                  else clean($kept; 65536) end' <<< "$req" > "$WORK/field.txt"
               scrub_secrets < "$WORK/field.txt" > "$WORK/field.scrubbed"
               # sed ends its output with a newline; keep the text's own ending.
               ends_nl=false
@@ -4662,6 +4850,7 @@ jobs:
             if [ "$(jq 'length' "$WORK/patch.json")" -gt 0 ]; then
               if gh api --method PATCH "repos/${GITHUB_REPOSITORY}/pulls/${pr}" --input "$WORK/patch.json" >/dev/null 2> "$WORK/err"; then
                 done_parts+=("updated the $(jq -r '[keys[] | if . == "body" then "description" else . end] | join(" and ")' "$WORK/patch.json")")
+                for field in $(jq -r 'keys[]' "$WORK/patch.json"); do touch "$WORK/landed_${field}_${pr}"; done
               else
                 cat "$WORK/err"
                 problems+=("the title/description edit failed")
@@ -4684,6 +4873,7 @@ jobs:
               if jq -n --rawfile text "$WORK/reply_${cid}.txt" --arg marker "$REPLY_MARKER" '{body: ($marker + "\n" + ($text | sub("\n+$"; "")))}' \
                 | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" --input - >/dev/null 2> "$WORK/err"; then
                 done_parts+=("replied to the review")
+                touch "$WORK/landed_reply_${pr}"
               else
                 cat "$WORK/err"
                 reply_ok=0
@@ -4692,9 +4882,10 @@ jobs:
             fi
 
             # Something said on the PR after forge-agent wrote this request
-            # (a review, or a comment from anyone but Forge) is not covered by
-            # this reply: the watermark would mark it handled, so it is not
-            # posted, and a thread with a comment after the request stays open.
+            # (a review, or a comment from anyone but Forge), as of the read
+            # just taken, is not covered by this reply: the watermark would
+            # mark it handled, so it is not posted, and a thread with a comment
+            # after the request stays open.
             newer=$(jq -r --arg at "$asked_at" '
               .data.repository.pullRequest
               | ([ (.comments.nodes[]? | select((.body // "") | test("<!-- forge-") | not) | .updatedAt),
@@ -4749,30 +4940,22 @@ jobs:
             if [ "$kept" -gt 0 ]; then
               problems+=("${kept} review thread(s) had new comments after Forge wrote this, so they stay open")
             fi
-            if jq -e '.superseded == true' <<< "$req" >/dev/null; then
-              done_parts+=("your reply wasn't posted: a newer reply to #${pr} from Forge replaced it")
-            fi
 
-            recorded=1
+            recorded=true
             if ! mark_final "$cid" applied "$req" "Forge applied this request to #${pr}."; then
               cat "$WORK/err"
               echo "::warning::Could not record the outcome on request comment ${cid}."
-              recorded=0
+              recorded=false
             fi
             echo "$cid" >> "$WORK/finished"
-
-            line="• ${pr_link}: "
-            if [ "${#done_parts[@]}" -gt 0 ]; then line+=$(join_parts "${done_parts[@]}"); else line+="nothing changed"; fi
-            if [ "$recorded" = 0 ]; then
-              line+=" (I couldn't mark the request done on #${ISSUE_NUMBER}, so a later \"stopped before it finished\" note about it is wrong)"
-            fi
-            if [ "${#problems[@]}" -gt 0 ]; then
-              report "$req" "${line}. Not done: $(join_parts "${problems[@]}")." 1
-              FAILED=1
-            else
-              report "$req" "${line}." 0
-            fi
+            jq -nc --argjson req "$req" --argjson recorded "$recorded" \
+              --arg done "$(printf '%s\n' ${done_parts[@]+"${done_parts[@]}"})" \
+              --arg problems "$(printf '%s\n' ${problems[@]+"${problems[@]}"})" \
+              '{req: $req, recorded: $recorded, done: ($done | split("\n") | map(select(. != ""))), problems: ($problems | split("\n") | map(select(. != "")))}' \
+              >> "$WORK/results.jsonl"
           done 3< "$WORK/requests.jsonl"
 
+          unlock_all
+          finalize_lines
           send_reports
           [ "$FAILED" = 0 ]
