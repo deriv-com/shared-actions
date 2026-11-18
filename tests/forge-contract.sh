@@ -564,9 +564,9 @@ check 'grep -q "^          trap revoke_reminted_token EXIT\$" "$WF"' \
   "the last reminted token is revoked when Run Forge exits"
 check 'awk "
   /^    steps:\$/ {s=1; next}
-  s && /^      - name: / {exit (\$0 == \"      - name: Record job start\" ? 0 : 1)}
+  s && /^      - name: / && \$0 != \"      - name: Check the command\" {exit (\$0 == \"      - name: Record job start\" ? 0 : 1)}
 " "$WF" && grep -q "^        run: echo \"FORGE_JOB_START=\$(date -u +%s)\" >> \"\$GITHUB_ENV\"\$" "$WF"' \
-  "the job's first step records its start, before any token is minted"
+  "the job's first step after the command check records its start, before any token is minted"
 check 'awk "
   /SCRIPT_START=\\\$\\(date -u \\+%s\\)/ {f=1}
   f && /START_EPOCH=\\\$FORGE_JOB_START/ {j=1}
@@ -2434,6 +2434,24 @@ for ok in "" auto revise update; do
   rc=0
   env -i PATH="$PATH" FORGE_COMMAND="$ok" bash -e "$C/claim-head.sh" > /dev/null 2>&1 || rc=$?
   check '[ "$rc" = 0 ]' "the claim step accepts command '${ok:-<empty>}'"
+done
+# "Check the command" is the forge job's first step; Report and its token
+# mint are gated on it, so a rejected command posts and relabels nothing.
+FIRST_STEP=$(awk '/^  forge:$/{f=1} f && /^      - name:/{print; exit}' "$WF")
+check '[ "$FIRST_STEP" = "      - name: Check the command" ]' "Check the command is the forge job's first step (got: $FIRST_STEP)"
+for gated in "Mint token for Report" "Report outcome"; do
+  check 'awk -v s="      - name: '"$gated"'" '"'"'$0 == s {f=1; n=0; next} f && n++ < 6'"'"' "$WF" | grep -F "if: always() && steps.command.outcome == '"'"'success'"'"'" >/dev/null' \
+    "$gated runs only after a command that passed the check"
+done
+C=$(new_case check-command)
+step_script "Check the command" "$C" > "$C/check.sh"
+for bad in pr_text auto2 "revise; echo hi"; do
+  rc=0; env -i PATH="$PATH" FORGE_COMMAND="$bad" bash -e "$C/check.sh" > "$C/check.log" 2>&1 || rc=$?
+  check '[ "$rc" != 0 ] && has "$C/check.log" "Unknown command"' "Check the command refuses '$bad'"
+done
+for ok in "" auto revise update; do
+  rc=0; env -i PATH="$PATH" FORGE_COMMAND="$ok" bash -e "$C/check.sh" > /dev/null 2>&1 || rc=$?
+  check '[ "$rc" = 0 ]' "Check the command accepts '${ok:-<empty>}'"
 done
 C=$(new_case unknown-run)
 echo pr_text > "$C/command"

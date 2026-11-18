@@ -63,17 +63,29 @@ printf '%s\n' "$*" >> "$S/gh.log"
 arg_after() { local want="$1" prev=""; shift; for a in "$@"; do [ "$prev" = "$want" ] && { printf '%s' "$a"; return; }; prev="$a"; done; }
 case "$*" in
   "api repos/o/r/issues/1213/comments --paginate") cat "$S/comments.json" ;;
-  # The issue's labels; forge_running: a Forge run is working on it.
-  "api repos/o/r/issues/1213 --jq "*) if [ -f "$S/forge_running" ]; then echo true; else echo false; fi ;;
-  # A stale claim's run: run_<id> holds its conclusion.
-  "api repos/o/r/actions/runs/"*" --jq "*)
-    id="${2#repos/o/r/actions/runs/}"; cat "$S/run_$id" 2>/dev/null || echo "" ;;
-  "api graphql -f query=query"*)
-    n=$(arg_after -F "$@"); n="${n#n=}"
-    if [ -f "$S/pr_$n.json" ]; then cat "$S/pr_$n.json"
-    else jq -n --argjson n "$n" '{data: {repository: {pullRequest: {state: "OPEN", body: "",
+  # A stale claim's run attempt: run_<id>_<attempt> (or run_<id>) holds its conclusion.
+  "api repos/o/r/actions/runs/"*"/attempts/"*" --jq "*)
+    ra="${2#repos/o/r/actions/runs/}"; id="${ra%%/*}"; at="${ra##*/}"
+    cat "$S/run_${id}_${at}" 2>/dev/null || cat "$S/run_$id" 2>/dev/null || echo "" ;;
+  # The per-PR read and the paginated threads read. pr_<n>.json overrides the
+  # PR; forge_running labels the issue, pr_running_<n> the PR, and
+  # threads_extra_<n>.jsonl adds threads from later pages.
+  "api graphql -f query=query"*|"api graphql --paginate -f query=query"*)
+    n=""; for a in "$@"; do case "$a" in n=*) n="${a#n=}" ;; esac; done
+    if [ -f "$S/pr_$n.json" ]; then pr=$(cat "$S/pr_$n.json")
+    else pr=$(jq -n '{data: {repository: {pullRequest: {state: "OPEN", title: "old title", body: "",
       closingIssuesReferences: {nodes: [{number: 1213}]},
-      reviewThreads: {pageInfo: {hasNextPage: false}, nodes: [{id: "PRRT_open", isResolved: false}, {id: "PRRT_done", isResolved: true}]}}}}}'
+      reviewThreads: {nodes: [{id: "PRRT_open", isResolved: false}, {id: "PRRT_done", isResolved: true}]}}}}}')
+    fi
+    pr=$(jq -c --argjson issue_running "$([ -f "$S/forge_running" ] && echo true || echo false)" \
+              --argjson pr_running "$([ -f "$S/pr_running_$n" ] && echo true || echo false)" '
+      .data.repository.issue.labels.nodes = (if $issue_running then [{name: "forge:running"}] else [] end)
+      | .data.repository.pullRequest.labels.nodes = (if $pr_running then [{name: "forge:running"}] else [] end)' <<< "$pr")
+    if [ "$3" = "--paginate" ]; then
+      jq -c '.data.repository.pullRequest.reviewThreads.nodes[]?' <<< "$pr"
+      cat "$S/threads_extra_$n.jsonl" 2>/dev/null || true
+    else
+      printf '%s\n' "$pr"
     fi ;;
   "api graphql -f query=mutation"*) id="${@: -1}"; echo "${id#id=}" >> "$S/resolved.log"; echo '{}' ;;
   "api --method PATCH repos/o/r/pulls/"*" --input "*)
@@ -134,6 +146,14 @@ comment() {
   jq -nc --argjson id "$1" --arg login "$2" --arg type "$3" --argjson age "$4" --arg body "$5" \
     '{id: $id, user: {login: $login, type: $type}, created_at: (now - $age | floor | todate), body: $body}'
 }
+# comment_edited <id> <created age> <edited age> <body>: a forge-gh-app[bot]
+# comment edited after it was written (a claim).
+comment_edited() {
+  jq -nc --argjson id "$1" --argjson age "$2" --argjson edited "$3" --arg body "$4" \
+    '{id: $id, user: {login: "forge-gh-app[bot]", type: "Bot"}, created_at: (now - $age | floor | todate), updated_at: (now - $edited | floor | todate), body: $body}'
+}
+# sha256 of a string, as forge-agent records a request's base.
+sha() { if command -v sha256sum >/dev/null 2>&1; then printf '%s' "$1" | sha256sum | cut -d' ' -f1; else printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; fi; }
 new_case() { local c="$TMP/$1"; mkdir -p "$c"; printf '%s' "$c"; }
 run_case() {  # run_case <case dir>
   local c="$1" rc=0
@@ -177,7 +197,7 @@ check '[ "$(jq -rs ".[1].body" "$C/pr_comments.jsonl" | head -1)" = "<!-- forge-
   "happy: the handled-reviews watermark follows the reply"
 check '[ "$(cat "$C/resolved.log")" = PRRT_open ]' \
   "happy: only the open thread that is on this PR is resolved"
-check '[ "$(marks "$C" claimed)" = 12 ] && [ "$(marks "$C" applied)" = 12 ] && [ "$(jq -sr ".[0].body" "$C/applied.jsonl" | head -1)" = "<!-- forge-slack-pr-text-claimed {\"ts\":\"5.5\",\"seq\":1,\"pr\":7,\"ch\":\"C9\",\"th\":\"9.9\",\"rp\":true,\"run\":0} -->" ]' \
+check '[ "$(marks "$C" claimed)" = 12 ] && [ "$(marks "$C" applied)" = 12 ] && [ "$(jq -sr ".[0].body" "$C/applied.jsonl" | head -1)" = "<!-- forge-slack-pr-text-claimed {\"ts\":\"5.5\",\"seq\":1,\"pr\":7,\"ch\":\"C9\",\"th\":\"9.9\",\"rp\":true,\"run\":0,\"attempt\":1} -->" ]' \
   "happy: the request is claimed before the PR is touched, then marked applied, without its payload"
 check '[ "$(grep -m1 "^api --method" "$C/gh.log" | cut -c1-48)" = "api --method PATCH repos/o/r/issues/comments/12 " ]' \
   "happy: the claim is the first write"
@@ -217,7 +237,8 @@ check '[ "$(jq -r .title "$C/pr_patch.jsonl")" = Injected ]' \
   "recent: a request that waited two hours for a busy runner is still applied"
 TRUNCATED=$(request 1 '{pr: 7, body: "x"}' | sed '/forge-slack-pr-text-body/,$d')
 C=$(untrusted_case truncated "$(comment 13 'forge-gh-app[bot]' Bot 30 "$TRUNCATED")")
-check 'nothing_written "$C"' "truncated: a request whose description section is missing never blanks the PR"
+check '[ ! -s "$C/pr_patch.jsonl" ] && [ ! -s "$C/pr_comments.jsonl" ] && [ "$(marks "$C" skipped)" = 13 ] && [[ "$(slack_text "$C")" == *"could not be read"* ]]' \
+  "truncated: a request whose description section is missing never blanks the PR, and is reported"
 
 # A PR that does not close this issue is skipped and reported.
 C=$(new_case unrelated-pr)
@@ -487,18 +508,19 @@ C=$(new_case forge-running)
 comment 79 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: x", reply: "Fixed."}')" > "$C/comments.jsonl"
 touch "$C/forge_running"
 run_case "$C"
-check '[ "$(cat "$C/rc")" = 0 ] && [ ! -s "$C/pr_patch.jsonl" ] && [ ! -s "$C/pr_comments.jsonl" ] && [ "$(marks "$C" skipped)" = 79 ]' \
+check '[ ! -s "$C/pr_patch.jsonl" ] && [ ! -s "$C/pr_comments.jsonl" ] && [ "$(marks "$C" skipped)" = 79 ]' \
   "forge-running: nothing is applied and the request is marked skipped"
 check '[[ "$(slack_text "$C")" == *"a Forge run is working on #1213 right now, so nothing was changed"* ]]' \
   "forge-running: the thread is told to ask again when the run finishes"
 
-# A thread past the first 100 is still tried.
+# Threads on later pages are read too; a thread id that is not on the PR is
+# never sent to GitHub.
 C=$(new_case many-threads)
-comment 80 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, threads: ["PRRT_far", "PRRT_done"]}')" > "$C/comments.jsonl"
-jq -n '{data: {repository: {pullRequest: {state: "OPEN", body: "", closingIssuesReferences: {nodes: [{number: 1213}]}, reviewThreads: {pageInfo: {hasNextPage: true}, nodes: [{id: "PRRT_done", isResolved: true}]}}}}}' > "$C/pr_7.json"
+comment 80 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, threads: ["PRRT_far", "PRRT_done", "PRRT_foreign"]}')" > "$C/comments.jsonl"
+echo '{"id":"PRRT_far","isResolved":false,"comments":{"nodes":[{"createdAt":"2020-01-01T00:00:00Z"}]}}' > "$C/threads_extra_7.jsonl"
 run_case "$C"
-check '[ "$(cat "$C/resolved.log")" = PRRT_far ]' \
-  "many-threads: a thread beyond the first page is tried; an already resolved one is not"
+check '[ "$(cat "$C/resolved.log")" = PRRT_far ] && grep -q "graphql --paginate" "$C/gh.log"' \
+  "many-threads: a thread from a later page is resolved; a resolved one and a foreign id are not"
 
 # Replies and notes are cleaned like the revise job's replies.
 C=$(new_case scrubbed)
@@ -511,9 +533,10 @@ check '[[ "$POSTED" == *"Thanks someone and org/team, channel. Token ***"* ]] &&
 
 # A stale claim whose run succeeded was applied: mark it so, quietly.
 C=$(new_case stale-claim-succeeded)
-comment 82 'forge-gh-app[bot]' Bot 2000 '<!-- forge-slack-pr-text-claimed {"ts":"5.5","seq":1,"pr":7,"ch":"C9","th":"9.9","rp":false,"run":4242} -->
+comment 82 'forge-gh-app[bot]' Bot 2000 '<!-- forge-slack-pr-text-claimed {"ts":"5.5","seq":1,"pr":7,"ch":"C9","th":"9.9","rp":false,"run":4242,"attempt":2} -->
 Forge is applying this request to #7.' > "$C/comments.jsonl"
-echo success > "$C/run_4242"
+echo failure > "$C/run_4242_1"
+echo success > "$C/run_4242_2"
 run_case "$C"
 check '[ "$(marks "$C" applied)" = 82 ] && [ -z "$(marks "$C" interrupted)" ] && [ ! -s "$C/slack.jsonl" ]' \
   "stale-claim-succeeded: a claim whose run succeeded is marked applied, with no false alarm"
@@ -536,6 +559,87 @@ FORGE_REPLY_WRITER="printf '%s\\n' '<!-- forge-revise-reply -->'"
 PRTEXT_REPLY_MARKER="REPLY_MARKER='<!-- forge-revise-reply -->'"
 check '[[ "$FORGE_JOB" == *"$FORGE_REPLY_WRITER"* ]] && [[ "$PR_TEXT_JOB" == *"$PRTEXT_REPLY_MARKER"* ]]' \
   "pr-text's reply marker is the one the revise reply writers post"
+
+# --- review round 2 (Nijil, Kimi) -------------------------------------------
+# A later reply that is empty once cleaned never replaces an earlier one.
+C=$(new_case later-empty-reply)
+{
+  comment 90 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, reply: "Fixed X", threads: ["PRRT_open"], watermark: true}')"
+  comment 91 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, reply: "<!-- nothing -->"}')"
+} > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(jq -sr ".[0].body" "$C/pr_comments.jsonl")" = "<!-- forge-revise-reply -->
+Fixed X" ] && [ "$(cat "$C/resolved.log")" = PRRT_open ]' \
+  "later-empty-reply: the earlier reply, watermark and thread survive a later empty reply"
+
+# forge:running on the PR itself (a revise on the PR work item) is seen too.
+C=$(new_case pr-running)
+comment 92 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: x"}')" > "$C/comments.jsonl"
+touch "$C/pr_running_7"
+run_case "$C"
+check '[ ! -s "$C/pr_patch.jsonl" ] && [ "$(marks "$C" skipped)" = 92 ] && [[ "$(slack_text "$C")" == *"a Forge run is working on #7 right now"* ]]' \
+  "pr-running: a Forge run labelled on the PR stops the edit"
+
+# Something said on the PR after the request: no watermark, the thread with
+# a later comment stays open, the reply still posts.
+C=$(new_case newer-review)
+comment 93 'forge-gh-app[bot]' Bot 3600 "$(request 1 '{pr: 7, reply: "Fixed.", watermark: true, threads: ["PRRT_old", "PRRT_new"]}')" > "$C/comments.jsonl"
+jq -n --arg recent "$(jq -nr 'now - 60 | floor | todate')" '{data: {repository: {pullRequest: {state: "OPEN", title: "t", body: "",
+  closingIssuesReferences: {nodes: [{number: 1213}]},
+  comments: {nodes: [{updatedAt: $recent, body: "## Claude review: request changes <!-- deriv-pr-review-claude -->"}, {updatedAt: $recent, body: "<!-- forge-revise-instructions --> mine"}]},
+  reviews: {nodes: []},
+  reviewThreads: {nodes: [
+    {id: "PRRT_old", isResolved: false, comments: {nodes: [{createdAt: "2020-01-01T00:00:00Z"}]}},
+    {id: "PRRT_new", isResolved: false, comments: {nodes: [{createdAt: $recent}]}}]}}}}}' > "$C/pr_7.json"
+run_case "$C"
+check '[ "$(jq -sr "map(.body | split(\"\\n\")[0]) | join(\"|\")" "$C/pr_comments.jsonl")" = "<!-- forge-revise-reply -->" ] && [ "$(cat "$C/resolved.log")" = PRRT_old ]' \
+  "newer-review: the reply posts, the watermark does not, and only the quiet thread is resolved"
+check '[[ "$(slack_text "$C")" == *"a newer review or comment arrived after Forge wrote this"* ]] && [[ "$(slack_text "$C")" == *"1 review thread(s) had new comments"* ]]' \
+  "newer-review: Slack says why"
+
+# A description or title changed since forge-agent read it is not overwritten.
+C=$(new_case base-mismatch)
+comment 94 'forge-gh-app[bot]' Bot 30 "$(request 1 "$(jq -nc --arg b "$(sha "what forge-agent read")" --arg t "$(sha "old title")" '{pr: 7, title: "fix: new", body: "New body.\n\nCloses #1213", base: {body: $b, title: $t}}')")" > "$C/comments.jsonl"
+jq -n '{data: {repository: {pullRequest: {state: "OPEN", title: "old title", body: "edited by a person", closingIssuesReferences: {nodes: [{number: 1213}]}, reviewThreads: {nodes: []}}}}}' > "$C/pr_7.json"
+run_case "$C"
+check '[ "$(jq -c . "$C/pr_patch.jsonl")" = "{\"pr\":\"7\",\"title\":\"fix: new\"}" ] && [[ "$(slack_text "$C")" == *"the description changed after Forge drafted this, so it wasn'"'"'t overwritten"* ]]' \
+  "base-mismatch: the changed description is left alone; the unchanged title is updated"
+
+# Title and description are scrubbed of tokens and Forge markers.
+C=$(new_case scrubbed-edit)
+comment 95 'forge-gh-app[bot]' Bot 30 "$(request 1 "$(jq -nc --arg t "$TOKEN" '{pr: 7, title: ("fix: " + $t), body: ("Body " + $t + " <!-- forge-revise-instructions --> end")}')")" > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(jq -r .title "$C/pr_patch.jsonl")" = "fix: ***" ] && [ "$(jq -r .body "$C/pr_patch.jsonl")" = "Body ***  end" ]' \
+  "scrubbed-edit: a token is masked in the title and description, and a Forge marker is dropped"
+
+# An unreadable request is reported and marked, not dropped.
+C=$(new_case malformed)
+{
+  comment 96 'forge-gh-app[bot]' Bot 30 '<!-- forge-slack-pr-text {"v":2,"ts":"5.5","seq":1,"pr":7,"ch":"C9","th":"9.9"} -->
+From a newer Forge.'
+  comment 97 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, body: "x"}' | sed '/forge-slack-pr-text-body/,$d')"
+} > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(marks "$C" skipped)" = "96,97" ] && [ ! -s "$C/pr_patch.jsonl" ] && [[ "$(slack_text "$C")" == *"could not be read"* ]]' \
+  "malformed: unreadable requests are marked skipped and their thread told"
+
+# A claim taken late in the request's day, then lost, is still reported.
+C=$(new_case late-claim)
+comment_edited 98 108000 1500 '<!-- forge-slack-pr-text-claimed {"ts":"5.5","seq":1,"pr":7,"ch":"C9","th":"9.9","rp":true,"run":0} -->
+Forge is applying this request to #7.' > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(marks "$C" interrupted)" = 98 ] && jq -r .body "$C/applied.jsonl" | grep -q "\"rp\":true"' \
+  "late-claim: a claim judged by its claim time is reported, and its rp is kept"
+
+# A superseded request that also edited the title says both.
+C=$(new_case superseded-with-title)
+{
+  comment 99 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, title: "fix: t", reply: "First"}')"
+  comment 100 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, reply: "Second"}')"
+} > "$C/comments.jsonl"
+run_case "$C"
+check '[[ "$(slack_text "$C")" == *"updated the title, your reply wasn'"'"'t posted: a newer reply to #7 from Forge replaced it"* ]]' \
+  "superseded-with-title: the title edit and the replaced reply are both reported"
 
 if [ "$fail" -ne 0 ]; then
   echo "forge-pr-text: FAILED"
