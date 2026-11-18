@@ -4666,7 +4666,7 @@ jobs:
           # closing references, labels (and the tracking issue's), its recent
           # comments and reviews with their authors, and, with "threads",
           # every review thread (all pages). Returns 1 when it cannot be read.
-          PR_QUERY='query($o: String!, $r: String!, $n: Int!, $i: Int!) { repository(owner: $o, name: $r) { issue(number: $i) { labels(first: 50) { nodes { name } } } pullRequest(number: $n) { state title body labels(first: 50) { nodes { name } } closingIssuesReferences(first: 50) { nodes { number repository { nameWithOwner } } } comments(last: 100) { nodes { createdAt updatedAt body author { __typename login } } } reviews(last: 50) { nodes { submittedAt author { __typename login } } } } } }'
+          PR_QUERY='query($o: String!, $r: String!, $n: Int!, $i: Int!) { repository(owner: $o, name: $r) { issue(number: $i) { labels(first: 50) { nodes { name } } } pullRequest(number: $n) { state title body labels(first: 50) { nodes { name } } closingIssuesReferences(first: 50) { nodes { number repository { nameWithOwner } } } comments(last: 100) { nodes { createdAt updatedAt body author { __typename login } } } reviews(last: 50) { nodes { submittedAt body author { __typename login } } } } } }'
           THREADS_QUERY='query($o: String!, $r: String!, $n: Int!, $endCursor: String) { repository(owner: $o, name: $r) { pullRequest(number: $n) { reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { id isResolved comments(last: 1) { nodes { createdAt } } } } } } }'
           RESOLVE_MUTATION='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }'
           read_pr() {
@@ -4687,7 +4687,9 @@ jobs:
           # filter_reviews, filter_human_comments and filter_review_bodies:
           # an AI review counts when it finished (updatedAt), a person's
           # comment (no Forge or review marker, not blank) when it was
-          # posted, a person's review when it was submitted. Bot comments
+          # posted, a person's review with a summary when it was submitted
+          # (inline comments are read from the open threads on every revise,
+          # whatever the watermark says). Bot comments
           # (previews, review placeholders) and bot reviews do not count:
           # revise ignores them, so a watermark over them hides nothing.
           OWED_JQ='
@@ -4702,7 +4704,7 @@ jobs:
                     (ai_review and (.updatedAt // "") > $at)
                     or (person and ((.body // "") | test("<!-- (forge-|deriv-pr-review-)") | not)
                         and ((.body // "") | test("[^[:space:]]")) and (.createdAt // "") > $at))
-                or any(.reviews.nodes[]?; person and (.submittedAt // "") > $at);
+                or any(.reviews.nodes[]?; person and ((.body // "") | test("[^[:space:]]")) and (.submittedAt // "") > $at);
           '
           # pr_blocker <pr> <want> [locked]: why this request cannot be
           # applied to the PR as last read, or nothing. "running #N": a Forge
@@ -4929,8 +4931,9 @@ jobs:
             # comment after the request stays open. The PR is read again once
             # the watermark is up: something that finished in between has an
             # earlier time than the watermark, so the watermark is removed.
-            # Anything finishing after that read is newer than the watermark,
-            # and revise sees it.
+            # It also is when that read fails: it stays only once the read
+            # shows nothing owed. Anything finishing after that read is newer
+            # than the watermark, and revise sees it.
             if [ "$reply_ok" = 1 ] && jq -e '.watermark == true' <<< "$req" >/dev/null; then
               if jq -e --arg at "$asked_at" "${OWED_JQ}"' owed($at)' "$WORK/pr_${pr}.json" >/dev/null; then
                 problems+=("a newer review or comment arrived after Forge wrote this, so it is still marked as owed")
@@ -4938,16 +4941,22 @@ jobs:
                   | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" --input - --jq '.id' 2> "$WORK/err"); then
                 cat "$WORK/err"
                 problems+=("the handled-reviews watermark was not posted")
-              elif ! gh api graphql -f query="$PR_QUERY" -f o="$OWNER" -f r="$REPO" -F n="$pr" -F i="$ISSUE_NUMBER" \
-                  > "$WORK/after_${pr}.json" 2> "$WORK/err"; then
-                cat "$WORK/err"
-                echo "::warning::Could not read #${pr} again after the watermark, so a review that finished just before it may be marked handled."
-              elif jq -e --arg at "$asked_at" "${OWED_JQ}"' owed($at)' "$WORK/after_${pr}.json" >/dev/null; then
-                if gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/${wm_id}" >/dev/null 2> "$WORK/err"; then
-                  problems+=("a newer review arrived while Forge marked the reviews handled, so they are still owed")
-                else
+              else
+                why=""
+                if ! gh api graphql -f query="$PR_QUERY" -f o="$OWNER" -f r="$REPO" -F n="$pr" -F i="$ISSUE_NUMBER" \
+                    > "$WORK/after_${pr}.json" 2> "$WORK/err"; then
                   cat "$WORK/err"
-                  problems+=("a newer review arrived while Forge marked the reviews handled, and the marker could not be removed, so ask me to revise to have it answered")
+                  why="Forge couldn't check the PR again after marking the reviews handled"
+                elif jq -e --arg at "$asked_at" "${OWED_JQ}"' owed($at)' "$WORK/after_${pr}.json" >/dev/null; then
+                  why="a newer review arrived while Forge marked the reviews handled"
+                fi
+                if [ -n "$why" ]; then
+                  if gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/${wm_id}" >/dev/null 2> "$WORK/err"; then
+                    problems+=("${why}, so they are still owed")
+                  else
+                    cat "$WORK/err"
+                    problems+=("${why}, and the marker could not be removed, so ask me to revise to have it answered")
+                  fi
                 fi
               fi
             fi

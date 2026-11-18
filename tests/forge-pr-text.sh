@@ -94,12 +94,16 @@ case "$*" in
     done
     late_review=false
     if [ -f "$S/review_after_watermark" ] && grep -F 'forge-revise-instructions' "$S/pr_comments.jsonl" >/dev/null 2>&1; then late_review=true; fi
+    # after_read_fail: the read after the watermark fails.
+    if [ -f "$S/after_read_fail" ] && [ "$3" != "--paginate" ] && grep -F 'forge-revise-instructions' "$S/pr_comments.jsonl" >/dev/null 2>&1; then
+      echo "gh: Server Error (HTTP 502)" >&2; exit 1
+    fi
     pr=$(jq -c --argjson issue_running "$issue_running" --argjson late_review "$late_review" \
               --argjson pr_running "$([ -f "$S/pr_running_$n" ] && echo true || echo false)" '
       .data.repository.pullRequest.state = ($ENV.FAKE_PR_STATE // .data.repository.pullRequest.state)
       | .data.repository.issue.labels.nodes = (if $issue_running then [{name: "forge:running"}] else [] end)
       | .data.repository.pullRequest.labels.nodes = (if $pr_running then [{name: "forge:running"}] else [] end)
-      | if $late_review then .data.repository.pullRequest.reviews.nodes += [{submittedAt: (now | todate), author: {__typename: "User", login: "rev"}}] else . end' <<< "$pr")
+      | if $late_review then .data.repository.pullRequest.reviews.nodes += [{submittedAt: (now | todate), body: "Please change this", author: {__typename: "User", login: "rev"}}] else . end' <<< "$pr")
     if [ "$3" = "--paginate" ]; then
       jq -c '.data.repository.pullRequest.reviewThreads.nodes[]?' <<< "$pr"
       cat "$S/threads_extra_$n.jsonl" 2>/dev/null || true
@@ -935,13 +939,13 @@ check '[ "$(jq -sr "[.[] | select(.id == \"132\" and (.body | startswith(\"<!-- 
 
 # What counts as newer activity is what the revise job would act on.
 # watermark_case <name> <comments jq array> -> case dir
-watermark_case() {
+watermark_case() {  # watermark_case <name> <comments jq array> [reviews jq array]
   local c
   c=$(new_case "$1")
   comment 134 'forge-gh-app[bot]' Bot 3600 "$(request 1 '{pr: 7, reply: "Fixed.", watermark: true}')" > "$c/comments.jsonl"
   jq -n --arg recent "$(jq -nr 'now - 60 | floor | todate')" --arg old "$(jq -nr 'now - 7200 | floor | todate')" \
     "{data: {repository: {pullRequest: {state: \"OPEN\", title: \"t\", body: \"\", closingIssuesReferences: {nodes: [{number: 1213}]},
-      comments: {nodes: $2}, reviews: {nodes: []}, reviewThreads: {nodes: []}}}}}" > "$c/pr_7.json"
+      comments: {nodes: $2}, reviews: {nodes: ${3:-[]}}, reviewThreads: {nodes: []}}}}}" > "$c/pr_7.json"
   run_case "$c"
   printf '%s' "$c"
 }
@@ -959,6 +963,11 @@ check '! watermarked "$C"' "ai-review-newer: an AI review that finished after th
 C=$(watermark_case person-quotes-marker '[{createdAt: $recent, updatedAt: $recent, body: "see <!-- forge-revise-reply --> above", author: {__typename: "User", login: "ana"}}]')
 check 'watermarked "$C"' "person-quotes-marker: a comment revise ignores (it carries a Forge marker) does not hold the watermark"
 
+C=$(watermark_case review-empty-newer '[]' '[{submittedAt: $recent, body: "", author: {__typename: "User", login: "ana"}}]')
+check 'watermarked "$C"' "review-empty-newer: a person's approval or inline-only review (no summary) does not hold the watermark, as in filter_review_bodies"
+C=$(watermark_case review-body-newer '[]' '[{submittedAt: $recent, body: "Please rename this", author: {__typename: "User", login: "ana"}}]')
+check '! watermarked "$C"' "review-body-newer: a person's review with a summary holds the watermark"
+
 # A review that finishes between the read and the watermark: the watermark is
 # removed again, or the run fails when it cannot be.
 C=$(new_case watermark-race)
@@ -973,6 +982,13 @@ touch "$C/review_after_watermark" "$C/wm_delete_fail"
 run_case "$C"
 check '[ "$(cat "$C/rc")" = 1 ] && [[ "$(slack_text "$C")" == *"the marker could not be removed, so ask me to revise"* ]]' \
   "watermark-race: a watermark that cannot be removed fails the run and says what to do"
+
+C=$(new_case watermark-read-fails)
+comment 139 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, reply: "Fixed.", watermark: true}')" > "$C/comments.jsonl"
+touch "$C/after_read_fail"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [ "$(cat "$C/deleted.log")" = 902 ] && [[ "$(slack_text "$C")" == *"Forge couldn'"'"'t check the PR again after marking the reviews handled, so they are still owed"* ]]' \
+  "watermark-read-fails: the watermark stays only after a read that shows nothing owed"
 
 # The review-thread pages are read only for a request that resolves threads.
 C=$(new_case threads-only-when-needed)
