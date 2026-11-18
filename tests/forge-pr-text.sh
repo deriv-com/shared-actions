@@ -38,7 +38,8 @@ check '[[ "$PR_TEXT_JOB" == *"group: forge-pr-text-"* ]]' \
 check '! grep -E "actions/checkout|spec-to-pr|claude" <<< "$PR_TEXT_JOB" >/dev/null' \
   "pr-text checks out nothing and runs no engine or model"
 COMMAND_INPUT=$(awk '/^      command:$/ {f=1; print; next} f && /^      [a-z_]+:$/ {exit} f {print}' "$WF")
-check '[[ "$COMMAND_INPUT" == *"\`pr-text\`"* ]] && [[ "$COMMAND_INPUT" == *"Slack"* ]]' \
+COMMAND_INPUT_FLAT=$(tr -s ' \n' ' ' <<< "$COMMAND_INPUT")
+check '[[ "$COMMAND_INPUT" == *"\`pr-text\`"* ]] && [[ "$COMMAND_INPUT_FLAT" == *"Any other value is rejected before anything runs, and the Slack thread is told."* ]]' \
   "the command input documents pr-text, and that any other command is rejected with a Slack reply"
 
 # --- behavioral --------------------------------------------------------------
@@ -80,11 +81,25 @@ case "$*" in
       reviewThreads: {nodes: [{id: "PRRT_open", isResolved: false}, {id: "PRRT_done", isResolved: true}]}}}}}')
     fi
     if [ -f "$S/state_$n" ]; then export FAKE_PR_STATE; FAKE_PR_STATE=$(cat "$S/state_$n"); else unset FAKE_PR_STATE; fi
-    pr=$(jq -c --argjson issue_running "$([ -f "$S/forge_running" ] && echo true || echo false)" \
+    # running_from_read_<k>: the issue gains forge:running from the k-th PR
+    # read on (a Forge run that labelled after pr-text's lock).
+    # review_after_watermark: a person's review shows up once the watermark
+    # has been posted (it finished between the read and the watermark).
+    [ "$3" = "--paginate" ] || echo read >> "$S/pr_reads"
+    reads=$(wc -l < "$S/pr_reads" 2>/dev/null | tr -d ' ' || echo 0)
+    issue_running=false
+    [ -f "$S/forge_running" ] && issue_running=true
+    for f in "$S"/running_from_read_*; do
+      [ -e "$f" ] && [ "${reads:-0}" -ge "${f##*running_from_read_}" ] && issue_running=true
+    done
+    late_review=false
+    if [ -f "$S/review_after_watermark" ] && grep -F 'forge-revise-instructions' "$S/pr_comments.jsonl" >/dev/null 2>&1; then late_review=true; fi
+    pr=$(jq -c --argjson issue_running "$issue_running" --argjson late_review "$late_review" \
               --argjson pr_running "$([ -f "$S/pr_running_$n" ] && echo true || echo false)" '
       .data.repository.pullRequest.state = ($ENV.FAKE_PR_STATE // .data.repository.pullRequest.state)
       | .data.repository.issue.labels.nodes = (if $issue_running then [{name: "forge:running"}] else [] end)
-      | .data.repository.pullRequest.labels.nodes = (if $pr_running then [{name: "forge:running"}] else [] end)' <<< "$pr")
+      | .data.repository.pullRequest.labels.nodes = (if $pr_running then [{name: "forge:running"}] else [] end)
+      | if $late_review then .data.repository.pullRequest.reviews.nodes += [{submittedAt: (now | todate), author: {__typename: "User", login: "rev"}}] else . end' <<< "$pr")
     if [ "$3" = "--paginate" ]; then
       jq -c '.data.repository.pullRequest.reviewThreads.nodes[]?' <<< "$pr"
       cat "$S/threads_extra_$n.jsonl" 2>/dev/null || true
@@ -116,6 +131,8 @@ case "$*" in
       grep -qxF "$l" "$S/labels_$n" || echo "$l" >> "$S/labels_$n"
     else
       if [ -f "$S/unlock_fail" ]; then echo "gh: Server Error (HTTP 502)" >&2; exit 1; fi
+      # unlock_fail_once: only the first removal is refused.
+      if [ -f "$S/unlock_fail_once" ]; then rm -f "$S/unlock_fail_once"; echo "gh: Server Error (HTTP 502)" >&2; exit 1; fi
       grep -vxF "$l" "$S/labels_$n" > "$S/labels_$n.next" || true; mv "$S/labels_$n.next" "$S/labels_$n"
     fi ;;
   "api graphql -f query=mutation"*) id="${@: -1}"; echo "${id#id=}" >> "$S/resolved.log"; echo '{}' ;;
@@ -128,9 +145,14 @@ case "$*" in
     # A state change sticks for later reads of the PR.
     st=$(jq -rs '.[-1] | select(.pr == "'"$n"'") | .state // empty | ascii_upcase' "$S/pr_patch.jsonl")
     [ -z "$st" ] || echo "$st" > "$S/state_$n" ;;
-  "api --method POST repos/o/r/issues/"*"/comments --input -")
+  # The watermark is removed again. wm_delete_fail: GitHub refuses.
+  "api --method DELETE repos/o/r/issues/comments/"*)
+    echo "${4##*/}" >> "$S/deleted.log"
+    if [ -f "$S/wm_delete_fail" ]; then echo "gh: Server Error (HTTP 502)" >&2; exit 1; fi ;;
+  "api --method POST repos/o/r/issues/"*"/comments --input -"|"api --method POST repos/o/r/issues/"*"/comments --input - --jq .id")
     # reply_fail: GitHub refuses the reviewer reply (the comment with the reply marker).
     # die_on_reply: the job is cancelled (SIGTERM) while the reply is posted.
+    # A comment's id is 900 plus its line in pr_comments.jsonl.
     n="${4#repos/o/r/issues/}"; n="${n%/comments}"; c=$(jq -c --arg n "$n" '{pr: $n, body}')
     if [ -f "$S/die_on_reply" ] && jq -e '.body | startswith("<!-- forge-revise-reply -->")' <<< "$c" >/dev/null; then
       kill -TERM "$PPID"; sleep 1; exit 1
@@ -138,7 +160,8 @@ case "$*" in
     if [ -f "$S/reply_fail" ] && jq -e '.body | startswith("<!-- forge-revise-reply -->")' <<< "$c" >/dev/null; then
       echo "gh: Server Error (HTTP 502)" >&2; exit 1
     fi
-    printf '%s\n' "$c" >> "$S/pr_comments.jsonl"; echo '{}' ;;
+    printf '%s\n' "$c" >> "$S/pr_comments.jsonl"
+    if [ "${@: -1}" = .id ]; then echo "$((900 + $(wc -l < "$S/pr_comments.jsonl")))"; else echo '{}'; fi ;;
   "api --method PATCH repos/o/r/issues/comments/"*" --input -")
     # Every claim and outcome mark. claim_fail: GitHub refuses the edit.
     # claim_fail_<id>: only that comment's claim is refused.
@@ -189,9 +212,36 @@ comment_edited() {
 # sha256 of a string, as forge-agent records a request's base.
 sha() { if command -v sha256sum >/dev/null 2>&1; then printf '%s' "$1" | sha256sum | cut -d' ' -f1; else printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; fi; }
 new_case() { local c="$TMP/$1"; mkdir -p "$c"; printf '%s' "$c"; }
+# fill_base <case dir>: forge-agent always sends the sha256 of the title and
+# description it read. A request here that edits one and names no base gets
+# the PR's current one (pr_<n>.json, or the fake's default PR), so only the
+# cases about base set it themselves.
+fill_base() {
+  local c="$1" line j n f t b
+  : > "$c/comments.filled"
+  while IFS= read -r line; do
+    j=$(jq -c '(.body // "") | first(capture("^<!-- forge-slack-pr-text (?<j>[^>]*) -->") | .j) // null | try fromjson catch null' <<< "$line" 2>/dev/null || echo null)
+    if jq -e 'type == "object" and (has("base") | not) and (.pr | type) == "number" and ((.title | type) == "string" or .body == true)' <<< "$j" >/dev/null 2>&1; then
+      n=$(jq -r .pr <<< "$j"); f="$c/pr_$n.json"
+      if [ -f "$f" ]; then
+        t=$(jq -j '.data.repository.pullRequest.title // ""' "$f"); b=$(jq -j '.data.repository.pullRequest.body // ""' "$f")
+      else
+        t="old title"; b=""
+      fi
+      line=$(jq -c --arg t "$(sha "$t")" --arg b "$(sha "$b")" '
+        (.body | capture("^<!-- forge-slack-pr-text (?<j>[^>]*) -->(?<rest>[\\s\\S]*)$")) as $m
+        | ($m.j | fromjson) as $p
+        | ($p + {base: ((if ($p.title | type) == "string" then {title: $t} else {} end) + (if $p.body == true then {body: $b} else {} end))}
+           | tojson | gsub("<"; "\\u003c") | gsub(">"; "\\u003e") | gsub("&"; "\\u0026")) as $nj
+        | .body = ("<!-- forge-slack-pr-text " + $nj + " -->" + $m.rest)' <<< "$line")
+    fi
+    printf '%s\n' "$line" >> "$c/comments.filled"
+  done < "$c/comments.jsonl"
+}
 run_case() {  # run_case <case dir>
   local c="$1" rc=0
-  jq -s '.' "$c/comments.jsonl" > "$c/comments.json"
+  fill_base "$c"
+  jq -s '.' "$c/comments.filled" > "$c/comments.json"
   env -i PATH="$BIN:$PATH" HOME="$c" FAKE_STATE="$c" GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 \
     SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake GH_TOKEN=ghs_fake \
     RUN_URL=https://github.com/o/r/actions/runs/1 \
@@ -853,6 +903,127 @@ C=$(new_case rejected-command-no-slack)
 rc=0
 env -i PATH="$BIN:$PATH" FAKE_STATE="$C" FORGE_COMMAND=bogus ISSUE_NUMBER=1213 bash -e "$TMP/check.sh" > "$C/run.log" 2>&1 || rc=$?
 check '[ "$rc" = 1 ] && [ ! -e "$C/slack.jsonl" ]' "rejected-command: no Slack call without a thread"
+C=$(new_case rejected-command-bad-issue)
+rc=0
+env -i PATH="$BIN:$PATH" FAKE_STATE="$C" FORGE_COMMAND=$'bogus\n::add-mask::x' ISSUE_NUMBER='1 <!channel>' \
+  SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake bash -e "$TMP/check.sh" > "$C/run.log" 2>&1 || rc=$?
+REJECT=$(slack_text "$C")
+check '[ "$rc" = 1 ] && [[ "$REJECT" == "Forge didn'"'"'t start: \`bogus::add-mask::x\` is not a Forge command"* ]] && [[ "$REJECT" != *"<!channel>"* ]] && ! grep "^::add-mask" "$C/run.log" >/dev/null && grep -xF "::error::Unknown command '"'"'bogus::add-mask::x'"'"'. Use auto, revise, update or pr-text (callers must pass command through from workflow_dispatch)." "$C/run.log" >/dev/null' \
+  "rejected-command-bad-issue: no raw issue number in Slack and no raw command in the log (got: $REJECT)"
+
+# A Forge run that labels after pr-text's lock is waiting for it: pr-text
+# keeps going. Only the read right after the lock backs off.
+C=$(new_case running-after-lock)
+{
+  comment 130 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, title: "fix: first"}')"
+  comment 131 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, reply: "Second."}')"
+} > "$C/comments.jsonl"
+touch "$C/running_from_read_2"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(marks "$C" applied)" = 130,131 ] && [ "$(jq -r .title "$C/pr_patch.jsonl")" = "fix: first" ] && [ "$(wc -l < "$C/pr_comments.jsonl" | tr -d " ")" = 1 ] && [[ "$(slack_text "$C")" != *"working on"* ]]' \
+  "running-after-lock: a forge:running set after the lock does not stop pr-text"
+
+# A reply replaced by a later one keeps rp in its final mark.
+C=$(new_case rp-superseded)
+{
+  comment 132 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, reply: "First."}')"
+  comment 133 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, reply: "Second."}')"
+} > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(jq -sr "[.[] | select(.id == \"132\" and (.body | startswith(\"<!-- forge-slack-pr-text-applied \")))] | length" "$C/applied.jsonl")" = 1 ] && jq -se "[.[] | select(.id == \"132\" and (.body | startswith(\"<!-- forge-slack-pr-text-applied \")))][0].body | contains(\"\\\"rp\\\":true\")" "$C/applied.jsonl" >/dev/null' \
+  "rp-superseded: the replaced request's final mark keeps rp:true"
+
+# What counts as newer activity is what the revise job would act on.
+# watermark_case <name> <comments jq array> -> case dir
+watermark_case() {
+  local c
+  c=$(new_case "$1")
+  comment 134 'forge-gh-app[bot]' Bot 3600 "$(request 1 '{pr: 7, reply: "Fixed.", watermark: true}')" > "$c/comments.jsonl"
+  jq -n --arg recent "$(jq -nr 'now - 60 | floor | todate')" --arg old "$(jq -nr 'now - 7200 | floor | todate')" \
+    "{data: {repository: {pullRequest: {state: \"OPEN\", title: \"t\", body: \"\", closingIssuesReferences: {nodes: [{number: 1213}]},
+      comments: {nodes: $2}, reviews: {nodes: []}, reviewThreads: {nodes: []}}}}}" > "$c/pr_7.json"
+  run_case "$c"
+  printf '%s' "$c"
+}
+watermarked() { jq -se 'any(.[]; .body | startswith("<!-- forge-revise-instructions -->"))' "$1/pr_comments.jsonl" >/dev/null; }
+C=$(watermark_case bot-comment-newer '[{createdAt: $old, updatedAt: $recent, body: "Preview ready", author: {__typename: "Bot", login: "cloudflare-workers-and-pages"}},
+  {createdAt: $recent, updatedAt: $recent, body: "Deploying a preview", author: {__typename: "Bot", login: "vercel"}},
+  {createdAt: $recent, updatedAt: $recent, body: "<!-- deriv-pr-review-progress-kimi --> reviewing", author: {__typename: "Bot", login: "github-actions"}}]')
+check '[ "$(cat "$C/rc")" = 0 ] && watermarked "$C"' "bot-comment-newer: a preview bot's edit or a review placeholder does not hold the watermark"
+C=$(watermark_case person-comment-newer '[{createdAt: $recent, updatedAt: $recent, body: "One more thing", author: {__typename: "User", login: "ana"}}]')
+check '! watermarked "$C" && [[ "$(slack_text "$C")" == *"a newer review or comment arrived"* ]]' "person-comment-newer: a person's new comment holds the watermark"
+C=$(watermark_case person-comment-edited '[{createdAt: $old, updatedAt: $recent, body: "Old note, edited", author: {__typename: "User", login: "ana"}}]')
+check 'watermarked "$C"' "person-comment-edited: an edit to a person's earlier comment does not count (revise goes by when it was posted)"
+C=$(watermark_case ai-review-newer '[{createdAt: $old, updatedAt: $recent, body: "Request changes <!-- deriv-pr-review-kimi -->", author: {__typename: "Bot", login: "github-actions"}}]')
+check '! watermarked "$C"' "ai-review-newer: an AI review that finished after the request holds the watermark"
+C=$(watermark_case person-quotes-marker '[{createdAt: $recent, updatedAt: $recent, body: "see <!-- forge-revise-reply --> above", author: {__typename: "User", login: "ana"}}]')
+check 'watermarked "$C"' "person-quotes-marker: a comment revise ignores (it carries a Forge marker) does not hold the watermark"
+
+# A review that finishes between the read and the watermark: the watermark is
+# removed again, or the run fails when it cannot be.
+C=$(new_case watermark-race)
+comment 135 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, reply: "Fixed.", watermark: true}')" > "$C/comments.jsonl"
+touch "$C/review_after_watermark"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [ "$(cat "$C/deleted.log")" = 902 ] && [[ "$(slack_text "$C")" == *"a newer review arrived while Forge marked the reviews handled, so they are still owed"* ]]' \
+  "watermark-race: a review that lands just before the watermark gets it removed again"
+C=$(new_case watermark-race-delete-fails)
+comment 136 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, reply: "Fixed.", watermark: true}')" > "$C/comments.jsonl"
+touch "$C/review_after_watermark" "$C/wm_delete_fail"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 1 ] && [[ "$(slack_text "$C")" == *"the marker could not be removed, so ask me to revise"* ]]' \
+  "watermark-race: a watermark that cannot be removed fails the run and says what to do"
+
+# The review-thread pages are read only for a request that resolves threads.
+C=$(new_case threads-only-when-needed)
+comment 137 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: x"}')" > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 0 ] && ! grep -F -- "--paginate -f query=query" "$C/gh.log" >/dev/null' \
+  "threads-only-when-needed: a title edit reads no review threads"
+C=$(new_case threads-when-needed)
+comment 138 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, reply: "Done.", threads: ["PRRT_open"]}')" > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(grep -cF -- "--paginate -f query=query" "$C/gh.log")" = 1 ] && [ "$(cat "$C/resolved.log")" = PRRT_open ]' \
+  "threads-when-needed: a request that resolves threads reads them once"
+
+# A title or description edit without the sha256 of the text it replaces is
+# malformed, so the guard always runs.
+C=$(new_case base-missing)
+{
+  comment 140 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: no base", base: {}}')"
+  comment 141 'forge-gh-app[bot]' Bot 25 "$(request 1 '{pr: 7, body: "no base", base: {title: "x"}}')"
+  comment 142 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, title: "fix: empty base", base: {title: ""}}')"
+  comment 143 'forge-gh-app[bot]' Bot 10 "$(request 1 '{pr: 8, title: "fix: ok"}')"
+} > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(marks "$C" skipped)" = 140,141,142 ] && [ "$(marks "$C" applied)" = 143 ] && [ "$(jq -r .pr "$C/pr_patch.jsonl")" = 8 ] && [ "$(cat "$C/rc")" = 1 ]' \
+  "base-missing: a title or description without a base sha256 is malformed; the valid request still applies"
+
+# Closing keywords inside a ~~~ fence or an unclosed fence do not count.
+C=$(new_case fences)
+comment 144 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 8, title: "fix: x"}')" > "$C/comments.jsonl"
+jq -n '{data: {repository: {pullRequest: {state: "OPEN", title: "t", body: "~~~\nFixes #1213\n~~~\n```\nCloses #1213", closingIssuesReferences: {nodes: []}, reviewThreads: {nodes: []}}}}}' > "$C/pr_8.json"
+run_case "$C"
+check '[ ! -s "$C/pr_patch.jsonl" ] && [ "$(marks "$C" skipped)" = 144 ]' "fences: keywords in a ~~~ fence or an unclosed fence are not closing references"
+C=$(new_case fences-outside)
+comment 145 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 8, title: "fix: x"}')" > "$C/comments.jsonl"
+jq -n '{data: {repository: {pullRequest: {state: "OPEN", title: "t", body: "~~~\ncode\n~~~\nFixes #1213", closingIssuesReferences: {nodes: []}, reviewThreads: {nodes: []}}}}}' > "$C/pr_8.json"
+run_case "$C"
+check '[ "$(jq -r .title "$C/pr_patch.jsonl")" = "fix: x" ]' "fences: a keyword after a closed ~~~ fence still counts"
+
+# Releasing the lock is retried once; the warning says who clears it.
+C=$(new_case unlock-retry)
+comment 146 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: x"}')" > "$C/comments.jsonl"
+touch "$C/unlock_fail_once"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 0 ] && ! grep -F "::warning::Could not remove forge:pr-text" "$C/run.log" >/dev/null && [ "$(grep -c -- "--remove-label" "$C/labels.log")" = 3 ]' \
+  "unlock-retry: a removal refused once is retried"
+C=$(new_case unlock-fails)
+comment 147 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: x"}')" > "$C/comments.jsonl"
+touch "$C/unlock_fail"
+run_case "$C"
+check 'grep -F "::warning::Could not remove forge:pr-text from #7. A Forge run started on #7 waits up to 10 minutes, then removes it; the next pr-text run that touches #7 also clears it." "$C/run.log" >/dev/null' \
+  "unlock-fails: the warning says who clears a label left on a PR"
 
 if [ "$fail" -ne 0 ]; then
   echo "forge-pr-text: FAILED"

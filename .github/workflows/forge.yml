@@ -119,7 +119,8 @@ on:
         type: string
       command:
         description: >-
-          dstp subcommand. `auto` opens the first PR. `revise` applies later
+          Which Forge job runs. `auto`, `revise` and `update` run dstp:
+          `auto` opens the first PR. `revise` applies later
           changes: AI PR Review comments (`<!-- deriv-pr-review-`), CI
           failures, and human Slack notes posted on the issue (or on the PR
           that issue_number names) as
@@ -334,13 +335,17 @@ jobs:
           case "${FORGE_COMMAND:-}" in
             ""|auto|revise|update) exit 0 ;;
           esac
-          echo "::error::Unknown command '${FORGE_COMMAND}'. Use auto, revise, update or pr-text (callers must pass command through from workflow_dispatch)."
-          # The Slack thread that asked hears why nothing started. The command
-          # is shown cut short and without backticks or Slack markup.
+          # The command is shown cut short, on one line and without backticks
+          # or Slack markup, and the issue number only when it is a number:
+          # neither has been checked yet.
+          shown=$(printf '%s' "$FORGE_COMMAND" | tr -cd '[:alnum:] ._:/-' | cut -c1-40)
+          where=""
+          if [[ "${ISSUE_NUMBER:-}" =~ ^[0-9]+$ ]]; then where=" on #${ISSUE_NUMBER}"; fi
+          echo "::error::Unknown command '${shown}'. Use auto, revise, update or pr-text (callers must pass command through from workflow_dispatch)."
+          # The Slack thread that asked hears why nothing started.
           if [ -n "${SLACK_CHANNEL:-}" ] && [ -n "${SLACK_THREAD_TS:-}" ] && [ -n "${SLACK_BOT_TOKEN:-}" ]; then
-            shown=$(printf '%s' "$FORGE_COMMAND" | tr -cd '[:alnum:] ._:/-' | cut -c1-40)
             if resp=$(jq -n --arg channel "$SLACK_CHANNEL" --arg ts "$SLACK_THREAD_TS" \
-                  --arg text "Forge didn't start on #${ISSUE_NUMBER}: \`${shown}\` is not a Forge command (auto, revise, update or pr-text). This is a bug in the caller's workflow." \
+                  --arg text "Forge didn't start${where}: \`${shown}\` is not a Forge command (auto, revise, update or pr-text). This is a bug in the caller's workflow." \
                   '{channel: $channel, thread_ts: $ts, text: $text, unfurl_links: false, unfurl_media: false}' \
                 | curl -sS --connect-timeout 5 --max-time 15 -X POST https://slack.com/api/chat.postMessage \
                     -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
@@ -4454,7 +4459,9 @@ jobs:
           # forge:pr-text. Each side sets its flag before it checks the
           # other's, so the two never write at the same time: whichever labels
           # second backs off (pr-text skips; the forge run waits for the
-          # release). Released on every exit.
+          # release). Only the first read, taken right after the lock, looks
+          # for forge:running: one that appears later belongs to a forge run
+          # already waiting for this lock. Released on every exit.
           # Labels go through the issues REST API, which takes a PR number
           # as well as an issue's.
           : > "$WORK/locked"
@@ -4470,7 +4477,8 @@ jobs:
             local n
             while IFS= read -r n; do
               gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/${n}/labels/forge%3Apr-text" >/dev/null 2>&1 \
-                || echo "::warning::Could not remove forge:pr-text from #${n}; the next Forge run on it waits up to 10 minutes, then removes it."
+                || gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/${n}/labels/forge%3Apr-text" >/dev/null 2>&1 \
+                || echo "::warning::Could not remove forge:pr-text from #${n}. A Forge run started on #${n} waits up to 10 minutes, then removes it; the next pr-text run that touches #${n} also clears it. Remove it by hand to skip the wait."
             done < <(sort -u "$WORK/locked")
             : > "$WORK/locked"
           }
@@ -4558,8 +4566,9 @@ jobs:
           # reported as unreadable. The JSON never contains ">" (forge-agent
           # escapes it), so [^>]* ends at the closing "-->". A description
           # travels raw after BODY_DELIM, so it is not inflated by JSON
-          # escaping. Every field must have the shape forge-agent writes; a
-          # request that does not (or another version, or a description
+          # escaping. Every field must have the shape forge-agent writes (a
+          # title or description always with the sha256 of the one it
+          # replaces, so the guard below always runs); a request that does not (or another version, or a description
           # section missing) is listed separately and reported, not dropped
           # and never fed to the steps below. A close/reopen request carries
           # only its note: any edit, reply, thread or watermark on it is
@@ -4575,6 +4584,8 @@ jobs:
               and (.watermark == null or (.watermark | type) == "boolean")
               and (.threads == null or ((.threads | type) == "array" and all(.threads[]; type == "string")))
               and (.base == null or ((.base | type) == "object" and all(.base[]; type == "string")))
+              and (.title == null or ((.base.title | type) == "string" and (.base.title | test("^[0-9a-f]{64}$"))))
+              and (.body != true or ((.base.body | type) == "string" and (.base.body | test("^[0-9a-f]{64}$"))))
               and (.body != true or ($parts | length) >= 2);
             [ .[]
               | select((.user.login // "") == $who and (.user.type // "") == "Bot")
@@ -4651,40 +4662,67 @@ jobs:
             exit 1
           fi
 
-          # read_pr <pr>: read a PR now: state, title and body, closing
-          # references, labels (and the tracking issue's), the newest review
-          # or comment from anyone but Forge, and every review thread (all
-          # pages). Returns 1 when it cannot be read.
-          PR_QUERY='query($o: String!, $r: String!, $n: Int!, $i: Int!) { repository(owner: $o, name: $r) { issue(number: $i) { labels(first: 50) { nodes { name } } } pullRequest(number: $n) { state title body labels(first: 50) { nodes { name } } closingIssuesReferences(first: 50) { nodes { number repository { nameWithOwner } } } comments(last: 100) { nodes { updatedAt body } } reviews(last: 50) { nodes { submittedAt } } } } }'
+          # read_pr <pr> [threads]: read a PR now: state, title and body,
+          # closing references, labels (and the tracking issue's), its recent
+          # comments and reviews with their authors, and, with "threads",
+          # every review thread (all pages). Returns 1 when it cannot be read.
+          PR_QUERY='query($o: String!, $r: String!, $n: Int!, $i: Int!) { repository(owner: $o, name: $r) { issue(number: $i) { labels(first: 50) { nodes { name } } } pullRequest(number: $n) { state title body labels(first: 50) { nodes { name } } closingIssuesReferences(first: 50) { nodes { number repository { nameWithOwner } } } comments(last: 100) { nodes { createdAt updatedAt body author { __typename login } } } reviews(last: 50) { nodes { submittedAt author { __typename login } } } } } }'
           THREADS_QUERY='query($o: String!, $r: String!, $n: Int!, $endCursor: String) { repository(owner: $o, name: $r) { pullRequest(number: $n) { reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { id isResolved comments(last: 1) { nodes { createdAt } } } } } } }'
           RESOLVE_MUTATION='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }'
           read_pr() {
+            rm -f "$WORK/threads_$1.jsonl"
             if gh api graphql -f query="$PR_QUERY" -f o="$OWNER" -f r="$REPO" -F n="$1" -F i="$ISSUE_NUMBER" \
                   > "$WORK/pr_$1.json" 2> "$WORK/err" \
-                && gh api graphql --paginate -f query="$THREADS_QUERY" -f o="$OWNER" -f r="$REPO" -F n="$1" \
-                  --jq '.data.repository.pullRequest.reviewThreads.nodes[]' > "$WORK/threads_$1.jsonl" 2>> "$WORK/err"; then
+                && { [ "${2:-}" != threads ] \
+                  || gh api graphql --paginate -f query="$THREADS_QUERY" -f o="$OWNER" -f r="$REPO" -F n="$1" \
+                    --jq '.data.repository.pullRequest.reviewThreads.nodes[]' > "$WORK/threads_$1.jsonl" 2>> "$WORK/err"; }; then
               return 0
             fi
             cat "$WORK/err"
             rm -f "$WORK/pr_$1.json"
             return 1
           }
-          # pr_blocker <pr> <want>: why this request cannot be applied to the
-          # PR as last read, or nothing. "running #N": a Forge run on the
-          # tracking issue or on the PR (the lock makes this a backstop).
-          # "closing": the PR does not close this issue (no closing reference
-          # to this repository's #N, and no closing keyword in the description
-          # outside HTML comments and fenced code). "state": the PR is not in
-          # the state the request needs.
+          # owed($at), over a PR as read: is there a review or comment newer
+          # than $at that the revise job would act on? The same filters as
+          # filter_reviews, filter_human_comments and filter_review_bodies:
+          # an AI review counts when it finished (updatedAt), a person's
+          # comment (no Forge or review marker, not blank) when it was
+          # posted, a person's review when it was submitted. Bot comments
+          # (previews, review placeholders) and bot reviews do not count:
+          # revise ignores them, so a watermark over them hides nothing.
+          OWED_JQ='
+            def person: (.author == null) or (.author.__typename == "User" and ((.author.login // "") | endswith("[bot]") | not));
+            def ai_review:
+              ((.body // "") | test("<!-- deriv-pr-review-"))
+              and ((.body // "") | test("<!-- deriv-pr-review-progress-") | not)
+              and ((.body // "") | test("<!-- forge-revise-reply -->") | not);
+            def owed($at):
+              .data.repository.pullRequest
+              | any(.comments.nodes[]?;
+                    (ai_review and (.updatedAt // "") > $at)
+                    or (person and ((.body // "") | test("<!-- (forge-|deriv-pr-review-)") | not)
+                        and ((.body // "") | test("[^[:space:]]")) and (.createdAt // "") > $at))
+                or any(.reviews.nodes[]?; person and (.submittedAt // "") > $at);
+          '
+          # pr_blocker <pr> <want> [locked]: why this request cannot be
+          # applied to the PR as last read, or nothing. "running #N": a Forge
+          # run on the tracking issue or on the PR. Only checked on the first
+          # read after the lock ("locked" skips it): a forge:running set later
+          # belongs to a run waiting for this lock. "closing": the PR does not
+          # close this issue (no closing reference to this repository's #N,
+          # and no closing keyword in the description outside HTML comments
+          # and fenced code, ``` or ~~~, closed or not). "state": the PR is
+          # not in the state the request needs.
           pr_blocker() {
-            jq -r --argjson issue "$ISSUE_NUMBER" --argjson pr "$1" --arg want "$2" --arg repo "$GITHUB_REPOSITORY" '
+            jq -r --argjson issue "$ISSUE_NUMBER" --argjson pr "$1" --arg want "$2" --arg repo "$GITHUB_REPOSITORY" \
+                --argjson locked "$([ "${3:-}" = locked ] && echo true || echo false)" '
               .data.repository as $d | $d.pullRequest as $p
-              | if any($d.issue.labels.nodes[]?; .name == "forge:running") then "running #\($issue)"
-                elif any($p.labels.nodes[]?; .name == "forge:running") then "running #\($pr)"
+              | if ($locked | not) and any($d.issue.labels.nodes[]?; .name == "forge:running") then "running #\($issue)"
+                elif ($locked | not) and any($p.labels.nodes[]?; .name == "forge:running") then "running #\($pr)"
                 elif (any($p.closingIssuesReferences.nodes[]?;
                         .number == $issue
                         and (((.repository.nameWithOwner // $repo) | ascii_downcase) == ($repo | ascii_downcase)))
-                      or (($p.body // "") | gsub("<!--[\\s\\S]*?-->"; "") | gsub("```[\\s\\S]*?```"; "")
+                      or (($p.body // "") | gsub("<!--[\\s\\S]*?-->"; "") | gsub("(```|~~~)[\\s\\S]*?(\\1|\\z)"; "")
                           | test("(?i)\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s+#\($issue)(?![0-9])"))) | not
                 then "closing"
                 elif (if $want == "open" then $p.state == "CLOSED" else $p.state == "OPEN" end) | not
@@ -4753,7 +4791,7 @@ jobs:
             def later($i; f): any($all[$i + 1:][]; .pr == $all[$i].pr and f);
             [ range(0; length) as $i | $all[$i]
               | (if (.reply | type) == "string" and later($i; .has_reply)
-                 then .reply = null | .has_reply = false | .watermark = false | .threads = [] | .superseded_reply = true
+                 then .reply = null | .has_reply = false | .watermark = false | .threads = [] | .superseded_reply = true | .rp = true
                  elif .has_reply
                  then .threads = ([ replies(.pr)[] | (.threads // [])[] ] | unique)
                       | .watermark = any(replies(.pr)[]; .watermark == true)
@@ -4776,12 +4814,16 @@ jobs:
             problems=()
 
             # Re-read the PR right before this request: an earlier request in
-            # this run may have reopened, closed or edited it.
-            if ! read_pr "$pr"; then
+            # this run may have reopened, closed or edited it, and the sha256
+            # guard needs the text as it is now. One query; the review-thread
+            # pages only when this request resolves threads.
+            want_threads=""
+            if jq -e '(.threads // []) | length > 0' <<< "$req" >/dev/null; then want_threads=threads; fi
+            if ! read_pr "$pr" "$want_threads"; then
               skip "$req" "Forge could not read #${pr}, so nothing was changed." "• <https://github.com/${GITHUB_REPOSITORY}/pull/${pr}|#${pr}>: I couldn't read the PR, so nothing was changed. Ask me again."
               continue
             fi
-            blocker=$(pr_blocker "$pr" "$want")
+            blocker=$(pr_blocker "$pr" "$want" locked)
             if [ -n "$blocker" ]; then
               blocked_skip "$req" "$pr" "$want" "$blocker"
               continue
@@ -4826,7 +4868,7 @@ jobs:
               jq -e --arg f "$field" '(.[$f] | type) == "string"' <<< "$req" >/dev/null || continue
               jq -j --arg f "$field" '.data.repository.pullRequest[$f] // ""' "$WORK/pr_${pr}.json" > "$WORK/current.txt"
               base=$(jq -r --arg f "$field" '.base[$f] // ""' <<< "$req")
-              if [ -n "$base" ] && [ "$(sha256_of "$WORK/current.txt")" != "$base" ]; then
+              if [ "$(sha256_of "$WORK/current.txt")" != "$base" ]; then
                 if [ "$field" = body ]; then
                   problems+=("the description changed after Forge drafted this, so it wasn't overwritten")
                 else
@@ -4881,24 +4923,32 @@ jobs:
               fi
             fi
 
-            # Something said on the PR after forge-agent wrote this request
-            # (a review, or a comment from anyone but Forge), as of the read
-            # just taken, is not covered by this reply: the watermark would
-            # mark it handled, so it is not posted, and a thread with a comment
-            # after the request stays open.
-            newer=$(jq -r --arg at "$asked_at" '
-              .data.repository.pullRequest
-              | ([ (.comments.nodes[]? | select((.body // "") | test("<!-- forge-") | not) | .updatedAt),
-                   (.reviews.nodes[]?.submittedAt) ] | map(select(. != null)) | max // "") as $last
-              | if $last != "" and $last > $at then "yes" else "" end' "$WORK/pr_${pr}.json")
-
+            # A review or comment the revise job would act on (OWED_JQ), newer
+            # than the request, is not covered by this reply: the watermark
+            # would mark it handled, so it is not posted, and a thread with a
+            # comment after the request stays open. The PR is read again once
+            # the watermark is up: something that finished in between has an
+            # earlier time than the watermark, so the watermark is removed.
+            # Anything finishing after that read is newer than the watermark,
+            # and revise sees it.
             if [ "$reply_ok" = 1 ] && jq -e '.watermark == true' <<< "$req" >/dev/null; then
-              if [ -n "$newer" ]; then
+              if jq -e --arg at "$asked_at" "${OWED_JQ}"' owed($at)' "$WORK/pr_${pr}.json" >/dev/null; then
                 problems+=("a newer review or comment arrived after Forge wrote this, so it is still marked as owed")
-              elif ! jq -n --arg body "$WATERMARK_BODY" '{body: $body}' \
-                  | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" --input - >/dev/null 2> "$WORK/err"; then
+              elif ! wm_id=$(jq -n --arg body "$WATERMARK_BODY" '{body: $body}' \
+                  | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" --input - --jq '.id' 2> "$WORK/err"); then
                 cat "$WORK/err"
                 problems+=("the handled-reviews watermark was not posted")
+              elif ! gh api graphql -f query="$PR_QUERY" -f o="$OWNER" -f r="$REPO" -F n="$pr" -F i="$ISSUE_NUMBER" \
+                  > "$WORK/after_${pr}.json" 2> "$WORK/err"; then
+                cat "$WORK/err"
+                echo "::warning::Could not read #${pr} again after the watermark, so a review that finished just before it may be marked handled."
+              elif jq -e --arg at "$asked_at" "${OWED_JQ}"' owed($at)' "$WORK/after_${pr}.json" >/dev/null; then
+                if gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/${wm_id}" >/dev/null 2> "$WORK/err"; then
+                  problems+=("a newer review arrived while Forge marked the reviews handled, so they are still owed")
+                else
+                  cat "$WORK/err"
+                  problems+=("a newer review arrived while Forge marked the reviews handled, and the marker could not be removed, so ask me to revise to have it answered")
+                fi
               fi
             fi
 
@@ -4908,7 +4958,7 @@ jobs:
             resolved=0
             asked=0
             kept=0
-            if [ "$reply_ok" = 1 ]; then
+            if [ "$reply_ok" = 1 ] && [ -n "$want_threads" ]; then
               while IFS= read -r line <&4; do
                 tid="${line%% *}"; state="${line#* }"
                 [ -n "$tid" ] || continue
