@@ -82,6 +82,10 @@ NODE_PREFLIGHT=$(sed -n "$(step_line "Preflight — does this Node run the engin
 check 'grep -q "package.json" <<< "$NODE_PREFLIGHT" && ! grep -qE "require\(\"\./|src/lib" <<< "$NODE_PREFLIGHT"' \
   "Node preflight reads package.json, not engine internals"
 check '! grep -qE "catch[[:space:]]*\{" <<< "$NODE_PREFLIGHT"' "Node preflight has no bare catch"
+check 'grep -qF "NODE_VERSION_INPUT: \${{ inputs.node_version }}" <<< "$NODE_PREFLIGHT"' \
+  "Node preflight gets the raw node_version, so its hint can tell set from empty"
+check 'grep -qF "NODE_ERROR: \${{ steps.node-preflight.outputs.error || steps.node.outputs.error }}" "$WF"' \
+  "Report reads the Node pick and preflight failure reasons"
 check 'awk "/^      slack_message_ts:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
   "input 'slack_message_ts' stays optional"
 check 'awk "/^      slack_mention_ts:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
@@ -859,64 +863,132 @@ fake_engine() {  # fake_engine <dir> <engines.node> [upstream-versions.json body
   jq -n --arg r "$2" '{name: "@deriv-com/spec-to-pr", engines: {node: $r}}' > "$1/forge-engine/package.json"
   if [[ -n "${3:-}" ]]; then printf '%s\n' "$3" > "$1/forge-engine/src/assets/upstream-versions.json"; fi
 }
-node_pick() {  # node_pick <dir> <node_version input>  -> "<exit> <picked>"
+node_pick() {  # node_pick <dir> <node_version input>  -> "<exit> <version>|<source>"; log in <dir>/pick.log
   local rc=0
   step_script "Pick the Node version" "$1" > "$1/pick.sh"
-  : > "$1/out"
-  RUNNER_TEMP="$1" GITHUB_OUTPUT="$1/out" NODE_VERSION="$2" bash "$1/pick.sh" > "$1/pick.log" 2>&1 || rc=$?
-  printf '%s %s' "$rc" "$(sed -n 's/^version=//p' "$1/out")"
+  : > "$1/out"; : > "$1/summary"
+  RUNNER_TEMP="$1" GITHUB_OUTPUT="$1/out" GITHUB_STEP_SUMMARY="$1/summary" NODE_VERSION="$2" ENGINE_TAG=v9.9.9 ENGINE_SHA=abc \
+    bash "$1/pick.sh" > "$1/pick.log" 2>&1 || rc=$?
+  printf '%s %s|%s' "$rc" "$(sed -n 's/^version=//p' "$1/out")" "$(sed -n 's/^source=//p' "$1/out")"
 }
-node_preflight() {  # node_preflight <dir> <fake node version>  -> "<exit> <output>"
+node_preflight() {  # node_preflight <dir> <fake node version> [input] [picked] [source]  -> "<exit> <output>"
   local rc=0 out
   step_script "Preflight — does this Node run the engine?" "$1" > "$1/preflight.sh"
   printf 'Object.defineProperty(process.versions, "node", { value: %s });\n' "\"$2\"" > "$1/shim.js"
-  out=$(RUNNER_TEMP="$1" ENGINE_TAG=v9.9.9 NODE_OPTIONS="--require $1/shim.js" bash "$1/preflight.sh" 2>&1) || rc=$?
+  : > "$1/out"; : > "$1/summary"
+  out=$(RUNNER_TEMP="$1" GITHUB_OUTPUT="$1/out" GITHUB_STEP_SUMMARY="$1/summary" ENGINE_TAG=v9.9.9 \
+    NODE_VERSION_INPUT="${3:-}" NODE_PICKED="${4:-${3:-}}" NODE_SOURCE="${5:-input}" \
+    NODE_OPTIONS="--require $1/shim.js" bash "$1/preflight.sh" 2>&1) || rc=$?
   printf '%s %s' "$rc" "$out"
 }
 NEW_VERSIONS='{"node": {"default": "24.22.3", "supported": ["24.22.3", "26.13.1"], "rollbackTargets": {"20": "0.8.3", "22": "0.8.3"}}}'
-NEW_ENGINE="$TMP_BEHAVIOR/node-new"; fake_engine "$NEW_ENGINE" "^24.22.3 || ^26.13.1" "$NEW_VERSIONS"
+NEW_RANGE="^24.22.3 || ^26.13.1"
+NEW_ENGINE="$TMP_BEHAVIOR/node-new"; fake_engine "$NEW_ENGINE" "$NEW_RANGE" "$NEW_VERSIONS"
 OLD_ENGINE="$TMP_BEHAVIOR/node-old"; fake_engine "$OLD_ENGINE" ">=20"
 ODD_ENGINE="$TMP_BEHAVIOR/node-odd"; fake_engine "$ODD_ENGINE" "~24.22" "$NEW_VERSIONS"
+node_engine() {  # node_engine <name> <engines.node> [upstream-versions.json body]  -> dir
+  local d="$TMP_BEHAVIOR/node-$1"; fake_engine "$d" "$2" "${3:-}"; printf '%s' "$d"
+}
 
+# Pick: where the version comes from.
 GOT=$(node_pick "$NEW_ENGINE" "")
-check '[[ "$GOT" == "0 24.22.3" ]]' "no node_version + engine naming Node 24.22.3 picks 24.22.3 (got $GOT)"
+check '[[ "$GOT" == "0 24.22.3|engine-default" ]]' "no node_version + engine naming Node 24.22.3 picks 24.22.3 (got $GOT)"
 GOT=$(node_pick "$OLD_ENGINE" "")
-check '[[ "$GOT" == "0 20.x" ]]' "no node_version + engine without upstream-versions.json picks 20.x (got $GOT)"
+check '[[ "$GOT" == "0 20.x|fallback" ]] && grep -q "has no src/assets/upstream-versions.json" "$OLD_ENGINE/pick.log"' \
+  "no node_version + engine without upstream-versions.json picks 20.x and says why (got $GOT)"
 GOT=$(node_pick "$NEW_ENGINE" "22")
-check '[[ "$GOT" == "0 22" ]]' "an explicit node_version wins over the engine's default (got $GOT)"
-NO_NODE_KEY="$TMP_BEHAVIOR/node-nokey"; fake_engine "$NO_NODE_KEY" ">=20" '{"claude-code": "2.0.0"}'
-GOT=$(node_pick "$NO_NODE_KEY" "")
-check '[[ "$GOT" == "0 20.x" ]]' "upstream-versions.json without a node key picks 20.x (got $GOT)"
-BAD_DEFAULT="$TMP_BEHAVIOR/node-baddefault"; fake_engine "$BAD_DEFAULT" ">=20" '{"node": {"default": "24; rm -rf /"}}'
-GOT=$(node_pick "$BAD_DEFAULT" "")
-check '[[ "$GOT" == "1 " ]] && grep -q "::error::.*not a version" "$BAD_DEFAULT/pick.log"' \
-  "an engine default that is not a version fails the pick (got $GOT)"
+check '[[ "$GOT" == "0 22|input" ]]' "an explicit node_version wins over the engine's default (got $GOT)"
+for in in "^24.22.3" "lts/jod" ">=24 <25" "24.x" "node"; do
+  GOT=$(node_pick "$NEW_ENGINE" "$in")
+  check '[[ "$GOT" == "0 $in|input" ]]' "node_version '$in' (a form setup-node takes) is accepted (got $GOT)"
+done
+# A file that exists but names no usable default: engines.node, never 20.x.
+D=$(node_engine numeric "$NEW_RANGE" '{"node": {"default": 24}}')
+GOT=$(node_pick "$D" "")
+check '[[ "$GOT" == "0 $NEW_RANGE|engines-node" ]] && grep -q "^::warning::spec-to-pr v9.9.9 has no .node.default string" "$D/pick.log" && ! grep -q "0.8.3" "$D/pick.log"' \
+  "a numeric .node.default falls back to engines.node with a warning, not 20.x (got $GOT)"
+D=$(node_engine nokey "$NEW_RANGE" '{"claude-code": "2.0.0"}')
+GOT=$(node_pick "$D" "")
+check '[[ "$GOT" == "0 $NEW_RANGE|engines-node" ]]' "upstream-versions.json without a node key falls back to engines.node (got $GOT)"
+for def in "^24.22.3" "lts/jod"; do
+  D=$(node_engine "def-${def//[^a-z0-9]/}" "$NEW_RANGE" "{\"node\": {\"default\": \"$def\"}}")
+  GOT=$(node_pick "$D" "")
+  check '[[ "$GOT" == "0 $def|engine-default" ]]' "an engine .node.default of '$def' is passed to setup-node as is (got $GOT)"
+done
+D=$(node_engine baddefault "$NEW_RANGE" '{"node": {"default": "24; rm -rf /"}}')
+GOT=$(node_pick "$D" "")
+check '[[ "$GOT" == "0 $NEW_RANGE|engines-node" ]] && grep -q "^::warning::.*cannot take" "$D/pick.log" && ! grep -q "rm -rf" "$D/pick.log"' \
+  "an engine .node.default with shell metacharacters warns and falls back to engines.node, unprinted (got $GOT)"
+# Pick: what stops it.
+D=$(node_engine multiline "$NEW_RANGE" "$NEW_VERSIONS")
+GOT=$(node_pick "$D" $'22\n::error::INJECTED')
+check '[[ "$GOT" == "1 |" ]] && ! grep -q "^::error::INJECTED" "$D/pick.log" && grep -q "^::error::node_version must be a single line" "$D/pick.log"' \
+  "a multi-line node_version fails before any of it is printed (got $GOT)"
+check 'grep -q "^error=node_version must be a single line" "$D/out" && grep -q "single line" "$D/summary"' \
+  "the pick's failure goes to a step output and the job summary"
+D=$(node_engine shellchars "$NEW_RANGE" "$NEW_VERSIONS")
+GOT=$(node_pick "$D" '22$(id)')
+check '[[ "$GOT" == "1 |" ]] && grep -q "^::error::node_version has characters setup-node never takes" "$D/pick.log" && ! grep -q "(id)" "$D/pick.log"' \
+  "a node_version with shell metacharacters fails, unprinted (got $GOT)"
+D=$(node_engine badversions "$NEW_RANGE" '{"node": {"default": ')
+GOT=$(node_pick "$D" "")
+check '[[ "$GOT" == "1 |" ]] && grep -q "^::error::spec-to-pr v9.9.9 has a src/assets/upstream-versions.json that is not valid JSON" "$D/pick.log" && ! grep -q "^jq: " "$D/pick.log"' \
+  "a malformed upstream-versions.json fails the pick with an ::error naming the release (got $GOT)"
+D=$(node_engine badpkg "$NEW_RANGE" '{"node": {}}'); printf '{"engines": ' > "$D/forge-engine/package.json"
+GOT=$(node_pick "$D" "")
+check '[[ "$GOT" == "1 |" ]] && grep -q "^::error::spec-to-pr v9.9.9 has a package.json that is missing or not valid JSON" "$D/pick.log" && ! grep -q "^jq: " "$D/pick.log"' \
+  "a malformed package.json in the engines.node fallback fails with an ::error naming the release (got $GOT)"
+D=$(node_engine norange "" '{"node": {}}')
+GOT=$(node_pick "$D" "")
+check '[[ "$GOT" == "1 |" ]] && grep -q "^::error::.*no usable engines.node" "$D/pick.log"' \
+  "no usable .node.default and no engines.node fails the pick (got $GOT)"
 
-GOT=$(node_preflight "$NEW_ENGINE" "22.23.5")
-check '[[ "$GOT" == "1 ::error::spec-to-pr v9.9.9 needs Node ^24.22.3 || ^26.13.1"*"runs Node 22.23.5"* ]]' \
-  "Node 22 against the new engine fails with the engine's range"
-check '[[ "$GOT" == *"Set node_version"*"leave node_version empty"* ]]' "the Node mismatch error names the fix"
+# Preflight.
+GOT=$(node_preflight "$NEW_ENGINE" "22.23.5" "22")
+check '[[ "$GOT" == "1 ::error::spec-to-pr v9.9.9 needs Node $NEW_RANGE"*"node_version \"22\" gave Node 22.23.5"* ]]' \
+  "node_version 22 against the new engine fails with the engine's range"
+check '[[ "$GOT" == *"Set node_version"*"leave it empty"* ]]' "with node_version set, the error offers leaving it empty"
 check '[[ "$GOT" == *"pin engine_ref to v0.8.3"* ]]' "the Node mismatch error names rollback v0.8.3 for Node 22"
-GOT=$(node_preflight "$NEW_ENGINE" "24.22.3")
+check 'grep -q "^error=spec-to-pr v9.9.9 needs Node" "$NEW_ENGINE/out" && grep -q "pin engine_ref to v0.8.3" "$NEW_ENGINE/summary"' \
+  "the preflight's failure goes to a step output and the job summary"
+GOT=$(node_preflight "$NEW_ENGINE" "24.22.2" "" "24.22.2" engine-default)
+check '[[ "$GOT" == "1 ::error::"*"the Node this release names for itself (24.22.2) gave Node 24.22.2"* && "$GOT" != *"leave"* && "$GOT" == *"Set node_version"*"pin engine_ref"* ]]' \
+  "with node_version empty, the error names the engine's own default and never says to leave node_version empty"
+check '[[ "$GOT" != *"pin engine_ref to v"* ]]' "no rollback release is named for a major the engine still supports"
+GOT=$(node_preflight "$(node_engine fallback-mismatch "$NEW_RANGE")" "20.19.0" "" "20.x" fallback)
+check '[[ "$GOT" == "1 ::error::"*"the Node 20.x fallback"* && "$GOT" != *"leave"* ]]' \
+  "the 20.x fallback failing engines.node is named as the fallback"
+GOT=$(node_preflight "$NEW_ENGINE" "20.19.0" "" "$NEW_RANGE" engines-node)
+check '[[ "$GOT" == "0 setup-node installed Node 20.19.0 from the engines.node"*"nothing more to check"* ]]' \
+  "when setup-node was handed engines.node, the preflight does not re-check it"
+GOT=$(node_preflight "$NEW_ENGINE" "24.22.3" "24.22.3")
 check '[[ "$GOT" == "0 Node 24.22.3 satisfies spec-to-pr v9.9.9"* ]]' "Node 24.22.3 passes against the new engine"
-GOT=$(node_preflight "$NEW_ENGINE" "26.14.0")
+GOT=$(node_preflight "$NEW_ENGINE" "26.14.0" "26")
 check '[[ "$GOT" == "0 "* ]]' "Node 26.14.0 passes the second alternative of the range"
-GOT=$(node_preflight "$NEW_ENGINE" "24.22.2")
-check '[[ "$GOT" == "1 ::error::"* && "$GOT" != *"pin engine_ref"* ]]' \
-  "Node 24.22.2 fails, with no rollback named for a major the engine still supports"
-GOT=$(node_preflight "$OLD_ENGINE" "20.19.0")
+GOT=$(node_preflight "$NEW_ENGINE" "26.13.1-nightly20261101" "26")
+check '[[ "$GOT" == "0 "* ]]' "a prerelease Node is compared without its suffix (26.13.1-nightly passes ^26.13.1)"
+GOT=$(node_preflight "$NEW_ENGINE" "22.0.0-rc.1" "22")
+check '[[ "$GOT" == "1 ::error::"*"gave Node 22.0.0-rc.1"* && "$GOT" != *NaN* ]]' "a prerelease Node that fails says so, with no NaN"
+GOT=$(node_preflight "$OLD_ENGINE" "20.19.0" "" "20.x" fallback)
 check '[[ "$GOT" == "0 "* ]]' "Node 20 passes against an engine with engines.node >=20"
-GOT=$(node_preflight "$OLD_ENGINE" "18.20.0")
-check '[[ "$GOT" == "1 ::error::"*">=20"* && "$GOT" != *"pin engine_ref"* ]]' \
+GOT=$(node_preflight "$OLD_ENGINE" "18.20.0" "18")
+check '[[ "$GOT" == "1 ::error::"*">=20"* && "$GOT" != *"pin engine_ref to v"* ]]' \
   "Node 18 fails against >=20, with no rollback when the engine lists none"
-GOT=$(node_preflight "$ODD_ENGINE" "24.22.3")
+GOT=$(node_preflight "$ODD_ENGINE" "24.22.3" "24.22.3")
 check '[[ "$GOT" == "0 ::warning::"*"~24.22"* ]]' "an engines.node range the check cannot read warns and continues"
+D=$(node_engine pf-badpkg "$NEW_RANGE" "$NEW_VERSIONS"); printf '{"engines": ' > "$D/forge-engine/package.json"
+GOT=$(node_preflight "$D" "24.22.3" "24.22.3")
+check '[[ "$GOT" == "1 ::error::spec-to-pr v9.9.9 has a package.json that is missing or not valid JSON"* && "$GOT" != *"    at "* ]]' \
+  "a malformed package.json fails the preflight with an ::error naming the release, no stack trace"
+D=$(node_engine pf-badversions "$NEW_RANGE" '{"node": '); GOT=$(node_preflight "$D" "22.23.5" "22")
+check '[[ "$GOT" == "1 ::error::spec-to-pr v9.9.9 needs Node"*"upstream-versions.json is not valid JSON"* && "$GOT" != *"    at "* ]]' \
+  "a malformed upstream-versions.json on the mismatch path still gives the ::error, no stack trace"
 
 # The checker's range forms, one at a time.
 range_case() {  # range_case <range> <fake node version>  -> exit code
   local d="$TMP_BEHAVIOR/node-range-$RANDOM$RANDOM"
   fake_engine "$d" "$1"
-  node_preflight "$d" "$2" | cut -d' ' -f1
+  node_preflight "$d" "$2" "x" | cut -d' ' -f1
 }
 for c in "20.x;20.1.0;0" "20.x;22.0.0;1" "20.x.x;20.9.9;0" ">=20;20.0.0;0" ">=20.5;20.4.9;1" \
          ">= 20.5.1;20.5.1;0" "^24.22.3;24.30.0;0" "^24.22.3;25.0.0;1" "^0.8.3;0.8.9;0" \
@@ -1603,6 +1675,14 @@ check '[ "$(reactions "$C" add)" = shrug ]' "success with no PR reacts shrug"
 C=$(report_only unresolved OUTCOME=success PR_UNRESOLVED=1 SLACK_MENTION_TS=3.3)
 check '[ "$(reactions "$C" add)" = warning ]' "no linked PR reacts warning"
 completion_of() { jq -rs '[.[] | select(.url | endswith("chat.postMessage")) | .p.text] | last // ""' "$1/slack.jsonl" 2>/dev/null || true; }
+NODE_REASON_FIXTURE='spec-to-pr v9.9.9 needs Node ^24.22.3 || ^26.13.1 (its package.json engines.node), but node_version "22" gave Node 22.23.5. Set node_version to a version in that range, or leave it empty to run the Node the engine release names. To stay on Node 22, pin engine_ref to v0.8.3, the last release that runs on it.'
+C=$(report_only node_stop OUTCOME=skipped COMMENT_ID=55 SLACK_MENTION_TS=3.3 "NODE_ERROR=$NODE_REASON_FIXTURE")
+check 'grep "^api --method PATCH repos/o/r/issues/comments/55 " "$C/gh.log" | grep -qF "body=🔨 Forge stopped before it started: $NODE_REASON_FIXTURE"' \
+  "a Node preflight stop puts its reason in the issue comment"
+check '[[ "$(completion_of "$C")" == *"Failed on "*"needs Node ^24.22.3 || ^26.13.1"*"pin engine_ref to v0.8.3"* ]] && [ "$(reactions "$C" add)" = x ]' \
+  "a Node preflight stop puts its reason in the Slack completion (got $(completion_of "$C"))"
+check '! grep "^api --method PATCH repos/o/r/issues/comments/55 " "$C/gh.log" | grep -qF "Forge failed."' \
+  "a Node preflight stop is not reported as the generic failure"
 C=$(report_only fork_update OUTCOME=failure FORGE_COMMAND=update PR_UNRESOLVED=1 PR_FROM_FORK=https://github.com/o/r/pull/8 SLACK_MENTION_TS=3.3)
 check '[[ "$(completion_of "$C")" == *"<https://github.com/o/r/pull/8|PR #8>, is from a fork."*"so there is nothing to update."* ]] && [ "$(reactions "$C" add)" = warning ]' \
   "an update run on a fork PR says there is nothing to update (got $(completion_of "$C"))"
