@@ -165,7 +165,7 @@ on:
       # --- per-repo tuning --------------------------------------------------
       node_version:
         description: >-
-          Node version for the target repo's toolchain and the spec-to-pr
+          Node version for the target repo's toolchain and the Forge
           engine: anything actions/setup-node takes (a version, a range or an
           alias). The target repo's install and verify commands also run on
           this Node (running the engine on its own Node is #217). Empty (the
@@ -572,11 +572,11 @@ jobs:
           # The same release label as the preflight: the tag, else the SHA's
           # first 12 characters.
           if [ -n "${ENGINE_TAG:-}" ]; then
-            ENGINE="spec-to-pr $ENGINE_TAG"
+            ENGINE="forge $ENGINE_TAG"
           elif [ -n "${ENGINE_SHA:-}" ]; then
-            ENGINE="spec-to-pr ${ENGINE_SHA:0:12}"
+            ENGINE="forge ${ENGINE_SHA:0:12}"
           else
-            ENGINE="the fetched spec-to-pr release"
+            ENGINE="the fetched engine release"
           fi
           # fail <message>: one ::error line, also kept as a step output for
           # Report and in the job summary (same header as the preflight).
@@ -659,7 +659,7 @@ jobs:
 
       - name: Preflight — does this Node run the engine?
         id: node-preflight
-        # spec-to-pr checks its own Node floor only when dstp starts, after the
+        # The engine checks its own Node floor only when dstp starts, after the
         # gateway preflight and install_command. Check the fetched release's
         # package.json engines.node now, before any npm ci, so a Node it cannot
         # run on stops the job in seconds with the fix named. When setup-node
@@ -687,10 +687,10 @@ jobs:
           // The same release label as the pick: the tag, else the SHA's first
           // 12 characters.
           const engine = env.ENGINE_TAG
-            ? `spec-to-pr ${env.ENGINE_TAG}`
+            ? `forge ${env.ENGINE_TAG}`
             : env.ENGINE_SHA
-              ? `spec-to-pr ${env.ENGINE_SHA.slice(0, 12)}`
-              : "the fetched spec-to-pr release";
+              ? `forge ${env.ENGINE_SHA.slice(0, 12)}`
+              : "the fetched engine release";
           const have = process.versions.node;
           // Engine-supplied text is printed on one line, so no part of it can
           // start a line and run as a workflow command.
@@ -799,7 +799,7 @@ jobs:
           fail(`${needs}, but ${named} ${gave}, which does not satisfy it. Set node_version in the calling workflow to a version in that range, or pin engine_ref to another release.${rollback}`);
           JS
 
-      - name: Install the spec-to-pr engine's dependencies
+      - name: Install the Forge engine's dependencies
         # Separate from the fetch so it runs on the Node picked and checked above.
         run: |
           set -euo pipefail
