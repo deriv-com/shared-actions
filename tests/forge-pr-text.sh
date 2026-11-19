@@ -154,7 +154,7 @@ case "$*" in
   # The forge-run marker of each Forge claim/outcome comment on n, oldest
   # first, as the step's --jq prints it: claim_runs_<n> ("none" for a
   # comment without one).
-  "api repos/o/r/issues/"*"/comments?per_page=100 --paginate --jq "*)
+  "api repos/o/r/issues/"*"/comments --paginate --jq "*)
     n="${2#repos/o/r/issues/}"; n="${n%%/*}"
     cat "$S/claim_runs_$n" 2>/dev/null || true ;;
   # A Forge run's status: run_status_<id>; run_read_fail fails the read.

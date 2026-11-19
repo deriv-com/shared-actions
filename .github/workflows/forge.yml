@@ -4839,7 +4839,7 @@ jobs:
           # removed.
           stale_running() {
             local run status
-            run=$(gh api "repos/${GITHUB_REPOSITORY}/issues/$1/comments?per_page=100" --paginate \
+            run=$(gh api "repos/${GITHUB_REPOSITORY}/issues/$1/comments" --paginate \
                   --jq '.[] | select((.user.type // "") == "Bot" and ((.body // "") | startswith("🔨")))
                         | (.body // "") | (first(capture("<!-- forge-run: (?<id>[0-9]+) -->") | .id) // "none")' 2> "$WORK/err") \
               || { cat "$WORK/err"; return 1; }
