@@ -513,7 +513,7 @@ C=$(new_case later-empty-own)
   comment 53 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, reply: "<!-- nothing -->", watermark: true, threads: ["PRRT_open"], th: "9.2"}')"
 } > "$C/comments.jsonl"
 run_case "$C"
-check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/resolved.log" ] && ! watermark_posted "$C" && [ "$(jq -sr ".[0].body | split(\"\\n\")[-1]" "$C/pr_comments.jsonl")" = Fixed ] && [[ "$(thread_text "$C" 9.2)" == *"there was no reply text, so the watermark and thread resolution were skipped"* ]] && [[ "$(thread_text "$C" 9.1)" == *"replied to the review"* ]] && [[ "$(thread_text "$C" 9.1)" != *"Not done"* ]]' \
+check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/resolved.log" ] && ! watermark_posted "$C" && [ "$(jq -sr ".[0].body | split(\"\\n\")[-1]" "$C/pr_comments.jsonl")" = Fixed ] && [[ "$(thread_text "$C" 9.2)" == *"there was no reply text, so the watermark and thread resolution were skipped"* ]] && [[ "$(thread_text "$C" 9.1)" == *"replied to the review"* ]] && [[ "$(thread_text "$C" 9.1)" != *"Not done"* ]] && [[ "$(thread_text "$C" 9.1)" != *"no reply text"* ]]' \
   "later-empty-own: a later empty reply keeps its thread and watermark, and only it is told there was no reply text"
 C=$(new_case earlier-empty-own)
 {
@@ -1089,6 +1089,18 @@ touch "$C/running_from_read_2"
 run_case "$C"
 check '[ "$(cat "$C/rc")" = 0 ] && [ "$(marks "$C" applied)" = 130,131 ] && [ "$(jq -r .title "$C/pr_patch.jsonl")" = "fix: first" ] && [ "$(wc -l < "$C/pr_comments.jsonl" | tr -d " ")" = 1 ] && [[ "$(slack_text "$C")" != *"working on"* ]]' \
   "running-after-lock: a forge:running set after the lock does not stop pr-text"
+# Two PRs read one after another: the issue gains forge:running on the second
+# PR's first read, from a run waiting for this lock. Only the first PR's read
+# counts for the issue, so neither PR is skipped.
+C=$(new_case running-mid-loop)
+{
+  comment 132 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, title: "fix: seven"}')"
+  comment 133 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 8, title: "fix: eight"}')"
+} > "$C/comments.jsonl"
+touch "$C/running_from_read_2"
+run_case "$C"
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(jq -sr "map(.pr) | join(\",\")" "$C/pr_patch.jsonl")" = "7,8" ] && [[ "$(slack_text "$C")" != *"working on"* ]]' \
+  "running-mid-loop: a forge:running that shows up on the issue in a later PR's first read does not skip that PR"
 
 # A reply replaced by a later one keeps rp in its final mark.
 C=$(new_case rp-superseded)

@@ -4851,7 +4851,8 @@ jobs:
           # pr_blocker <pr> <want> [locked]: why this request cannot be
           # applied to the PR as last read, or nothing. "running #N": a Forge
           # run on the tracking issue or on the PR. Only checked on the first
-          # read after the lock ("locked" skips it): a forge:running set later
+          # read after the lock ("locked" skips it), and for the issue only on
+          # the first PR's read (issue_first.json): a forge:running set later
           # belongs to a run waiting for this lock. "closing": the PR does not
           # close this issue (no closing reference to this repository's #N,
           # and no closing keyword in the description outside HTML comments
@@ -4859,9 +4860,10 @@ jobs:
           # not in the state the request needs.
           pr_blocker() {
             jq -r --argjson issue "$ISSUE_NUMBER" --argjson pr "$1" --arg want "$2" --arg repo "$GITHUB_REPOSITORY" \
-                --argjson locked "$([ "${3:-}" = locked ] && echo true || echo false)" "${CLOSES_JQ}"'
+                --argjson locked "$([ "${3:-}" = locked ] && echo true || echo false)" \
+                --slurpfile first "$WORK/issue_first.json" "${CLOSES_JQ}"'
               .data.repository as $d | $d.pullRequest as $p
-              | if ($locked | not) and any($d.issue.labels.nodes[]?; .name == "forge:running") then "running #\($issue)"
+              | if ($locked | not) and any($first[0].data.repository.issue.labels.nodes[]?; .name == "forge:running") then "running #\($issue)"
                 elif ($locked | not) and any($p.labels.nodes[]?; .name == "forge:running") then "running #\($pr)"
                 elif (any($p.closingIssuesReferences.nodes[]?;
                         .number == $issue
@@ -4942,6 +4944,14 @@ jobs:
           if [ "$cleared" = 1 ]; then
             for pr in $(jq -r '.pr' "$WORK/claimed.jsonl" | sort -un); do read_pr "$pr" || true; done
           fi
+          # The issue as the first of those reads saw it. The PRs are read one
+          # after another, so a forge:running that shows up on the issue in a
+          # later PR's read was set after the lock, by a run that is waiting
+          # for it: only this first read counts for the issue.
+          echo '{}' > "$WORK/issue_first.json"
+          for pr in $(jq -r '.pr' "$WORK/claimed.jsonl" | sort -un); do
+            if [ -f "$WORK/pr_${pr}.json" ]; then cp "$WORK/pr_${pr}.json" "$WORK/issue_first.json"; break; fi
+          done
 
           # Which claimed requests can be applied, from that first read. The
           # others are skipped and reported now. The reply, cleaned like the
