@@ -294,8 +294,10 @@ jobs:
 
     timeout-minutes: ${{ inputs.timeout_minutes }}
 
+    # A pr-text dispatch skips this job, but it is keyed apart anyway, so a
+    # skipped job can never take a queued revise's place in its group.
     concurrency:
-      group: forge-${{ github.repository }}-${{ inputs.issue_number }}
+      group: ${{ inputs.command == 'pr-text' && format('forge-skipped-{0}', github.run_id) || format('forge-{0}-{1}', github.repository, inputs.issue_number) }}
       cancel-in-progress: false
 
     permissions:
@@ -507,7 +509,9 @@ jobs:
           # stale), forge:running is checked in a fresh read: if it is
           # missing it is set again, and the lock is checked again after
           # that, with a full wait. If it still can't be confirmed after 3
-          # tries, the step fails rather than run without it.
+          # tries, a wait apart, the step fails rather than run without it.
+          # Only label reads that still fail once an expired lock is removed
+          # go ahead without that check, as they did before it.
           wait_for_pr_text() {
             local i=0 again=0 expired=0 labels
             while :; do
@@ -521,8 +525,10 @@ jobs:
                   echo "::warning::forge:running is missing from #${ISSUE_NUMBER} (a pr-text run can take it for an earlier run's and remove it). Setting it again."
                   gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels" -f 'labels[]=forge:running' >/dev/null \
                     || echo "::warning::Could not set forge:running on #${ISSUE_NUMBER} again."
-                  # A pr-text run that locks from here on gets a full wait.
+                  # A pr-text run that locks from here on gets a full wait. The
+                  # pause lets a brief API error or a lagging read pass.
                   again=$((again + 1)); i=0; expired=0
+                  sleep "${PR_TEXT_WAIT_SECONDS:-10}"
                   continue
                 fi
               else
@@ -532,7 +538,7 @@ jobs:
                 [ "$expired" = 0 ] || return 0
               fi
               if [ "$i" -ge "${PR_TEXT_WAIT_POLLS:-60}" ]; then
-                echo "::warning::forge:pr-text stayed on #${ISSUE_NUMBER} for 10 minutes, so the pr-text run that set it likely stopped without removing it. Removing it and going ahead."
+                echo "::warning::forge:pr-text stayed on #${ISSUE_NUMBER} for 10 minutes, so the pr-text run that set it likely stopped without removing it. Removing it."
                 gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/forge%3Apr-text" >/dev/null \
                   || echo "::warning::Could not remove forge:pr-text from #${ISSUE_NUMBER}."
                 # Check forge:running in a fresh read, as when the lock clears.
@@ -4977,10 +4983,12 @@ jobs:
           # watermark the others asked for, so they still close and land only
           # once a reply posts. Each thread is judged from the latest request
           # that asked for it (thread_at), and the watermark from the latest
-          # request that asked for one (asked_at): forge-agent had seen what
-          # came before that request, but a comment on an inherited thread,
-          # or a review, that arrived after it is newer than what was
-          # answered, so it keeps that thread open and holds the watermark.
+          # request that asked for one (asked_at), but never from later than
+          # the reply itself was written (a later request whose reply is
+          # empty lends its threads, not its time): a comment on an inherited
+          # thread, or a review, that arrived after that is newer than what
+          # was answered, so it keeps that thread open and holds the
+          # watermark.
           # Each request that lost a field to a later one is told, once the
           # later one has run.
           jq -c -s '
@@ -4994,9 +5002,10 @@ jobs:
                  elif .has_reply
                  then .threads = ([ replies(.pr)[] | (.threads // [])[] ] | unique)
                       | .watermark = any(replies(.pr)[]; .watermark == true)
-                      | .thread_at = reduce (replies(.pr)[] | .created_at as $at | (.threads // [])[] | strings | {t: ., at: $at}) as $x
+                      | .created_at as $own
+                      | .thread_at = reduce (replies(.pr)[] | ([.created_at, $own] | min) as $at | (.threads // [])[] | strings | {t: ., at: $at}) as $x
                           ({}; .[$x.t] = ([.[$x.t] // "", $x.at] | max))
-                      | .asked_at = (([ replies(.pr)[] | select(.watermark == true) | .created_at ] | max) // .created_at)
+                      | .asked_at = (([ replies(.pr)[] | select(.watermark == true) | [.created_at, $own] | min ] | max) // .created_at)
                  else . end)
               | (if (.title | type) == "string" and later($i; (.title | type) == "string")
                  then .title = null | .superseded_title = true else . end)
@@ -5155,8 +5164,8 @@ jobs:
             # more comments since the last watermark than the 100 read, where
             # such a request could be out of sight (OWED_JQ's held), is not
             # covered by this reply: the watermark would mark it handled, so
-            # it is not posted, and a thread with a comment after the request
-            # stays open. The PR is read again once the watermark is up:
+            # it is not posted, and a thread with a comment after the latest
+            # request that asked for it stays open. The PR is read again once the watermark is up:
             # something that arrived in between has an earlier time than the
             # watermark, so the watermark is removed. It also is when that
             # read fails: it stays only once the read shows nothing owed. The re-check measures Slack notes from the

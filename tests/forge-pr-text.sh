@@ -35,6 +35,8 @@ check '[ "$MINT" = "permission-actions: read permission-issues: write permission
   "pr-text mints the write App token with only issues and pull-requests write, plus actions read for stale claims (got: $MINT)"
 check '[[ "$PR_TEXT_JOB" == *"group: forge-pr-text-"* ]]' \
   "pr-text has its own concurrency group, so it never displaces a queued revise"
+check 'grep -xF "      group: \${{ inputs.command == '"'"'pr-text'"'"' && format('"'"'forge-skipped-{0}'"'"', github.run_id) || format('"'"'forge-{0}-{1}'"'"', github.repository, inputs.issue_number) }}" <<< "$FORGE_JOB" >/dev/null' \
+  "the forge job skipped for pr-text is keyed apart from the revise group, so it can't displace a queued revise"
 check '! grep -E "actions/checkout|spec-to-pr|claude" <<< "$PR_TEXT_JOB" >/dev/null' \
   "pr-text checks out nothing and runs no engine or model"
 COMMAND_INPUT=$(awk '/^      command:$/ {f=1; print; next} f && /^      [a-z_]+:$/ {exit} f {print}' "$WF")
@@ -498,8 +500,22 @@ jq -n --arg mid "$(jq -nr 'now - 300 | floor | todate')" '{data: {repository: {p
   reviews: {nodes: [{submittedAt: $mid, body: "Please fix", author: {__typename: "User", login: "rev"}}]},
   reviewThreads: {nodes: [{id: "PRRT_mid", isResolved: false, comments: {nodes: [{createdAt: $mid}]}}]}}}}}' > "$C/pr_7.json"
 run_case "$C"
-check '[ "$(cat "$C/resolved.log")" = PRRT_mid ] && jq -se "any(.[]; .body | startswith(\"<!-- forge-revise-instructions -->\"))" "$C/pr_comments.jsonl" >/dev/null' \
+check '[ "$(cat "$C/resolved.log")" = PRRT_mid ] && jq -se "any(.[]; .body | startswith(\"<!-- forge-revise-instructions -->\"))" "$C/pr_comments.jsonl" >/dev/null && [ ! -s "$C/deleted.log" ]' \
   "superseded-own-thread: the replying request's own thread and watermark are judged from its own time"
+# A later request whose reply is empty lends its thread and watermark, not
+# its time: a comment after the reply was written still counts as newer.
+C=$(new_case later-empty-lends)
+{
+  comment 50 'forge-gh-app[bot]' Bot 600 "$(request 1 '{pr: 7, reply: "First"}')"
+  comment 51 'forge-gh-app[bot]' Bot 60 "$(request 2 '{pr: 7, reply: "<!-- nothing -->", watermark: true, threads: ["PRRT_mid"]}')"
+} > "$C/comments.jsonl"
+jq -n --arg mid "$(jq -nr 'now - 300 | floor | todate')" '{data: {repository: {pullRequest: {state: "OPEN", title: "t", body: "",
+  closingIssuesReferences: {nodes: [{number: 1213}]}, comments: {nodes: []},
+  reviews: {nodes: [{submittedAt: $mid, body: "Please fix", author: {__typename: "User", login: "rev"}}]},
+  reviewThreads: {nodes: [{id: "PRRT_mid", isResolved: false, comments: {nodes: [{createdAt: $mid}]}}]}}}}}' > "$C/pr_7.json"
+run_case "$C"
+check '[ ! -s "$C/resolved.log" ] && ! jq -se "any(.[]; .body | startswith(\"<!-- forge-revise-instructions -->\"))" "$C/pr_comments.jsonl" >/dev/null && [ "$(jq -sr ".[0].body | split(\"\\n\")[-1]" "$C/pr_comments.jsonl")" = First ]' \
+  "later-empty-lends: an earlier reply that takes a later empty reply's thread and watermark is still judged from its own time"
 # A request's Slack thread is used only with its own channel; otherwise the
 # dispatch's channel and thread are used together.
 C=$(new_case slack-pair)
@@ -733,7 +749,6 @@ check '[ -n "$FORGE_SCRUB" ] && [ "$FORGE_SCRUB" = "$PRTEXT_SCRUB" ]' "pr-text's
 FORGE_WM=$(printf '%s\n' "$FORGE_JOB" | grep -A1 "body=\$(printf '%s\\\\n%s' '<!-- forge-revise-instructions -->'" | sed -n "s/.*'\(<[^']*\)'.*/\1/p" | tr '\n' '|')
 PRTEXT_WM=$(printf '%s\n' "$PR_TEXT_JOB" | grep -A1 "WATERMARK_BODY=\$(printf" | sed -n "s/.*'\(<[^']*\)'.*/\1/p" | tr '\n' '|')
 check '[ -n "$FORGE_WM" ] && [ "$FORGE_WM" = "$PRTEXT_WM" ]' "pr-text's watermark body is post_silent_watermark's (got: $PRTEXT_WM)"
-# Every printf in the forge job that writes a reply marker writes this one.
 # Every printf in the forge job that writes a reply marker (any marker that
 # starts like one, so a renamed marker still shows) writes this one.
 FORGE_REPLY_MARKERS=$(grep -v '^ *#' <<< "$FORGE_JOB" | grep -E "printf '%s(\\\\n)+' '<!-- forge-revise-re" | sed -E "s/.*printf '%s(\\\\n)+' '([^']*)'.*/\\2/" | sort | uniq -c | sed 's/^ *//' || true)
