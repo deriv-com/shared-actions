@@ -70,6 +70,8 @@ The remaining directories under `.github/actions/` implement internal building b
 
 [`forge.yml`](.github/workflows/forge.yml) runs `deriv-com/spec-to-pr` against an issue (`command: auto`) or an open same-repo PR (`command: revise` | `update`), handling GitHub App token rotation, AI review wait/revise loops, base-branch updates, and optional Slack progress threads. Full caller header and input reference live at the top of [`forge.yml`](.github/workflows/forge.yml).
 
+The engine and the target repo's toolchain run on `node_version`, which defaults to the Node the engine release names; the job stops early, before any install, if `node_version` doesn't satisfy the engine's `engines.node`.
+
 ### App info (version stamp)
 
 [`generate_app_info`](.github/actions/generate_app_info/) creates or updates an
