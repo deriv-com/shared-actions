@@ -4497,6 +4497,15 @@ jobs:
                   problems+=("${what}, and the newer ${field/body/description} to #${pr} that replaced it did not land either")
                 fi
               done
+              # An empty reply whose threads and watermark went with another
+              # request's reply: done if that reply posted.
+              if jq -e '.req.lent_reply == true' <<< "$rec" >/dev/null; then
+                if [ -f "$WORK/landed_reply_${pr}" ]; then
+                  parts+=("your reply was empty once cleaned, so its threads and watermark went with the other reply to #${pr}")
+                else
+                  problems+=("your reply was empty once cleaned, and the other reply to #${pr} that took its threads and watermark did not post either")
+                fi
+              fi
               line="• <https://github.com/${GITHUB_REPOSITORY}/pull/${pr}|#${pr}>: "
               if [ "${#parts[@]}" -gt 0 ]; then line+=$(join_parts "${parts[@]}"); else line+="nothing changed"; fi
               if jq -e '.recorded == false' <<< "$rec" >/dev/null; then
@@ -4979,7 +4988,9 @@ jobs:
 
           # Several eligible requests on one PR: only the last reply with text
           # is posted, and only the last title and the last description are
-          # written. The reply's request takes over the threads and the
+          # written. A request whose reply is empty once cleaned lends its
+          # threads and watermark to that reply (lent_reply) and is told how
+          # it went, like a superseded one. The reply's request takes over the threads and the
           # watermark the others asked for, so they still close and land only
           # once a reply posts. Each thread is judged from the latest request
           # that asked for it (thread_at), and the watermark from the latest
@@ -4999,6 +5010,10 @@ jobs:
               | .asked_at = .created_at | .thread_at = {}
               | (if (.reply | type) == "string" and later($i; .has_reply)
                  then .reply = null | .has_reply = false | .watermark = false | .threads = [] | .superseded_reply = true | .rp = true
+                 elif (.reply | type) == "string" and (.has_reply | not)
+                      and (((.threads // []) | length) > 0 or .watermark == true)
+                      and any($all[]; .pr == $all[$i].pr and .has_reply)
+                 then .reply = null | .watermark = false | .threads = [] | .lent_reply = true | .rp = true
                  elif .has_reply
                  then .threads = ([ replies(.pr)[] | (.threads // [])[] ] | unique)
                       | .watermark = any(replies(.pr)[]; .watermark == true)
