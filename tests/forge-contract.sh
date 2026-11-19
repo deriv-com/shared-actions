@@ -340,13 +340,21 @@ check 'grep -q "Branches are not accepted" "$WF"' \
 
 # The engine lives in deriv-com/forge-agent under engine/. A release tag there
 # points at a commit whose tree is engine/, so the fetched root is the package
-# root and no path under $DIR may gain an engine/ prefix.
+# root: the install and FORGE_CLI paths below must not gain an engine/ prefix.
 check 'awk "/id: engine-token/{f=1} f && /repositories:/{print; exit}" "$WF" | grep -qE "^ +repositories: forge-agent$"' \
   "engine token step is scoped to repositories: forge-agent"
-check '! grep -q "spec-to-pr\.git" "$WF"' \
-  "no spec-to-pr.git URL left in the workflow"
+# Any URL or owner/repo form of the old repo; the package name
+# @deriv-com/spec-to-pr stays (epic "Names that stay"), so the @ form is allowed.
+check '! grep -qE "(^|[^@])deriv-com/spec-to-pr" "$WF"' \
+  "the workflow no longer names the old deriv-com/spec-to-pr repo"
+check 'grep -qF "( cd \"\$DIR\" && npm ci --omit=dev --include=optional )" "$WF"' \
+  "the engine installs at the root of \$DIR (release root is the engine root)"
 check 'grep -qF "echo \"FORGE_CLI=\$DIR/bin/cli.js\"" "$WF"' \
   "FORGE_CLI is still \$DIR/bin/cli.js (release root is the engine root)"
+# forge-agent also holds the Forge service, so the fetch must refuse a commit
+# whose root is not the engine before npm ci runs it with the write token.
+check 'grep -qF "!= \"@deriv-com/spec-to-pr\" ]" "$WF" && grep -qF "is not an engine release commit" "$WF"' \
+  "the fetch refuses a commit whose root is not the engine package"
 
 # Every third-party action pinned by SHA (the repo-wide rule this workflow must
 # not be an exception to).
