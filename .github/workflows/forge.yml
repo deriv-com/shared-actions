@@ -460,7 +460,8 @@ jobs:
           # comment's last line (Report keeps it there), and it goes up before
           # forge:running does, so whenever pr-text sees the label the newest
           # Forge comment names the run that set it. HTML comments are removed
-          # from the brief, which is untrusted Slack text.
+          # from the brief, which is untrusted Slack text, until none is left
+          # (a removal can join the text around it into a new opener).
           BRIEF="${ANALYSIS_BRIEF:0:10000}"
           PAYLOAD=$(mktemp)
           trap 'rm -f "$PAYLOAD"' EXIT
@@ -471,7 +472,8 @@ jobs:
             --arg run_id "${GITHUB_RUN_ID:-}" \
             '
             def header: "🔨 **Forge** picked this up — [watch the run](\($run)).\($via)";
-            def safe: $brief | gsub("<!--[\\s\\S]*?(-->|\\z)"; "") | gsub("<!--"; "");
+            def nocomments: (gsub("<!--[\\s\\S]*?(-->|\\z)"; "") | gsub("<!--"; "")) as $n | if $n == . then . else $n | nocomments end;
+            def safe: $brief | nocomments;
             def trimmed: safe | gsub("\\A[\\n\\r\\t ]+"; "") | gsub("[\\n\\r\\t ]+\\z"; "");
             def marker: if ($run_id | test("^[0-9]+$")) then "\n\n<!-- forge-run: \($run_id) -->" else "" end;
             {body: ((if trimmed == "" then header else
@@ -501,29 +503,41 @@ jobs:
           # the label still being there. A pr-text run that read the issue
           # before this run's claim comment went up can take a forge:running
           # left by an earlier, finished run for stale and remove it while
-          # this run waits. So when the lock is gone, forge:running is checked
-          # in the same read: if it is missing it is set again, and the lock
-          # is checked again after that, as above.
+          # this run waits. So once the lock is gone (cleared, or removed as
+          # stale), forge:running is checked in a fresh read: if it is
+          # missing it is set again, and the lock is checked again after
+          # that, with a full wait. If it still can't be confirmed after 3
+          # tries, the step fails rather than run without it.
           wait_for_pr_text() {
-            local i=0 again=0 labels
+            local i=0 again=0 expired=0 labels
             while :; do
               if labels=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels?per_page=100" --jq '.[].name' 2>&1); then
-                if ! grep -qxF 'forge:pr-text' <<< "$labels"; then
-                  if grep -qxF 'forge:running' <<< "$labels" || [ "$again" -ge 3 ]; then return 0; fi
-                  echo "::warning::forge:running was removed from #${ISSUE_NUMBER} while this run waited (a pr-text run took it for an earlier run's). Setting it again."
+                if [ "$expired" = 1 ] || ! grep -qxF 'forge:pr-text' <<< "$labels"; then
+                  grep -qxF 'forge:running' <<< "$labels" && return 0
+                  if [ "$again" -ge 3 ]; then
+                    echo "::error::forge:running is still missing from #${ISSUE_NUMBER} after setting it again 3 times, so a pr-text run could write during this run. Stopping."
+                    return 1
+                  fi
+                  echo "::warning::forge:running is missing from #${ISSUE_NUMBER} (a pr-text run can take it for an earlier run's and remove it). Setting it again."
                   gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels" -f 'labels[]=forge:running' >/dev/null \
                     || echo "::warning::Could not set forge:running on #${ISSUE_NUMBER} again."
-                  again=$((again + 1))
+                  # A pr-text run that locks from here on gets a full wait.
+                  again=$((again + 1)); i=0; expired=0
                   continue
                 fi
               else
                 echo "::warning::Could not read the labels on #${ISSUE_NUMBER}: ${labels}"
+                # Reads that still fail after the lock was removed: go ahead,
+                # as before (forge:running was set before the wait).
+                [ "$expired" = 0 ] || return 0
               fi
               if [ "$i" -ge "${PR_TEXT_WAIT_POLLS:-60}" ]; then
                 echo "::warning::forge:pr-text stayed on #${ISSUE_NUMBER} for 10 minutes, so the pr-text run that set it likely stopped without removing it. Removing it and going ahead."
                 gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/forge%3Apr-text" >/dev/null \
                   || echo "::warning::Could not remove forge:pr-text from #${ISSUE_NUMBER}."
-                return 0
+                # Check forge:running in a fresh read, as when the lock clears.
+                expired=1
+                continue
               fi
               [ "$i" -gt 0 ] || echo "A Forge PR change from Slack is being applied on #${ISSUE_NUMBER}; waiting for it to finish."
               i=$((i + 1))
@@ -4686,19 +4700,34 @@ jobs:
           done 3< "$WORK/pending.jsonl"
           [ -s "$WORK/claimed.jsonl" ] || exit "$FAILED"
 
-          # Take the lock before any PR is read. A lock that cannot be set
-          # means no PR is written: every claimed request is skipped.
+          # Take the lock before any PR is read. A lock that cannot be set on
+          # the issue means no PR is written: every claimed request is
+          # skipped. One that cannot be set on a PR (a number that doesn't
+          # exist, say) skips only that PR's requests.
           gh label create "forge:pr-text" --repo "$GITHUB_REPOSITORY" --color c5def5 \
             --description "Forge is applying a PR change" --force >/dev/null 2>&1 || true
-          LOCKED=1
-          for n in "$ISSUE_NUMBER" $(jq -r '.pr' "$WORK/claimed.jsonl" | sort -un); do
-            lock "$n" || { LOCKED=0; break; }
-          done
-          if [ "$LOCKED" = 0 ]; then
+          if ! lock "$ISSUE_NUMBER"; then
             while IFS= read -r req <&3; do
               skip "$req" "Forge skipped this request: it could not take its lock on #${ISSUE_NUMBER}." "• <https://github.com/${GITHUB_REPOSITORY}/pull/$(jq -r '.pr' <<< "$req")|#$(jq -r '.pr' <<< "$req")>: I couldn't take the lock that keeps a Forge run from writing at the same time, so nothing was changed. Ask me again."
             done 3< "$WORK/claimed.jsonl"
             exit 1
+          fi
+          : > "$WORK/unlocked"
+          for n in $(jq -r '.pr' "$WORK/claimed.jsonl" | sort -un); do
+            lock "$n" || echo "$n" >> "$WORK/unlocked"
+          done
+          if [ -s "$WORK/unlocked" ]; then
+            : > "$WORK/claimed.next"
+            while IFS= read -r req <&3; do
+              pr=$(jq -r '.pr' <<< "$req")
+              if grep -qxF "$pr" "$WORK/unlocked"; then
+                skip "$req" "Forge skipped this request: it could not take its lock on #${pr}." "• <https://github.com/${GITHUB_REPOSITORY}/pull/${pr}|#${pr}>: I couldn't take the lock on #${pr} that keeps a Forge run from writing at the same time, so nothing was changed. Check that #${pr} exists, then ask me again."
+              else
+                printf '%s\n' "$req" >> "$WORK/claimed.next"
+              fi
+            done 3< "$WORK/claimed.jsonl"
+            mv "$WORK/claimed.next" "$WORK/claimed.jsonl"
+            [ -s "$WORK/claimed.jsonl" ] || exit 1
           fi
 
           # read_pr <pr> [threads]: read a PR now: state, title and body,
@@ -4946,24 +4975,28 @@ jobs:
           # is posted, and only the last title and the last description are
           # written. The reply's request takes over the threads and the
           # watermark the others asked for, so they still close and land only
-          # once a reply posts. It is then judged from the earliest of those
-          # requests (asked_at): a comment on an inherited thread, or a review,
-          # that arrived after the earlier request was drafted is newer than
-          # what forge-agent saw then, so it keeps that thread open and holds
-          # the watermark. Each request that lost a field to a later one is
-          # told, once the later one has run.
+          # once a reply posts. Each thread is judged from the latest request
+          # that asked for it (thread_at), and the watermark from the latest
+          # request that asked for one (asked_at): forge-agent had seen what
+          # came before that request, but a comment on an inherited thread,
+          # or a review, that arrived after it is newer than what was
+          # answered, so it keeps that thread open and holds the watermark.
+          # Each request that lost a field to a later one is told, once the
+          # later one has run.
           jq -c -s '
             . as $all
             | def replies($p): [ $all[] | select(.pr == $p and (.reply | type) == "string") ];
             def later($i; f): any($all[$i + 1:][]; .pr == $all[$i].pr and f);
             [ range(0; length) as $i | $all[$i]
-              | .asked_at = .created_at
+              | .asked_at = .created_at | .thread_at = {}
               | (if (.reply | type) == "string" and later($i; .has_reply)
                  then .reply = null | .has_reply = false | .watermark = false | .threads = [] | .superseded_reply = true | .rp = true
                  elif .has_reply
                  then .threads = ([ replies(.pr)[] | (.threads // [])[] ] | unique)
                       | .watermark = any(replies(.pr)[]; .watermark == true)
-                      | .asked_at = ([ replies(.pr)[] | .created_at ] | min)
+                      | .thread_at = reduce (replies(.pr)[] | .created_at as $at | (.threads // [])[] | strings | {t: ., at: $at}) as $x
+                          ({}; .[$x.t] = ([.[$x.t] // "", $x.at] | max))
+                      | .asked_at = (([ replies(.pr)[] | select(.watermark == true) | .created_at ] | max) // .created_at)
                  else . end)
               | (if (.title | type) == "string" and later($i; (.title | type) == "string")
                  then .title = null | .superseded_title = true else . end)
@@ -5164,8 +5197,9 @@ jobs:
             fi
 
             # Resolve the requested threads that are on this PR (all pages
-            # read), still open, and quiet since the request was written. A
-            # thread id that is not on this PR is never sent to GitHub.
+            # read), still open, and quiet since the latest request that asked
+            # for them was written. A thread id that is not on this PR is
+            # never sent to GitHub.
             resolved=0
             asked=0
             kept=0
@@ -5183,11 +5217,11 @@ jobs:
                 else
                   cat "$WORK/err"
                 fi
-              done 4< <(jq -r -s --arg at "$asked_at" --argjson req "$(jq -c '{threads}' <<< "$req")" '
-                (map(select(.isResolved == false)) | map({key: .id, value: ((.comments.nodes[0].createdAt // "") > $at)}) | from_entries) as $open
+              done 4< <(jq -r -s --arg at "$asked_at" --argjson req "$(jq -c '{threads, thread_at}' <<< "$req")" '
+                (map(select(.isResolved == false)) | map({key: .id, value: (.comments.nodes[0].createdAt // "")}) | from_entries) as $last
                 | ($req.threads // [])[]? | strings
-                | . as $t | select($open | has($t))
-                | "\($t) \(if $open[$t] then "newer" else "ok" end)"
+                | . as $t | select($last | has($t))
+                | "\($t) \(if $last[$t] > (($req.thread_at // {})[$t] // $at) then "newer" else "ok" end)"
               ' "$WORK/threads_${pr}.jsonl")
             fi
             if [ "$resolved" -eq 1 ]; then
@@ -5241,7 +5275,7 @@ jobs:
             exit 0
           fi
           if resp=$(jq -n --arg channel "$SLACK_CHANNEL" --arg ts "$SLACK_THREAD_TS" \
-                --arg text "❌ Forge couldn't make the PR change: it couldn't get its GitHub token for this repository. The <${RUN_URL}|run log> has the details. Ask me again once that's fixed." \
+                --arg text "❌ Forge couldn't make the PR change: it couldn't get its GitHub token for this repository. The <${RUN_URL}|run log> has the details. Your request is still queued: the next PR change you ask for on this issue within 24 hours applies it too, so there's no need to repeat it." \
                 '{channel: $channel, thread_ts: $ts, text: $text, unfurl_links: false, unfurl_media: false}' \
               | curl -sS --connect-timeout 5 --max-time 15 -X POST https://slack.com/api/chat.postMessage \
                   -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
