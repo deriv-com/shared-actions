@@ -502,32 +502,27 @@ jq -n --arg mid "$(jq -nr 'now - 300 | floor | todate')" '{data: {repository: {p
 run_case "$C"
 check '[ "$(cat "$C/resolved.log")" = PRRT_mid ] && jq -se "any(.[]; .body | startswith(\"<!-- forge-revise-instructions -->\"))" "$C/pr_comments.jsonl" >/dev/null && [ ! -s "$C/deleted.log" ]' \
   "superseded-own-thread: the replying request's own thread and watermark are judged from its own time"
-# A later request whose reply is empty lends its threads and watermark to
-# the earlier reply and is told so, without failing the run.
-C=$(new_case later-empty-lent)
+# A request whose reply is empty once cleaned keeps its threads and
+# watermark, wherever it is: the reply that posts doesn't take them, and the
+# empty one is told there was no reply text, in its own Slack thread.
+thread_text() { jq -sr --arg th "$2" 'map(select(.thread_ts == $th) | .text) | join("\n")' "$1/slack.jsonl"; }
+watermark_posted() { jq -se 'any(.[]; .body | startswith("<!-- forge-revise-instructions -->"))' "$1/pr_comments.jsonl" >/dev/null; }
+C=$(new_case later-empty-own)
 {
-  comment 52 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, reply: "Fixed"}')"
-  comment 53 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, reply: "<!-- nothing -->", watermark: true, threads: ["PRRT_open"]}')"
+  comment 52 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, reply: "Fixed", th: "9.1"}')"
+  comment 53 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, reply: "<!-- nothing -->", watermark: true, threads: ["PRRT_open"], th: "9.2"}')"
 } > "$C/comments.jsonl"
 run_case "$C"
-check '[ "$(cat "$C/rc")" = 0 ] && [ "$(cat "$C/resolved.log")" = PRRT_open ] && jq -se "any(.[]; .body | startswith(\"<!-- forge-revise-instructions -->\"))" "$C/pr_comments.jsonl" >/dev/null && [[ "$(slack_text "$C")" == *"your reply was empty once cleaned, so its threads and watermark went with the other reply to #7"* ]] && [[ "$(slack_text "$C")" != *"there was no reply text"* ]]' \
-  "later-empty-lent: a later empty reply's thread and watermark land with the earlier reply, and it is reported done"
-# A later request whose reply is empty lends its thread and watermark, not
-# its time: a comment after the reply was written still counts as newer.
-C=$(new_case later-empty-lends)
+check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/resolved.log" ] && ! watermark_posted "$C" && [ "$(jq -sr ".[0].body | split(\"\\n\")[-1]" "$C/pr_comments.jsonl")" = Fixed ] && [[ "$(thread_text "$C" 9.2)" == *"there was no reply text, so the watermark and thread resolution were skipped"* ]] && [[ "$(thread_text "$C" 9.1)" == *"replied to the review"* ]] && [[ "$(thread_text "$C" 9.1)" != *"Not done"* ]]' \
+  "later-empty-own: a later empty reply keeps its thread and watermark, and only it is told there was no reply text"
+C=$(new_case earlier-empty-own)
 {
-  comment 50 'forge-gh-app[bot]' Bot 600 "$(request 1 '{pr: 7, reply: "First"}')"
-  comment 51 'forge-gh-app[bot]' Bot 60 "$(request 2 '{pr: 7, reply: "<!-- nothing -->", watermark: true, threads: ["PRRT_mid"]}')"
+  comment 54 'forge-gh-app[bot]' Bot 20 "$(request 1 '{pr: 7, reply: "<!-- nothing -->", watermark: true, threads: ["PRRT_open"], th: "9.1"}')"
+  comment 55 'forge-gh-app[bot]' Bot 10 "$(request 2 '{pr: 7, reply: "Fixed", th: "9.2"}')"
 } > "$C/comments.jsonl"
-jq -n --arg mid "$(jq -nr 'now - 300 | floor | todate')" '{data: {repository: {pullRequest: {state: "OPEN", title: "t", body: "",
-  closingIssuesReferences: {nodes: [{number: 1213}]}, comments: {nodes: []},
-  reviews: {nodes: [{submittedAt: $mid, body: "Please fix", author: {__typename: "User", login: "rev"}}]},
-  reviewThreads: {nodes: [{id: "PRRT_mid", isResolved: false, comments: {nodes: [{createdAt: $mid}]}}]}}}}}' > "$C/pr_7.json"
 run_case "$C"
-check '[ ! -s "$C/resolved.log" ] && ! jq -se "any(.[]; .body | startswith(\"<!-- forge-revise-instructions -->\"))" "$C/pr_comments.jsonl" >/dev/null && [ "$(jq -sr ".[0].body | split(\"\\n\")[-1]" "$C/pr_comments.jsonl")" = First ]' \
-  "later-empty-lends: an earlier reply that takes a later empty reply's thread and watermark is still judged from its own time"
-check '[ "$(cat "$C/rc")" = 1 ] && [[ "$(slack_text "$C")" == *"your reply was empty once cleaned, so its threads and watermark went with the other reply to #7"* ]] && [[ "$(slack_text "$C")" == *"a newer review or comment arrived after Forge wrote this"* ]]' \
-  "later-empty-lends: the empty reply is told where its work went, and the held watermark is reported on the reply that carried it"
+check '[ "$(cat "$C/rc")" = 1 ] && [ ! -s "$C/resolved.log" ] && ! watermark_posted "$C" && [[ "$(thread_text "$C" 9.1)" == *"there was no reply text"* ]] && [[ "$(thread_text "$C" 9.1)" != *"replaced it"* ]] && [[ "$(thread_text "$C" 9.2)" != *"Not done"* ]]' \
+  "earlier-empty-own: an earlier empty reply is told there was no reply text, not that it was replaced, and keeps its thread and watermark"
 # A request's Slack thread is used only with its own channel; otherwise the
 # dispatch's channel and thread are used together.
 C=$(new_case slack-pair)
@@ -1028,7 +1023,7 @@ check '[ "$(cat "$C/rc")" = 0 ] && [ "$(reads "$C")" = 5 ] && grep -F "::warning
 C=$(wait_case wait-running-removed 'echo forge:pr-text > "$c/labels_1213"' 'touch "$c/clear_after_2"')
 check '[ "$(cat "$C/rc")" = 0 ] && [ "$(cat "$C/labels.log")" = "--add-label 1213 forge:running" ] && [ "$(reads "$C")" = 3 ] && grep -F "::warning::forge:running is missing from #1213" "$C/run.log" >/dev/null' \
   "wait: a forge:running removed while waiting is set again, then the lock is read again"
-check 'awk '"'"'/again=\$\(\(again \+ 1\)\)/ {a=NR} a && NR == a + 1 && /^ *sleep "\$\{PR_TEXT_WAIT_SECONDS:-10\}"$/ {ok=1} END {exit !ok}'"'"' "$TMP/wait.sh"' \
+check 'awk '"'"'/^ *again=\$\(\(again \+ 1\)\);/ {a=NR} a && NR == a + 1 && /^ *sleep "\$\{PR_TEXT_WAIT_SECONDS:-10\}"$/ {ok=1} END {exit !ok}'"'"' "$TMP/wait.sh"' \
   "wait: the tries to set forge:running again are a wait apart"
 C=$(wait_case wait-running-kept)
 check '[ "$(cat "$C/rc")" = 0 ] && [ ! -s "$C/labels.log" ] && [ "$(reads "$C")" = 1 ]' \

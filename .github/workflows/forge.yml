@@ -510,8 +510,8 @@ jobs:
           # missing it is set again, and the lock is checked again after
           # that, with a full wait. If it still can't be confirmed after 3
           # tries, a wait apart, the step fails rather than run without it.
-          # Only label reads that still fail once an expired lock is removed
-          # go ahead without that check, as they did before it.
+          # Only a label read that fails once an expired lock is removed goes
+          # ahead without that check, as it did before it.
           wait_for_pr_text() {
             local i=0 again=0 expired=0 labels
             while :; do
@@ -533,8 +533,8 @@ jobs:
                 fi
               else
                 echo "::warning::Could not read the labels on #${ISSUE_NUMBER}: ${labels}"
-                # Reads that still fail after the lock was removed: go ahead,
-                # as before (forge:running was set before the wait).
+                # A read that fails after the expired lock was removed: go
+                # ahead, as before (forge:running was set before the wait).
                 [ "$expired" = 0 ] || return 0
               fi
               if [ "$i" -ge "${PR_TEXT_WAIT_POLLS:-60}" ]; then
@@ -4497,15 +4497,6 @@ jobs:
                   problems+=("${what}, and the newer ${field/body/description} to #${pr} that replaced it did not land either")
                 fi
               done
-              # An empty reply whose threads and watermark went with another
-              # request's reply: done if that reply posted.
-              if jq -e '.req.lent_reply == true' <<< "$rec" >/dev/null; then
-                if [ -f "$WORK/landed_reply_${pr}" ]; then
-                  parts+=("your reply was empty once cleaned, so its threads and watermark went with the other reply to #${pr}")
-                else
-                  problems+=("your reply was empty once cleaned, and the other reply to #${pr} that took its threads and watermark did not post either")
-                fi
-              fi
               line="• <https://github.com/${GITHUB_REPOSITORY}/pull/${pr}|#${pr}>: "
               if [ "${#parts[@]}" -gt 0 ]; then line+=$(join_parts "${parts[@]}"); else line+="nothing changed"; fi
               if jq -e '.recorded == false' <<< "$rec" >/dev/null; then
@@ -4988,39 +4979,32 @@ jobs:
 
           # Several eligible requests on one PR: only the last reply with text
           # is posted, and only the last title and the last description are
-          # written. A request whose reply is empty once cleaned lends its
-          # threads and watermark to that reply (lent_reply) and is told how
-          # it went, like a superseded one. The reply's request takes over the threads and the
-          # watermark the others asked for, so they still close and land only
-          # once a reply posts. Each thread is judged from the latest request
-          # that asked for it (thread_at), and the watermark from the latest
-          # request that asked for one (asked_at), but never from later than
-          # the reply itself was written (a later request whose reply is
-          # empty lends its threads, not its time): a comment on an inherited
-          # thread, or a review, that arrived after that is newer than what
-          # was answered, so it keeps that thread open and holds the
-          # watermark.
-          # Each request that lost a field to a later one is told, once the
-          # later one has run.
+          # written. That reply's request takes over the threads and the
+          # watermark that the earlier replies with text asked for, so they
+          # still close and land only once a reply posts. Each thread is
+          # judged from the latest of those requests that asked for it
+          # (thread_at), and the watermark from the latest that asked for one
+          # (asked_at): a comment on an inherited thread, or a review, that
+          # arrived after that is newer than what was answered, so it keeps
+          # that thread open and holds the watermark. A request whose reply is
+          # empty once cleaned takes part in none of this, wherever it is:
+          # like a single request, it gets neither its watermark nor its
+          # threads, and is told there was no reply text. Each request that
+          # lost a field to a later one is told, once the later one has run.
           jq -c -s '
             . as $all
-            | def replies($p): [ $all[] | select(.pr == $p and (.reply | type) == "string") ];
+            | def replies($p): [ $all[] | select(.pr == $p and .has_reply) ];
             def later($i; f): any($all[$i + 1:][]; .pr == $all[$i].pr and f);
             [ range(0; length) as $i | $all[$i]
               | .asked_at = .created_at | .thread_at = {}
-              | (if (.reply | type) == "string" and later($i; .has_reply)
+              | (if .has_reply and later($i; .has_reply)
                  then .reply = null | .has_reply = false | .watermark = false | .threads = [] | .superseded_reply = true | .rp = true
-                 elif (.reply | type) == "string" and (.has_reply | not)
-                      and (((.threads // []) | length) > 0 or .watermark == true)
-                      and any($all[]; .pr == $all[$i].pr and .has_reply)
-                 then .reply = null | .watermark = false | .threads = [] | .lent_reply = true | .rp = true
                  elif .has_reply
                  then .threads = ([ replies(.pr)[] | (.threads // [])[] ] | unique)
                       | .watermark = any(replies(.pr)[]; .watermark == true)
-                      | .created_at as $own
-                      | .thread_at = reduce (replies(.pr)[] | ([.created_at, $own] | min) as $at | (.threads // [])[] | strings | {t: ., at: $at}) as $x
+                      | .thread_at = reduce (replies(.pr)[] | .created_at as $at | (.threads // [])[] | strings | {t: ., at: $at}) as $x
                           ({}; .[$x.t] = ([.[$x.t] // "", $x.at] | max))
-                      | .asked_at = (([ replies(.pr)[] | select(.watermark == true) | [.created_at, $own] | min ] | max) // .created_at)
+                      | .asked_at = (([ replies(.pr)[] | select(.watermark == true) | .created_at ] | max) // .created_at)
                  else . end)
               | (if (.title | type) == "string" and later($i; (.title | type) == "string")
                  then .title = null | .superseded_title = true else . end)
