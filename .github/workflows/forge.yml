@@ -415,10 +415,11 @@ jobs:
           set -euo pipefail
 
           # Backstop for "Check the command", which already stopped the job
-          # on anything else.
+          # on anything else. The value isn't printed: that step shows it
+          # cleaned.
           case "${FORGE_COMMAND:-}" in
             ""|auto|revise|update) ;;
-            *) echo "::error::Unknown command '${FORGE_COMMAND}'"; exit 1 ;;
+            *) echo '::error::Unknown command. "Check the command" should have stopped this run: use auto, revise or update.'; exit 1 ;;
           esac
 
           # Fail fast on a bad dispatch input. The value flows into the
@@ -470,7 +471,7 @@ jobs:
             --arg run_id "${GITHUB_RUN_ID:-}" \
             '
             def header: "🔨 **Forge** picked this up — [watch the run](\($run)).\($via)";
-            def safe: $brief | gsub("<!--[\\s\\S]*?(-->|\\z)"; "");
+            def safe: $brief | gsub("<!--[\\s\\S]*?(-->|\\z)"; "") | gsub("<!--"; "");
             def trimmed: safe | gsub("\\A[\\n\\r\\t ]+"; "") | gsub("[\\n\\r\\t ]+\\z"; "");
             def marker: if ($run_id | test("^[0-9]+$")) then "\n\n<!-- forge-run: \($run_id) -->" else "" end;
             {body: ((if trimmed == "" then header else
@@ -497,12 +498,24 @@ jobs:
           # both start together, pr-text backs off and this run waits for its
           # release. A label left by a pr-text run that died is removed after
           # 10 minutes (pr-text's timeout). A label read that fails counts as
-          # the label still being there.
+          # the label still being there. A pr-text run that read the issue
+          # before this run's claim comment went up can take a forge:running
+          # left by an earlier, finished run for stale and remove it while
+          # this run waits. So when the lock is gone, forge:running is checked
+          # in the same read: if it is missing it is set again, and the lock
+          # is checked again after that, as above.
           wait_for_pr_text() {
-            local i=0 labels
+            local i=0 again=0 labels
             while :; do
               if labels=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels?per_page=100" --jq '.[].name' 2>&1); then
-                grep -qxF 'forge:pr-text' <<< "$labels" || return 0
+                if ! grep -qxF 'forge:pr-text' <<< "$labels"; then
+                  if grep -qxF 'forge:running' <<< "$labels" || [ "$again" -ge 3 ]; then return 0; fi
+                  echo "::warning::forge:running was removed from #${ISSUE_NUMBER} while this run waited (a pr-text run took it for an earlier run's). Setting it again."
+                  gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels" -f 'labels[]=forge:running' >/dev/null \
+                    || echo "::warning::Could not set forge:running on #${ISSUE_NUMBER} again."
+                  again=$((again + 1))
+                  continue
+                fi
               else
                 echo "::warning::Could not read the labels on #${ISSUE_NUMBER}: ${labels}"
               fi
@@ -780,8 +793,9 @@ jobs:
             revise) COMMAND=revise ;;
             update) COMMAND=update ;;
             ""|auto) COMMAND=auto ;;
-            # The claim step rejects anything else; this is the backstop.
-            *) echo "::error::Unknown command '${COMMAND}'"; exit 1 ;;
+            # "Check the command" rejects anything else; this is the backstop.
+            # The value isn't printed: that step shows it cleaned.
+            *) echo '::error::Unknown command. "Check the command" should have stopped this run: use auto, revise or update.'; exit 1 ;;
           esac
 
           SLACK_PROGRESS_TS="${SLACK_MESSAGE_TS:-}"
@@ -4231,7 +4245,9 @@ jobs:
   # command=pr-text. This job applies EVERY pending request on the issue with
   # the write App, oldest first. It claims every request (rewriting the
   # comment) before touching any PR, so each is handled exactly once, then
-  # reports the result in the Slack thread the request names. A run that finds
+  # reports the result in the Slack thread the request names (the dispatch's
+  # thread when the request's channel or thread is missing, or when the
+  # write token can't be minted and nothing is applied). A run that finds
   # nothing pending (an earlier run applied it) is a quiet no-op, so a pending
   # run that GitHub's concurrency group cancels loses nothing. While a Forge
   # run works on the issue (forge:running), nothing is applied. No checkout,
@@ -4365,8 +4381,11 @@ jobs:
           thread_of() {  # thread_of <request json> -> "channel thread"
             local c t
             c=$(jq -r '.ch // ""' <<< "$1"); t=$(jq -r '.th // ""' <<< "$1")
-            [[ "$c" =~ ^[A-Z0-9]+$ ]] || c="${SLACK_CHANNEL:-}"
-            [[ "$t" =~ ^[0-9]+\.[0-9]+$ ]] || t="${SLACK_THREAD_TS:-}"
+            # A thread belongs to its channel, so the dispatch's pair stands
+            # in for both when either one is missing or malformed.
+            if ! [[ "$c" =~ ^[A-Z0-9]+$ && "$t" =~ ^[0-9]+\.[0-9]+$ ]]; then
+              c="${SLACK_CHANNEL:-}"; t="${SLACK_THREAD_TS:-}"
+            fi
             printf '%s %s' "$c" "$t"
           }
           # report <request json> <line> <failed 0|1>
@@ -4927,18 +4946,24 @@ jobs:
           # is posted, and only the last title and the last description are
           # written. The reply's request takes over the threads and the
           # watermark the others asked for, so they still close and land only
-          # once a reply posts. Each request that lost a field to a later one
-          # is told, once the later one has run.
+          # once a reply posts. It is then judged from the earliest of those
+          # requests (asked_at): a comment on an inherited thread, or a review,
+          # that arrived after the earlier request was drafted is newer than
+          # what forge-agent saw then, so it keeps that thread open and holds
+          # the watermark. Each request that lost a field to a later one is
+          # told, once the later one has run.
           jq -c -s '
             . as $all
             | def replies($p): [ $all[] | select(.pr == $p and (.reply | type) == "string") ];
             def later($i; f): any($all[$i + 1:][]; .pr == $all[$i].pr and f);
             [ range(0; length) as $i | $all[$i]
+              | .asked_at = .created_at
               | (if (.reply | type) == "string" and later($i; .has_reply)
                  then .reply = null | .has_reply = false | .watermark = false | .threads = [] | .superseded_reply = true | .rp = true
                  elif .has_reply
                  then .threads = ([ replies(.pr)[] | (.threads // [])[] ] | unique)
                       | .watermark = any(replies(.pr)[]; .watermark == true)
+                      | .asked_at = ([ replies(.pr)[] | .created_at ] | min)
                  else . end)
               | (if (.title | type) == "string" and later($i; (.title | type) == "string")
                  then .title = null | .superseded_title = true else . end)
@@ -4952,7 +4977,7 @@ jobs:
           while IFS= read -r req <&3; do
             pr=$(jq -r '.pr' <<< "$req")
             cid=$(jq -r '.comment_id' <<< "$req")
-            asked_at=$(jq -r '.created_at' <<< "$req")
+            asked_at=$(jq -r '.asked_at' <<< "$req")
             want=$(jq -r 'if .state == "closed" or .state == "open" then .state else "" end' <<< "$req")
             done_parts=()
             problems=()
@@ -5197,3 +5222,32 @@ jobs:
           finalize_lines
           send_reports
           [ "$FAILED" = 0 ]
+
+      # "Apply PR text" reports everything once it runs. A write token that
+      # can't be minted (a caller missing the App secrets, an outage) stops
+      # the job before it, so the Slack thread that asked hears it here. The
+      # requests stay pending, so a later pr-text run within 24 hours still
+      # applies them.
+      - name: Tell Slack the PR change didn't start
+        if: failure() && steps.pr-text-token.outcome == 'failure'
+        env:
+          SLACK_CHANNEL: ${{ inputs.slack_channel }}
+          SLACK_THREAD_TS: ${{ inputs.slack_thread_ts }}
+          SLACK_BOT_TOKEN: ${{ secrets.FORGE_SLACK_BOT_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if ! [[ "${SLACK_CHANNEL:-}" =~ ^[A-Z0-9]+$ && "${SLACK_THREAD_TS:-}" =~ ^[0-9]+\.[0-9]+$ ]] || [ -z "${SLACK_BOT_TOKEN:-}" ]; then
+            echo "::warning::No Slack thread to tell that the PR change didn't start."
+            exit 0
+          fi
+          if resp=$(jq -n --arg channel "$SLACK_CHANNEL" --arg ts "$SLACK_THREAD_TS" \
+                --arg text "❌ Forge couldn't make the PR change: it couldn't get its GitHub token for this repository. The <${RUN_URL}|run log> has the details. Ask me again once that's fixed." \
+                '{channel: $channel, thread_ts: $ts, text: $text, unfurl_links: false, unfurl_media: false}' \
+              | curl -sS --connect-timeout 5 --max-time 15 -X POST https://slack.com/api/chat.postMessage \
+                  -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+                  -H 'Content-type: application/json; charset=utf-8' --data @-); then
+            jq -e '.ok == true' <<< "$resp" >/dev/null 2>&1 \
+              || echo "::warning::Slack did not post the notice: $(jq -r '.error // "unreadable response"' <<< "$resp" 2>/dev/null)"
+          else
+            echo "::warning::Could not post the notice to Slack (the request failed)."
+          fi

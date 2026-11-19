@@ -2424,10 +2424,10 @@ C=$(new_case unknown-claim)
 step_script "Claim the issue" "$C" > "$C/claim.sh"
 rc=0
 env -i PATH="$FAKE_BIN:$PATH" HOME="$C/home" FAKE_STATE="$C" GITHUB_OUTPUT="$C/out" \
-  GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 FORGE_COMMAND=pr_text GH_TOKEN=ghs_faketoken \
+  GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 FORGE_COMMAND=$'pr_text\n::add-mask::x' GH_TOKEN=ghs_faketoken \
   bash -e "$C/claim.sh" > "$C/claim.log" 2>&1 || rc=$?
-check '[ "$rc" != 0 ] && has "$C/claim.log" "Unknown command '"'"'pr_text'"'"'" && [ ! -s "$C/gh.log" ]' \
-  "the claim step refuses an unknown command before any label or comment"
+check '[ "$rc" != 0 ] && has "$C/claim.log" "::error::Unknown command. \"Check the command\" should have stopped this run" && ! has "$C/claim.log" "pr_text" && ! grep "^::add-mask" "$C/claim.log" >/dev/null && [ ! -s "$C/gh.log" ]' \
+  "the claim step refuses an unknown command before any label or comment, without printing it"
 for ok in "" auto revise update; do
   C=$(new_case "known-claim-${ok:-empty}")
   step_script "Claim the issue" "$C" | sed -n '1,/^esac$/p' > "$C/claim-head.sh"
@@ -2440,7 +2440,7 @@ done
 FIRST_STEP=$(awk '/^  forge:$/{f=1} f && /^      - name:/{print; exit}' "$WF")
 check '[ "$FIRST_STEP" = "      - name: Check the command" ]' "Check the command is the forge job's first step (got: $FIRST_STEP)"
 for gated in "Mint token for Report" "Report outcome"; do
-  check 'awk -v s="      - name: '"$gated"'" '"'"'$0 == s {f=1; n=0; next} f && n++ < 6'"'"' "$WF" | grep -F "if: always() && steps.command.outcome == '"'"'success'"'"'" >/dev/null' \
+  check 'awk -v s="      - name: '"$gated"'" '"'"'$0 == s {f=1; n=0; next} f && n++ < 6'"'"' "$WF" | grep -xF "        if: always() && steps.command.outcome == '"'"'success'"'"'" >/dev/null' \
     "$gated runs only after a command that passed the check"
 done
 C=$(new_case check-command)
@@ -2456,8 +2456,8 @@ done
 C=$(new_case unknown-run)
 echo pr_text > "$C/command"
 run_case "$C"
-check '[ "$(cat "$C/run.rc")" != 0 ] && has "$C/run.log" "Unknown command '"'"'pr_text'"'"'" && [ ! -f "$C/dstp_ran" ]' \
-  "Run Forge refuses an unknown command and never runs dstp as auto"
+check '[ "$(cat "$C/run.rc")" != 0 ] && has "$C/run.log" "::error::Unknown command. \"Check the command\" should have stopped this run" && ! has "$C/run.log" "pr_text" && [ ! -f "$C/dstp_ran" ]' \
+  "Run Forge refuses an unknown command, without printing it, and never runs dstp as auto"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"

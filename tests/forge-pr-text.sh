@@ -25,9 +25,9 @@ job_block() {  # job_block <job id>  -> that job's lines
 }
 FORGE_JOB=$(job_block forge)
 PR_TEXT_JOB=$(job_block pr-text)
-check '[[ "$FORGE_JOB" == *"if: inputs.command != '"'"'pr-text'"'"'"* ]]' \
+check 'grep -xF "    if: inputs.command != '"'"'pr-text'"'"'" <<< "$FORGE_JOB" >/dev/null' \
   "the forge job skips command=pr-text (an unknown command would otherwise run as auto)"
-check '[[ "$PR_TEXT_JOB" == *"if: inputs.command == '"'"'pr-text'"'"'"* ]]' \
+check 'grep -xF "    if: inputs.command == '"'"'pr-text'"'"'" <<< "$PR_TEXT_JOB" >/dev/null' \
   "the pr-text job runs only for command=pr-text"
 check '[[ "$PR_TEXT_JOB" == *"permissions: {}"* ]]' "pr-text gives GITHUB_TOKEN no permissions"
 MINT=$(printf '%s\n' "$PR_TEXT_JOB" | grep -E '^ +permission-[a-z-]+:' | sed 's/^ *//' | sort | tr '\n' ' ')
@@ -472,6 +472,26 @@ C=$(new_case superseded-threads)
 run_case "$C"
 check '[ "$(cat "$C/rc")" = 0 ] && [ "$(cat "$C/resolved.log")" = PRRT_open ] && [ "$(jq -sr ".[0].body | split(\"\\n\")[-1]" "$C/pr_comments.jsonl")" = Second ] && [ "$(wc -l < "$C/pr_comments.jsonl" | tr -d " ")" = 2 ]' \
   "superseded-threads: one reply, one watermark, and the thread closes with the reply that replaced the first"
+# The reply that takes over a thread is judged from the earlier request: a
+# comment on that thread between the two requests keeps it open.
+C=$(new_case superseded-asked-at)
+{
+  comment 42 'forge-gh-app[bot]' Bot 600 "$(request 1 '{pr: 7, reply: "First", threads: ["PRRT_mid"]}')"
+  comment 43 'forge-gh-app[bot]' Bot 60 "$(request 2 '{pr: 7, reply: "Second"}')"
+} > "$C/comments.jsonl"
+jq -n --arg mid "$(jq -nr 'now - 300 | floor | todate')" '{data: {repository: {pullRequest: {state: "OPEN", title: "t", body: "",
+  closingIssuesReferences: {nodes: [{number: 1213}]}, comments: {nodes: []}, reviews: {nodes: []},
+  reviewThreads: {nodes: [{id: "PRRT_mid", isResolved: false, comments: {nodes: [{createdAt: $mid}]}}]}}}}}' > "$C/pr_7.json"
+run_case "$C"
+check '[ ! -s "$C/resolved.log" ] && [ "$(jq -sr ".[0].body | split(\"\\n\")[-1]" "$C/pr_comments.jsonl")" = Second ] && [[ "$(slack_text "$C")" == *"1 review thread(s) had new comments"* ]]' \
+  "superseded-asked-at: a comment on an inherited thread after the earlier request keeps it open"
+# A request's Slack thread is used only with its own channel; otherwise the
+# dispatch's channel and thread are used together.
+C=$(new_case slack-pair)
+comment 44 'forge-gh-app[bot]' Bot 30 "$(request 1 '{pr: 7, title: "fix: x", ch: ""}')" > "$C/comments.jsonl"
+run_case "$C"
+check '[ "$(jq -sr "map(\"\\(.channel) \\(.thread_ts)\") | unique | join(\",\")" "$C/slack.jsonl")" = "C1 1.1" ] && [[ "$(slack_text "$C")" == *"#7>: updated the title"* ]]' \
+  "slack-pair: a request with no channel is reported in the dispatch's thread, not its own thread in another channel"
 C=$(new_case superseded-reply-fails)
 cp "$TMP/superseded-threads/comments.jsonl" "$C/comments.jsonl"
 touch "$C/reply_fail"
@@ -682,10 +702,11 @@ check '[ -n "$FORGE_SCRUB" ] && [ "$FORGE_SCRUB" = "$PRTEXT_SCRUB" ]' "pr-text's
 FORGE_WM=$(printf '%s\n' "$FORGE_JOB" | grep -A1 "body=\$(printf '%s\\\\n%s' '<!-- forge-revise-instructions -->'" | sed -n "s/.*'\(<[^']*\)'.*/\1/p" | tr '\n' '|')
 PRTEXT_WM=$(printf '%s\n' "$PR_TEXT_JOB" | grep -A1 "WATERMARK_BODY=\$(printf" | sed -n "s/.*'\(<[^']*\)'.*/\1/p" | tr '\n' '|')
 check '[ -n "$FORGE_WM" ] && [ "$FORGE_WM" = "$PRTEXT_WM" ]' "pr-text's watermark body is post_silent_watermark's (got: $PRTEXT_WM)"
-FORGE_REPLY_WRITER="printf '%s\\n' '<!-- forge-revise-reply -->'"
+# Every printf in the forge job that writes a reply marker writes this one.
+FORGE_REPLY_MARKERS=$(grep -E "printf '%s(\\\\n)+' '<!-- forge-revise-reply" <<< "$FORGE_JOB" | sed -E "s/.*printf '%s(\\\\n)+' '([^']*)'.*/\\2/" | sort | uniq -c | sed 's/^ *//' || true)
 PRTEXT_REPLY_MARKER="REPLY_MARKER='<!-- forge-revise-reply -->'"
-check '[[ "$FORGE_JOB" == *"$FORGE_REPLY_WRITER"* ]] && [[ "$PR_TEXT_JOB" == *"$PRTEXT_REPLY_MARKER"* ]]' \
-  "pr-text's reply marker is the one the revise reply writers post"
+check '[ "$FORGE_REPLY_MARKERS" = "3 <!-- forge-revise-reply -->" ] && grep -xF "          $PRTEXT_REPLY_MARKER" <<< "$PR_TEXT_JOB" >/dev/null' \
+  "pr-text's reply marker is the one all 3 revise reply writers post (got: $FORGE_REPLY_MARKERS)"
 
 # --- review round 2 (Nijil, Kimi) -------------------------------------------
 # A later reply that is empty once cleaned never replaces an earlier one.
@@ -915,7 +936,7 @@ echo wait_for_pr_text >> "$TMP/wait.sh"
 wait_case() {  # wait_case <name> [setup...] -> case dir
   local c rc=0
   c=$(new_case "$1"); shift
-  : > "$c/labels_1213"
+  echo forge:running > "$c/labels_1213"
   for s in "$@"; do eval "$s"; done
   env -i PATH="$BIN:$PATH" FAKE_STATE="$c" GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 \
     PR_TEXT_WAIT_SECONDS=0 PR_TEXT_WAIT_POLLS=3 bash -euo pipefail "$TMP/wait.sh" > "$c/run.log" 2>&1 || rc=$?
@@ -925,15 +946,33 @@ wait_case() {  # wait_case <name> [setup...] -> case dir
 reads() { wc -l < "$1/label_reads" | tr -d ' '; }
 C=$(wait_case wait-none)
 check '[ "$(cat "$C/rc")" = 0 ] && [ "$(reads "$C")" = 1 ] && [ ! -s "$C/labels.log" ]' "wait: no forge:pr-text, no wait"
-C=$(wait_case wait-clears 'echo forge:pr-text > "$c/labels_1213"' 'touch "$c/clear_after_3"')
+C=$(wait_case wait-clears 'echo forge:pr-text >> "$c/labels_1213"' 'touch "$c/clear_after_3"')
 check '[ "$(cat "$C/rc")" = 0 ] && [ "$(reads "$C")" = 3 ] && [ ! -s "$C/labels.log" ] && [ "$(grep -c "waiting for it to finish" "$C/run.log")" = 1 ]' \
   "wait: waits while forge:pr-text is on the issue and goes ahead once it is removed"
-C=$(wait_case wait-stale 'echo forge:pr-text > "$c/labels_1213"')
+C=$(wait_case wait-stale 'echo forge:pr-text >> "$c/labels_1213"')
 check '[ "$(cat "$C/rc")" = 0 ] && [ "$(reads "$C")" = 4 ] && [ "$(cat "$C/labels.log")" = "--remove-label 1213 forge:pr-text" ] && grep -F "::warning::forge:pr-text stayed on #1213" "$C/run.log" >/dev/null' \
   "wait: a forge:pr-text left past pr-text's timeout is removed with a warning"
 C=$(wait_case wait-read-fails 'touch "$c/labels_read_fail"')
 check '[ "$(cat "$C/rc")" = 0 ] && [ "$(reads "$C")" = 4 ] && grep -F "::warning::Could not read the labels on #1213" "$C/run.log" >/dev/null' \
   "wait: a label read that fails counts as the lock still held"
+# A pr-text run that took this run's forge:running for an earlier run's and
+# removed it: once the lock is gone the label is set again, and the lock is
+# checked again after that.
+C=$(wait_case wait-running-removed 'echo forge:pr-text > "$c/labels_1213"' 'touch "$c/clear_after_2"')
+check '[ "$(cat "$C/rc")" = 0 ] && [ "$(cat "$C/labels.log")" = "--add-label 1213 forge:running" ] && [ "$(reads "$C")" = 3 ] && grep -F "::warning::forge:running was removed from #1213 while this run waited" "$C/run.log" >/dev/null' \
+  "wait: a forge:running removed while waiting is set again, then the lock is read again"
+C=$(wait_case wait-running-kept)
+check '[ "$(cat "$C/rc")" = 0 ] && [ ! -s "$C/labels.log" ] && [ "$(reads "$C")" = 1 ]' \
+  "wait: a forge:running still there is left alone"
+
+# The forge job's 10-minute wait and pr-text's 20-minute stale-claim limit
+# both follow from pr-text's timeout-minutes.
+PR_TEXT_TIMEOUT=$(sed -n 's/^    timeout-minutes: \([0-9]*\)$/\1/p' <<< "$PR_TEXT_JOB")
+WAIT_POLLS=$(grep -oE 'PR_TEXT_WAIT_POLLS:-[0-9]+' <<< "$CLAIM" | sed 's/.*-//' | sort -u)
+WAIT_SECONDS=$(grep -oE 'PR_TEXT_WAIT_SECONDS:-[0-9]+' <<< "$CLAIM" | sed 's/.*-//' | sort -u)
+STALE_CLAIM=$(grep -oE 'select\(\$claimed < \(\$now - [0-9]+\)' "$TMP/apply.sh" | grep -oE '[0-9]+' || true)
+check '[[ "$PR_TEXT_TIMEOUT" =~ ^[0-9]+$ ]] && [ "$((WAIT_POLLS * WAIT_SECONDS))" = "$((PR_TEXT_TIMEOUT * 60))" ] && [ "$STALE_CLAIM" = "$((PR_TEXT_TIMEOUT * 120))" ]' \
+  "the claim step waits pr-text's timeout, and a claim is stale after twice it (got timeout=$PR_TEXT_TIMEOUT polls=$WAIT_POLLS x ${WAIT_SECONDS}s stale=$STALE_CLAIM)"
 
 # A rejected command tells the Slack thread, with the command defanged.
 step_script "Check the command" > "$TMP/check.sh"
@@ -955,6 +994,24 @@ env -i PATH="$BIN:$PATH" FAKE_STATE="$C" FORGE_COMMAND=$'bogus\n::add-mask::x' I
 REJECT=$(slack_text "$C")
 check '[ "$rc" = 1 ] && [[ "$REJECT" == "Forge didn'"'"'t start: \`bogus::add-mask::x\` is not a Forge command"* ]] && [[ "$REJECT" != *"<!channel>"* ]] && ! grep "^::add-mask" "$C/run.log" >/dev/null && grep -xF "::error::Unknown command '"'"'bogus::add-mask::x'"'"'. Use auto, revise, update or pr-text (callers must pass command through from workflow_dispatch)." "$C/run.log" >/dev/null' \
   "rejected-command-bad-issue: no raw issue number in Slack and no raw command in the log (got: $REJECT)"
+
+# A write token that can't be minted: "Apply PR text" never runs, so a step
+# after it tells the Slack thread.
+MINT_STEP=$(awk '$0 == "      - name: Tell Slack the PR change didn'"'"'t start" {f=1; print; next} f && /^      - name:/ {exit} f && /^        run:/ {exit} f {print}' <<< "$PR_TEXT_JOB")
+check 'grep -xF "        if: failure() && steps.pr-text-token.outcome == '"'"'failure'"'"'" <<< "$MINT_STEP" >/dev/null' \
+  "the mint-failure notice runs only when the token step failed"
+step_script "Tell Slack the PR change didn't start" > "$TMP/mint.sh"
+C=$(new_case mint-fails)
+rc=0
+env -i PATH="$BIN:$PATH" FAKE_STATE="$C" SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake RUN_URL=https://x/runs/1 \
+  bash -e "$TMP/mint.sh" > "$C/run.log" 2>&1 || rc=$?
+check '[ "$rc" = 0 ] && [ "$(jq -r .thread_ts "$C/slack.jsonl")" = 1.1 ] && [[ "$(slack_text "$C")" == *"couldn'"'"'t get its GitHub token"* ]]' \
+  "mint-fails: the Slack thread is told the PR change didn't start"
+C=$(new_case mint-fails-no-slack)
+rc=0
+env -i PATH="$BIN:$PATH" FAKE_STATE="$C" SLACK_CHANNEL=C1 SLACK_THREAD_TS='1.1 <!here>' SLACK_BOT_TOKEN=xoxb-fake bash -e "$TMP/mint.sh" > "$C/run.log" 2>&1 || rc=$?
+check '[ "$rc" = 0 ] && [ ! -e "$C/slack.jsonl" ] && grep -F "::warning::No Slack thread" "$C/run.log" >/dev/null' \
+  "mint-fails: no Slack call without a well-formed thread"
 
 # A Forge run that labels after pr-text's lock is waiting for it: pr-text
 # keeps going. Only the read right after the lock backs off.
@@ -1233,11 +1290,11 @@ label_at=$(line_of "$CLAIM" '--remove-label "forge" --add-label "forge:running"'
 check '[[ "$post_at" =~ ^[0-9]+$ ]] && [[ "$label_at" =~ ^[0-9]+$ ]] && [ "$post_at" -lt "$label_at" ]' \
   "the claim step posts its comment (with the marker) before it sets forge:running (got post=$post_at label=$label_at)"
 awk '/^ *'"'"'$/ {f=1; next} /^ *'"'"' > "\$PAYLOAD"$/ {f=0} f' <<< "$(step_script "Claim the issue")" > "$TMP/claim.jq"
-CLAIM_BODY=$(jq -nr --arg run https://x --arg via "" --arg brief $'notes <!-- forge-run: 111 --> and <!-- open' --arg run_id 555 -f "$TMP/claim.jq" | jq -r .body)
+CLAIM_BODY=$(jq -nr --arg run https://x --arg via "" --arg brief $'notes <!-- forge-run: 111 --> and <!-<!---->- hidden --> and <!-- open' --arg run_id 555 -f "$TMP/claim.jq" | jq -r .body)
 eval "$(awk '/^FORGE_RUN_JQ=/ {f=1} f {print} f && /;'"'"'$/ {exit}' "$TMP/apply.sh")"
 CLAIM_RUN=$(jq -nr --arg body "$CLAIM_BODY" "${FORGE_RUN_JQ}"' [{body: $body} | forge_run("Bot")] | last')
-check '[ "$CLAIM_RUN" = 555 ] && [[ "$CLAIM_BODY" != *"forge-run: 111"* ]] && [[ "$CLAIM_BODY" != *"<!-- open"* ]] && [[ "$CLAIM_BODY" == *"notes"* ]]' \
-  "the claim comment drops HTML comments from the brief, and pr-text's filter reads its own run (555) from it (got $CLAIM_RUN)"
+check '[ "$CLAIM_RUN" = 555 ] && [ "$(grep -c "<!--" <<< "$CLAIM_BODY" || true)" = 1 ] && [[ "$CLAIM_BODY" == *"<!-- forge-run: 555 -->" ]] && [[ "$CLAIM_BODY" == *"notes"* ]]' \
+  "the claim comment drops HTML comments from the brief (a nested opener too), and pr-text's filter reads its own run (555) from it (got $CLAIM_RUN)"
 mark_at=$(line_of "$REPORT" 'BODY=$(printf '"'"'%s\n\n<!-- forge-run: %s -->'"'"' "$BODY" "$GITHUB_RUN_ID")')
 last_body_at=$(awk '/^BODY=/ && !/forge-run/ {n = NR} END {print n}' <<< "$REPORT")
 patch_at=$(grep -nF 'gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}"' <<< "$REPORT" | cut -d: -f1 || true)
