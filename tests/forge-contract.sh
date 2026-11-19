@@ -330,13 +330,23 @@ check 'grep -q "install_command" "$WF"' \
 
 # --- supply chain ---------------------------------------------------------
 # The engine runs with a write token in scope, so tracking a branch would let
-# any push to spec-to-pr execute in every caller repo. The default may be a caret
+# any push to forge-agent execute in every caller repo. The default may be a caret
 # range (resolved against vX.Y.Z tags only) or a 40-char SHA (which bypasses the
 # tag list entirely). Anchored: the whole quoted value must be one of the two.
 check 'awk "/^      engine_ref:/{f=1} f && /default:/{print; exit}" "$WF" | grep -qE "^ +default: \"(\^[0-9]+\.[0-9]+\.[0-9]+|[0-9a-f]{40})\"$"' \
   "engine_ref default is exactly a caret range or a full 40-char SHA, not a branch"
 check 'grep -q "Branches are not accepted" "$WF"' \
   "engine_ref resolver rejects anything that is not a range, release tag or SHA"
+
+# The engine lives in deriv-com/forge-agent under engine/. A release tag there
+# points at a commit whose tree is engine/, so the fetched root is the package
+# root and no path under $DIR may gain an engine/ prefix.
+check 'awk "/id: engine-token/{f=1} f && /repositories:/{print; exit}" "$WF" | grep -qE "^ +repositories: forge-agent$"' \
+  "engine token step is scoped to repositories: forge-agent"
+check '! grep -q "spec-to-pr\.git" "$WF"' \
+  "no spec-to-pr.git URL left in the workflow"
+check 'grep -qF "echo \"FORGE_CLI=\$DIR/bin/cli.js\"" "$WF"' \
+  "FORGE_CLI is still \$DIR/bin/cli.js (release root is the engine root)"
 
 # Every third-party action pinned by SHA (the repo-wide rule this workflow must
 # not be an exception to).

@@ -1,7 +1,8 @@
 name: Forge — issue to PR
 
 # Reusable workflow. Turns a GitHub issue into a pull request using the
-# deriv-com/spec-to-pr engine: it classifies the issue (bugfix | feature |
+# Forge engine (formerly dstp), which lives in deriv-com/forge-agent under
+# engine/ and is released there as vX.Y.Z tags: it classifies the issue (bugfix | feature |
 # refactor), writes a design doc and a plan, implements them, verifies the
 # result, and opens the PR — all committed so the "why" travels with the change.
 #
@@ -197,24 +198,30 @@ on:
         type: string
       engine_ref:
         description: >-
-          Which deriv-com/spec-to-pr release to run. One of:
+          Which Forge engine release, from deriv-com/forge-agent, to run. One of:
             • a caret range, e.g. "^0.6.7" — the newest vX.Y.Z tag that is
               semver-compatible with it (npm caret rules: while the engine is
               0.x the minor is the breaking boundary, so "^0.6.7" means
               ">=0.6.7 <0.7.0"; from 1.x on it means "same major");
             • an exact tag, e.g. "v0.6.7";
             • a full 40-char commit SHA, to freeze.
-          A range or tag follows whatever vX.Y.Z tags exist on spec-to-pr at run
-          time. Tags are not protected there (its rulesets cover branches only),
-          so anyone with write access to that repo can create or move one, and
-          the next run executes it with this job's write token in scope. A tag
-          can be moved, a commit cannot: pass a 40-char SHA to freeze.
+          A range or tag follows whatever vX.Y.Z tags exist on forge-agent at
+          run time. In forge-agent, v* tags are engine releases only: each one
+          points at a commit whose tree is the engine/ folder. Tags are not
+          protected there (its rulesets cover branches only), so anyone with
+          write access to that repo can create or move one, and the next run
+          executes it with this job's write token in scope. A tag can be moved,
+          a commit cannot: pass a 40-char SHA to freeze.
           Branches and pre-release tags are rejected. The resolved tag and SHA
           are logged and posted on the issue.
         required: false
         # Policy: every caller that doesn't pass engine_ref runs the newest
         # v0.8.x tag, and each new v0.8.x tag rolls out to them with no PR here.
-        # spec-to-pr ships features in 0.8.x patches, so this is "newest 0.8.x",
+        # The v0.3.0 to v0.8.4 tags were carried over unchanged from the
+        # engine's old repo, pointing at the same commits, so ^0.8.0 resolves
+        # to the same engine from either repo. Releases from 0.9.0 on are cut in
+        # forge-agent. Repos move to 0.9 one at a time by passing engine_ref.
+        # The engine ships features in 0.8.x patches, so this is "newest 0.8.x",
         # not "bug fixes only". Bump the range deliberately for a new minor
         # (0.x) / major (1.x+). node_version follows the engine release by
         # default, so a patch that raises the engine's Node floor needs no
@@ -259,7 +266,7 @@ on:
         description: "Private key for CLIENT_ID_GHAPP_WRITE"
         required: true
       CLIENT_ID_GHAPP:
-        description: "Read-only app, used to fetch the spec-to-pr engine"
+        description: "Read-only app, used to fetch the Forge engine from deriv-com/forge-agent"
         required: true
       PRIVATE_KEY_GHAPP:
         description: "Private key for CLIENT_ID_GHAPP"
@@ -349,17 +356,18 @@ jobs:
       # The real exposure is spend (LLM tokens + CI minutes). If that ever bites,
       # a rate limit is the right lever, not an allowlist.
 
-      - name: Mint token to read the spec-to-pr engine
+      - name: Mint token to read the Forge engine
         id: engine-token
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
           # Deliberately a different app from the one above: the write app is
-          # installed on the target repo, not on deriv-com/spec-to-pr, and GitHub
-          # answers 404 (not 403) for a repo outside an installation.
+          # installed on the target repo, not on deriv-com/forge-agent (where the
+          # engine lives), and GitHub answers 404 (not 403) for a repo outside an
+          # installation.
           app-id: ${{ secrets.CLIENT_ID_GHAPP }}
           private-key: ${{ secrets.PRIVATE_KEY_GHAPP }}
           owner: deriv-com
-          repositories: spec-to-pr
+          repositories: forge-agent
           permission-contents: read
 
       # ---- claim the issue ----------------------------------------------
@@ -451,13 +459,16 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           token: ${{ steps.repo-token.outputs.token }}
-          fetch-depth: 0 # spec-to-pr diffs against the base branch
+          fetch-depth: 0 # the engine diffs against the base branch
 
-      - name: Fetch the spec-to-pr engine
+      - name: Fetch the Forge engine
         id: engine
         # Fetched into RUNNER_TEMP, not the workspace, so the agent can never see
         # or commit the engine's own files. git only: Node is set up after this,
         # from what the fetched release names, and the engine's deps after that.
+        # A release tag in deriv-com/forge-agent points at a commit whose tree is
+        # engine/, so the engine's package.json and bin/cli.js sit at the root of
+        # $DIR: no path below says engine/.
         env:
           ENGINE_TOKEN: ${{ steps.engine-token.outputs.token }}
           ENGINE_REF: ${{ inputs.engine_ref }}
@@ -466,7 +477,7 @@ jobs:
           DIR="$RUNNER_TEMP/forge-engine"
           git init -q "$DIR"
           git -C "$DIR" remote add origin \
-            "https://x-access-token:${ENGINE_TOKEN}@github.com/deriv-com/spec-to-pr.git"
+            "https://x-access-token:${ENGINE_TOKEN}@github.com/deriv-com/forge-agent.git"
 
           # ---- resolve engine_ref to a commit SHA -------------------------
           # Everything below fetches a SHA, so a range or tag is resolved first,
@@ -487,7 +498,7 @@ jobs:
           elif [[ "$ENGINE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             ENGINE_SHA=$(tag_sha "$ENGINE_REF")
             ENGINE_TAG="$ENGINE_REF"
-            [ -n "$ENGINE_SHA" ] || { echo "::error::tag $ENGINE_REF does not exist in deriv-com/spec-to-pr"; exit 1; }
+            [ -n "$ENGINE_SHA" ] || { echo "::error::tag $ENGINE_REF does not exist in deriv-com/forge-agent"; exit 1; }
             echo "engine_ref $ENGINE_REF -> $ENGINE_SHA"
           elif [[ "$ENGINE_REF" =~ ^\^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
             MAJ=${BASH_REMATCH[1]} MIN=${BASH_REMATCH[2]} PAT=${BASH_REMATCH[3]}
@@ -501,10 +512,10 @@ jobs:
                   M == 0 && m > 0   { if (x == 0 && y == m && z >= p) print; next }
                                     { if (x == 0 && y == 0 && z == p) print }' \
               | sort -V | tail -1)
-            [ -n "$TAG" ] || { echo "::error::no spec-to-pr release tag satisfies $ENGINE_REF"; exit 1; }
+            [ -n "$TAG" ] || { echo "::error::no release tag satisfies $ENGINE_REF in deriv-com/forge-agent"; exit 1; }
             ENGINE_SHA=$(tag_sha "$TAG")
             ENGINE_TAG="$TAG"
-            [ -n "$ENGINE_SHA" ] || { echo "::error::could not resolve tag $TAG to a commit in deriv-com/spec-to-pr"; exit 1; }
+            [ -n "$ENGINE_SHA" ] || { echo "::error::could not resolve tag $TAG to a commit in deriv-com/forge-agent"; exit 1; }
             echo "engine_ref $ENGINE_REF -> $TAG ($ENGINE_SHA)"
           else
             echo "::error::engine_ref must be a caret range (^X.Y.Z), a release tag (vX.Y.Z) or a 40-char SHA — got '$ENGINE_REF'. Branches are not accepted."
@@ -522,7 +533,7 @@ jobs:
             echo "engine_sha=$ENGINE_SHA"
           } >> "$GITHUB_OUTPUT"
           # Drop the embedded credential; it isn't needed past the fetch.
-          git -C "$DIR" remote set-url origin "https://github.com/deriv-com/spec-to-pr.git"
+          git -C "$DIR" remote set-url origin "https://github.com/deriv-com/forge-agent.git"
           echo "Engine at $(git -C "$DIR" rev-parse HEAD)"
 
       - name: Pick the Node version
@@ -4230,7 +4241,7 @@ jobs:
           # Empty when the run failed before the engine was fetched. A SHA input
           # has no tag, so only the commit is shown.
           if [ -n "${ENGINE_SHA:-}" ]; then
-            BODY=$(printf '%s\n\n<sub>Engine: spec-to-pr %s`%s`</sub>' "$BODY" \
+            BODY=$(printf '%s\n\n<sub>Engine: forge %s`%s`</sub>' "$BODY" \
               "${ENGINE_TAG:+$ENGINE_TAG }" "${ENGINE_SHA:0:7}")
           fi
 

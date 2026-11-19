@@ -2,7 +2,7 @@
 # tests/forge-resolver.sh
 #
 # Executes forge.yml's own engine_ref resolver against a local fixture repo.
-# That block decides which spec-to-pr commit runs, with a write token in scope,
+# That block decides which engine commit (from deriv-com/forge-agent) runs, with a write token in scope,
 # in every caller repo — so its semantics are pinned by running it, not by
 # grepping for its shape. The block is extracted from the workflow verbatim, so
 # this test cannot drift from what actually ships.
@@ -25,8 +25,8 @@ if ! grep -q 'ENGINE_SHA=' "$RESOLVER" || ! grep -q 'Branches are not accepted' 
   exit 1
 fi
 
-# --- fixture: a fake spec-to-pr --------------------------------------------
-REPO="$FIX/spec-to-pr"
+# --- fixture: a fake forge-agent -------------------------------------------
+REPO="$FIX/forge-agent"
 git init -q "$REPO"
 git -C "$REPO" config user.name test
 git -C "$REPO" config user.email test@example.com
@@ -55,7 +55,7 @@ commit_tag v2.0.0
 git -C "$REPO" commit -q --allow-empty -m "unreviewed"
 git -C "$REPO" branch v0.6.99
 
-# The workflow's `origin` is spec-to-pr; point it at the fixture instead.
+# The workflow's `origin` is forge-agent; point it at the fixture instead.
 DIR="$FIX/engine"
 git init -q "$DIR"
 git -C "$DIR" remote add origin "$REPO"
@@ -96,8 +96,8 @@ expect '^0.5.0'  "$(c v0.5.0)"    # 0.x: minor is the boundary, so not 0.6.x
 expect '^1.2.0'  "$(c v1.3.4)"    # >=1: major is the boundary, so not 2.0.0
 expect '^0.0.3'  "$(c v0.0.3)"    # 0.0.x: exact patch only
 expect '^v0.6.7' "$(c v0.6.10)"   # a leading v is tolerated
-reject '^0.6.11' "no spec-to-pr release tag satisfies"   # only a pre-release matches
-reject '^0.8.0'  "no spec-to-pr release tag satisfies"
+reject '^0.6.11' "no release tag satisfies"   # only a pre-release matches
+reject '^0.8.0'  "no release tag satisfies"
 
 # Exact tags.
 expect 'v0.6.1'  "$(c v0.6.1)"    # annotated: the commit, not the tag object
