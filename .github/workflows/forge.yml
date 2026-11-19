@@ -204,9 +204,10 @@ on:
               0.x the minor is the breaking boundary, so "^0.6.7" means
               ">=0.6.7 <0.7.0"; from 1.x on it means "same major");
             • an exact tag, e.g. "v0.6.7";
-            • a full 40-char commit SHA, to freeze. It must be the commit a
-              release tag points at: other forge-agent commits hold the Forge
-              service, not the engine, and the fetch step refuses them.
+            • a full 40-char commit SHA, to freeze. Use the commit a release
+              tag points at. The fetch step refuses a commit whose root is not
+              the engine package (other forge-agent commits hold the Forge
+              service), but it does not check that a SHA is tagged.
           A range or tag follows whatever vX.Y.Z tags exist on forge-agent at
           run time. In forge-agent, v* tags are engine releases only: each one
           points at a commit whose tree is the engine/ folder. Tags are not
@@ -528,6 +529,18 @@ jobs:
           # explicitly — the tag lookup above and this fetch then cannot disagree.
           git -C "$DIR" fetch -q --depth 1 origin "$ENGINE_SHA"
           git -C "$DIR" checkout -q --detach FETCH_HEAD
+          # ---- engine release guard ---------------------------------------
+          # forge-agent also holds the Forge service. Only a commit whose root is
+          # the engine package may run, so refuse anything else here: before its
+          # tag and SHA are reported, and before npm ci installs it with the write
+          # token in scope. This checks the tree's shape, not that a SHA is tagged.
+          # If engine/package.json is ever renamed, change the name here first.
+          ENGINE_PKG_NAME=$(jq -r '.name // empty' "$DIR/package.json") || ENGINE_PKG_NAME=""
+          if [ "$ENGINE_PKG_NAME" != "@deriv-com/spec-to-pr" ] || [ ! -f "$DIR/bin/cli.js" ]; then
+            echo "::error::$ENGINE_SHA is not an engine release commit: its root has no @deriv-com/spec-to-pr package.json and bin/cli.js. engine_ref must be a release tag in deriv-com/forge-agent, or the SHA such a tag points at."
+            exit 1
+          fi
+          # ---- end engine release guard -----------------------------------
           # The default floats, so the issue comment names what actually ran —
           # the claim comment is posted before this step and can't.
           {
@@ -537,14 +550,6 @@ jobs:
           # Drop the embedded credential; it isn't needed past the fetch.
           git -C "$DIR" remote set-url origin "https://github.com/deriv-com/forge-agent.git"
           echo "Engine at $(git -C "$DIR" rev-parse HEAD)"
-          # forge-agent also holds the Forge service. Only a release commit (what a
-          # v* tag points at) has the engine at its root, so refuse anything else
-          # here, before npm ci installs it with the write token in scope.
-          if [ "$(jq -r '.name // empty' "$DIR/package.json" 2>/dev/null)" != "@deriv-com/spec-to-pr" ] \
-             || [ ! -f "$DIR/bin/cli.js" ]; then
-            echo "::error::$ENGINE_SHA is not an engine release commit: its root has no @deriv-com/spec-to-pr package.json and bin/cli.js. engine_ref must be a release tag in deriv-com/forge-agent, or the SHA such a tag points at."
-            exit 1
-          fi
 
       - name: Pick the Node version
         id: node

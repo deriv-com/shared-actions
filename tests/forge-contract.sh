@@ -349,12 +349,39 @@ check '! grep -qE "(^|[^@])deriv-com/spec-to-pr" "$WF"' \
   "the workflow no longer names the old deriv-com/spec-to-pr repo"
 check 'grep -qF "( cd \"\$DIR\" && npm ci --omit=dev --include=optional )" "$WF"' \
   "the engine installs at the root of \$DIR (release root is the engine root)"
+check '! grep -qE "\\\$DIR/engine" "$WF"' \
+  "no path under \$DIR gains an engine/ prefix"
 check 'grep -qF "echo \"FORGE_CLI=\$DIR/bin/cli.js\"" "$WF"' \
   "FORGE_CLI is still \$DIR/bin/cli.js (release root is the engine root)"
 # forge-agent also holds the Forge service, so the fetch must refuse a commit
-# whose root is not the engine before npm ci runs it with the write token.
-check 'grep -qF "!= \"@deriv-com/spec-to-pr\" ]" "$WF" && grep -qF "is not an engine release commit" "$WF"' \
-  "the fetch refuses a commit whose root is not the engine package"
+# whose root is not the engine before npm ci runs it with the write token. The
+# guard is pinned by RUNNING it (extracted verbatim between its markers, like the
+# resolver in tests/forge-resolver.sh), not by grepping for its shape.
+GUARD="$(awk '/# ---- engine release guard/{f=1} f { sub(/^          /, ""); print } /# ---- end engine release guard/{exit}' "$WF")"
+check '[ -n "$GUARD" ] && grep -q "is not an engine release commit" <<<"$GUARD"' \
+  "the engine release guard is extractable between its markers"
+# Fixture JSON has one key each: a comma inside {…} would brace-expand under eval.
+guard_case() {  # guard_case <name> <package.json content or -> <with cli.js: yes|no>; prints the exit code
+  local d; d="$(mktemp -d)"
+  [ "$2" != "-" ] && printf '%s\n' "$2" > "$d/package.json"
+  if [ "$3" = yes ]; then mkdir -p "$d/bin" && : > "$d/bin/cli.js"; fi
+  local rc=0
+  ( export DIR="$d" ENGINE_SHA="deadbeef"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1 || rc=$?
+  rm -rf "$d"; echo "$rc"
+}
+check '[ "$(guard_case ok "{\"name\":\"@deriv-com/spec-to-pr\"}" yes)" = 0 ]' \
+  "the guard accepts an engine release root"
+check '[ "$(guard_case service "{\"name\":\"forge-agent\"}" yes)" = 1 ]' \
+  "the guard refuses a Forge service root"
+check '[ "$(guard_case nopkg - yes)" = 1 ]' \
+  "the guard refuses a root with no package.json"
+check '[ "$(guard_case badjson "{not json" yes)" = 1 ]' \
+  "the guard refuses a package.json jq cannot parse"
+check '[ "$(guard_case nocli "{\"name\":\"@deriv-com/spec-to-pr\"}" no)" = 1 ]' \
+  "the guard refuses a root with no bin/cli.js"
+# Order inside the fetch step: guard, then the reported tag/SHA, then npm ci.
+check 'awk "/# ---- end engine release guard/{g=NR} /echo \"engine_sha=/{o=NR} /npm ci --omit=dev --include=optional/{n=NR} END{exit !(g && o && n && g < o && o < n)}" "$WF"' \
+  "the guard runs before engine_sha is reported and before npm ci"
 
 # Every third-party action pinned by SHA (the repo-wide rule this workflow must
 # not be an exception to).
