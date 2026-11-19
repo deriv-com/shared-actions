@@ -93,6 +93,8 @@ check 'grep -qF "NODE_VERSION_INPUT: \${{ inputs.node_version }}" <<< "$NODE_PRE
   "Node preflight gets the raw node_version, so its hint can tell set from empty"
 check 'grep -qF "NODE_ERROR: \${{ steps.node-preflight.outputs.error || steps.node.outputs.error }}" <<< "$(step_body "Report outcome")"' \
   "Report outcome reads the Node pick and preflight failure reasons"
+check 'grep -qF "ENGINE_ERROR: \${{ steps.engine.outputs.error }}" <<< "$(step_body "Report outcome")"' \
+  "Report outcome reads the engine release guard's reason"
 # One summary header for a stop in either step.
 NODE_SUMMARY_HEADER="### Forge stopped before installing anything"
 check 'grep -qF "$NODE_SUMMARY_HEADER" <<< "$NODE_PICK" && grep -qF "$NODE_SUMMARY_HEADER" <<< "$NODE_PREFLIGHT"' \
@@ -347,11 +349,12 @@ check 'awk "/id: engine-token/{f=1} f && /repositories:/{print; exit}" "$WF" | g
 # @deriv-com/spec-to-pr stays (epic "Names that stay"), so the @ form is allowed.
 check '! grep -qE "(^|[^@])deriv-com/spec-to-pr" "$WF"' \
   "the workflow no longer names the old deriv-com/spec-to-pr repo"
-check 'grep -qF "( cd \"\$DIR\" && npm ci --omit=dev --include=optional )" "$WF"' \
+# Anchored on the functional line (no leading #), so a commented-out copy can't pass.
+check 'step_body "Install the Forge engine'"'"'s dependencies" | grep -qE "^ +\( cd \"\\\$DIR\" && npm ci --omit=dev --include=optional \)$"' \
   "the engine installs at the root of \$DIR (release root is the engine root)"
-check '! grep -qE "\\\$DIR/engine" "$WF"' \
-  "no path under \$DIR gains an engine/ prefix"
-check 'grep -qF "echo \"FORGE_CLI=\$DIR/bin/cli.js\"" "$WF"' \
+check '! grep -qE "\\\$\\{?DIR\\}?\"?/engine" "$WF"' \
+  "no path under \$DIR gains an engine/ prefix (\$DIR/engine, \${DIR}/engine, \"\$DIR\"/engine)"
+check 'grep -qE "^ +echo \"FORGE_CLI=\\\$DIR/bin/cli.js\"" "$WF"' \
   "FORGE_CLI is still \$DIR/bin/cli.js (release root is the engine root)"
 # forge-agent also holds the Forge service, so the fetch must refuse a commit
 # whose root is not the engine before npm ci runs it with the write token. The
@@ -366,22 +369,28 @@ guard_case() {  # guard_case <name> <package.json content or -> <with cli.js: ye
   [ "$2" != "-" ] && printf '%s\n' "$2" > "$d/package.json"
   if [ "$3" = yes ]; then mkdir -p "$d/bin" && : > "$d/bin/cli.js"; fi
   local rc=0
-  ( export DIR="$d" ENGINE_SHA="deadbeef"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1 || rc=$?
-  rm -rf "$d"; echo "$rc"
+  ( export DIR="$d" ENGINE_SHA="deadbeef" GITHUB_OUTPUT="$d.out"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1 || rc=$?
+  GUARD_OUTPUT="$(cat "$d.out" 2>/dev/null || true)"
+  rm -rf "$d" "$d.out"; echo "$rc"
 }
 check '[ "$(guard_case ok "{\"name\":\"@deriv-com/spec-to-pr\"}" yes)" = 0 ]' \
   "the guard accepts an engine release root"
 check '[ "$(guard_case service "{\"name\":\"forge-agent\"}" yes)" = 1 ]' \
   "the guard refuses a Forge service root"
+# A refusal is kept as the step's error output, which Report posts as the reason.
+# A subshell, so its exit status can't end the whole script (check evals in place).
+check '( d=$(mktemp -d); echo "{\"name\":\"forge-agent\"}" > "$d/package.json"; mkdir -p "$d/bin"; : > "$d/bin/cli.js"; ( export DIR="$d" ENGINE_SHA="deadbeef" GITHUB_OUTPUT="$d/out"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1; grep -q "^error=deadbeef is not an engine release commit" "$d/out"; r=$?; rm -rf "$d"; exit $r )' \
+  "a refused commit is kept as the fetch step's error output, naming the SHA"
 check '[ "$(guard_case nopkg - yes)" = 1 ]' \
   "the guard refuses a root with no package.json"
 check '[ "$(guard_case badjson "{not json" yes)" = 1 ]' \
   "the guard refuses a package.json jq cannot parse"
 check '[ "$(guard_case nocli "{\"name\":\"@deriv-com/spec-to-pr\"}" no)" = 1 ]' \
   "the guard refuses a root with no bin/cli.js"
-# Order inside the fetch step: guard, then the reported tag/SHA, then npm ci.
-check 'awk "/# ---- end engine release guard/{g=NR} /echo \"engine_sha=/{o=NR} /npm ci --omit=dev --include=optional/{n=NR} END{exit !(g && o && n && g < o && o < n)}" "$WF"' \
-  "the guard runs before engine_sha is reported and before npm ci"
+# Order inside the fetch step: the guard, then the reported tag/SHA. (The step
+# order check above already puts the fetch before the dependency install.)
+check 'step_body "Fetch the Forge engine" | awk "/# ---- end engine release guard/{g=NR} /echo \"engine_sha=/{o=NR} END{exit !(g && o && g < o)}"' \
+  "inside the fetch step, the guard runs before engine_sha is reported"
 
 # Every third-party action pinned by SHA (the repo-wide rule this workflow must
 # not be an exception to).
@@ -1782,6 +1791,15 @@ check 'grep -qF "Fix \`node_version\` or \`engine_ref\` in the calling workflow,
   "a Node preflight stop tells the caller to fix the workflow config, not just retry"
 check '! grep -qF "Forge failed." <<< "$NODE_STOP_COMMENT"' \
   "a Node preflight stop is not reported as the generic failure"
+ENGINE_REASON_FIXTURE='0123456789abcdef0123456789abcdef01234567 is not an engine release commit: its root has no @deriv-com/spec-to-pr package.json and bin/cli.js. engine_ref must be a release tag in deriv-com/forge-agent, or the SHA such a tag points at.'
+C=$(report_only engine_stop OUTCOME=skipped COMMENT_ID=56 SLACK_MENTION_TS=3.3 "ENGINE_ERROR=$ENGINE_REASON_FIXTURE")
+ENGINE_STOP_COMMENT=$(grep "^api --method PATCH repos/o/r/issues/comments/56 " "$C/gh.log" || true)
+check 'grep -qF "body=🔨 Forge stopped before it started: $ENGINE_REASON_FIXTURE" <<< "$ENGINE_STOP_COMMENT"' \
+  "an engine guard stop puts its reason, with the refused SHA, in the issue comment"
+check 'grep -qF "Fix \`engine_ref\` in the calling workflow, then re-apply the \`forge\` label." "$C/gh.log" && ! grep -qF "label to retry" "$C/gh.log" && ! grep -qF "Forge failed." <<< "$ENGINE_STOP_COMMENT"' \
+  "an engine guard stop names the fix, not a generic retry"
+check '[[ "$(completion_of "$C")" == *"Failed on "*"is not an engine release commit"* ]] && [ "$(reactions "$C" add)" = x ]' \
+  "an engine guard stop puts its reason in the Slack completion (got $(completion_of "$C"))"
 C=$(report_only fork_update OUTCOME=failure FORGE_COMMAND=update PR_UNRESOLVED=1 PR_FROM_FORK=https://github.com/o/r/pull/8 SLACK_MENTION_TS=3.3)
 check '[[ "$(completion_of "$C")" == *"<https://github.com/o/r/pull/8|PR #8>, is from a fork."*"so there is nothing to update."* ]] && [ "$(reactions "$C" add)" = warning ]' \
   "an update run on a fork PR says there is nothing to update (got $(completion_of "$C"))"

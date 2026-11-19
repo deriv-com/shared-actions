@@ -537,7 +537,14 @@ jobs:
           # If engine/package.json is ever renamed, change the name here first.
           ENGINE_PKG_NAME=$(jq -r '.name // empty' "$DIR/package.json") || ENGINE_PKG_NAME=""
           if [ "$ENGINE_PKG_NAME" != "@deriv-com/spec-to-pr" ] || [ ! -f "$DIR/bin/cli.js" ]; then
-            echo "::error::$ENGINE_SHA is not an engine release commit: its root has no @deriv-com/spec-to-pr package.json and bin/cli.js. engine_ref must be a release tag in deriv-com/forge-agent, or the SHA such a tag points at."
+            ENGINE_REFUSED="$ENGINE_SHA is not an engine release commit: its root has no @deriv-com/spec-to-pr package.json and bin/cli.js. engine_ref must be a release tag in deriv-com/forge-agent, or the SHA such a tag points at."
+            echo "::error::$ENGINE_REFUSED"
+            # Kept for Report (the issue comment and Slack) and the job summary, so
+            # the stop names the refused commit and its fix instead of a retry.
+            echo "error=$ENGINE_REFUSED" >> "${GITHUB_OUTPUT:-/dev/null}"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '### Forge stopped before installing anything\n\n%s\n' "$ENGINE_REFUSED" >> "$GITHUB_STEP_SUMMARY"
+            fi
             exit 1
           fi
           # ---- end engine release guard -----------------------------------
@@ -3444,6 +3451,8 @@ jobs:
           ENGINE_SHA: ${{ steps.engine.outputs.engine_sha }}
           # Why the Node pick or preflight stopped the job, fix included.
           NODE_ERROR: ${{ steps.node-preflight.outputs.error || steps.node.outputs.error }}
+          # Why the engine release guard refused the fetched commit (names the SHA).
+          ENGINE_ERROR: ${{ steps.engine.outputs.error }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # Same bot token as forge-agent. Completion is a new thread reply;
           # the living card is chat.update'd to a quiet done line.
@@ -4221,6 +4230,17 @@ jobs:
             REACTION="white_check_mark"
             [ "$EMOJI" = "⚠️" ] && REACTION="warning"
             LABEL="forge:done"
+          elif [ -n "${ENGINE_ERROR:-}" ]; then
+            # The engine release guard refused the fetched commit before Node was
+            # picked or anything installed. Deterministic, like a Node stop: the
+            # same engine_ref is refused again, so the hint is to fix it.
+            ENGINE_REASON=$(printf '%s' "$ENGINE_ERROR" | tr -d '\r' | cut -c1-1000)
+            BODY=$(printf '🔨 Forge stopped before it started: %s\n\n[Full log](%s)\n\nFix `engine_ref` in the calling workflow, then re-apply the `forge` label.\n\nTook %s.' "$ENGINE_REASON" "$RUN_URL" "$TOOK")
+            RUN_FAILED=1
+            LABEL="forge:failed"
+            REACTION="x"
+            QUIET="❌ Failed · engine check"
+            SLACK_TEXT=$(printf '%s❌ Failed on %s: %s\nThe <%s|run log> has the details.\nTook %s.' "$WHO" "$ISSUE_LINK" "$(printf '%s' "$ENGINE_REASON" | slack_escape)" "$RUN_URL" "$TOOK")
           elif [ -n "${NODE_ERROR:-}" ]; then
             # The Node pick or preflight stopped the job before anything was
             # installed or dstp started. Its message names the fix, so it is
@@ -4253,8 +4273,10 @@ jobs:
             fi
           fi
 
-          # Empty when the run failed before the engine was fetched. A SHA input
-          # has no tag, so only the commit is shown.
+          # Empty when the run failed before the engine was fetched, or when the
+          # release guard refused the fetched commit (that reason, which names the
+          # SHA, is the comment body then). A SHA input has no tag, so only the
+          # commit is shown.
           if [ -n "${ENGINE_SHA:-}" ]; then
             BODY=$(printf '%s\n\n<sub>Engine: forge %s`%s`</sub>' "$BODY" \
               "${ENGINE_TAG:+$ENGINE_TAG }" "${ENGINE_SHA:0:7}")
