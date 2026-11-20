@@ -369,9 +369,10 @@ guard_case() {  # guard_case <name> <package.json content or -> <with cli.js: ye
   [ "$2" != "-" ] && printf '%s\n' "$2" > "$d/package.json"
   if [ "$3" = yes ]; then mkdir -p "$d/bin" && : > "$d/bin/cli.js"; fi
   local rc=0
-  ( export DIR="$d" ENGINE_SHA="deadbeef" GITHUB_OUTPUT="$d.out"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1 || rc=$?
+  # A fixture summary, so the refusal cases never write into this job's own summary.
+  ( export DIR="$d" ENGINE_SHA="deadbeef" GITHUB_OUTPUT="$d.out" GITHUB_STEP_SUMMARY="$d.summary"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1 || rc=$?
   GUARD_OUTPUT="$(cat "$d.out" 2>/dev/null || true)"
-  rm -rf "$d" "$d.out"; echo "$rc"
+  rm -rf "$d" "$d.out" "$d.summary"; echo "$rc"
 }
 check '[ "$(guard_case ok "{\"name\":\"@deriv-com/spec-to-pr\"}" yes)" = 0 ]' \
   "the guard accepts an engine release root"
@@ -379,8 +380,12 @@ check '[ "$(guard_case service "{\"name\":\"forge-agent\"}" yes)" = 1 ]' \
   "the guard refuses a Forge service root"
 # A refusal is kept as the step's error output, which Report posts as the reason.
 # A subshell, so its exit status can't end the whole script (check evals in place).
-check '( d=$(mktemp -d); echo "{\"name\":\"forge-agent\"}" > "$d/package.json"; mkdir -p "$d/bin"; : > "$d/bin/cli.js"; ( export DIR="$d" ENGINE_SHA="deadbeef" GITHUB_OUTPUT="$d/out"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1; grep -q "^error=deadbeef is not an engine release commit" "$d/out"; r=$?; rm -rf "$d"; exit $r )' \
+check '( d=$(mktemp -d); echo "{\"name\":\"forge-agent\"}" > "$d/package.json"; mkdir -p "$d/bin"; : > "$d/bin/cli.js"; ( export DIR="$d" ENGINE_SHA="deadbeef" GITHUB_OUTPUT="$d/out" GITHUB_STEP_SUMMARY="$d/summary"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1; grep -q "^error=deadbeef is not an engine release commit" "$d/out"; r=$?; rm -rf "$d"; exit $r )' \
   "a refused commit is kept as the fetch step's error output, naming the SHA"
+check '( d=$(mktemp -d); echo "{\"name\":\"forge-agent\"}" > "$d/package.json"; mkdir -p "$d/bin"; : > "$d/bin/cli.js"; ( export DIR="$d" ENGINE_SHA="deadbeef" GITHUB_OUTPUT="$d/out" GITHUB_STEP_SUMMARY="$d/summary"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1; grep -q "^### Forge stopped before installing anything$" "$d/summary" && grep -q "^deadbeef is not an engine release commit" "$d/summary"; r=$?; rm -rf "$d"; exit $r )' \
+  "a refused commit is written to the job summary under its header, naming the SHA"
+check '( d=$(mktemp -d); echo "{\"name\":\"@deriv-com/spec-to-pr\"}" > "$d/package.json"; mkdir -p "$d/bin"; : > "$d/bin/cli.js"; : > "$d/summary"; ( export DIR="$d" ENGINE_SHA="deadbeef" GITHUB_OUTPUT="$d/out" GITHUB_STEP_SUMMARY="$d/summary"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1; [ ! -s "$d/summary" ]; r=$?; rm -rf "$d"; exit $r )' \
+  "an accepted engine release root writes nothing to the job summary"
 check '[ "$(guard_case nopkg - yes)" = 1 ]' \
   "the guard refuses a root with no package.json"
 check '[ "$(guard_case badjson "{not json" yes)" = 1 ]' \
