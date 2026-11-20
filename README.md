@@ -14,7 +14,7 @@ Everything here is consumed at `@master`, so **changes are live for every consum
 | Workflow | Purpose | Docs | Status |
 |---|---|---|---|
 | [`ai-pr-review.yml`](.github/workflows/ai-pr-review.yml) | Pluggable LLM PR review (`kimi` \| `anthropic` \| `grok` \| `codex` \| `muse` \| `antigravity`) | [AI_PR_REVIEW_README.md](.github/workflows/AI_PR_REVIEW_README.md) | ✅ active |
-| [`forge.yml`](.github/workflows/forge.yml) | Turns an issue into a verified PR (`auto`), or revises/updates an open PR (`revise` \| `update`) via the Forge engine (formerly `spec-to-pr`) | [Forge](#forge-issue-to-pr) | ✅ active |
+| [`forge.yml`](.github/workflows/forge.yml) | Turns an issue into a verified PR (`auto`), or revises/updates an open PR (`revise` \| `update`) via the Forge engine (formerly `spec-to-pr`); `pr-text` applies PR text changes forge-agent requests from Slack | [Forge](#forge-issue-to-pr) | ✅ active |
 | [`dependonme-bot.yml`](.github/workflows/dependonme-bot.yml) | Auto-fixes Dependabot security alerts and opens/auto-merges fix PRs | [DEPENDONME_BOT_README.md](.github/workflows/DEPENDONME_BOT_README.md) | ✅ active |
 | [`qa-checklist.yml`](.github/workflows/qa-checklist.yml) | Generates a QA checklist for a PR when someone comments `@checkmaite` | [QA_CHECKLIST_README.md](.github/workflows/QA_CHECKLIST_README.md) | ✅ active |
 | [`archive-on-merge.yml`](.github/workflows/archive-on-merge.yml) | Archives completed OpenSpec changes into a follow-up PR when a PR merges | [Archive on Merge](#archive-on-merge-openspec) | ✅ active |
@@ -70,7 +70,7 @@ The remaining directories under `.github/actions/` implement internal building b
 
 The engine moved from `deriv-com/spec-to-pr` to [`deriv-com/forge-agent`](https://github.com/deriv-com/forge-agent) under `engine/`, and is released there as `vX.Y.Z` tags (the old `v0.3.0`–`v0.8.4` tags were carried over unchanged).
 
-[`forge.yml`](.github/workflows/forge.yml) runs the Forge engine from `deriv-com/forge-agent` against an issue (`command: auto`) or an open same-repo PR (`command: revise` | `update`), handling GitHub App token rotation, AI review wait/revise loops, base-branch updates, and optional Slack progress threads. Full caller header and input reference live at the top of [`forge.yml`](.github/workflows/forge.yml).
+[`forge.yml`](.github/workflows/forge.yml) runs the Forge engine from `deriv-com/forge-agent` against an issue (`command: auto`) or an open same-repo PR (`command: revise` | `update`), handling GitHub App token rotation, AI review wait/revise loops, base-branch updates, and optional Slack progress threads. `command: pr-text` runs no engine: it applies a PR title or description edit, a reply to the reviewers, thread resolution, or a close or reopen that forge-agent left as a request on the issue, with this workflow's write App. Any other command is rejected before anything runs, and the Slack thread that asked is told. Full caller header and input reference live at the top of [`forge.yml`](.github/workflows/forge.yml).
 
 The engine and the target repo's toolchain run on `node_version`, which defaults to the Node the engine release names; the job stops early, before any install, if `node_version` doesn't satisfy the engine's `engines.node`.
 
@@ -141,6 +141,7 @@ node --test .github/actions/**/*.test.js
 bash tests/ai-pr-review-contract.sh
 bash tests/qa-checklist-contract.sh
 bash tests/forge-contract.sh
+bash tests/forge-pr-text.sh
 bash tests/forge-resolver.sh
 
 # 3. Workflow static analysis (actionlint 1.7.12, shellcheck disabled to match CI)

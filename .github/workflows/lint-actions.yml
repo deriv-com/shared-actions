@@ -24,6 +24,7 @@ on:
       - '.github/prompts/**'
       - 'tests/ai-pr-review-contract.sh'
       - 'tests/forge-contract.sh'
+      - 'tests/forge-pr-text.sh'
       - 'tests/forge-resolver.sh'
       - 'tests/qa-checklist-contract.sh'
   workflow_dispatch:
@@ -122,6 +123,9 @@ jobs:
 
       - name: Forge contract tests
         run: bash tests/forge-contract.sh
+
+      - name: Forge pr-text tests
+        run: bash tests/forge-pr-text.sh
 
       - name: Forge engine_ref resolver tests
         run: bash tests/forge-resolver.sh

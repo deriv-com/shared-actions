@@ -95,6 +95,10 @@ check 'grep -qF "NODE_ERROR: \${{ steps.node-preflight.outputs.error || steps.no
   "Report outcome reads the Node pick and preflight failure reasons"
 check 'grep -qF "ENGINE_ERROR: \${{ steps.engine.outputs.error }}" <<< "$(step_body "Report outcome")"' \
   "Report outcome reads the engine release guard's reason"
+check 'grep -qF "CLAIM_ERROR: \${{ steps.claim.outputs.error }}" <<< "$(step_body "Report outcome")"' \
+  "Report outcome reads the claim step's stop reason"
+check 'grep -qF "echo \"error=\${CLAIM_REASON}\" >> \"\$GITHUB_OUTPUT\"" <<< "$(step_body "Claim the issue")"' \
+  "the claim step keeps its stop reason as a step output (K-016)"
 # One summary header for a stop in either step.
 NODE_SUMMARY_HEADER="### Forge stopped before installing anything"
 check 'grep -qF "$NODE_SUMMARY_HEADER" <<< "$NODE_PICK" && grep -qF "$NODE_SUMMARY_HEADER" <<< "$NODE_PREFLIGHT"' \
@@ -670,9 +674,9 @@ check 'grep -q "^          trap revoke_reminted_token EXIT\$" "$WF"' \
   "the last reminted token is revoked when Run Forge exits"
 check 'awk "
   /^    steps:\$/ {s=1; next}
-  s && /^      - name: / {exit (\$0 == \"      - name: Record job start\" ? 0 : 1)}
+  s && /^      - name: / && \$0 != \"      - name: Check the command\" {exit (\$0 == \"      - name: Record job start\" ? 0 : 1)}
 " "$WF" && grep -q "^        run: echo \"FORGE_JOB_START=\$(date -u +%s)\" >> \"\$GITHUB_ENV\"\$" "$WF"' \
-  "the job's first step records its start, before any token is minted"
+  "the job's first step after the command check records its start, before any token is minted"
 check 'awk "
   /SCRIPT_START=\\\$\\(date -u \\+%s\\)/ {f=1}
   f && /START_EPOCH=\\\$FORGE_JOB_START/ {j=1}
@@ -919,7 +923,7 @@ step_script() {  # step_script <step name> <case dir>
   awk -v s="      - name: $1" '
     $0 == s {f=1}
     f && /^        run: \|$/ {r=1; next}
-    r && /^      - name:/ {exit}
+    r && (/^      - name:/ || /^  [a-z][a-z0-9_-]*:$/ || /^  # ----/) {exit}
     r { sub(/^          /, ""); print }
   ' "$WF" | sed "s#/tmp/#$2/tmp/#g"
 }
@@ -1805,6 +1809,13 @@ check 'grep -qF "Fix \`engine_ref\` in the calling workflow, then re-apply the \
   "an engine guard stop names the fix, not a generic retry"
 check '[[ "$(completion_of "$C")" == *"Failed on "*"is not an engine release commit"* ]] && [ "$(reactions "$C" add)" = x ]' \
   "an engine guard stop puts its reason in the Slack completion (got $(completion_of "$C"))"
+CLAIM_REASON_FIXTURE='forge:running is still missing from #7 after setting it again 3 times, so a pr-text run could write during this run.'
+C=$(report_only claim_stop OUTCOME=skipped COMMENT_ID=57 SLACK_MENTION_TS=3.3 "CLAIM_ERROR=$CLAIM_REASON_FIXTURE")
+CLAIM_STOP_COMMENT=$(grep "^api --method PATCH repos/o/r/issues/comments/57 " "$C/gh.log" || true)
+check 'grep -qF "body=🔨 Forge stopped before it started: $CLAIM_REASON_FIXTURE" <<< "$CLAIM_STOP_COMMENT" && grep -qF "Re-apply the \`forge\` label to retry." "$C/gh.log" && ! grep -qF "Forge failed." <<< "$CLAIM_STOP_COMMENT"' \
+  "a claim stop puts its reason in the issue comment and says to retry"
+check '[[ "$(completion_of "$C")" == *"Failed on "*"forge:running is still missing"* ]] && [ "$(reactions "$C" add)" = x ]' \
+  "a claim stop puts its reason in the Slack completion (got $(completion_of "$C"))"
 C=$(report_only fork_update OUTCOME=failure FORGE_COMMAND=update PR_UNRESOLVED=1 PR_FROM_FORK=https://github.com/o/r/pull/8 SLACK_MENTION_TS=3.3)
 check '[[ "$(completion_of "$C")" == *"<https://github.com/o/r/pull/8|PR #8>, is from a fork."*"so there is nothing to update."* ]] && [ "$(reactions "$C" add)" = warning ]' \
   "an update run on a fork PR says there is nothing to update (got $(completion_of "$C"))"
@@ -2727,6 +2738,47 @@ check 'grep -q "keep_plan .*plan_path" "$WF"' \
   "run_dstp hands dstp's plan_path to keep_plan"
 check 'grep -qF "TAIL=\$(tail -c 3000 /tmp/forge.log 2>/dev/null | scrub_log" "$WF" && grep -qF "tail -c 262144 /tmp/forge.log | scrub_log" "$WF"' \
   "the issue comment's tail and failure.log share one scrub"
+
+# --- unknown commands are refused, never folded into auto ------------------
+# The claim step stops before any label or comment; Run Forge is the backstop.
+C=$(new_case unknown-claim)
+step_script "Claim the issue" "$C" > "$C/claim.sh"
+rc=0
+env -i PATH="$FAKE_BIN:$PATH" HOME="$C/home" FAKE_STATE="$C" GITHUB_OUTPUT="$C/out" \
+  GITHUB_REPOSITORY=o/r ISSUE_NUMBER=1213 FORGE_COMMAND=$'pr_text\n::add-mask::x' GH_TOKEN=ghs_faketoken \
+  bash -e "$C/claim.sh" > "$C/claim.log" 2>&1 || rc=$?
+check '[ "$rc" != 0 ] && has "$C/claim.log" "::error::Unknown command. \"Check the command\" should have stopped this run" && ! has "$C/claim.log" "pr_text" && ! grep "^::add-mask" "$C/claim.log" >/dev/null && [ ! -s "$C/gh.log" ]' \
+  "the claim step refuses an unknown command before any label or comment, without printing it"
+for ok in "" auto revise update; do
+  C=$(new_case "known-claim-${ok:-empty}")
+  step_script "Claim the issue" "$C" | sed -n '1,/^esac$/p' > "$C/claim-head.sh"
+  rc=0
+  env -i PATH="$PATH" FORGE_COMMAND="$ok" bash -e "$C/claim-head.sh" > /dev/null 2>&1 || rc=$?
+  check '[ "$rc" = 0 ]' "the claim step accepts command '${ok:-<empty>}'"
+done
+# "Check the command" is the forge job's first step; Report and its token
+# mint are gated on it, so a rejected command posts and relabels nothing.
+FIRST_STEP=$(awk '/^  forge:$/{f=1} f && /^      - name:/{print; exit}' "$WF")
+check '[ "$FIRST_STEP" = "      - name: Check the command" ]' "Check the command is the forge job's first step (got: $FIRST_STEP)"
+for gated in "Mint token for Report" "Report outcome"; do
+  check 'awk -v s="      - name: '"$gated"'" '"'"'$0 == s {f=1; n=0; next} f && n++ < 6'"'"' "$WF" | grep -xF "        if: always() && steps.command.outcome == '"'"'success'"'"'" >/dev/null' \
+    "$gated runs only after a command that passed the check"
+done
+C=$(new_case check-command)
+step_script "Check the command" "$C" > "$C/check.sh"
+for bad in pr_text auto2 "revise; echo hi"; do
+  rc=0; env -i PATH="$PATH" FORGE_COMMAND="$bad" bash -e "$C/check.sh" > "$C/check.log" 2>&1 || rc=$?
+  check '[ "$rc" != 0 ] && has "$C/check.log" "Unknown command"' "Check the command refuses '$bad'"
+done
+for ok in "" auto revise update; do
+  rc=0; env -i PATH="$PATH" FORGE_COMMAND="$ok" bash -e "$C/check.sh" > /dev/null 2>&1 || rc=$?
+  check '[ "$rc" = 0 ]' "Check the command accepts '${ok:-<empty>}'"
+done
+C=$(new_case unknown-run)
+echo pr_text > "$C/command"
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" != 0 ] && has "$C/run.log" "::error::Unknown command. \"Check the command\" should have stopped this run" && ! has "$C/run.log" "pr_text" && [ ! -f "$C/dstp_ran" ]' \
+  "Run Forge refuses an unknown command, without printing it, and never runs dstp as auto"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "❌ forge.yml contract test failed"
