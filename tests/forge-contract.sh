@@ -63,8 +63,8 @@ step_line() { grep -m1 -n "^      - name: $1\$" "$WF" | cut -d: -f1; }
 step_body() {
   awk -v s="      - name: $1" '$0 == s {f=1; print; next} f && /^      - name:/ {exit} f {print}' "$WF"
 }
-ORDER=("Checkout" "Fetch the spec-to-pr engine" "Pick the Node version" "Setup Node"
-       "Preflight — does this Node run the engine?" "Install the spec-to-pr engine's dependencies"
+ORDER=("Checkout" "Fetch the Forge engine" "Pick the Node version" "Setup Node"
+       "Preflight — does this Node run the engine?" "Install the Forge engine's dependencies"
        "Resolve the LLM gateway" "Install dependencies")
 for i in "${!ORDER[@]}"; do
   check '[[ -n "$(step_line "${ORDER[$i]}")" ]]' "step '${ORDER[$i]}' exists"
@@ -93,6 +93,8 @@ check 'grep -qF "NODE_VERSION_INPUT: \${{ inputs.node_version }}" <<< "$NODE_PRE
   "Node preflight gets the raw node_version, so its hint can tell set from empty"
 check 'grep -qF "NODE_ERROR: \${{ steps.node-preflight.outputs.error || steps.node.outputs.error }}" <<< "$(step_body "Report outcome")"' \
   "Report outcome reads the Node pick and preflight failure reasons"
+check 'grep -qF "ENGINE_ERROR: \${{ steps.engine.outputs.error }}" <<< "$(step_body "Report outcome")"' \
+  "Report outcome reads the engine release guard's reason"
 # One summary header for a stop in either step.
 NODE_SUMMARY_HEADER="### Forge stopped before installing anything"
 check 'grep -qF "$NODE_SUMMARY_HEADER" <<< "$NODE_PICK" && grep -qF "$NODE_SUMMARY_HEADER" <<< "$NODE_PREFLIGHT"' \
@@ -330,13 +332,70 @@ check 'grep -q "install_command" "$WF"' \
 
 # --- supply chain ---------------------------------------------------------
 # The engine runs with a write token in scope, so tracking a branch would let
-# any push to spec-to-pr execute in every caller repo. The default may be a caret
+# any push to forge-agent execute in every caller repo. The default may be a caret
 # range (resolved against vX.Y.Z tags only) or a 40-char SHA (which bypasses the
 # tag list entirely). Anchored: the whole quoted value must be one of the two.
 check 'awk "/^      engine_ref:/{f=1} f && /default:/{print; exit}" "$WF" | grep -qE "^ +default: \"(\^[0-9]+\.[0-9]+\.[0-9]+|[0-9a-f]{40})\"$"' \
   "engine_ref default is exactly a caret range or a full 40-char SHA, not a branch"
 check 'grep -q "Branches are not accepted" "$WF"' \
   "engine_ref resolver rejects anything that is not a range, release tag or SHA"
+
+# The engine lives in deriv-com/forge-agent under engine/. A release tag there
+# points at a commit whose tree is engine/, so the fetched root is the package
+# root: the install and FORGE_CLI paths below must not gain an engine/ prefix.
+check 'awk "/id: engine-token/{f=1} f && /repositories:/{print; exit}" "$WF" | grep -qE "^ +repositories: forge-agent$"' \
+  "engine token step is scoped to repositories: forge-agent"
+# Any URL or owner/repo form of the old repo; the package name
+# @deriv-com/spec-to-pr stays (epic "Names that stay"), so the @ form is allowed.
+check '! grep -qE "(^|[^@])deriv-com/spec-to-pr" "$WF"' \
+  "the workflow no longer names the old deriv-com/spec-to-pr repo"
+# Anchored on the functional line (no leading #), so a commented-out copy can't pass.
+check 'step_body "Install the Forge engine'"'"'s dependencies" | grep -qE "^ +\( cd \"\\\$DIR\" && npm ci --omit=dev --include=optional \)$"' \
+  "the engine installs at the root of \$DIR (release root is the engine root)"
+check '! grep -qE "\\\$\\{?DIR\\}?\"?/engine" "$WF"' \
+  "no path under \$DIR gains an engine/ prefix (\$DIR/engine, \${DIR}/engine, \"\$DIR\"/engine)"
+check 'grep -qE "^ +echo \"FORGE_CLI=\\\$DIR/bin/cli.js\"" "$WF"' \
+  "FORGE_CLI is still \$DIR/bin/cli.js (release root is the engine root)"
+# forge-agent also holds the Forge service, so the fetch must refuse a commit
+# whose root is not the engine before npm ci runs it with the write token. The
+# guard is pinned by RUNNING it (extracted verbatim between its markers, like the
+# resolver in tests/forge-resolver.sh), not by grepping for its shape.
+GUARD="$(awk '/# ---- engine release guard/{f=1} f { sub(/^          /, ""); print } /# ---- end engine release guard/{exit}' "$WF")"
+check '[ -n "$GUARD" ] && grep -q "is not an engine release commit" <<<"$GUARD"' \
+  "the engine release guard is extractable between its markers"
+# Fixture JSON has one key each: a comma inside {…} would brace-expand under eval.
+guard_case() {  # guard_case <name> <package.json content or -> <with cli.js: yes|no>; prints the exit code
+  local d; d="$(mktemp -d)"
+  [ "$2" != "-" ] && printf '%s\n' "$2" > "$d/package.json"
+  if [ "$3" = yes ]; then mkdir -p "$d/bin" && : > "$d/bin/cli.js"; fi
+  local rc=0
+  # A fixture summary, so the refusal cases never write into this job's own summary.
+  ( export DIR="$d" ENGINE_SHA="deadbeef" GITHUB_OUTPUT="$d.out" GITHUB_STEP_SUMMARY="$d.summary"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1 || rc=$?
+  GUARD_OUTPUT="$(cat "$d.out" 2>/dev/null || true)"
+  rm -rf "$d" "$d.out" "$d.summary"; echo "$rc"
+}
+check '[ "$(guard_case ok "{\"name\":\"@deriv-com/spec-to-pr\"}" yes)" = 0 ]' \
+  "the guard accepts an engine release root"
+check '[ "$(guard_case service "{\"name\":\"forge-agent\"}" yes)" = 1 ]' \
+  "the guard refuses a Forge service root"
+# A refusal is kept as the step's error output, which Report posts as the reason.
+# A subshell, so its exit status can't end the whole script (check evals in place).
+check '( d=$(mktemp -d); echo "{\"name\":\"forge-agent\"}" > "$d/package.json"; mkdir -p "$d/bin"; : > "$d/bin/cli.js"; ( export DIR="$d" ENGINE_SHA="deadbeef" GITHUB_OUTPUT="$d/out" GITHUB_STEP_SUMMARY="$d/summary"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1; grep -q "^error=deadbeef is not an engine release commit" "$d/out"; r=$?; rm -rf "$d"; exit $r )' \
+  "a refused commit is kept as the fetch step's error output, naming the SHA"
+check '( d=$(mktemp -d); echo "{\"name\":\"forge-agent\"}" > "$d/package.json"; mkdir -p "$d/bin"; : > "$d/bin/cli.js"; ( export DIR="$d" ENGINE_SHA="deadbeef" GITHUB_OUTPUT="$d/out" GITHUB_STEP_SUMMARY="$d/summary"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1; grep -q "^### Forge stopped before installing anything$" "$d/summary" && grep -q "^deadbeef is not an engine release commit" "$d/summary"; r=$?; rm -rf "$d"; exit $r )' \
+  "a refused commit is written to the job summary under its header, naming the SHA"
+check '( d=$(mktemp -d); echo "{\"name\":\"@deriv-com/spec-to-pr\"}" > "$d/package.json"; mkdir -p "$d/bin"; : > "$d/bin/cli.js"; : > "$d/summary"; ( export DIR="$d" ENGINE_SHA="deadbeef" GITHUB_OUTPUT="$d/out" GITHUB_STEP_SUMMARY="$d/summary"; bash -euo pipefail -c "$GUARD" ) >/dev/null 2>&1; [ ! -s "$d/summary" ]; r=$?; rm -rf "$d"; exit $r )' \
+  "an accepted engine release root writes nothing to the job summary"
+check '[ "$(guard_case nopkg - yes)" = 1 ]' \
+  "the guard refuses a root with no package.json"
+check '[ "$(guard_case badjson "{not json" yes)" = 1 ]' \
+  "the guard refuses a package.json jq cannot parse"
+check '[ "$(guard_case nocli "{\"name\":\"@deriv-com/spec-to-pr\"}" no)" = 1 ]' \
+  "the guard refuses a root with no bin/cli.js"
+# Order inside the fetch step: the guard, then the reported tag/SHA. (The step
+# order check above already puts the fetch before the dependency install.)
+check 'step_body "Fetch the Forge engine" | awk "/# ---- end engine release guard/{g=NR} /echo \"engine_sha=/{o=NR} END{exit !(g && o && g < o)}"' \
+  "inside the fetch step, the guard runs before engine_sha is reported"
 
 # Every third-party action pinned by SHA (the repo-wide rule this workflow must
 # not be an exception to).
@@ -923,7 +982,7 @@ done
 # A file that exists but names no usable default: engines.node, never 20.x.
 D=$(node_engine numeric "$NEW_RANGE" '{"node": {"default": 24}}')
 GOT=$(node_pick "$D" "")
-check '[[ "$GOT" == "0 $NEW_RANGE|engines-node" ]] && grep -q "^::warning::spec-to-pr v9.9.9 has no .node.default string" "$D/pick.log" && ! grep -q "0.8.3" "$D/pick.log"' \
+check '[[ "$GOT" == "0 $NEW_RANGE|engines-node" ]] && grep -q "^::warning::forge v9.9.9 has no .node.default string" "$D/pick.log" && ! grep -q "0.8.3" "$D/pick.log"' \
   "a numeric .node.default falls back to engines.node with a warning, not 20.x (got $GOT)"
 D=$(node_engine nokey "$NEW_RANGE" '{"claude-code": "2.0.0"}')
 GOT=$(node_pick "$D" "")
@@ -950,11 +1009,11 @@ check '[[ "$GOT" == "1 |" ]] && grep -q "^::error::node_version has characters s
   "a node_version with shell metacharacters fails, unprinted (got $GOT)"
 D=$(node_engine badversions "$NEW_RANGE" '{"node": {"default": ')
 GOT=$(node_pick "$D" "")
-check '[[ "$GOT" == "1 |" ]] && grep -q "^::error::spec-to-pr v9.9.9 has a src/assets/upstream-versions.json that is not valid JSON" "$D/pick.log" && ! grep -q "^jq: " "$D/pick.log"' \
+check '[[ "$GOT" == "1 |" ]] && grep -q "^::error::forge v9.9.9 has a src/assets/upstream-versions.json that is not valid JSON" "$D/pick.log" && ! grep -q "^jq: " "$D/pick.log"' \
   "a malformed upstream-versions.json fails the pick with an ::error naming the release (got $GOT)"
 D=$(node_engine badpkg "$NEW_RANGE" '{"node": {}}'); printf '{"engines": ' > "$D/forge-engine/package.json"
 GOT=$(node_pick "$D" "")
-check '[[ "$GOT" == "1 |" ]] && grep -q "^::error::spec-to-pr v9.9.9 has a package.json that is missing or not valid JSON" "$D/pick.log" && ! grep -q "^jq: " "$D/pick.log"' \
+check '[[ "$GOT" == "1 |" ]] && grep -q "^::error::forge v9.9.9 has a package.json that is missing or not valid JSON" "$D/pick.log" && ! grep -q "^jq: " "$D/pick.log"' \
   "a malformed package.json in the engines.node fallback fails with an ::error naming the release (got $GOT)"
 D=$(node_engine norange "" '{"node": {}}')
 GOT=$(node_pick "$D" "")
@@ -963,11 +1022,11 @@ check '[[ "$GOT" == "1 |" ]] && grep -q "^::error::.*no usable engines.node" "$D
 
 # Preflight.
 GOT=$(node_preflight "$NEW_ENGINE" "22.23.5" "22")
-check '[[ "$GOT" == "1 ::error::spec-to-pr v9.9.9 needs Node $NEW_RANGE"*"node_version \"22\" gave Node 22.23.5"* ]]' \
+check '[[ "$GOT" == "1 ::error::forge v9.9.9 needs Node $NEW_RANGE"*"node_version \"22\" gave Node 22.23.5"* ]]' \
   "node_version 22 against the new engine fails with the engine's range"
 check '[[ "$GOT" == *"Set node_version"*"leave it empty"* ]]' "with node_version set, the error offers leaving it empty"
 check '[[ "$GOT" == *"pin engine_ref to v0.8.3"* ]]' "the Node mismatch error names rollback v0.8.3 for Node 22"
-check 'grep -q "^error=spec-to-pr v9.9.9 needs Node" "$NEW_ENGINE/out" && grep -q "pin engine_ref to v0.8.3" "$NEW_ENGINE/summary"' \
+check 'grep -q "^error=forge v9.9.9 needs Node" "$NEW_ENGINE/out" && grep -q "pin engine_ref to v0.8.3" "$NEW_ENGINE/summary"' \
   "the preflight's failure goes to a step output and the job summary"
 GOT=$(node_preflight "$NEW_ENGINE" "24.22.2" "" "24.22.2" engine-default)
 check '[[ "$GOT" == "1 ::error::"*"the Node this release names for itself (24.22.2) gave Node 24.22.2"* && "$GOT" != *"leave"* && "$GOT" == *"Set node_version"*"pin engine_ref"* ]]' \
@@ -980,7 +1039,7 @@ GOT=$(node_preflight "$NEW_ENGINE" "20.19.0" "" "$NEW_RANGE" engines-node)
 check '[[ "$GOT" == "0 setup-node installed Node 20.19.0 from the engines.node"*"nothing more to check"* ]]' \
   "when setup-node was handed engines.node, the preflight does not re-check it"
 GOT=$(node_preflight "$NEW_ENGINE" "24.22.3" "24.22.3")
-check '[[ "$GOT" == "0 Node 24.22.3 satisfies spec-to-pr v9.9.9"* ]]' "Node 24.22.3 passes against the new engine"
+check '[[ "$GOT" == "0 Node 24.22.3 satisfies forge v9.9.9"* ]]' "Node 24.22.3 passes against the new engine"
 GOT=$(node_preflight "$NEW_ENGINE" "26.14.0" "26")
 check '[[ "$GOT" == "0 "* ]]' "Node 26.14.0 passes the second alternative of the range"
 GOT=$(node_preflight "$NEW_ENGINE" "26.13.1-nightly20261101" "26")
@@ -997,17 +1056,17 @@ GOT=$(node_preflight "$ODD_ENGINE" "24.22.3" "24.22.3")
 check '[[ "$GOT" == "0 ::warning::"*"~24.22"* ]]' "an engines.node range the check cannot read warns and continues"
 D=$(node_engine pf-badpkg "$NEW_RANGE" "$NEW_VERSIONS"); printf '{"engines": ' > "$D/forge-engine/package.json"
 GOT=$(node_preflight "$D" "24.22.3" "24.22.3")
-check '[[ "$GOT" == "1 ::error::spec-to-pr v9.9.9 has a package.json that is missing or not valid JSON"* && "$GOT" != *"    at "* ]]' \
+check '[[ "$GOT" == "1 ::error::forge v9.9.9 has a package.json that is missing or not valid JSON"* && "$GOT" != *"    at "* ]]' \
   "a malformed package.json fails the preflight with an ::error naming the release, no stack trace"
 D=$(node_engine pf-badversions "$NEW_RANGE" '{"node": '); GOT=$(node_preflight "$D" "24.22.3" "24.22.3")
-check '[[ "$GOT" == "1 ::error::spec-to-pr v9.9.9 has a src/assets/upstream-versions.json that is not valid JSON"* && "$GOT" != *"    at "* ]]' \
+check '[[ "$GOT" == "1 ::error::forge v9.9.9 has a src/assets/upstream-versions.json that is not valid JSON"* && "$GOT" != *"    at "* ]]' \
   "a malformed upstream-versions.json fails the preflight even when node_version is set and satisfies, no stack trace"
 GOT=$(node_preflight "$D" "24.22.3" "" "$NEW_RANGE" engines-node)
 check '[[ "$GOT" == "1 ::error::"*"upstream-versions.json that is not valid JSON"* ]]' \
   "a malformed upstream-versions.json fails the preflight on the engines.node path too"
 D=$(node_engine pf-noengines ""); echo '{"name": "@deriv-com/spec-to-pr"}' > "$D/forge-engine/package.json"
 GOT=$(node_preflight "$D" "18.0.0" "18")
-check '[[ "$GOT" == "0 spec-to-pr v9.9.9 declares no engines.node; nothing to check." ]]' \
+check '[[ "$GOT" == "0 forge v9.9.9 declares no engines.node; nothing to check." ]]' \
   "a release that declares no engines.node is let through, with a log line saying so (got $GOT)"
 # An engines.node with a line break never prints a line of its own, so it
 # cannot run as a workflow command, on the pass, warning or error path.
@@ -1025,12 +1084,12 @@ done
 LONG_SHA=0123456789abcdef0123456789abcdef01234567
 D=$(node_engine label-pick "$NEW_RANGE" '{"node": ')
 GOT=$(NODE_TEST_TAG="" NODE_TEST_SHA="$LONG_SHA" node_pick "$D" "")
-check 'grep -q "^::error::spec-to-pr 0123456789ab has a src/assets/upstream-versions.json" "$D/pick.log"' \
+check 'grep -q "^::error::forge 0123456789ab has a src/assets/upstream-versions.json" "$D/pick.log"' \
   "the pick names a release without a tag by the SHA's first 12 characters"
 PICK_SUMMARY_HEAD=$(head -n1 "$D/summary")
 D=$(node_engine label-preflight "$NEW_RANGE" "$NEW_VERSIONS")
 GOT=$(NODE_TEST_TAG="" NODE_TEST_SHA="$LONG_SHA" node_preflight "$D" "22.23.5" "22")
-check '[[ "$GOT" == "1 ::error::spec-to-pr 0123456789ab needs Node"* ]]' \
+check '[[ "$GOT" == "1 ::error::forge 0123456789ab needs Node"* ]]' \
   "the preflight names a release without a tag by the SHA's first 12 characters"
 check '[[ -n "$PICK_SUMMARY_HEAD" && "$PICK_SUMMARY_HEAD" == "$(head -n1 "$D/summary")" ]]' \
   "the pick and the preflight write the same job-summary header (got '$PICK_SUMMARY_HEAD')"
@@ -1726,7 +1785,7 @@ check '[ "$(reactions "$C" add)" = shrug ]' "success with no PR reacts shrug"
 C=$(report_only unresolved OUTCOME=success PR_UNRESOLVED=1 SLACK_MENTION_TS=3.3)
 check '[ "$(reactions "$C" add)" = warning ]' "no linked PR reacts warning"
 completion_of() { jq -rs '[.[] | select(.url | endswith("chat.postMessage")) | .p.text] | last // ""' "$1/slack.jsonl" 2>/dev/null || true; }
-NODE_REASON_FIXTURE='spec-to-pr v9.9.9 needs Node ^24.22.3 || ^26.13.1 (its package.json engines.node), but node_version "22" gave Node 22.23.5. Set node_version to a version in that range, or leave it empty to run the Node the engine release names. To stay on Node 22, pin engine_ref to v0.8.3, the last release that runs on it.'
+NODE_REASON_FIXTURE='forge v9.9.9 needs Node ^24.22.3 || ^26.13.1 (its package.json engines.node), but node_version "22" gave Node 22.23.5. Set node_version to a version in that range, or leave it empty to run the Node the engine release names. To stay on Node 22, pin engine_ref to v0.8.3, the last release that runs on it.'
 C=$(report_only node_stop OUTCOME=skipped COMMENT_ID=55 SLACK_MENTION_TS=3.3 "NODE_ERROR=$NODE_REASON_FIXTURE")
 NODE_STOP_COMMENT=$(grep "^api --method PATCH repos/o/r/issues/comments/55 " "$C/gh.log" || true)
 check 'grep -qF "body=🔨 Forge stopped before it started: $NODE_REASON_FIXTURE" <<< "$NODE_STOP_COMMENT"' \
@@ -1737,6 +1796,15 @@ check 'grep -qF "Fix \`node_version\` or \`engine_ref\` in the calling workflow,
   "a Node preflight stop tells the caller to fix the workflow config, not just retry"
 check '! grep -qF "Forge failed." <<< "$NODE_STOP_COMMENT"' \
   "a Node preflight stop is not reported as the generic failure"
+ENGINE_REASON_FIXTURE='0123456789abcdef0123456789abcdef01234567 is not an engine release commit: its root has no @deriv-com/spec-to-pr package.json and bin/cli.js. engine_ref must be a release tag in deriv-com/forge-agent, or the SHA such a tag points at.'
+C=$(report_only engine_stop OUTCOME=skipped COMMENT_ID=56 SLACK_MENTION_TS=3.3 "ENGINE_ERROR=$ENGINE_REASON_FIXTURE")
+ENGINE_STOP_COMMENT=$(grep "^api --method PATCH repos/o/r/issues/comments/56 " "$C/gh.log" || true)
+check 'grep -qF "body=🔨 Forge stopped before it started: $ENGINE_REASON_FIXTURE" <<< "$ENGINE_STOP_COMMENT"' \
+  "an engine guard stop puts its reason, with the refused SHA, in the issue comment"
+check 'grep -qF "Fix \`engine_ref\` in the calling workflow, then re-apply the \`forge\` label." "$C/gh.log" && ! grep -qF "label to retry" "$C/gh.log" && ! grep -qF "Forge failed." <<< "$ENGINE_STOP_COMMENT"' \
+  "an engine guard stop names the fix, not a generic retry"
+check '[[ "$(completion_of "$C")" == *"Failed on "*"is not an engine release commit"* ]] && [ "$(reactions "$C" add)" = x ]' \
+  "an engine guard stop puts its reason in the Slack completion (got $(completion_of "$C"))"
 C=$(report_only fork_update OUTCOME=failure FORGE_COMMAND=update PR_UNRESOLVED=1 PR_FROM_FORK=https://github.com/o/r/pull/8 SLACK_MENTION_TS=3.3)
 check '[[ "$(completion_of "$C")" == *"<https://github.com/o/r/pull/8|PR #8>, is from a fork."*"so there is nothing to update."* ]] && [ "$(reactions "$C" add)" = warning ]' \
   "an update run on a fork PR says there is nothing to update (got $(completion_of "$C"))"

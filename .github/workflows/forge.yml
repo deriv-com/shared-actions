@@ -1,7 +1,8 @@
 name: Forge — issue to PR
 
 # Reusable workflow. Turns a GitHub issue into a pull request using the
-# deriv-com/spec-to-pr engine: it classifies the issue (bugfix | feature |
+# Forge engine, which lives in deriv-com/forge-agent under engine/ and is
+# released there as vX.Y.Z tags: it classifies the issue (bugfix | feature |
 # refactor), writes a design doc and a plan, implements them, verifies the
 # result, and opens the PR — all committed so the "why" travels with the change.
 #
@@ -164,7 +165,7 @@ on:
       # --- per-repo tuning --------------------------------------------------
       node_version:
         description: >-
-          Node version for the target repo's toolchain and the spec-to-pr
+          Node version for the target repo's toolchain and the Forge
           engine: anything actions/setup-node takes (a version, a range or an
           alias). The target repo's install and verify commands also run on
           this Node (running the engine on its own Node is #217). Empty (the
@@ -197,24 +198,33 @@ on:
         type: string
       engine_ref:
         description: >-
-          Which deriv-com/spec-to-pr release to run. One of:
+          Which Forge engine release, from deriv-com/forge-agent, to run. One of:
             • a caret range, e.g. "^0.6.7" — the newest vX.Y.Z tag that is
               semver-compatible with it (npm caret rules: while the engine is
               0.x the minor is the breaking boundary, so "^0.6.7" means
               ">=0.6.7 <0.7.0"; from 1.x on it means "same major");
             • an exact tag, e.g. "v0.6.7";
-            • a full 40-char commit SHA, to freeze.
-          A range or tag follows whatever vX.Y.Z tags exist on spec-to-pr at run
-          time. Tags are not protected there (its rulesets cover branches only),
-          so anyone with write access to that repo can create or move one, and
-          the next run executes it with this job's write token in scope. A tag
-          can be moved, a commit cannot: pass a 40-char SHA to freeze.
+            • a full 40-char commit SHA, to freeze. Use the commit a release
+              tag points at. The fetch step refuses a commit whose root is not
+              the engine package (other forge-agent commits hold the Forge
+              service), but it does not check that a SHA is tagged.
+          A range or tag follows whatever vX.Y.Z tags exist on forge-agent at
+          run time. In forge-agent, v* tags are engine releases only: each one
+          points at a commit whose tree is the engine/ folder. Tags are not
+          protected there (its rulesets cover branches only), so anyone with
+          write access to that repo can create or move one, and the next run
+          executes it with this job's write token in scope. A tag can be moved,
+          a commit cannot: pass a 40-char SHA to freeze.
           Branches and pre-release tags are rejected. The resolved tag and SHA
           are logged and posted on the issue.
         required: false
         # Policy: every caller that doesn't pass engine_ref runs the newest
         # v0.8.x tag, and each new v0.8.x tag rolls out to them with no PR here.
-        # spec-to-pr ships features in 0.8.x patches, so this is "newest 0.8.x",
+        # The v0.3.0 to v0.8.4 tags were carried over unchanged from the
+        # engine's old repo, pointing at the same commits, so ^0.8.0 resolves
+        # to the same engine from either repo. Releases from 1.0.0 on are cut in
+        # forge-agent. Repos move to 1.x one at a time by passing engine_ref.
+        # The engine ships features in 0.8.x patches, so this is "newest 0.8.x",
         # not "bug fixes only". Bump the range deliberately for a new minor
         # (0.x) / major (1.x+). node_version follows the engine release by
         # default, so a patch that raises the engine's Node floor needs no
@@ -259,7 +269,7 @@ on:
         description: "Private key for CLIENT_ID_GHAPP_WRITE"
         required: true
       CLIENT_ID_GHAPP:
-        description: "Read-only app, used to fetch the spec-to-pr engine"
+        description: "Read-only app, used to fetch the Forge engine from deriv-com/forge-agent"
         required: true
       PRIVATE_KEY_GHAPP:
         description: "Private key for CLIENT_ID_GHAPP"
@@ -349,17 +359,18 @@ jobs:
       # The real exposure is spend (LLM tokens + CI minutes). If that ever bites,
       # a rate limit is the right lever, not an allowlist.
 
-      - name: Mint token to read the spec-to-pr engine
+      - name: Mint token to read the Forge engine
         id: engine-token
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
           # Deliberately a different app from the one above: the write app is
-          # installed on the target repo, not on deriv-com/spec-to-pr, and GitHub
-          # answers 404 (not 403) for a repo outside an installation.
+          # installed on the target repo, not on deriv-com/forge-agent (where the
+          # engine lives), and GitHub answers 404 (not 403) for a repo outside an
+          # installation.
           app-id: ${{ secrets.CLIENT_ID_GHAPP }}
           private-key: ${{ secrets.PRIVATE_KEY_GHAPP }}
           owner: deriv-com
-          repositories: spec-to-pr
+          repositories: forge-agent
           permission-contents: read
 
       # ---- claim the issue ----------------------------------------------
@@ -451,13 +462,16 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           token: ${{ steps.repo-token.outputs.token }}
-          fetch-depth: 0 # spec-to-pr diffs against the base branch
+          fetch-depth: 0 # the engine diffs against the base branch
 
-      - name: Fetch the spec-to-pr engine
+      - name: Fetch the Forge engine
         id: engine
         # Fetched into RUNNER_TEMP, not the workspace, so the agent can never see
         # or commit the engine's own files. git only: Node is set up after this,
         # from what the fetched release names, and the engine's deps after that.
+        # A release tag in deriv-com/forge-agent points at a commit whose tree is
+        # engine/, so the engine's package.json and bin/cli.js sit at the root of
+        # $DIR: no path below says engine/.
         env:
           ENGINE_TOKEN: ${{ steps.engine-token.outputs.token }}
           ENGINE_REF: ${{ inputs.engine_ref }}
@@ -466,7 +480,7 @@ jobs:
           DIR="$RUNNER_TEMP/forge-engine"
           git init -q "$DIR"
           git -C "$DIR" remote add origin \
-            "https://x-access-token:${ENGINE_TOKEN}@github.com/deriv-com/spec-to-pr.git"
+            "https://x-access-token:${ENGINE_TOKEN}@github.com/deriv-com/forge-agent.git"
 
           # ---- resolve engine_ref to a commit SHA -------------------------
           # Everything below fetches a SHA, so a range or tag is resolved first,
@@ -487,7 +501,7 @@ jobs:
           elif [[ "$ENGINE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             ENGINE_SHA=$(tag_sha "$ENGINE_REF")
             ENGINE_TAG="$ENGINE_REF"
-            [ -n "$ENGINE_SHA" ] || { echo "::error::tag $ENGINE_REF does not exist in deriv-com/spec-to-pr"; exit 1; }
+            [ -n "$ENGINE_SHA" ] || { echo "::error::tag $ENGINE_REF does not exist in deriv-com/forge-agent"; exit 1; }
             echo "engine_ref $ENGINE_REF -> $ENGINE_SHA"
           elif [[ "$ENGINE_REF" =~ ^\^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
             MAJ=${BASH_REMATCH[1]} MIN=${BASH_REMATCH[2]} PAT=${BASH_REMATCH[3]}
@@ -501,10 +515,10 @@ jobs:
                   M == 0 && m > 0   { if (x == 0 && y == m && z >= p) print; next }
                                     { if (x == 0 && y == 0 && z == p) print }' \
               | sort -V | tail -1)
-            [ -n "$TAG" ] || { echo "::error::no spec-to-pr release tag satisfies $ENGINE_REF"; exit 1; }
+            [ -n "$TAG" ] || { echo "::error::no release tag satisfies $ENGINE_REF in deriv-com/forge-agent"; exit 1; }
             ENGINE_SHA=$(tag_sha "$TAG")
             ENGINE_TAG="$TAG"
-            [ -n "$ENGINE_SHA" ] || { echo "::error::could not resolve tag $TAG to a commit in deriv-com/spec-to-pr"; exit 1; }
+            [ -n "$ENGINE_SHA" ] || { echo "::error::could not resolve tag $TAG to a commit in deriv-com/forge-agent"; exit 1; }
             echo "engine_ref $ENGINE_REF -> $TAG ($ENGINE_SHA)"
           else
             echo "::error::engine_ref must be a caret range (^X.Y.Z), a release tag (vX.Y.Z) or a 40-char SHA — got '$ENGINE_REF'. Branches are not accepted."
@@ -515,6 +529,25 @@ jobs:
           # explicitly — the tag lookup above and this fetch then cannot disagree.
           git -C "$DIR" fetch -q --depth 1 origin "$ENGINE_SHA"
           git -C "$DIR" checkout -q --detach FETCH_HEAD
+          # ---- engine release guard ---------------------------------------
+          # forge-agent also holds the Forge service. Only a commit whose root is
+          # the engine package may run, so refuse anything else here: before its
+          # tag and SHA are reported, and before npm ci installs it with the write
+          # token in scope. This checks the tree's shape, not that a SHA is tagged.
+          # If engine/package.json is ever renamed, change the name here first.
+          ENGINE_PKG_NAME=$(jq -r '.name // empty' "$DIR/package.json") || ENGINE_PKG_NAME=""
+          if [ "$ENGINE_PKG_NAME" != "@deriv-com/spec-to-pr" ] || [ ! -f "$DIR/bin/cli.js" ]; then
+            ENGINE_REFUSED="$ENGINE_SHA is not an engine release commit: its root has no @deriv-com/spec-to-pr package.json and bin/cli.js. engine_ref must be a release tag in deriv-com/forge-agent, or the SHA such a tag points at."
+            echo "::error::$ENGINE_REFUSED"
+            # Kept for Report (the issue comment and Slack) and the job summary, so
+            # the stop names the refused commit and its fix instead of a retry.
+            echo "error=$ENGINE_REFUSED" >> "${GITHUB_OUTPUT:-/dev/null}"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '### Forge stopped before installing anything\n\n%s\n' "$ENGINE_REFUSED" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 1
+          fi
+          # ---- end engine release guard -----------------------------------
           # The default floats, so the issue comment names what actually ran —
           # the claim comment is posted before this step and can't.
           {
@@ -522,7 +555,7 @@ jobs:
             echo "engine_sha=$ENGINE_SHA"
           } >> "$GITHUB_OUTPUT"
           # Drop the embedded credential; it isn't needed past the fetch.
-          git -C "$DIR" remote set-url origin "https://github.com/deriv-com/spec-to-pr.git"
+          git -C "$DIR" remote set-url origin "https://github.com/deriv-com/forge-agent.git"
           echo "Engine at $(git -C "$DIR" rev-parse HEAD)"
 
       - name: Pick the Node version
@@ -546,11 +579,11 @@ jobs:
           # The same release label as the preflight: the tag, else the SHA's
           # first 12 characters.
           if [ -n "${ENGINE_TAG:-}" ]; then
-            ENGINE="spec-to-pr $ENGINE_TAG"
+            ENGINE="forge $ENGINE_TAG"
           elif [ -n "${ENGINE_SHA:-}" ]; then
-            ENGINE="spec-to-pr ${ENGINE_SHA:0:12}"
+            ENGINE="forge ${ENGINE_SHA:0:12}"
           else
-            ENGINE="the fetched spec-to-pr release"
+            ENGINE="the fetched engine release"
           fi
           # fail <message>: one ::error line, also kept as a step output for
           # Report and in the job summary (same header as the preflight).
@@ -633,7 +666,7 @@ jobs:
 
       - name: Preflight — does this Node run the engine?
         id: node-preflight
-        # spec-to-pr checks its own Node floor only when dstp starts, after the
+        # The engine checks its own Node floor only when dstp starts, after the
         # gateway preflight and install_command. Check the fetched release's
         # package.json engines.node now, before any npm ci, so a Node it cannot
         # run on stops the job in seconds with the fix named. When setup-node
@@ -661,10 +694,10 @@ jobs:
           // The same release label as the pick: the tag, else the SHA's first
           // 12 characters.
           const engine = env.ENGINE_TAG
-            ? `spec-to-pr ${env.ENGINE_TAG}`
+            ? `forge ${env.ENGINE_TAG}`
             : env.ENGINE_SHA
-              ? `spec-to-pr ${env.ENGINE_SHA.slice(0, 12)}`
-              : "the fetched spec-to-pr release";
+              ? `forge ${env.ENGINE_SHA.slice(0, 12)}`
+              : "the fetched engine release";
           const have = process.versions.node;
           // Engine-supplied text is printed on one line, so no part of it can
           // start a line and run as a workflow command.
@@ -773,7 +806,7 @@ jobs:
           fail(`${needs}, but ${named} ${gave}, which does not satisfy it. Set node_version in the calling workflow to a version in that range, or pin engine_ref to another release.${rollback}`);
           JS
 
-      - name: Install the spec-to-pr engine's dependencies
+      - name: Install the Forge engine's dependencies
         # Separate from the fetch so it runs on the Node picked and checked above.
         run: |
           set -euo pipefail
@@ -3418,6 +3451,8 @@ jobs:
           ENGINE_SHA: ${{ steps.engine.outputs.engine_sha }}
           # Why the Node pick or preflight stopped the job, fix included.
           NODE_ERROR: ${{ steps.node-preflight.outputs.error || steps.node.outputs.error }}
+          # Why the engine release guard refused the fetched commit (names the SHA).
+          ENGINE_ERROR: ${{ steps.engine.outputs.error }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # Same bot token as forge-agent. Completion is a new thread reply;
           # the living card is chat.update'd to a quiet done line.
@@ -4195,6 +4230,17 @@ jobs:
             REACTION="white_check_mark"
             [ "$EMOJI" = "⚠️" ] && REACTION="warning"
             LABEL="forge:done"
+          elif [ -n "${ENGINE_ERROR:-}" ]; then
+            # The engine release guard refused the fetched commit before Node was
+            # picked or anything installed. Deterministic, like a Node stop: the
+            # same engine_ref is refused again, so the hint is to fix it.
+            ENGINE_REASON=$(printf '%s' "$ENGINE_ERROR" | tr -d '\r' | cut -c1-1000)
+            BODY=$(printf '🔨 Forge stopped before it started: %s\n\n[Full log](%s)\n\nFix `engine_ref` in the calling workflow, then re-apply the `forge` label.\n\nTook %s.' "$ENGINE_REASON" "$RUN_URL" "$TOOK")
+            RUN_FAILED=1
+            LABEL="forge:failed"
+            REACTION="x"
+            QUIET="❌ Failed · engine check"
+            SLACK_TEXT=$(printf '%s❌ Failed on %s: %s\nThe <%s|run log> has the details.\nTook %s.' "$WHO" "$ISSUE_LINK" "$(printf '%s' "$ENGINE_REASON" | slack_escape)" "$RUN_URL" "$TOOK")
           elif [ -n "${NODE_ERROR:-}" ]; then
             # The Node pick or preflight stopped the job before anything was
             # installed or dstp started. Its message names the fix, so it is
@@ -4227,10 +4273,12 @@ jobs:
             fi
           fi
 
-          # Empty when the run failed before the engine was fetched. A SHA input
-          # has no tag, so only the commit is shown.
+          # Empty when the run failed before the engine was fetched, or when the
+          # release guard refused the fetched commit (that reason, which names the
+          # SHA, is the comment body then). A SHA input has no tag, so only the
+          # commit is shown.
           if [ -n "${ENGINE_SHA:-}" ]; then
-            BODY=$(printf '%s\n\n<sub>Engine: spec-to-pr %s`%s`</sub>' "$BODY" \
+            BODY=$(printf '%s\n\n<sub>Engine: forge %s`%s`</sub>' "$BODY" \
               "${ENGINE_TAG:+$ENGINE_TAG }" "${ENGINE_SHA:0:7}")
           fi
 
