@@ -539,7 +539,13 @@ jobs:
                 if [ "$expired" = 1 ] || ! grep -qxF 'forge:pr-text' <<< "$labels"; then
                   grep -qxF 'forge:running' <<< "$labels" && return 0
                   if [ "$again" -ge 3 ]; then
-                    echo "::error::forge:running is still missing from #${ISSUE_NUMBER} after setting it again 3 times, so a pr-text run could write during this run. Stopping."
+                    CLAIM_REASON="forge:running is still missing from #${ISSUE_NUMBER} after setting it again 3 times, so a pr-text run could write during this run."
+                    echo "::error::${CLAIM_REASON} Stopping."
+                    # Report reads this, so the issue and Slack get the reason, not the generic failure (K-016).
+                    echo "error=${CLAIM_REASON}" >> "$GITHUB_OUTPUT"
+                    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                      printf '### Forge stopped before it started\n\n%s\n' "$CLAIM_REASON" >> "$GITHUB_STEP_SUMMARY"
+                    fi
                     return 1
                   fi
                   echo "::warning::forge:running is missing from #${ISSUE_NUMBER} (a pr-text run can take it for an earlier run's and remove it). Setting it again."
@@ -3591,6 +3597,8 @@ jobs:
           NODE_ERROR: ${{ steps.node-preflight.outputs.error || steps.node.outputs.error }}
           # Why the engine release guard refused the fetched commit (names the SHA).
           ENGINE_ERROR: ${{ steps.engine.outputs.error }}
+          # Why the claim step stopped: forge:running could not be kept on the issue.
+          CLAIM_ERROR: ${{ steps.claim.outputs.error }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # Same bot token as forge-agent. Completion is a new thread reply;
           # the living card is chat.update'd to a quiet done line.
@@ -4368,6 +4376,17 @@ jobs:
             REACTION="white_check_mark"
             [ "$EMOJI" = "⚠️" ] && REACTION="warning"
             LABEL="forge:done"
+          elif [ -n "${CLAIM_ERROR:-}" ]; then
+            # The claim step could not keep forge:running on the issue, so it
+            # stopped before anything ran. Unlike an engine or Node stop this is
+            # transient (a pr-text run racing the label), so the hint is to retry.
+            CLAIM_REASON=$(printf '%s' "$CLAIM_ERROR" | tr -d '\r' | cut -c1-1000)
+            BODY=$(printf '🔨 Forge stopped before it started: %s\n\n[Full log](%s)\n\nRe-apply the `forge` label to retry.\n\nTook %s.' "$CLAIM_REASON" "$RUN_URL" "$TOOK")
+            RUN_FAILED=1
+            LABEL="forge:failed"
+            REACTION="x"
+            QUIET="❌ Failed · claim"
+            SLACK_TEXT=$(printf '%s❌ Failed on %s: %s\nThe <%s|run log> has the details.\nTook %s.' "$WHO" "$ISSUE_LINK" "$(printf '%s' "$CLAIM_REASON" | slack_escape)" "$RUN_URL" "$TOOK")
           elif [ -n "${ENGINE_ERROR:-}" ]; then
             # The engine release guard refused the fetched commit before Node was
             # picked or anything installed. Deterministic, like a Node stop: the
