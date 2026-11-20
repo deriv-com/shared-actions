@@ -1,7 +1,8 @@
 name: Forge — issue to PR
 
 # Reusable workflow. Turns a GitHub issue into a pull request using the
-# deriv-com/spec-to-pr engine: it classifies the issue (bugfix | feature |
+# Forge engine, which lives in deriv-com/forge-agent under engine/ and is
+# released there as vX.Y.Z tags: it classifies the issue (bugfix | feature |
 # refactor), writes a design doc and a plan, implements them, verifies the
 # result, and opens the PR — all committed so the "why" travels with the change.
 #
@@ -171,9 +172,16 @@ on:
 
       # --- per-repo tuning --------------------------------------------------
       node_version:
-        description: "Node version for the target repo's toolchain"
+        description: >-
+          Node version for the target repo's toolchain and the Forge
+          engine: anything actions/setup-node takes (a version, a range or an
+          alias). The target repo's install and verify commands also run on
+          this Node (running the engine on its own Node is #217). Empty (the
+          default) means the Node the engine release names, so it moves with
+          engine_ref. The job stops early, before any install, if node_version
+          doesn't satisfy the engine's package.json engines.node.
         required: false
-        default: "20.x"
+        default: ""
         type: string
       install_command:
         description: >-
@@ -198,26 +206,37 @@ on:
         type: string
       engine_ref:
         description: >-
-          Which deriv-com/spec-to-pr release to run. One of:
+          Which Forge engine release, from deriv-com/forge-agent, to run. One of:
             • a caret range, e.g. "^0.6.7" — the newest vX.Y.Z tag that is
               semver-compatible with it (npm caret rules: while the engine is
               0.x the minor is the breaking boundary, so "^0.6.7" means
               ">=0.6.7 <0.7.0"; from 1.x on it means "same major");
             • an exact tag, e.g. "v0.6.7";
-            • a full 40-char commit SHA, to freeze.
-          A range or tag follows whatever vX.Y.Z tags exist on spec-to-pr at run
-          time. Tags are not protected there (its rulesets cover branches only),
-          so anyone with write access to that repo can create or move one, and
-          the next run executes it with this job's write token in scope. A tag
-          can be moved, a commit cannot: pass a 40-char SHA to freeze.
+            • a full 40-char commit SHA, to freeze. Use the commit a release
+              tag points at. The fetch step refuses a commit whose root is not
+              the engine package (other forge-agent commits hold the Forge
+              service), but it does not check that a SHA is tagged.
+          A range or tag follows whatever vX.Y.Z tags exist on forge-agent at
+          run time. In forge-agent, v* tags are engine releases only: each one
+          points at a commit whose tree is the engine/ folder. Tags are not
+          protected there (its rulesets cover branches only), so anyone with
+          write access to that repo can create or move one, and the next run
+          executes it with this job's write token in scope. A tag can be moved,
+          a commit cannot: pass a 40-char SHA to freeze.
           Branches and pre-release tags are rejected. The resolved tag and SHA
           are logged and posted on the issue.
         required: false
         # Policy: every caller that doesn't pass engine_ref runs the newest
         # v0.8.x tag, and each new v0.8.x tag rolls out to them with no PR here.
-        # spec-to-pr ships features in 0.8.x patches, so this is "newest 0.8.x",
+        # The v0.3.0 to v0.8.4 tags were carried over unchanged from the
+        # engine's old repo, pointing at the same commits, so ^0.8.0 resolves
+        # to the same engine from either repo. Releases from 1.0.0 on are cut in
+        # forge-agent. Repos move to 1.x one at a time by passing engine_ref.
+        # The engine ships features in 0.8.x patches, so this is "newest 0.8.x",
         # not "bug fixes only". Bump the range deliberately for a new minor
-        # (0.x) / major (1.x+).
+        # (0.x) / major (1.x+). node_version follows the engine release by
+        # default, so a patch that raises the engine's Node floor needs no
+        # change here.
         default: "^0.8.0"
         type: string
       fast_lane:
@@ -258,7 +277,7 @@ on:
         description: "Private key for CLIENT_ID_GHAPP_WRITE"
         required: true
       CLIENT_ID_GHAPP:
-        description: "Read-only app, used to fetch the spec-to-pr engine"
+        description: "Read-only app, used to fetch the Forge engine from deriv-com/forge-agent"
         required: true
       PRIVATE_KEY_GHAPP:
         description: "Private key for CLIENT_ID_GHAPP"
@@ -390,17 +409,18 @@ jobs:
       # The real exposure is spend (LLM tokens + CI minutes). If that ever bites,
       # a rate limit is the right lever, not an allowlist.
 
-      - name: Mint token to read the spec-to-pr engine
+      - name: Mint token to read the Forge engine
         id: engine-token
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
           # Deliberately a different app from the one above: the write app is
-          # installed on the target repo, not on deriv-com/spec-to-pr, and GitHub
-          # answers 404 (not 403) for a repo outside an installation.
+          # installed on the target repo, not on deriv-com/forge-agent (where the
+          # engine lives), and GitHub answers 404 (not 403) for a repo outside an
+          # installation.
           app-id: ${{ secrets.CLIENT_ID_GHAPP }}
           private-key: ${{ secrets.PRIVATE_KEY_GHAPP }}
           owner: deriv-com
-          repositories: spec-to-pr
+          repositories: forge-agent
           permission-contents: read
 
       # ---- claim the issue ----------------------------------------------
@@ -571,17 +591,16 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           token: ${{ steps.repo-token.outputs.token }}
-          fetch-depth: 0 # spec-to-pr diffs against the base branch
+          fetch-depth: 0 # the engine diffs against the base branch
 
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: ${{ inputs.node_version }}
-
-      - name: Fetch the spec-to-pr engine
+      - name: Fetch the Forge engine
         id: engine
         # Fetched into RUNNER_TEMP, not the workspace, so the agent can never see
-        # or commit the engine's own files.
+        # or commit the engine's own files. git only: Node is set up after this,
+        # from what the fetched release names, and the engine's deps after that.
+        # A release tag in deriv-com/forge-agent points at a commit whose tree is
+        # engine/, so the engine's package.json and bin/cli.js sit at the root of
+        # $DIR: no path below says engine/.
         env:
           ENGINE_TOKEN: ${{ steps.engine-token.outputs.token }}
           ENGINE_REF: ${{ inputs.engine_ref }}
@@ -590,7 +609,7 @@ jobs:
           DIR="$RUNNER_TEMP/forge-engine"
           git init -q "$DIR"
           git -C "$DIR" remote add origin \
-            "https://x-access-token:${ENGINE_TOKEN}@github.com/deriv-com/spec-to-pr.git"
+            "https://x-access-token:${ENGINE_TOKEN}@github.com/deriv-com/forge-agent.git"
 
           # ---- resolve engine_ref to a commit SHA -------------------------
           # Everything below fetches a SHA, so a range or tag is resolved first,
@@ -611,7 +630,7 @@ jobs:
           elif [[ "$ENGINE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             ENGINE_SHA=$(tag_sha "$ENGINE_REF")
             ENGINE_TAG="$ENGINE_REF"
-            [ -n "$ENGINE_SHA" ] || { echo "::error::tag $ENGINE_REF does not exist in deriv-com/spec-to-pr"; exit 1; }
+            [ -n "$ENGINE_SHA" ] || { echo "::error::tag $ENGINE_REF does not exist in deriv-com/forge-agent"; exit 1; }
             echo "engine_ref $ENGINE_REF -> $ENGINE_SHA"
           elif [[ "$ENGINE_REF" =~ ^\^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
             MAJ=${BASH_REMATCH[1]} MIN=${BASH_REMATCH[2]} PAT=${BASH_REMATCH[3]}
@@ -625,10 +644,10 @@ jobs:
                   M == 0 && m > 0   { if (x == 0 && y == m && z >= p) print; next }
                                     { if (x == 0 && y == 0 && z == p) print }' \
               | sort -V | tail -1)
-            [ -n "$TAG" ] || { echo "::error::no spec-to-pr release tag satisfies $ENGINE_REF"; exit 1; }
+            [ -n "$TAG" ] || { echo "::error::no release tag satisfies $ENGINE_REF in deriv-com/forge-agent"; exit 1; }
             ENGINE_SHA=$(tag_sha "$TAG")
             ENGINE_TAG="$TAG"
-            [ -n "$ENGINE_SHA" ] || { echo "::error::could not resolve tag $TAG to a commit in deriv-com/spec-to-pr"; exit 1; }
+            [ -n "$ENGINE_SHA" ] || { echo "::error::could not resolve tag $TAG to a commit in deriv-com/forge-agent"; exit 1; }
             echo "engine_ref $ENGINE_REF -> $TAG ($ENGINE_SHA)"
           else
             echo "::error::engine_ref must be a caret range (^X.Y.Z), a release tag (vX.Y.Z) or a 40-char SHA — got '$ENGINE_REF'. Branches are not accepted."
@@ -639,6 +658,25 @@ jobs:
           # explicitly — the tag lookup above and this fetch then cannot disagree.
           git -C "$DIR" fetch -q --depth 1 origin "$ENGINE_SHA"
           git -C "$DIR" checkout -q --detach FETCH_HEAD
+          # ---- engine release guard ---------------------------------------
+          # forge-agent also holds the Forge service. Only a commit whose root is
+          # the engine package may run, so refuse anything else here: before its
+          # tag and SHA are reported, and before npm ci installs it with the write
+          # token in scope. This checks the tree's shape, not that a SHA is tagged.
+          # If engine/package.json is ever renamed, change the name here first.
+          ENGINE_PKG_NAME=$(jq -r '.name // empty' "$DIR/package.json") || ENGINE_PKG_NAME=""
+          if [ "$ENGINE_PKG_NAME" != "@deriv-com/spec-to-pr" ] || [ ! -f "$DIR/bin/cli.js" ]; then
+            ENGINE_REFUSED="$ENGINE_SHA is not an engine release commit: its root has no @deriv-com/spec-to-pr package.json and bin/cli.js. engine_ref must be a release tag in deriv-com/forge-agent, or the SHA such a tag points at."
+            echo "::error::$ENGINE_REFUSED"
+            # Kept for Report (the issue comment and Slack) and the job summary, so
+            # the stop names the refused commit and its fix instead of a retry.
+            echo "error=$ENGINE_REFUSED" >> "${GITHUB_OUTPUT:-/dev/null}"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '### Forge stopped before installing anything\n\n%s\n' "$ENGINE_REFUSED" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 1
+          fi
+          # ---- end engine release guard -----------------------------------
           # The default floats, so the issue comment names what actually ran —
           # the claim comment is posted before this step and can't.
           {
@@ -646,8 +684,262 @@ jobs:
             echo "engine_sha=$ENGINE_SHA"
           } >> "$GITHUB_OUTPUT"
           # Drop the embedded credential; it isn't needed past the fetch.
-          git -C "$DIR" remote set-url origin "https://github.com/deriv-com/spec-to-pr.git"
+          git -C "$DIR" remote set-url origin "https://github.com/deriv-com/forge-agent.git"
           echo "Engine at $(git -C "$DIR" rev-parse HEAD)"
+
+      - name: Pick the Node version
+        id: node
+        # The caller's node_version wins. Otherwise the engine release names its
+        # own Node (src/assets/upstream-versions.json .node.default), so the
+        # default moves with engine_ref and nothing here copies the engine's
+        # floor. If the release names no usable default, setup-node gets its
+        # package.json engines.node range and installs a Node that satisfies it
+        # (setup-node prefers versions cached on the runner). Only a release
+        # with neither gets 20.x (releases from before upstream-versions.json
+        # ran on Node 20 and later). jq/bash only: no Node has been set up yet.
+        env:
+          NODE_VERSION: ${{ inputs.node_version }}
+          ENGINE_TAG: ${{ steps.engine.outputs.engine_tag }}
+          ENGINE_SHA: ${{ steps.engine.outputs.engine_sha }}
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/forge-engine"
+          VERSIONS="$DIR/src/assets/upstream-versions.json"
+          # The same release label as the preflight: the tag, else the SHA's
+          # first 12 characters.
+          if [ -n "${ENGINE_TAG:-}" ]; then
+            ENGINE="forge $ENGINE_TAG"
+          elif [ -n "${ENGINE_SHA:-}" ]; then
+            ENGINE="forge ${ENGINE_SHA:0:12}"
+          else
+            ENGINE="the fetched engine release"
+          fi
+          # fail <message>: one ::error line, also kept as a step output for
+          # Report and in the job summary (same header as the preflight).
+          fail() {
+            echo "::error::$1"
+            echo "error=$1" >> "$GITHUB_OUTPUT"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '### Forge stopped before installing anything\n\n%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 1
+          }
+          # What setup-node takes: a version, a range (^ ~ >= < || x * and
+          # spaces) or an alias (lts/jod, node). Line breaks and the shell
+          # metacharacters a version never needs ($ ` ; & ( ) quotes \) are
+          # refused. The value only travels through env and step outputs.
+          SETUP_NODE_SPEC='^[0-9A-Za-z.^~<>=|*+/ -]+$'
+          usable() { [[ "$1" =~ $SETUP_NODE_SPEC ]]; }
+
+          # Checked before node_version is printed anywhere: a second line
+          # starting with :: would run as a workflow command.
+          if [[ "$NODE_VERSION" == *[$'\n\r']* ]]; then
+            fail "node_version must be a single line."
+          fi
+          if [ -n "$NODE_VERSION" ]; then
+            usable "$NODE_VERSION" \
+              || fail "node_version has characters setup-node never takes (\$, backticks, ;, &, parentheses, quotes or backslashes). Use a version, a range such as ^24.22.3, or an alias such as lts/jod."
+            echo "Node $NODE_VERSION: from the node_version input"
+            {
+              echo "version=$NODE_VERSION"
+              echo "source=input"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -f "$VERSIONS" ]; then
+            DEFAULT=$(jq -r '(.node.default)? // empty | strings' "$VERSIONS" 2>/dev/null) \
+              || fail "$ENGINE has a src/assets/upstream-versions.json that is not valid JSON, so the job cannot tell which Node it needs. Set node_version in the calling workflow, or pin engine_ref to another release."
+            if [ -n "$DEFAULT" ] && usable "$DEFAULT"; then
+              echo "Node $DEFAULT: $ENGINE names it as its own Node (upstream-versions.json .node.default)"
+              {
+                echo "version=$DEFAULT"
+                echo "source=engine-default"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ -n "$DEFAULT" ]; then
+              WHAT="a .node.default that setup-node cannot take in src/assets/upstream-versions.json"
+            else
+              WHAT="no .node.default string in src/assets/upstream-versions.json"
+            fi
+          else
+            WHAT="no src/assets/upstream-versions.json"
+          fi
+
+          # No usable default: the release's own engines.node range.
+          RANGE=$(jq -r '(.engines.node)? // empty | strings' "$DIR/package.json" 2>/dev/null) \
+            || fail "$ENGINE has a package.json that is missing or not valid JSON, so the job cannot tell which Node it needs. Pin engine_ref to another release."
+          if [ -n "$RANGE" ] && usable "$RANGE"; then
+            PICK="$RANGE" SOURCE=engines-node
+            if [ -f "$VERSIONS" ]; then
+              echo "::warning::$ENGINE has $WHAT, so setup-node gets its package.json engines.node ($RANGE) and installs a Node that satisfies it (setup-node prefers versions cached on the runner)."
+            else
+              echo "Node $RANGE: $ENGINE has $WHAT, so setup-node gets its package.json engines.node and installs a Node that satisfies it (setup-node prefers versions cached on the runner)"
+            fi
+          elif [ ! -f "$VERSIONS" ]; then
+            PICK=20.x SOURCE=fallback
+            echo "Node $PICK: $ENGINE has $WHAT and no usable engines.node, so it names no Node of its own (releases from before upstream-versions.json ran on Node 20 and later)"
+          else
+            fail "$ENGINE has $WHAT and no usable engines.node in package.json, so the job cannot tell which Node it needs. Set node_version in the calling workflow."
+          fi
+          {
+            echo "version=$PICK"
+            echo "source=$SOURCE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+
+      - name: Preflight — does this Node run the engine?
+        id: node-preflight
+        # The engine checks its own Node floor only when dstp starts, after the
+        # gateway preflight and install_command. Check the fetched release's
+        # package.json engines.node now, before any npm ci, so a Node it cannot
+        # run on stops the job in seconds with the fix named. When setup-node
+        # was handed engines.node itself, the Node it installed (setup-node
+        # prefers versions cached on the runner) satisfies it by construction,
+        # and a release that declares no engines.node has nothing to check.
+        # Otherwise the exact Node installed is compared with a small checker
+        # that reads the forms engines.node uses (a || b, ^x.y.z, >=x[.y[.z]],
+        # x.x). As in npm semver, a prerelease Node satisfies none of them. Any
+        # other form is warned about and let through, and dstp's own check
+        # still applies. A failure is also kept as a step output, which Report
+        # posts as the reason, and in the job summary.
+        env:
+          ENGINE_TAG: ${{ steps.engine.outputs.engine_tag }}
+          ENGINE_SHA: ${{ steps.engine.outputs.engine_sha }}
+          NODE_VERSION_INPUT: ${{ inputs.node_version }}
+          NODE_PICKED: ${{ steps.node.outputs.version }}
+          NODE_SOURCE: ${{ steps.node.outputs.source }}
+        run: |
+          set -euo pipefail
+          node - <<'JS'
+          const fs = require("fs");
+          const env = process.env;
+          const dir = `${env.RUNNER_TEMP}/forge-engine`;
+          // The same release label as the pick: the tag, else the SHA's first
+          // 12 characters.
+          const engine = env.ENGINE_TAG
+            ? `forge ${env.ENGINE_TAG}`
+            : env.ENGINE_SHA
+              ? `forge ${env.ENGINE_SHA.slice(0, 12)}`
+              : "the fetched engine release";
+          const have = process.versions.node;
+          // Engine-supplied text is printed on one line, so no part of it can
+          // start a line and run as a workflow command.
+          const oneLine = (text) => String(text).replace(/[\r\n]+/g, " ");
+
+          // fail: one ::error line, also kept for Report and the job summary
+          // (same header as the pick).
+          const fail = (text) => {
+            const msg = oneLine(text);
+            console.log(`::error::${msg}`);
+            if (env.GITHUB_OUTPUT) fs.appendFileSync(env.GITHUB_OUTPUT, `error=${msg}\n`);
+            if (env.GITHUB_STEP_SUMMARY) {
+              fs.appendFileSync(env.GITHUB_STEP_SUMMARY, `### Forge stopped before installing anything\n\n${msg}\n`);
+            }
+            process.exit(1);
+          };
+          // readJson: { value } or { error }, so a broken file gets a message
+          // that names the release instead of a stack trace.
+          const readJson = (rel) => {
+            try {
+              return { value: JSON.parse(fs.readFileSync(`${dir}/${rel}`, "utf8")) };
+            } catch (err) {
+              return { error: err.message };
+            }
+          };
+          const field = (obj, ...keys) =>
+            keys.reduce((o, k) => (o && typeof o === "object" ? o[k] : undefined), obj);
+
+          // upstream-versions.json is checked whenever the release ships it,
+          // whatever path picked the Node.
+          let versions = {};
+          if (fs.existsSync(`${dir}/src/assets/upstream-versions.json`)) {
+            const read = readJson("src/assets/upstream-versions.json");
+            if (read.error) {
+              fail(`${engine} has a src/assets/upstream-versions.json that is not valid JSON (${read.error}). Pin engine_ref to another release.`);
+            }
+            versions = read.value;
+          }
+          if (env.NODE_SOURCE === "engines-node") {
+            console.log(`setup-node installed Node ${have} from the engines.node of ${engine} (${env.NODE_PICKED}); nothing more to check.`);
+            process.exit(0);
+          }
+          const pkg = readJson("package.json");
+          if (pkg.error) {
+            fail(`${engine} has a package.json that is missing or not valid JSON (${pkg.error}), so the job cannot check which Node it runs on. Pin engine_ref to another release.`);
+          }
+          const rawRange = field(pkg.value, "engines", "node");
+          if (typeof rawRange !== "string" || !rawRange.trim()) {
+            console.log(`${engine} declares no engines.node; nothing to check.`);
+            process.exit(0);
+          }
+          const range = oneLine(rawRange);
+
+          // npm semver: a prerelease (24.0.0-rc.1) satisfies none of these plain
+          // forms, and build metadata (+...) is ignored.
+          const core = have.replace(/\+.*$/, "");
+          const prerelease = core.includes("-");
+          const v = core.replace(/-.*$/, "").split(".").map(Number);
+          const cmp = (a, b) => {
+            for (let i = 0; i < 3; i++) if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) - (b[i] || 0);
+            return 0;
+          };
+          // true / false, or null when this checker does not read the form.
+          const form = (c) => {
+            let m;
+            if ((m = /^\^(\d+)\.(\d+)\.(\d+)$/.exec(c))) {
+              const w = m.slice(1).map(Number);
+              if (cmp(v, w) < 0) return false;
+              if (w[0] > 0) return v[0] === w[0];
+              if (w[1] > 0) return v[0] === 0 && v[1] === w[1];
+              return cmp(v, w) === 0;
+            }
+            if ((m = /^>=\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?$/.exec(c)))
+              return cmp(v, [m[1], m[2] || 0, m[3] || 0].map(Number)) >= 0;
+            if ((m = /^(\d+)(?:\.(\d+|x))?\.x$/.exec(c)))
+              return v[0] === Number(m[1]) && (m[2] === undefined || m[2] === "x" || v[1] === Number(m[2]));
+            return null;
+          };
+          const sat = (c) => {
+            const ok = form(c);
+            return ok === null ? null : ok && !prerelease;
+          };
+          const results = range.split("||").map((c) => sat(c.trim()));
+          if (results.includes(true)) {
+            console.log(`Node ${have} satisfies ${engine} (engines.node ${range}).`);
+            process.exit(0);
+          }
+          if (results.includes(null)) {
+            console.log(`::warning::${engine} has engines.node "${range}", which this check cannot read; continuing on Node ${have}. dstp checks it again when it starts.`);
+            process.exit(0);
+          }
+
+          let rollback = "";
+          const target = field(versions, "node", "rollbackTargets", String(v[0]));
+          if (typeof target === "string" || typeof target === "number") {
+            rollback = ` To stay on Node ${v[0]}, pin engine_ref to v${String(target).replace(/^v/, "")}, the last release that runs on it.`;
+          }
+          const gave = `gave Node ${have}${prerelease ? ", a prerelease, which npm semver does not match against a plain range" : ""}`;
+          const needs = `${engine} needs Node ${range} (its package.json engines.node)`;
+          if (env.NODE_VERSION_INPUT) {
+            fail(`${needs}, but node_version "${env.NODE_VERSION_INPUT}" ${gave}. Set node_version to a version in that range, or leave it empty to run the Node the engine release names.${rollback}`);
+          }
+          const named = env.NODE_SOURCE === "fallback"
+            ? "the Node 20.x fallback (this release names no Node of its own)"
+            : `the Node this release names for itself (${env.NODE_PICKED})`;
+          fail(`${needs}, but ${named} ${gave}, which does not satisfy it. Set node_version in the calling workflow to a version in that range, or pin engine_ref to another release.${rollback}`);
+          JS
+
+      - name: Install the Forge engine's dependencies
+        # Separate from the fetch so it runs on the Node picked and checked above.
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/forge-engine"
           # The engine has its own dependency tree; install it in its own dir so
           # it never mixes with the target repo's workspaces. Keep optional deps:
           # the claude-code native binary ships as a platform-specific optional
@@ -747,7 +1039,7 @@ jobs:
           set -uo pipefail
           echo "base_url: ${ANTHROPIC_BASE_URL:-<unset>} | model: ${ANTHROPIC_MODEL:-<unset>}"
           cd "$RUNNER_TEMP/forge-engine"
-          # CLAUDE_BIN is exported by the fetch step, so this exercises exactly the
+          # CLAUDE_BIN is exported by the engine install step, so this exercises exactly the
           # binary the ELF guard there validated — no second copy of the resolver
           # that could drift from it.
           echo "claude binary: $CLAUDE_BIN"
@@ -3295,6 +3587,10 @@ jobs:
           OUTCOME: ${{ steps.forge.outcome }}
           ENGINE_TAG: ${{ steps.engine.outputs.engine_tag }}
           ENGINE_SHA: ${{ steps.engine.outputs.engine_sha }}
+          # Why the Node pick or preflight stopped the job, fix included.
+          NODE_ERROR: ${{ steps.node-preflight.outputs.error || steps.node.outputs.error }}
+          # Why the engine release guard refused the fetched commit (names the SHA).
+          ENGINE_ERROR: ${{ steps.engine.outputs.error }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # Same bot token as forge-agent. Completion is a new thread reply;
           # the living card is chat.update'd to a quiet done line.
@@ -4072,6 +4368,30 @@ jobs:
             REACTION="white_check_mark"
             [ "$EMOJI" = "⚠️" ] && REACTION="warning"
             LABEL="forge:done"
+          elif [ -n "${ENGINE_ERROR:-}" ]; then
+            # The engine release guard refused the fetched commit before Node was
+            # picked or anything installed. Deterministic, like a Node stop: the
+            # same engine_ref is refused again, so the hint is to fix it.
+            ENGINE_REASON=$(printf '%s' "$ENGINE_ERROR" | tr -d '\r' | cut -c1-1000)
+            BODY=$(printf '🔨 Forge stopped before it started: %s\n\n[Full log](%s)\n\nFix `engine_ref` in the calling workflow, then re-apply the `forge` label.\n\nTook %s.' "$ENGINE_REASON" "$RUN_URL" "$TOOK")
+            RUN_FAILED=1
+            LABEL="forge:failed"
+            REACTION="x"
+            QUIET="❌ Failed · engine check"
+            SLACK_TEXT=$(printf '%s❌ Failed on %s: %s\nThe <%s|run log> has the details.\nTook %s.' "$WHO" "$ISSUE_LINK" "$(printf '%s' "$ENGINE_REASON" | slack_escape)" "$RUN_URL" "$TOOK")
+          elif [ -n "${NODE_ERROR:-}" ]; then
+            # The Node pick or preflight stopped the job before anything was
+            # installed or dstp started. Its message names the fix, so it is
+            # the reason, not the empty dstp log.
+            NODE_REASON=$(printf '%s' "$NODE_ERROR" | tr -d '\r' | cut -c1-1000)
+            # A Node stop is deterministic: re-labelling with the same caller
+            # config fails the same way, so the hint is to fix the config.
+            BODY=$(printf '🔨 Forge stopped before it started: %s\n\n[Full log](%s)\n\nFix `node_version` or `engine_ref` in the calling workflow, then re-apply the `forge` label.\n\nTook %s.' "$NODE_REASON" "$RUN_URL" "$TOOK")
+            RUN_FAILED=1
+            LABEL="forge:failed"
+            REACTION="x"
+            QUIET="❌ Failed · Node check"
+            SLACK_TEXT=$(printf '%s❌ Failed on %s: %s\nThe <%s|run log> has the details.\nTook %s.' "$WHO" "$ISSUE_LINK" "$(printf '%s' "$NODE_REASON" | slack_escape)" "$RUN_URL" "$TOOK")
           else
             # The log tail goes into an issue comment via the API, where Actions' secret
             # masking does NOT apply, so scrub_log is the only protection.
@@ -4091,10 +4411,12 @@ jobs:
             fi
           fi
 
-          # Empty when the run failed before the engine was fetched. A SHA input
-          # has no tag, so only the commit is shown.
+          # Empty when the run failed before the engine was fetched, or when the
+          # release guard refused the fetched commit (that reason, which names the
+          # SHA, is the comment body then). A SHA input has no tag, so only the
+          # commit is shown.
           if [ -n "${ENGINE_SHA:-}" ]; then
-            BODY=$(printf '%s\n\n<sub>Engine: spec-to-pr %s`%s`</sub>' "$BODY" \
+            BODY=$(printf '%s\n\n<sub>Engine: forge %s`%s`</sub>' "$BODY" \
               "${ENGINE_TAG:+$ENGINE_TAG }" "${ENGINE_SHA:0:7}")
           fi
           # The claim comment's run marker stays, so pr-text can still tell
