@@ -1,0 +1,247 @@
+name: AI Test Case PR
+
+on:
+  workflow_call:
+    inputs:
+      claude_model:
+        description: "Claude model to use for test generation"
+        required: false
+        default: "claude-sonnet-4-5"
+        type: string
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: "Anthropic API key for Claude"
+        required: true
+      AGENT_METRICS_API_URL:
+        description: "Base URL for the metrics dashboard API. Leave unset to skip POSTing events."
+        required: false
+      AGENT_METRICS_API_KEY:
+        description: "API key for authenticating POST requests to the metrics dashboard."
+        required: false
+
+jobs:
+  generate-test-pr:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    concurrency:
+      group: ai-test-case-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Security Check - Validate User Access
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "Validating access for user: $ACTOR"
+
+          echo "::add-mask::${GH_TOKEN}"
+
+          MEMBERSHIP=$(curl -s -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/orgs/deriv-com/members/$ACTOR" \
+            -w "%{http_code}" -o /dev/null)
+          [[ "$MEMBERSHIP" == "204" ]] && echo "Verified org member" && exit 0
+
+          COLLAB=$(curl -s -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/repos/${REPO}/collaborators/$ACTOR" \
+            -w "%{http_code}" -o /dev/null)
+          [[ "$COLLAB" == "204" ]] && echo "Verified collaborator" && exit 0
+
+          echo "Access denied for user: $ACTOR"
+          exit 1
+
+      - name: Log Workflow Triggered
+        id: trigger-info
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          WORKFLOW_START_TIME=$(date +%s)
+          echo "start_time=$WORKFLOW_START_TIME" >> $GITHUB_OUTPUT
+          echo "## AI Test Case PR -- Workflow Info" >> $GITHUB_STEP_SUMMARY
+          echo "Event: ${GITHUB_EVENT_NAME}" >> $GITHUB_STEP_SUMMARY
+          echo "PR Number: #$PR_NUMBER" >> $GITHUB_STEP_SUMMARY
+          echo "PR Title: $PR_TITLE" >> $GITHUB_STEP_SUMMARY
+          echo "Repository: $REPO" >> $GITHUB_STEP_SUMMARY
+
+          EVENTS_FILE="/tmp/gentests_events_${GITHUB_RUN_ID}.jsonl"
+          PR_LINK="https://github.com/${REPO}/pull/${PR_NUMBER}"
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg repo "$REPO" \
+            --arg pr_link "$PR_LINK" \
+            '{
+              agent: "AI Test Case PR",
+              event_type: "workflow_triggered",
+              run_id: $run_id,
+              timestamp: (now | todate),
+              payload: {
+                repository: $repo,
+                pr_link: $pr_link,
+                workflow_name: "ai-test-case-pr"
+              }
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Generate Tests Action
+        id: ai-test-case-pr
+        uses: deriv-com/shared-actions/.github/actions/ai_test_case_pr@master
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          repository: ${{ github.repository }}
+          pr_number: ${{ github.event.pull_request.number }}
+          head_branch: ${{ github.event.pull_request.head.ref }}
+          claude_model: ${{ inputs.claude_model || 'claude-sonnet-4-5' }}
+
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          TEST_PR_CREATED: ${{ steps.ai-test-case-pr.outputs.test_pr_created }}
+          TEST_PR_URL: ${{ steps.ai-test-case-pr.outputs.test_pr_url }}
+          WORKFLOW_START_TIME: ${{ steps.trigger-info.outputs.start_time }}
+          AGENT_METRICS_API_URL: ${{ secrets.AGENT_METRICS_API_URL }}
+          AGENT_METRICS_API_KEY: ${{ secrets.AGENT_METRICS_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Number | #$PR_NUMBER |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test PR Created | ${TEST_PR_CREATED:-false} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test PR URL | ${TEST_PR_URL:-N/A} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | $JOB_STATUS |" >> $GITHUB_STEP_SUMMARY
+
+          # Compute duration
+          END_TIME=$(date +%s)
+          START_TIME="${WORKFLOW_START_TIME:-$END_TIME}"
+          DURATION_SECONDS=$((END_TIME - START_TIME))
+
+          # Log workflow_completed event
+          EVENTS_FILE="/tmp/gentests_events_${GITHUB_RUN_ID}.jsonl"
+          STATUS_VAL=$([ "$JOB_STATUS" = "success" ] && echo "success" || echo "failed")
+          TEST_PR_BOOL=$([ "${TEST_PR_CREATED:-false}" = "true" ] && echo "true" || echo "false")
+          if [ "$JOB_STATUS" = "success" ]; then
+            ERROR_JSON="null"
+          else
+            ERROR_JSON="\"Job failed with status: $JOB_STATUS\""
+          fi
+          [[ ! "$DURATION_SECONDS" =~ ^[0-9]+$ ]] && DURATION_SECONDS=0
+          jq -cn \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg repo "$REPO" \
+            --arg status "$STATUS_VAL" \
+            --argjson duration "$DURATION_SECONDS" \
+            --argjson test_pr_created "$TEST_PR_BOOL" \
+            --argjson error "$ERROR_JSON" \
+            '{
+              agent: "AI Test Case PR",
+              event_type: "workflow_completed",
+              run_id: $run_id,
+              timestamp: (now | todate),
+              payload: {
+                repository: $repo,
+                status: $status,
+                duration_seconds: $duration,
+                test_pr_created: $test_pr_created,
+                error: $error
+              }
+            }' >> "$EVENTS_FILE" 2>/dev/null || true
+
+          # POST accumulated events to metrics dashboard
+          if [[ -n "$AGENT_METRICS_API_URL" ]] && [ -f "$EVENTS_FILE" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Metrics Dashboard" >> $GITHUB_STEP_SUMMARY
+
+            CURL_HEADERS=(-H "Content-Type: application/json")
+            [[ -n "$AGENT_METRICS_API_KEY" ]] && CURL_HEADERS+=(-H "X-API-Key: $AGENT_METRICS_API_KEY")
+
+            POST_SUCCESS=0
+            POST_FAIL=0
+            while IFS= read -r EVENT_LINE; do
+              HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/api_response.json \
+                "${CURL_HEADERS[@]}" \
+                "${AGENT_METRICS_API_URL}/api/v1/events" \
+                -X POST \
+                -d "$EVENT_LINE")
+
+              if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "201" ]]; then
+                POST_SUCCESS=$((POST_SUCCESS + 1))
+              else
+                POST_FAIL=$((POST_FAIL + 1))
+                echo "Event POST returned HTTP $HTTP_CODE" >> $GITHUB_STEP_SUMMARY
+              fi
+            done < "$EVENTS_FILE"
+
+            echo "Events sent to dashboard: $POST_SUCCESS success, $POST_FAIL failed" >> $GITHUB_STEP_SUMMARY
+          else
+            if [[ -z "$AGENT_METRICS_API_URL" ]]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "AGENT_METRICS_API_URL not set -- events logged to job summary only" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+          # Display accumulated event log
+          if [ -f "$EVENTS_FILE" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "## AI Test Case PR -- Event Log" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            EVENT_NUM=0
+            while IFS= read -r EVENT_LINE; do
+              EVENT_NUM=$((EVENT_NUM + 1))
+              EVENT_TYPE=$(echo "$EVENT_LINE" | jq -r '.event_type // "unknown"')
+              {
+                echo "<details>"
+                printf "<summary>Event %d: <code>%s</code></summary>\n" "$EVENT_NUM" "$EVENT_TYPE"
+                echo ""
+                echo '```json'
+                echo "$EVENT_LINE" | jq '.'
+                echo '```'
+                echo ""
+                echo "</details>"
+                echo ""
+              } >> "$GITHUB_STEP_SUMMARY"
+            done < "$EVENTS_FILE"
+          fi
+
+      - name: Prepare Event Log Artifact
+        if: always()
+        run: |
+          EVENTS_FILE="/tmp/gentests_events_${GITHUB_RUN_ID}.jsonl"
+          ARTIFACT_DIR="/tmp/gentests_artifact_${GITHUB_RUN_ID}"
+          mkdir -p "$ARTIFACT_DIR"
+          if [ -s "$EVENTS_FILE" ]; then
+            jq -s '.' "$EVENTS_FILE" > "$ARTIFACT_DIR/ai-test-case-pr-payload.json"
+          else
+            echo '[]' > "$ARTIFACT_DIR/ai-test-case-pr-payload.json"
+          fi
+          rm -f "$EVENTS_FILE"
+
+      - name: Upload Event Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-test-case-pr-event-log-${{ github.run_id }}
+          path: /tmp/gentests_artifact_${{ github.run_id }}/ai-test-case-pr-payload.json
+          retention-days: 90
+          if-no-files-found: warn
