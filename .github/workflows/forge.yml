@@ -91,7 +91,7 @@ on:
         required: false
         type: string
       slack_mention_ts:
-        description: "Slack ts of the requester's message; Report swaps its status reaction"
+        description: "Slack ts of the requester's message; Report swaps its status reaction, and engine 1.x puts that message's screenshots first"
         required: false
         type: string
       requested_by:

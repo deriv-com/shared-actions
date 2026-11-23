@@ -107,8 +107,12 @@ check 'awk "/^      slack_message_ts:/{f=1} f && /required:/{print; exit}" "$WF"
   "input 'slack_message_ts' stays optional"
 check 'awk "/^      slack_mention_ts:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
   "slack_mention_ts is an optional input"
-check 'grep -q "SLACK_MENTION_TS: \${{ inputs.slack_mention_ts }}" "$WF"' \
+# Each step that needs it reads it from its own env, so each is checked on its
+# own: a file-wide grep would pass on either copy (K-001).
+check 'grep -qF "SLACK_MENTION_TS: \${{ inputs.slack_mention_ts }}" <<< "$(step_body "Report outcome")"' \
   "Report reads slack_mention_ts"
+check 'grep -qF "SLACK_MENTION_TS: \${{ inputs.slack_mention_ts }}" <<< "$(step_body "Run Forge")"' \
+  "Run Forge passes slack_mention_ts to the engine (it picks that message's screenshots first)"
 check 'awk "/^      slack_started_at:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
   "input 'slack_started_at' stays optional"
 
