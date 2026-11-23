@@ -108,11 +108,13 @@ check 'awk "/^      slack_message_ts:/{f=1} f && /required:/{print; exit}" "$WF"
 check 'awk "/^      slack_mention_ts:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
   "slack_mention_ts is an optional input"
 # Each step that needs it reads it from its own env, so each is checked on its
-# own: a file-wide grep would pass on either copy (K-001).
-check 'grep -qF "SLACK_MENTION_TS: \${{ inputs.slack_mention_ts }}" <<< "$(step_body "Report outcome")"' \
+# own (a file-wide grep would pass on either copy), as the exact env line, so a
+# commented-out copy does not count (K-001).
+MENTION_TS_ENV='          SLACK_MENTION_TS: ${{ inputs.slack_mention_ts }}'
+check 'grep -qxF "$MENTION_TS_ENV" <<< "$(step_body "Report outcome")"' \
   "Report reads slack_mention_ts"
-check 'grep -qF "SLACK_MENTION_TS: \${{ inputs.slack_mention_ts }}" <<< "$(step_body "Run Forge")"' \
-  "Run Forge passes slack_mention_ts to the engine (it picks that message's screenshots first)"
+check 'grep -qxF "$MENTION_TS_ENV" <<< "$(step_body "Run Forge")"' \
+  "Run Forge has slack_mention_ts in its env"
 check 'awk "/^      slack_started_at:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
   "input 'slack_started_at' stays optional"
 
