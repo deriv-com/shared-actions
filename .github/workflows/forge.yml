@@ -91,7 +91,7 @@ on:
         required: false
         type: string
       slack_mention_ts:
-        description: "Slack ts of the requester's message; Report swaps its status reaction"
+        description: "Slack ts of the requester's message; Report swaps its status reaction, and with engine_ref ^1.x the engine puts that message's screenshots first"
         required: false
         type: string
       requested_by:
@@ -1094,6 +1094,14 @@ jobs:
           # Not DSTP_FORGE_RUN_ID: forge_run_env passes it to the first dstp run only.
           FORGE_RUN_ID: ${{ inputs.forge_run_id }}
           SLACK_BOT_TOKEN: ${{ secrets.FORGE_SLACK_BOT_TOKEN }}
+          # Engine 1.x reads the thread the run was started from into the agent's
+          # prompt (forge-agent #220, PR #226: startedFromSlackThread in
+          # engine/src/lib/connectors/slack.js). SLACK_CHANNEL and SLACK_THREAD_TS
+          # come from the job env; the requester's message ts lets it pick that
+          # message's screenshots first, and the engine drops a value that is not
+          # a Slack ts. Empty outside Slack runs. Engine 0.8.x never reads it
+          # (v0.8.4 has no SLACK_MENTION_TS), so the ^0.8.0 default ignores it.
+          SLACK_MENTION_TS: ${{ inputs.slack_mention_ts }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -o pipefail
