@@ -1235,6 +1235,8 @@ case "$args" in
     # default the PR is open, from this repository, and closes issue 1213.
     u="${args#pr view }"; u="${u%% *}"; n="${u##*/}"
     if [ -f "$S/named_pr_fail" ]; then cat "$S/named_pr_fail" >&2; exit 1
+    elif [ -f "$S/named_pr_502_once" ] && [ ! -f "$S/named_pr_502_once.done" ]; then
+      touch "$S/named_pr_502_once.done"; echo "gh: Bad Gateway (HTTP 502)" >&2; exit 1
     elif [ -f "$S/named_pr_$n.json" ]; then cat "$S/named_pr_$n.json"
     else echo '{"state": "OPEN", "body": "", "isCrossRepository": false, "closingIssuesReferences": [{"number": 1213, "repository": {"name": "r", "owner": {"login": "o"}}}]}'; fi ;;
   "pr view https://github.com/o/r/pull/7 --json baseRefName --jq .baseRefName") echo master ;;
@@ -1862,6 +1864,21 @@ check '[[ "$(completion_of "$C")" == *"<https://github.com/o/r/pull/8|PR #8>, is
 C=$(report_only fork_junk OUTCOME=failure PR_UNRESOLVED=1 "PR_FROM_FORK=https://evil.example/o/r/pull/8" SLACK_MENTION_TS=3.3)
 check '[[ "$(completion_of "$C")" == *"No open PR is linked to issue"* ]] && ! has "$C/slack.jsonl" "evil.example"' \
   "a pr_from_fork that is not a GitHub pull URL is never posted"
+# The named-PR outputs (#227) get the same URL check and the update wording.
+for out in PR_NOT_LINKED PR_NAMED_UNREAD; do
+  C=$(report_only "junk_$out" OUTCOME=failure PR_UNRESOLVED=1 "$out=https://evil.example/o/r/pull/8" SLACK_MENTION_TS=3.3)
+  check '[[ "$(completion_of "$C")" == *"No open PR is linked to issue"* ]] && ! has "$C/slack.jsonl" "evil.example"' \
+    "a $out that is not a GitHub pull URL is never posted"
+done
+C=$(report_only not_linked_update OUTCOME=failure FORGE_COMMAND=update PR_UNRESOLVED=1 PR_NOT_LINKED=https://github.com/o/r/pull/8 SLACK_MENTION_TS=3.3)
+check '[[ "$(completion_of "$C")" == *"<https://github.com/o/r/pull/8|PR #8> is not an open PR that closes issue"*"so there is nothing to update."* ]] && [ "$(reactions "$C" add)" = warning ]' \
+  "an update on a named PR that does not close the issue says there is nothing to update (got $(completion_of "$C"))"
+C=$(report_only unread_update OUTCOME=failure FORGE_COMMAND=update PR_UNRESOLVED=1 PR_NAMED_UNREAD=https://github.com/o/r/pull/8 SLACK_MENTION_TS=3.3)
+check '[[ "$(completion_of "$C")" == *"could not read <https://github.com/o/r/pull/8|PR #8>"*"so it did not update anything."* ]]' \
+  "an update on a named PR that cannot be read says it did not update anything (got $(completion_of "$C"))"
+C=$(report_only invalid_update OUTCOME=failure FORGE_COMMAND=update PR_UNRESOLVED=1 PR_NUMBER_INVALID=1 SLACK_MENTION_TS=3.3)
+check '[[ "$(completion_of "$C")" == *"The PR to update on issue"*"was not given as a PR number, so Forge did not update anything."* ]]' \
+  "an update with an invalid pr_number says so (got $(completion_of "$C"))"
 
 # The only open PR that closes the issue is from a fork, and its branch is
 # named feature like this repository's PR branch (#195): no dstp run, no
@@ -2700,12 +2717,29 @@ run_case "$C"
 check '[ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && grep -qxF "pr_from_fork=https://github.com/o/r/pull/7" "$C/out" && grep -q "^pr_unresolved=1$" "$C/out"' \
   "a named PR from a fork is refused, and no other PR is revised in its place"
 
+# A number that is no PR here (an issue's number, a typo): gh pr view says so
+# in GraphQL's words, with no HTTP status. Read once, never retried, and
+# reported as not a PR that closes the issue.
+C=$(quiet_case named_pr_not_a_pr)
+echo 7 > "$C/pr_number"
+echo "GraphQL: Could not resolve to a PullRequest with the number of 7. (repository.pullRequest)" > "$C/named_pr_fail"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && grep -qxF "pr_not_linked=https://github.com/o/r/pull/7" "$C/out" && ! grep -q "^pr_named_unread=" "$C/out" && [ "$(grep -c "json state,body,isCrossRepository,closingIssuesReferences" "$C/gh.log")" = 1 ] && ! grep -qsx 60 "$C/sleep.log"' \
+  "a pr_number that names no PR is read once and refused as not closing the issue"
+
+C=$(quiet_case named_pr_502_once)
+echo 7 > "$C/pr_number"
+touch "$C/named_pr_502_once"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out" && [ "$(grep -c "json state,body,isCrossRepository,closingIssuesReferences" "$C/gh.log")" = 2 ] && grep -qsx 60 "$C/sleep.log" && has "$C/run.log" "Retrying in 60s"' \
+  "a 502 on the named PR read is retried, and the retry is in the log"
+
 C=$(quiet_case named_pr_unread)
 echo 7 > "$C/pr_number"
-echo "gh: Not Found (HTTP 404)" > "$C/named_pr_fail"
+echo "gh: Bad Gateway (HTTP 502)" > "$C/named_pr_fail"
 run_case "$C"
 check '[ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && grep -qxF "pr_named_unread=https://github.com/o/r/pull/7" "$C/out" && grep -q "^pr_unresolved=1$" "$C/out" && ! grep -q "^pr_not_linked=" "$C/out"' \
-  "a named PR that cannot be read stops the run without calling it unlinked"
+  "a named PR that keeps failing to read stops the run without calling it unlinked"
 check '[ "$(head -1 "$C/completion.txt")" = "⚠️ Forge could not read <https://github.com/o/r/pull/7|PR #7> to check that it closes issue <https://github.com/o/r/issues/1213|#1213>, so it did not revise anything. Ask again in a few minutes." ]' \
   "the completion says the PR could not be read (got $(head -1 "$C/completion.txt"))"
 

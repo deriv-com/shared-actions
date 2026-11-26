@@ -3117,6 +3117,25 @@ jobs:
             return 0
           }
 
+          # gh_read of the named PR. A number that is no PR in this repository
+          # (an issue's number, or a typo) is GraphQL's "Could not resolve to a
+          # PullRequest" with no HTTP status, which gh_read would retry: return
+          # 3 for it instead, which gate_read does not retry.
+          named_pr_read() {
+            local err out rc=0
+            err=$(mktemp)
+            out=$(gh_read pr view "$1" --json state,body,isCrossRepository,closingIssuesReferences 2>"$err") || rc=$?
+            if [ "$rc" -ne 0 ] && grep -q "Could not resolve to a PullRequest" "$err"; then
+              rm -f "$err"
+              echo "$1 is not a pull request in ${GITHUB_REPOSITORY}" >&2
+              return 3
+            fi
+            cat "$err" >&2
+            rm -f "$err"
+            [ "$rc" -eq 0 ] || return "$rc"
+            printf '%s' "$out"
+          }
+
           # The PR the requester named (pr_number, forge-agent#227), in place
           # of find_open_pr's first pick. The PR itself is read, so it is found
           # however many PRs the repo has open. It qualifies only when it is
@@ -3125,13 +3144,17 @@ jobs:
           # a number cannot point the run at an unrelated PR. Sets
           # FOUND_PR_URL; FORK_PR_URL for a fork PR (the same missing-counts-
           # as-fork rule as find_open_pr); NOT_LINKED_PR_URL when it is not an
-          # open PR that closes the issue; UNREAD_PR_URL when it could not be
-          # read (gate_read retries a 5xx or rate limit).
+          # open PR that closes the issue, or names no PR at all; UNREAD_PR_URL
+          # when it could not be read (gate_read retries a 5xx or rate limit).
           named_open_pr() {
-            local want info closes
+            local want info closes rc=0
             want="https://github.com/${GITHUB_REPOSITORY}/pull/${PR_NUMBER}"
-            if ! info=$(gate_read "PR #${PR_NUMBER}" gh_read pr view "$want" --json state,body,isCrossRepository,closingIssuesReferences 2>/dev/null) \
-              || ! printf '%s' "$info" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            info=$(gate_read "PR #${PR_NUMBER}" named_pr_read "$want") || rc=$?
+            if [ "$rc" -eq 3 ]; then
+              NOT_LINKED_PR_URL="$want"
+              return 0
+            fi
+            if [ "$rc" -ne 0 ] || ! printf '%s' "$info" | jq -e 'type == "object"' >/dev/null 2>&1; then
               UNREAD_PR_URL="$want"
               return 0
             fi
