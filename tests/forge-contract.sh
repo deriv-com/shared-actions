@@ -2731,7 +2731,7 @@ C=$(quiet_case named_pr_502_once)
 echo 7 > "$C/pr_number"
 touch "$C/named_pr_502_once"
 run_case "$C"
-check '[ ! -s "$C/unhandled.log" ] && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out" && [ "$(grep -c "json state,body,isCrossRepository,closingIssuesReferences" "$C/gh.log")" = 2 ] && grep -qsx 60 "$C/sleep.log" && has "$C/run.log" "Retrying in 60s"' \
+check '[ ! -s "$C/unhandled.log" ] && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out" && [ "$(grep -c "json state,body,isCrossRepository,closingIssuesReferences" "$C/gh.log")" = 2 ] && [ "$(grep -cx 60 "$C/sleep.log")" = 1 ] && has "$C/run.log" "Retrying in 60s"' \
   "a 502 on the named PR read is retried, and the retry is in the log"
 
 C=$(quiet_case named_pr_unread)
