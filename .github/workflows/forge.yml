@@ -3136,6 +3136,35 @@ jobs:
             printf '%s' "$out"
           }
 
+          # The closing-keyword test pr-text uses (the same text, pinned equal
+          # by tests/forge-contract.sh): named_open_pr reads a PR body with it
+          # so a body that only mentions the issue in a comment or a code
+          # fence, or inside a longer word, does not qualify (#227).
+          # closes_issue($issue), over a description: a closing keyword for
+          # #$issue outside HTML comments and fenced code, closed or not.
+          # Fences follow CommonMark: a run of 3+ backticks or tildes at the
+          # start of a line (up to 3 spaces in) opens one, and only a line
+          # holding a run of the same character at least as long closes it.
+          # pr_blocker reads it, and a description pr-text writes always
+          # passes it. open_fence: the opening run of the fence a description
+          # leaves open, or "", so the same run can close it before a closing
+          # line is added.
+          CLOSES_JQ='
+            def fence_scan:
+              gsub("<!--[\\s\\S]*?-->"; "") | split("\n")
+              | reduce .[] as $l ({out: [], open: ""};
+                  (first($l | capture("^ {0,3}(?<r>`{3,}|~{3,})") | .r) // "") as $r
+                  | if .open == "" then
+                      (if $r != "" then .open = $r else .out += [$l] end)
+                    elif $r != "" and $r[0:1] == .open[0:1] and ($r | length) >= (.open | length)
+                         and ($l | test("^ {0,3}(`+|~+)[ \\t]*$")) then .open = ""
+                    else . end);
+            def closes_issue($issue):
+              fence_scan | .out | join("\n")
+              | test("(?i)\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s+#\($issue)(?![0-9])");
+            def open_fence: fence_scan | .open;
+          '
+
           # The PR the requester named (pr_number, forge-agent#227), in place
           # of find_open_pr's first pick. The PR itself is read, so it is found
           # however many PRs the repo has open. It qualifies only when it is
@@ -3158,11 +3187,11 @@ jobs:
               UNREAD_PR_URL="$want"
               return 0
             fi
-            closes=$(printf '%s' "$info" | jq -r --arg n "$ISSUE_NUMBER" --arg repo "$GITHUB_REPOSITORY" '
+            closes=$(printf '%s' "$info" | jq -r --arg n "$ISSUE_NUMBER" --arg repo "$GITHUB_REPOSITORY" "${CLOSES_JQ}"'
               (.state == "OPEN") and (
                 ([.closingIssuesReferences[]? | select((.number | tostring) == $n
                   and (("\(.repository.owner.login // "")/\(.repository.name // "")" | ascii_downcase) == ($repo | ascii_downcase)))] | length > 0)
-                or ((.body // "") | test("(?i)(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s+#" + $n + "\\b"))
+                or ((.body // "") | closes_issue($n))
               )' 2>/dev/null || echo false)
             if [ "$closes" != "true" ]; then
               NOT_LINKED_PR_URL="$want"
@@ -4175,7 +4204,7 @@ jobs:
             [ "$MODE" = "update" ] && VERB="update"
             NOT_LINKED_NUM="${NOT_LINKED_URL##*/}"
             FACTS="PR #${NOT_LINKED_NUM} is not an open PR that closes this issue, so there is nothing to ${VERB}."
-            QUIET="⚠️ PR does not close this issue"
+            QUIET="⚠️ Not an open PR for this issue"
             REACTION="warning"
             BODY=$(printf '🔨 %s\n\nAdd `Closes #%s` to that PR body, or name the PR that closes this issue, and ask again.\n\nTook %s.' "$FACTS" "$ISSUE_NUMBER" "$TOOK")
             LABEL="forge:failed"

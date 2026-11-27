@@ -110,9 +110,12 @@ check 'awk "/^      slack_mention_ts:/{f=1} f && /required:/{print; exit}" "$WF"
 # pr_number (forge-agent#227): optional, so callers that don't pass it work as
 # before, and in the forge job's env, where Run Forge reads it. Report reads
 # only what Run Forge made of it.
-check 'awk "/^      pr_number:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
+forge_job_env() {
+  awk '/^  forge:$/ {j=1; next} j && /^  [a-z_-]+:$/ {exit} j && /^    env:$/ {e=1; next} e && /^    [^ ]/ {e=0} e {print}' "$WF"
+}
+check 'grep -q "required: false" <<< "$(awk "/^      pr_number:/{f=1} f && /required:/{print; exit}" "$WF")"' \
   "pr_number is an optional input"
-check 'grep -qxF "      PR_NUMBER: \${{ inputs.pr_number }}" "$WF"' \
+check 'grep -qxF "      PR_NUMBER: \${{ inputs.pr_number }}" <<< "$(forge_job_env)"' \
   "the forge job's env carries pr_number"
 check 'grep -qxF "          PR_NOT_LINKED: \${{ steps.forge.outputs.pr_not_linked }}" <<< "$(step_body "Report outcome")"' \
   "Report reads pr_not_linked"
@@ -132,9 +135,6 @@ check 'grep -qxF "$MENTION_TS_ENV" <<< "$(step_body "Run Forge")"' \
 # SLACK_THREAD_TS, which Run Forge gets from the forge job's env. Pinned as exact
 # lines in that env (or in Run Forge's own), so moving them into only the steps
 # that post to Slack, as the pr-text job does, fails here.
-forge_job_env() {
-  awk '/^  forge:$/ {j=1; next} j && /^  [a-z_-]+:$/ {exit} j && /^    env:$/ {e=1; next} e && /^    [^ ]/ {e=0} e {print}' "$WF"
-}
 for THREAD_ENV in 'SLACK_CHANNEL: ${{ inputs.slack_channel }}' 'SLACK_THREAD_TS: ${{ inputs.slack_thread_ts }}'; do
   check 'grep -qxF "      $THREAD_ENV" <<< "$(forge_job_env)" || grep -qxF "          $THREAD_ENV" <<< "$(step_body "Run Forge")"' \
     "Run Forge gets ${THREAD_ENV%%:*} (forge job env or its own)"
@@ -2698,8 +2698,12 @@ check '[ ! -s "$C/unhandled.log" ] && grep -qxF "pr_url=https://github.com/o/r/p
 for nl in "mention|OPEN|Mentions #1213 but closes nothing|false|[]" \
   "closed|CLOSED|Closes #1213|false|[]" \
   'other_repo|OPEN||false|[{"number": 1213, "repository": {"name": "other", "owner": {"login": "o"}}}]' \
-  "other_issue|OPEN|Closes #12134|false|[]"; do
+  "other_issue|OPEN|Closes #12134|false|[]" \
+  "longer_word|OPEN|This prefixes #1213 only|false|[]" \
+  "comment|OPEN|<!-- Closes #1213 -->|false|[]" \
+  'fence|OPEN|```\nCloses #1213\n```|false|[]'; do
   IFS='|' read -r name state body fork closing <<< "$nl"
+  body=$(printf '%b' "$body")
   C=$(quiet_case "named_pr_$name")
   echo 7 > "$C/pr_number"
   named_pr_json "$state" "$body" "$fork" "$closing" > "$C/named_pr_7.json"
@@ -2709,6 +2713,22 @@ for nl in "mention|OPEN|Mentions #1213 but closes nothing|false|[]" \
 done
 check '[ "$(head -1 "$C/completion.txt")" = "⚠️ <https://github.com/o/r/pull/7|PR #7> is not an open PR that closes issue <https://github.com/o/r/issues/1213|#1213>, so there is nothing to revise. Add Closes #1213 to that PR body, or name the PR that closes the issue, and ask again." ] && grep -q "^issue edit 1213 --repo o/r .*--add-label forge:failed$" "$C/gh.log"' \
   "the completion names the PR and says why (got $(head -1 "$C/completion.txt"))"
+
+# A closing line after a closed comment and a closed fence still counts, and
+# the test is the one pr-text uses: the two CLOSES_JQ copies are the same text.
+C=$(quiet_case named_pr_body_after_fence)
+echo 7 > "$C/pr_number"
+named_pr_json OPEN "$(printf '<!-- note -->\n~~~\nCloses #5\n~~~\n\nCloses #1213')" false '[]' > "$C/named_pr_7.json"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out"' \
+  "a closing line after a closed comment and fence still qualifies a named PR"
+closes_jq_copy() {  # closes_jq_copy <n>: the n-th CLOSES_JQ='...' block in the workflow
+  awk -v want="$1" '/^          CLOSES_JQ=\x27/ {n++; f=(n == want)} f {print} f && /^          \x27$/ {f=0}' "$WF"
+}
+CJ_FORGE=$(closes_jq_copy 1)
+CJ_TEXT=$(closes_jq_copy 2)
+check '[ "$(wc -l <<< "$CJ_FORGE")" -gt 5 ] && [ "$CJ_FORGE" = "$CJ_TEXT" ] && [ -z "$(closes_jq_copy 3)" ]' \
+  "the forge job and pr-text share one CLOSES_JQ text"
 
 C=$(quiet_case named_pr_fork)
 echo 7 > "$C/pr_number"
