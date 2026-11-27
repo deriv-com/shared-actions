@@ -24,6 +24,7 @@ name: Forge — issue to PR
 #         forge_run_id:    { required: false, type: string }  # run id forge-agent registered
 #         analysis_brief:  { required: false, type: string }
 #         command:         { required: false, type: string }  # auto (first open), revise, update or pr-text
+#         pr_number:       { required: false, type: string }  # open PR to revise when the issue has several
 #
 #   jobs:
 #     forge:
@@ -40,6 +41,7 @@ name: Forge — issue to PR
 #         forge_run_id:    ${{ github.event.inputs.forge_run_id }}
 #         analysis_brief:  ${{ github.event.inputs.analysis_brief }}
 #         command:         ${{ github.event.inputs.command || 'auto' }}
+#         pr_number:       ${{ github.event.inputs.pr_number }}
 #         install_command: "npm ci"          # whatever your CI runs
 #       secrets:
 #         CLIENT_ID_GHAPP_WRITE:   ${{ secrets.CLIENT_ID_GHAPP_WRITE }}
@@ -72,6 +74,19 @@ on:
           closing line to its description. auto refuses a PR.
         required: true
         type: string
+
+      pr_number:
+        description: >-
+          For revise and update on an issue: the open PR to work on, when the
+          issue has more than one (forge-agent#227). It must be an open PR
+          from a branch of this repository that closes the issue, either as a
+          closing reference or with Closes, Fixes or Resolves #<issue> in its
+          body; otherwise the run stops before dstp. Labels, the run comment
+          and the closing line stay on the issue. Ignored when issue_number
+          is itself a PR, and by auto.
+        required: false
+        type: string
+        default: ""
 
       # --- Slack (only set by the forge-agent dispatch path) ---------------
       slack_channel:
@@ -329,6 +344,7 @@ jobs:
     env:
       ISSUE_NUMBER: ${{ inputs.issue_number }}
       ISSUE_URL: ${{ github.server_url }}/${{ github.repository }}/issues/${{ inputs.issue_number }}
+      PR_NUMBER: ${{ inputs.pr_number }}
       SLACK_CHANNEL: ${{ inputs.slack_channel }}
       SLACK_THREAD_TS: ${{ inputs.slack_thread_ts }}
       SLACK_MESSAGE_TS: ${{ inputs.slack_message_ts }}
@@ -3101,6 +3117,94 @@ jobs:
             return 0
           }
 
+          # gh_read of the named PR. A number that is no PR in this repository
+          # (an issue's number, or a typo) is GraphQL's "Could not resolve to a
+          # PullRequest" with no HTTP status, which gh_read would retry: return
+          # 3 for it instead, which gate_read does not retry.
+          named_pr_read() {
+            local err out rc=0
+            err=$(mktemp)
+            out=$(gh_read pr view "$1" --json state,body,isCrossRepository,closingIssuesReferences 2>"$err") || rc=$?
+            if [ "$rc" -ne 0 ] && grep -q "Could not resolve to a PullRequest" "$err"; then
+              rm -f "$err"
+              echo "$1 is not a pull request in ${GITHUB_REPOSITORY}" >&2
+              return 3
+            fi
+            cat "$err" >&2
+            rm -f "$err"
+            [ "$rc" -eq 0 ] || return "$rc"
+            printf '%s' "$out"
+          }
+
+          # The closing-keyword test pr-text uses (the same text, pinned equal
+          # by tests/forge-contract.sh): named_open_pr reads a PR body with it
+          # so a body that only mentions the issue in a comment or a code
+          # fence, or inside a longer word, does not qualify (#227).
+          # closes_issue($issue), over a description: a closing keyword for
+          # #$issue outside HTML comments and fenced code, closed or not.
+          # Fences follow CommonMark: a run of 3+ backticks or tildes at the
+          # start of a line (up to 3 spaces in) opens one, and only a line
+          # holding a run of the same character at least as long closes it.
+          # A backtick run followed by more backticks on the line is an
+          # inline code span, not a fence. CRLF and lone CR line ends count
+          # as newlines. This job only uses closes_issue; open_fence stays so
+          # the text is the same, byte for byte, as pr-text's (a contract
+          # check pins them equal).
+          CLOSES_JQ='
+            def fence_scan:
+              gsub("\r\n?"; "\n") | gsub("<!--[\\s\\S]*?-->"; "") | split("\n")
+              | reduce .[] as $l ({out: [], open: ""};
+                  (first($l | capture("^ {0,3}(?<r>`{3,}|~{3,})") | .r) // "") as $r
+                  | if .open == "" then
+                      (if $r != "" and ($r[0:1] == "~" or ($l | test("^ {0,3}`+[^`]*$")))
+                       then .open = $r else .out += [$l] end)
+                    elif $r != "" and $r[0:1] == .open[0:1] and ($r | length) >= (.open | length)
+                         and ($l | test("^ {0,3}(`+|~+)[ \\t]*$")) then .open = ""
+                    else . end);
+            def closes_issue($issue):
+              fence_scan | .out | join("\n")
+              | test("(?i)\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s+#\($issue)(?![0-9])");
+            def open_fence: fence_scan | .open;
+          '
+
+          # The PR the requester named (pr_number, forge-agent#227), in place
+          # of find_open_pr's first pick. The PR itself is read, so it is found
+          # however many PRs the repo has open. It qualifies only when it is
+          # open and closes the issue, through a closing reference to this
+          # repository's issue or Closes, Fixes or Resolves #N in its body, so
+          # a number cannot point the run at an unrelated PR. Sets
+          # FOUND_PR_URL; FORK_PR_URL for a fork PR (the same missing-counts-
+          # as-fork rule as find_open_pr); NOT_LINKED_PR_URL when it is not an
+          # open PR that closes the issue, or names no PR at all; UNREAD_PR_URL
+          # when it could not be read (gate_read retries a 5xx or rate limit).
+          named_open_pr() {
+            local want info closes rc=0
+            want="https://github.com/${GITHUB_REPOSITORY}/pull/${PR_NUMBER}"
+            info=$(gate_read "PR #${PR_NUMBER}" named_pr_read "$want") || rc=$?
+            if [ "$rc" -eq 3 ]; then
+              NOT_LINKED_PR_URL="$want"
+              return 0
+            fi
+            if [ "$rc" -ne 0 ] || ! printf '%s' "$info" | jq -e 'type == "object"' >/dev/null 2>&1; then
+              UNREAD_PR_URL="$want"
+              return 0
+            fi
+            closes=$(printf '%s' "$info" | jq -r --arg n "$ISSUE_NUMBER" --arg repo "$GITHUB_REPOSITORY" "${CLOSES_JQ}"'
+              (.state == "OPEN") and (
+                ([.closingIssuesReferences[]? | select((.number | tostring) == $n
+                  and (("\(.repository.owner.login // "")/\(.repository.name // "")" | ascii_downcase) == ($repo | ascii_downcase)))] | length > 0)
+                or ((.body // "") | closes_issue($n))
+              )' 2>/dev/null || echo false)
+            if [ "$closes" != "true" ]; then
+              NOT_LINKED_PR_URL="$want"
+            elif printf '%s' "$info" | jq -e '.isCrossRepository != false' >/dev/null 2>&1; then
+              FORK_PR_URL="$want"
+            else
+              FOUND_PR_URL="$want"
+            fi
+            return 0
+          }
+
           # A PR as the work item (#173). GitHub numbers issues and PRs
           # together, so issue_number can name a PR, and the issues API then
           # answers with a pull_request key. revise and update work on that
@@ -3140,7 +3244,17 @@ jobs:
             STATUS=0
             FOUND_PR_URL=""
             FORK_PR_URL=""
-            if [ -z "$WORK_PR_URL" ]; then
+            NOT_LINKED_PR_URL=""
+            UNREAD_PR_URL=""
+            BAD_PR_NUMBER=""
+            if [ -z "$WORK_PR_URL" ] && [ -n "${PR_NUMBER:-}" ]; then
+              if [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,8}$ ]]; then
+                named_open_pr
+              else
+                BAD_PR_NUMBER=1
+                echo "pr_number is not a PR number; cannot ${COMMAND}"
+              fi
+            elif [ -z "$WORK_PR_URL" ]; then
               find_open_pr
             elif [ "$WORK_PR_STATE" != "open" ]; then
               echo "PR #${ISSUE_NUMBER} is ${WORK_PR_STATE}; cannot ${COMMAND}"
@@ -3163,6 +3277,14 @@ jobs:
               elif [ -n "$FORK_PR_URL" ]; then
                 echo "The open PR for issue #${ISSUE_NUMBER} (${FORK_PR_URL}) is from a fork; Forge works only on branches in this repository, so it cannot ${COMMAND}"
                 echo "pr_from_fork=$FORK_PR_URL" >> "$GITHUB_OUTPUT"
+              elif [ -n "$NOT_LINKED_PR_URL" ]; then
+                echo "${NOT_LINKED_PR_URL} is not an open PR that closes issue #${ISSUE_NUMBER}; cannot ${COMMAND}"
+                echo "pr_not_linked=$NOT_LINKED_PR_URL" >> "$GITHUB_OUTPUT"
+              elif [ -n "$UNREAD_PR_URL" ]; then
+                echo "Could not read ${UNREAD_PR_URL} to check that it closes issue #${ISSUE_NUMBER}; cannot ${COMMAND}"
+                echo "pr_named_unread=$UNREAD_PR_URL" >> "$GITHUB_OUTPUT"
+              elif [ -n "$BAD_PR_NUMBER" ]; then
+                echo "pr_number_invalid=1" >> "$GITHUB_OUTPUT"
               elif [ -z "$WORK_PR_URL" ]; then
                 echo "No open PR linked to issue #${ISSUE_NUMBER}; cannot revise"
               fi
@@ -3548,6 +3670,9 @@ jobs:
           PR_URL: ${{ steps.forge.outputs.pr_url }}
           PR_UNRESOLVED: ${{ steps.forge.outputs.pr_unresolved }}
           PR_FROM_FORK: ${{ steps.forge.outputs.pr_from_fork }}
+          PR_NOT_LINKED: ${{ steps.forge.outputs.pr_not_linked }}
+          PR_NAMED_UNREAD: ${{ steps.forge.outputs.pr_named_unread }}
+          PR_NUMBER_INVALID: ${{ steps.forge.outputs.pr_number_invalid }}
           WORK_PR: ${{ steps.forge.outputs.work_pr }}
           AUTO_ON_PR: ${{ steps.forge.outputs.auto_on_pr }}
           NO_CHANGE: ${{ steps.forge.outputs.no_change }}
@@ -4026,6 +4151,15 @@ jobs:
           if [[ "${PR_FROM_FORK:-}" =~ ^https://github.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[1-9][0-9]*$ ]]; then
             FORK_URL="$PR_FROM_FORK"
           fi
+          # The same check for a named PR that does not close the issue (#227).
+          NOT_LINKED_URL=""
+          if [[ "${PR_NOT_LINKED:-}" =~ ^https://github.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[1-9][0-9]*$ ]]; then
+            NOT_LINKED_URL="$PR_NOT_LINKED"
+          fi
+          UNREAD_URL=""
+          if [[ "${PR_NAMED_UNREAD:-}" =~ ^https://github.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[1-9][0-9]*$ ]]; then
+            UNREAD_URL="$PR_NAMED_UNREAD"
+          fi
           if [ "${AUTO_ON_PR:-}" = "1" ]; then
             # A PR as the work item of an auto run (#173): auto builds a PR
             # from an issue, so Run Forge refused before dstp.
@@ -4064,6 +4198,41 @@ jobs:
             BODY=$(printf '🔨 %s\n\nTook %s.' "$FACTS" "$TOOK")
             LABEL="forge:failed"
             SLACK_TEXT=$(printf '%s⚠️ %s is not open, so there is nothing to %s.\nTook %s.' "$WHO" "$ISSUE_LINK" "$VERB" "$TOOK")
+          elif [ "${PR_UNRESOLVED:-}" = "1" ] && [ -n "$NOT_LINKED_URL" ]; then
+            # The PR the requester named (pr_number, forge-agent#227) is not
+            # an open PR that closes this issue, so Run Forge stopped before
+            # dstp instead of working on another PR.
+            VERB="revise"
+            [ "$MODE" = "update" ] && VERB="update"
+            NOT_LINKED_NUM="${NOT_LINKED_URL##*/}"
+            FACTS="PR #${NOT_LINKED_NUM} is not an open PR that closes this issue, so there is nothing to ${VERB}."
+            QUIET="⚠️ Not an open PR for this issue"
+            REACTION="warning"
+            BODY=$(printf '🔨 %s\n\nAdd `Closes #%s` to that PR body, or name the PR that closes this issue, and ask again.\n\nTook %s.' "$FACTS" "$ISSUE_NUMBER" "$TOOK")
+            LABEL="forge:failed"
+            SLACK_TEXT=$(printf '%s⚠️ <%s|PR #%s> is not an open PR that closes issue %s, so there is nothing to %s. Add Closes #%s to that PR body, or name the PR that closes the issue, and ask again.\nTook %s.' "$WHO" "$NOT_LINKED_URL" "$NOT_LINKED_NUM" "$ISSUE_LINK" "$VERB" "$ISSUE_NUMBER" "$TOOK")
+          elif [ "${PR_UNRESOLVED:-}" = "1" ] && [ -n "$UNREAD_URL" ]; then
+            # The named PR could not be read, so Run Forge could not check it
+            # closes this issue and did not start (#227).
+            VERB="revise"
+            [ "$MODE" = "update" ] && VERB="update"
+            UNREAD_NUM="${UNREAD_URL##*/}"
+            FACTS="Forge could not read PR #${UNREAD_NUM} to check that it closes this issue, so it did not ${VERB} anything."
+            QUIET="⚠️ Could not read the PR"
+            REACTION="warning"
+            BODY=$(printf '🔨 %s\n\nAsk again in a few minutes.\n\nTook %s.' "$FACTS" "$TOOK")
+            LABEL="forge:failed"
+            SLACK_TEXT=$(printf '%s⚠️ Forge could not read <%s|PR #%s> to check that it closes issue %s, so it did not %s anything. Ask again in a few minutes.\nTook %s.' "$WHO" "$UNREAD_URL" "$UNREAD_NUM" "$ISSUE_LINK" "$VERB" "$TOOK")
+          elif [ "${PR_UNRESOLVED:-}" = "1" ] && [ "${PR_NUMBER_INVALID:-}" = "1" ]; then
+            # pr_number was set but is not a PR number, so nothing was read (#227).
+            VERB="revise"
+            [ "$MODE" = "update" ] && VERB="update"
+            FACTS="The PR to ${VERB} was not given as a PR number, so Forge did not ${VERB} anything."
+            QUIET="⚠️ PR number not valid"
+            REACTION="warning"
+            BODY=$(printf '🔨 %s\n\nName the PR by its number or link and ask again.\n\nTook %s.' "$FACTS" "$TOOK")
+            LABEL="forge:failed"
+            SLACK_TEXT=$(printf '%s⚠️ The PR to %s on issue %s was not given as a PR number, so Forge did not %s anything. Name the PR by its number or link and ask again.\nTook %s.' "$WHO" "$VERB" "$ISSUE_LINK" "$VERB" "$TOOK")
           elif [ "${PR_UNRESOLVED:-}" = "1" ]; then
             VERB="revise"
             [ "$MODE" = "update" ] && VERB="update"
@@ -5184,11 +5353,12 @@ jobs:
           # line is added.
           CLOSES_JQ='
             def fence_scan:
-              gsub("<!--[\\s\\S]*?-->"; "") | split("\n")
+              gsub("\r\n?"; "\n") | gsub("<!--[\\s\\S]*?-->"; "") | split("\n")
               | reduce .[] as $l ({out: [], open: ""};
                   (first($l | capture("^ {0,3}(?<r>`{3,}|~{3,})") | .r) // "") as $r
                   | if .open == "" then
-                      (if $r != "" then .open = $r else .out += [$l] end)
+                      (if $r != "" and ($r[0:1] == "~" or ($l | test("^ {0,3}`+[^`]*$")))
+                       then .open = $r else .out += [$l] end)
                     elif $r != "" and $r[0:1] == .open[0:1] and ($r | length) >= (.open | length)
                          and ($l | test("^ {0,3}(`+|~+)[ \\t]*$")) then .open = ""
                     else . end);

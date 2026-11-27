@@ -107,6 +107,22 @@ check 'awk "/^      slack_message_ts:/{f=1} f && /required:/{print; exit}" "$WF"
   "input 'slack_message_ts' stays optional"
 check 'awk "/^      slack_mention_ts:/{f=1} f && /required:/{print; exit}" "$WF" | grep -q "required: false"' \
   "slack_mention_ts is an optional input"
+# pr_number (forge-agent#227): optional, so callers that don't pass it work as
+# before, and in the forge job's env, where Run Forge reads it. Report reads
+# only what Run Forge made of it.
+forge_job_env() {
+  awk '/^  forge:$/ {j=1; next} j && /^  [a-z_-]+:$/ {exit} j && /^    env:$/ {e=1; next} e && /^    [^ ]/ {e=0} e {print}' "$WF"
+}
+check 'grep -q "required: false" <<< "$(awk "/^      pr_number:/{f=1} f && /required:/{print; exit}" "$WF")"' \
+  "pr_number is an optional input"
+check 'grep -qxF "      PR_NUMBER: \${{ inputs.pr_number }}" <<< "$(forge_job_env)"' \
+  "the forge job's env carries pr_number"
+check 'grep -qxF "          PR_NOT_LINKED: \${{ steps.forge.outputs.pr_not_linked }}" <<< "$(step_body "Report outcome")"' \
+  "Report reads pr_not_linked"
+check 'grep -qxF "          PR_NAMED_UNREAD: \${{ steps.forge.outputs.pr_named_unread }}" <<< "$(step_body "Report outcome")" && grep -qxF "          PR_NUMBER_INVALID: \${{ steps.forge.outputs.pr_number_invalid }}" <<< "$(step_body "Report outcome")"' \
+  "Report reads pr_named_unread and pr_number_invalid"
+check 'grep -qF "pr_number:       { required: false, type: string }" "$WF" && grep -qF "pr_number:       \${{ github.event.inputs.pr_number }}" "$WF"' \
+  "the minimal caller in the header declares and passes pr_number"
 # Each step that needs it reads it from its own env, so each is checked on its
 # own (a file-wide grep would pass on either copy), as the exact env line, so a
 # commented-out copy does not count.
@@ -119,9 +135,6 @@ check 'grep -qxF "$MENTION_TS_ENV" <<< "$(step_body "Run Forge")"' \
 # SLACK_THREAD_TS, which Run Forge gets from the forge job's env. Pinned as exact
 # lines in that env (or in Run Forge's own), so moving them into only the steps
 # that post to Slack, as the pr-text job does, fails here.
-forge_job_env() {
-  awk '/^  forge:$/ {j=1; next} j && /^  [a-z_-]+:$/ {exit} j && /^    env:$/ {e=1; next} e && /^    [^ ]/ {e=0} e {print}' "$WF"
-}
 for THREAD_ENV in 'SLACK_CHANNEL: ${{ inputs.slack_channel }}' 'SLACK_THREAD_TS: ${{ inputs.slack_thread_ts }}'; do
   check 'grep -qxF "      $THREAD_ENV" <<< "$(forge_job_env)" || grep -qxF "          $THREAD_ENV" <<< "$(step_body "Run Forge")"' \
     "Run Forge gets ${THREAD_ENV%%:*} (forge job env or its own)"
@@ -1216,6 +1229,16 @@ case "$args" in
     u="${args#pr view }"; u="${u%% *}"; n="${u##*/}"
     if [ -f "$S/head_repo_$n.json" ]; then cat "$S/head_repo_$n.json"
     else echo '{"headRefName": "feature", "isCrossRepository": false, "headRepository": {"name": "r"}, "headRepositoryOwner": {"login": "o"}}'; fi ;;
+  "pr view https://github.com/o/r/pull/"*" --json state,body,isCrossRepository,closingIssuesReferences")
+    # The named PR read (pr_number, forge-agent#227). named_pr_<n>.json
+    # overrides, named_pr_fail fails it with that file as gh's stderr. By
+    # default the PR is open, from this repository, and closes issue 1213.
+    u="${args#pr view }"; u="${u%% *}"; n="${u##*/}"
+    if [ -f "$S/named_pr_fail" ]; then cat "$S/named_pr_fail" >&2; exit 1
+    elif [ -f "$S/named_pr_502_once" ] && [ ! -f "$S/named_pr_502_once.done" ]; then
+      touch "$S/named_pr_502_once.done"; echo "gh: Bad Gateway (HTTP 502)" >&2; exit 1
+    elif [ -f "$S/named_pr_$n.json" ]; then cat "$S/named_pr_$n.json"
+    else echo '{"state": "OPEN", "body": "", "isCrossRepository": false, "closingIssuesReferences": [{"number": 1213, "repository": {"name": "r", "owner": {"login": "o"}}}]}'; fi ;;
   "pr view https://github.com/o/r/pull/7 --json baseRefName --jq .baseRefName") echo master ;;
   "pr view https://github.com/o/r/pull/7 --json title,body") cat "$S/pr.json" ;;
   "pr checkout"*) : ;;
@@ -1465,6 +1488,7 @@ run_case() {  # run_case <case dir>
   env -i IGNORED_SCAN_JQ="$IGNORED_SCAN_JQ" IGNORED_CHECKS_RE="$IGNORED_CHECKS_RE" PATH="$FAKE_BIN:$PATH" HOME="$c/home" GIT_CONFIG_GLOBAL="$c/home/gitconfig" \
     FAKE_STATE="$c" GITHUB_OUTPUT="$c/out" GITHUB_ENV="$c/env" \
     GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=1 ISSUE_NUMBER="$num" ISSUE_URL="https://github.com/o/r/issues/$num" \
+    PR_NUMBER="$(cat "$c/pr_number" 2>/dev/null || true)" \
     FORGE_COMMAND="$cmd" FAST_LANE=false TIMEOUT_MINUTES="$(cat "$c/timeout_minutes" 2>/dev/null || echo 90)" \
     AI_REVIEWS_ONLY="$(cat "$c/ai_reviews_only" 2>/dev/null || echo false)" \
     CLAUDE_BIN="$FAKE_BIN/claude" FORGE_CLI="$c/cli.js" \
@@ -1477,6 +1501,7 @@ run_case() {  # run_case <case dir>
   while IFS= read -r kv; do renv+=("$kv"); done < <(report_env_args "$c")
   env -i IGNORED_SCAN_JQ="$IGNORED_SCAN_JQ" IGNORED_CHECKS_RE="$IGNORED_CHECKS_RE" PATH="$FAKE_BIN:$PATH" HOME="$c/home" FAKE_STATE="$c" \
     GITHUB_REPOSITORY=o/r ISSUE_NUMBER="$num" ISSUE_URL="https://github.com/o/r/issues/$num" \
+    PR_NUMBER="$(cat "$c/pr_number" 2>/dev/null || true)" \
     GH_TOKEN=ghs_faketoken COMMENT_ID=55 OUTCOME=success FORGE_COMMAND="$cmd" \
     SLACK_CHANNEL=C1 SLACK_THREAD_TS=1.1 SLACK_BOT_TOKEN=xoxb-fake SLACK_MENTION_TS=3.3 \
     RUN_URL=https://github.com/o/r/actions/runs/1 \
@@ -1839,6 +1864,21 @@ check '[[ "$(completion_of "$C")" == *"<https://github.com/o/r/pull/8|PR #8>, is
 C=$(report_only fork_junk OUTCOME=failure PR_UNRESOLVED=1 "PR_FROM_FORK=https://evil.example/o/r/pull/8" SLACK_MENTION_TS=3.3)
 check '[[ "$(completion_of "$C")" == *"No open PR is linked to issue"* ]] && ! has "$C/slack.jsonl" "evil.example"' \
   "a pr_from_fork that is not a GitHub pull URL is never posted"
+# The named-PR outputs (#227) get the same URL check and the update wording.
+for out in PR_NOT_LINKED PR_NAMED_UNREAD; do
+  C=$(report_only "junk_$out" OUTCOME=failure PR_UNRESOLVED=1 "$out=https://evil.example/o/r/pull/8" SLACK_MENTION_TS=3.3)
+  check '[[ "$(completion_of "$C")" == *"No open PR is linked to issue"* ]] && ! has "$C/slack.jsonl" "evil.example"' \
+    "a $out that is not a GitHub pull URL is never posted"
+done
+C=$(report_only not_linked_update OUTCOME=failure FORGE_COMMAND=update PR_UNRESOLVED=1 PR_NOT_LINKED=https://github.com/o/r/pull/8 SLACK_MENTION_TS=3.3)
+check '[[ "$(completion_of "$C")" == *"<https://github.com/o/r/pull/8|PR #8> is not an open PR that closes issue"*"so there is nothing to update."* ]] && [ "$(reactions "$C" add)" = warning ]' \
+  "an update on a named PR that does not close the issue says there is nothing to update (got $(completion_of "$C"))"
+C=$(report_only unread_update OUTCOME=failure FORGE_COMMAND=update PR_UNRESOLVED=1 PR_NAMED_UNREAD=https://github.com/o/r/pull/8 SLACK_MENTION_TS=3.3)
+check '[[ "$(completion_of "$C")" == *"could not read <https://github.com/o/r/pull/8|PR #8>"*"so it did not update anything."* ]]' \
+  "an update on a named PR that cannot be read says it did not update anything (got $(completion_of "$C"))"
+C=$(report_only invalid_update OUTCOME=failure FORGE_COMMAND=update PR_UNRESOLVED=1 PR_NUMBER_INVALID=1 SLACK_MENTION_TS=3.3)
+check '[[ "$(completion_of "$C")" == *"The PR to update on issue"*"was not given as a PR number, so Forge did not update anything."* ]]' \
+  "an update with an invalid pr_number says so (got $(completion_of "$C"))"
 
 # The only open PR that closes the issue is from a fork, and its branch is
 # named feature like this repository's PR branch (#195): no dstp run, no
@@ -2628,6 +2668,142 @@ check '[ ! -s "$C/unhandled.log" ] && has "$C/run.log" "Could not read #1213, so
   "a work item that cannot be read is treated as an issue, as before"
 check '[ "$(grep -cx "api repos/o/r/issues/1213" "$C/gh.log")" = 1 ] && ! grep -qsx 60 "$C/sleep.log"' \
   "a 4xx on the work item read is not retried"
+
+# --- the PR the requester named (pr_number, forge-agent#227) ----------------
+# Issue 1213 has two open PRs that close it. find_open_pr would take the
+# first, #8; the requester named #7, so the run works on #7, read directly,
+# and the labels stay on the issue.
+TWO_OPEN='{"data": {"repository": {"issue": {"closedByPullRequestsReferences": {"nodes": [{"url": "https://github.com/o/r/pull/8", "state": "OPEN", "isCrossRepository": false}, {"url": "https://github.com/o/r/pull/7", "state": "OPEN", "isCrossRepository": false}]}}}}}'
+named_pr_json() {  # named_pr_json <state> <body> <isCrossRepository> <closing refs JSON>
+  jq -nc --arg s "$1" --arg b "$2" --argjson f "$3" --argjson c "$4" '{state: $s, body: $b, isCrossRepository: $f, closingIssuesReferences: $c}'
+}
+C=$(quiet_case named_pr)
+echo 7 > "$C/pr_number"
+printf '%s\n' "$TWO_OPEN" > "$C/closed_by.json"
+run_case "$C"
+check '[ "$(cat "$C/run.rc")" = 0 ] && [ ! -s "$C/unhandled.log" ] && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out" && ! grep -q "^work_pr=" "$C/out" && ! grep -q "^pr_unresolved=" "$C/out"' \
+  "a named PR that closes the issue is revised instead of find_open_pr's first pick"
+check 'grep -qF "pr view https://github.com/o/r/pull/7 --json state,body,isCrossRepository,closingIssuesReferences" "$C/gh.log" && ! grep -q "closedByPullRequestsReferences" "$C/gh.log" && ! grep -q "^pr list --state open" "$C/gh.log"' \
+  "the named PR is read directly, not looked up in the issue's PR lists"
+check 'grep -q "^issue edit 1213 --repo o/r .*--add-label forge:done$" "$C/gh.log" && ! grep -q "^issue edit 7 " "$C/gh.log"' \
+  "the labels stay on the issue for a named PR"
+
+C=$(quiet_case named_pr_body)
+echo 7 > "$C/pr_number"
+named_pr_json OPEN "Fixes #1213" false '[]' > "$C/named_pr_7.json"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out"' \
+  "a named PR that closes the issue only through its body still qualifies"
+
+for nl in "mention|OPEN|Mentions #1213 but closes nothing|false|[]" \
+  "closed|CLOSED|Closes #1213|false|[]" \
+  'other_repo|OPEN||false|[{"number": 1213, "repository": {"name": "other", "owner": {"login": "o"}}}]' \
+  "other_issue|OPEN|Closes #12134|false|[]" \
+  "longer_word|OPEN|This prefixes #1213 only|false|[]" \
+  "comment|OPEN|<!-- Closes #1213 -->|false|[]" \
+  'fence|OPEN|```\nCloses #1213\n```|false|[]'; do
+  IFS='|' read -r name state body fork closing <<< "$nl"
+  body=$(printf '%b' "$body")
+  C=$(quiet_case "named_pr_$name")
+  echo 7 > "$C/pr_number"
+  named_pr_json "$state" "$body" "$fork" "$closing" > "$C/named_pr_7.json"
+  run_case "$C"
+  check '[ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && grep -qxF "pr_not_linked=https://github.com/o/r/pull/7" "$C/out" && grep -q "^pr_unresolved=1$" "$C/out" && ! grep -q "^pr_url=" "$C/out"' \
+    "a named PR that is not an open PR closing the issue ($name) is refused before dstp, and no other PR is revised"
+done
+check '[ "$(head -1 "$C/completion.txt")" = "⚠️ <https://github.com/o/r/pull/7|PR #7> is not an open PR that closes issue <https://github.com/o/r/issues/1213|#1213>, so there is nothing to revise. Add Closes #1213 to that PR body, or name the PR that closes the issue, and ask again." ] && grep -q "^issue edit 1213 --repo o/r .*--add-label forge:failed$" "$C/gh.log"' \
+  "the completion names the PR and says why (got $(head -1 "$C/completion.txt"))"
+
+# A closing line after a closed comment and a closed fence still counts, and
+# the test is the one pr-text uses: the two CLOSES_JQ copies are the same text.
+C=$(quiet_case named_pr_body_after_fence)
+echo 7 > "$C/pr_number"
+named_pr_json OPEN "$(printf '<!-- note -->\n~~~\nCloses #5\n~~~\n\nCloses #1213')" false '[]' > "$C/named_pr_7.json"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out"' \
+  "a closing line after a closed comment and fence still qualifies a named PR"
+
+# A body saved with CRLF line ends closes its fences like an LF one, and a
+# line that starts with an inline code span does not open a fence.
+for nl in 'crlf_fence|<!-- note -->\r\n```\r\ncode\r\n```\r\n\r\nCloses #1213' \
+  'span_before|```foo```\n\nCloses #1213' \
+  'span_then_fence|```foo```\n\n```\nCloses #5\n```\n\nCloses #1213'; do
+  IFS='|' read -r name body <<< "$nl"
+  body=$(printf '%b' "$body")
+  C=$(quiet_case "named_pr_$name")
+  echo 7 > "$C/pr_number"
+  named_pr_json OPEN "$body" false '[]' > "$C/named_pr_7.json"
+  run_case "$C"
+  check '[ ! -s "$C/unhandled.log" ] && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out"' \
+    "a closing line still counts after a CRLF fence or an inline code span ($name)"
+done
+C=$(quiet_case named_pr_span_fenced)
+echo 7 > "$C/pr_number"
+named_pr_json OPEN "$(printf '```foo```\n\n```\nCloses #1213\n```')" false '[]' > "$C/named_pr_7.json"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && grep -qxF "pr_not_linked=https://github.com/o/r/pull/7" "$C/out"' \
+  "a closing line inside a real fence stays ignored after an inline code span"
+
+# closes_jq_copy <job> <n>: the n-th CLOSES_JQ='...' block inside one job.
+closes_jq_copy() {
+  awk -v job="  $1:" -v want="$2" '
+    /^  [a-z_-]+:$/ {j = ($0 == job)}
+    j && /^          CLOSES_JQ=\x27/ {n++; f=(n == want)}
+    f {print} f && /^          \x27$/ {f=0}' "$WF"
+}
+CJ_FORGE=$(closes_jq_copy forge 1)
+CJ_TEXT=$(closes_jq_copy pr-text 1)
+check '[ "$(wc -l <<< "$CJ_FORGE")" -gt 5 ] && [ "$CJ_FORGE" = "$CJ_TEXT" ] && [ -z "$(closes_jq_copy forge 2)" ] && [ -z "$(closes_jq_copy pr-text 2)" ]' \
+  "the forge job and pr-text each hold one CLOSES_JQ, and the text is the same"
+
+C=$(quiet_case named_pr_fork)
+echo 7 > "$C/pr_number"
+named_pr_json OPEN "" true '[{"number": 1213, "repository": {"name": "r", "owner": {"login": "o"}}}]' > "$C/named_pr_7.json"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && grep -qxF "pr_from_fork=https://github.com/o/r/pull/7" "$C/out" && grep -q "^pr_unresolved=1$" "$C/out"' \
+  "a named PR from a fork is refused, and no other PR is revised in its place"
+
+# A number that is no PR here (an issue's number, a typo): gh pr view says so
+# in GraphQL's words, with no HTTP status. Read once, never retried, and
+# reported as not a PR that closes the issue.
+C=$(quiet_case named_pr_not_a_pr)
+echo 7 > "$C/pr_number"
+echo "GraphQL: Could not resolve to a PullRequest with the number of 7. (repository.pullRequest)" > "$C/named_pr_fail"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && grep -qxF "pr_not_linked=https://github.com/o/r/pull/7" "$C/out" && ! grep -q "^pr_named_unread=" "$C/out" && [ "$(grep -c "json state,body,isCrossRepository,closingIssuesReferences" "$C/gh.log")" = 1 ] && ! grep -qsx 60 "$C/sleep.log"' \
+  "a pr_number that names no PR is read once and refused as not closing the issue"
+
+C=$(quiet_case named_pr_502_once)
+echo 7 > "$C/pr_number"
+touch "$C/named_pr_502_once"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out" && [ "$(grep -c "json state,body,isCrossRepository,closingIssuesReferences" "$C/gh.log")" = 2 ] && [ "$(grep -cx 60 "$C/sleep.log")" = 1 ] && has "$C/run.log" "Retrying in 60s"' \
+  "a 502 on the named PR read is retried, and the retry is in the log"
+
+C=$(quiet_case named_pr_unread)
+echo 7 > "$C/pr_number"
+echo "gh: Bad Gateway (HTTP 502)" > "$C/named_pr_fail"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && grep -qxF "pr_named_unread=https://github.com/o/r/pull/7" "$C/out" && grep -q "^pr_unresolved=1$" "$C/out" && ! grep -q "^pr_not_linked=" "$C/out"' \
+  "a named PR that keeps failing to read stops the run without calling it unlinked"
+check '[ "$(head -1 "$C/completion.txt")" = "⚠️ Forge could not read <https://github.com/o/r/pull/7|PR #7> to check that it closes issue <https://github.com/o/r/issues/1213|#1213>, so it did not revise anything. Ask again in a few minutes." ]' \
+  "the completion says the PR could not be read (got $(head -1 "$C/completion.txt"))"
+
+C=$(quiet_case named_pr_invalid)
+printf '%s\n' '7;id' > "$C/pr_number"
+printf '%s\n' "$TWO_OPEN" > "$C/closed_by.json"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && [ ! -f "$C/dstp_count" ] && grep -q "^pr_number_invalid=1$" "$C/out" && grep -q "^pr_unresolved=1$" "$C/out" && ! grep -q "^pr_url=" "$C/out" && ! grep -q "closedByPullRequestsReferences" "$C/gh.log" && ! grep -q "^pr view" "$C/gh.log"' \
+  "a pr_number that is not a number reads nothing and revises no PR"
+check '[ "$(head -1 "$C/completion.txt")" = "⚠️ The PR to revise on issue <https://github.com/o/r/issues/1213|#1213> was not given as a PR number, so Forge did not revise anything. Name the PR by its number or link and ask again." ]' \
+  "the completion says the PR number was not valid (got $(head -1 "$C/completion.txt"))"
+
+C=$(quiet_case named_pr_on_work_pr)
+echo 7 > "$C/issue_number"
+echo 8 > "$C/pr_number"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && grep -q "^work_pr=1$" "$C/out" && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out" && ! grep -q "pull/8" "$C/gh.log"' \
+  "pr_number is ignored when issue_number is itself a PR"
 
 # --- behavioral: a failed run's Slack copy and who it tags -------------------
 # Report runs as-is on a failed run against a fake Slack, with the log of
