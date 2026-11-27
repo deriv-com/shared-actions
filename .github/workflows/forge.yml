@@ -3145,17 +3145,19 @@ jobs:
           # Fences follow CommonMark: a run of 3+ backticks or tildes at the
           # start of a line (up to 3 spaces in) opens one, and only a line
           # holding a run of the same character at least as long closes it.
-          # pr_blocker reads it, and a description pr-text writes always
-          # passes it. open_fence: the opening run of the fence a description
-          # leaves open, or "", so the same run can close it before a closing
-          # line is added.
+          # A backtick run followed by more backticks on the line is an
+          # inline code span, not a fence. CRLF and lone CR line ends count
+          # as newlines. This job only uses closes_issue; open_fence stays so
+          # the text is the same, byte for byte, as pr-text's (a contract
+          # check pins them equal).
           CLOSES_JQ='
             def fence_scan:
-              gsub("<!--[\\s\\S]*?-->"; "") | split("\n")
+              gsub("\r\n?"; "\n") | gsub("<!--[\\s\\S]*?-->"; "") | split("\n")
               | reduce .[] as $l ({out: [], open: ""};
                   (first($l | capture("^ {0,3}(?<r>`{3,}|~{3,})") | .r) // "") as $r
                   | if .open == "" then
-                      (if $r != "" then .open = $r else .out += [$l] end)
+                      (if $r != "" and ($r[0:1] == "~" or ($l | test("^ {0,3}`+[^`]*$")))
+                       then .open = $r else .out += [$l] end)
                     elif $r != "" and $r[0:1] == .open[0:1] and ($r | length) >= (.open | length)
                          and ($l | test("^ {0,3}(`+|~+)[ \\t]*$")) then .open = ""
                     else . end);
@@ -5351,11 +5353,12 @@ jobs:
           # line is added.
           CLOSES_JQ='
             def fence_scan:
-              gsub("<!--[\\s\\S]*?-->"; "") | split("\n")
+              gsub("\r\n?"; "\n") | gsub("<!--[\\s\\S]*?-->"; "") | split("\n")
               | reduce .[] as $l ({out: [], open: ""};
                   (first($l | capture("^ {0,3}(?<r>`{3,}|~{3,})") | .r) // "") as $r
                   | if .open == "" then
-                      (if $r != "" then .open = $r else .out += [$l] end)
+                      (if $r != "" and ($r[0:1] == "~" or ($l | test("^ {0,3}`+[^`]*$")))
+                       then .open = $r else .out += [$l] end)
                     elif $r != "" and $r[0:1] == .open[0:1] and ($r | length) >= (.open | length)
                          and ($l | test("^ {0,3}(`+|~+)[ \\t]*$")) then .open = ""
                     else . end);

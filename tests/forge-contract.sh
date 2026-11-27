@@ -2722,13 +2722,39 @@ named_pr_json OPEN "$(printf '<!-- note -->\n~~~\nCloses #5\n~~~\n\nCloses #1213
 run_case "$C"
 check '[ ! -s "$C/unhandled.log" ] && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out"' \
   "a closing line after a closed comment and fence still qualifies a named PR"
-closes_jq_copy() {  # closes_jq_copy <n>: the n-th CLOSES_JQ='...' block in the workflow
-  awk -v want="$1" '/^          CLOSES_JQ=\x27/ {n++; f=(n == want)} f {print} f && /^          \x27$/ {f=0}' "$WF"
+
+# A body saved with CRLF line ends closes its fences like an LF one, and a
+# line that starts with an inline code span does not open a fence.
+for nl in 'crlf_fence|<!-- note -->\r\n```\r\ncode\r\n```\r\n\r\nCloses #1213' \
+  'span_before|```foo```\n\nCloses #1213' \
+  'span_then_fence|```foo```\n\n```\nCloses #5\n```\n\nCloses #1213'; do
+  IFS='|' read -r name body <<< "$nl"
+  body=$(printf '%b' "$body")
+  C=$(quiet_case "named_pr_$name")
+  echo 7 > "$C/pr_number"
+  named_pr_json OPEN "$body" false '[]' > "$C/named_pr_7.json"
+  run_case "$C"
+  check '[ ! -s "$C/unhandled.log" ] && grep -qxF "pr_url=https://github.com/o/r/pull/7" "$C/out"' \
+    "a closing line still counts after a CRLF fence or an inline code span ($name)"
+done
+C=$(quiet_case named_pr_span_fenced)
+echo 7 > "$C/pr_number"
+named_pr_json OPEN "$(printf '```foo```\n\n```\nCloses #1213\n```')" false '[]' > "$C/named_pr_7.json"
+run_case "$C"
+check '[ ! -s "$C/unhandled.log" ] && grep -qxF "pr_not_linked=https://github.com/o/r/pull/7" "$C/out"' \
+  "a closing line inside a real fence stays ignored after an inline code span"
+
+# closes_jq_copy <job> <n>: the n-th CLOSES_JQ='...' block inside one job.
+closes_jq_copy() {
+  awk -v job="  $1:" -v want="$2" '
+    /^  [a-z_-]+:$/ {j = ($0 == job)}
+    j && /^          CLOSES_JQ=\x27/ {n++; f=(n == want)}
+    f {print} f && /^          \x27$/ {f=0}' "$WF"
 }
-CJ_FORGE=$(closes_jq_copy 1)
-CJ_TEXT=$(closes_jq_copy 2)
-check '[ "$(wc -l <<< "$CJ_FORGE")" -gt 5 ] && [ "$CJ_FORGE" = "$CJ_TEXT" ] && [ -z "$(closes_jq_copy 3)" ]' \
-  "the forge job and pr-text share one CLOSES_JQ text"
+CJ_FORGE=$(closes_jq_copy forge 1)
+CJ_TEXT=$(closes_jq_copy pr-text 1)
+check '[ "$(wc -l <<< "$CJ_FORGE")" -gt 5 ] && [ "$CJ_FORGE" = "$CJ_TEXT" ] && [ -z "$(closes_jq_copy forge 2)" ] && [ -z "$(closes_jq_copy pr-text 2)" ]' \
+  "the forge job and pr-text each hold one CLOSES_JQ, and the text is the same"
 
 C=$(quiet_case named_pr_fork)
 echo 7 > "$C/pr_number"
